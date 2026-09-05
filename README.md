@@ -85,3 +85,7 @@ curl -fsSL https://raw.githubusercontent.com/aleksanderbernacki12-byte/aiproxy/m
 make build      # current platform
 make build-all  # macOS (arm64 + amd64), Linux (amd64), Windows (amd64)
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
