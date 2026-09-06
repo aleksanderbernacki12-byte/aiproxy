@@ -65,7 +65,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	addr := fs.String("addr", "127.0.0.1:8080", "address for the proxy to listen on")
 	target := fs.String("target", "", "HTTPS URL to forward requests to (required)")
 	configPath := fs.String("config", "", "path to a JSON config file (custom rules, rate limit, cache, cost estimation, extra target routes; default: aiproxy.json in the working directory, if present)")
+	logFormat := fs.String("log-format", "text", `log output format: "text" (colored, human-readable) or "json" (one JSON object per line, safe to pipe into a log aggregator)`)
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	var proxyLogFormat proxy.LogFormat
+	switch *logFormat {
+	case "text":
+		proxyLogFormat = proxy.LogFormatText
+	case "json":
+		proxyLogFormat = proxy.LogFormatJSON
+	default:
+		fmt.Fprintf(stderr, "aiproxy: -log-format must be \"text\" or \"json\", got %q\n", *logFormat)
 		return 2
 	}
 
@@ -99,6 +111,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	})
 
 	server := proxy.New(*addr, targetURL, engine)
+	server.LogFormat = proxyLogFormat
+	if proxyLogFormat == proxy.LogFormatJSON {
+		// The JSON payload already carries its own "time" field; a
+		// prepended timestamp prefix would break every line's JSON.
+		server.Logger = log.New(os.Stderr, "", 0)
+	}
 
 	if cfg != nil {
 		customRules, ruleErrs := compileCustomRules(cfg.CustomRules)

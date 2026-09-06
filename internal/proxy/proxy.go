@@ -105,9 +105,43 @@ type Server struct {
 	// default) omits the cost line entirely.
 	CostPer1KTokens float64
 
+	// LogFormat selects how every log line below is rendered. The zero
+	// value behaves as LogFormatText, so existing callers that never set
+	// it see no change in behavior.
+	LogFormat LogFormat
+
 	routes       []route
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
+}
+
+// LogFormat selects Server's log output shape.
+type LogFormat string
+
+const (
+	// LogFormatText is the default: colored, human-readable lines like
+	// "[ALLOW] GET /endpoint".
+	LogFormatText LogFormat = "text"
+
+	// LogFormatJSON emits one JSON object per line instead — including
+	// the shutdown summary — so the whole log stream is safe to pipe
+	// into a log aggregator or `jq`, with no stray non-JSON lines mixed
+	// in. Callers using this format should also strip any timestamp
+	// prefix from Logger (e.g. log.New(w, "", 0)): the JSON payload
+	// already carries its own "time" field, and a prepended prefix would
+	// break every line's JSON.
+	LogFormatJSON LogFormat = "json"
+)
+
+// logEvent is the shape of one line logged under LogFormatJSON.
+type logEvent struct {
+	Time    string `json:"time"`
+	Level   string `json:"level"`
+	Method  string `json:"method,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Rule    string `json:"rule,omitempty"`
+	Tokens  int    `json:"tokens,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // New creates a Server that listens on addr, forwards allowed requests to
@@ -327,7 +361,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// runs before the usage log line so a durable cache write is
 		// never left pending behind an already-visible log line.
 		if err := s.Cache.Set(reqCtx.cacheKey, resp); err != nil {
-			s.logf("aiproxy: cache: failed to store response: %v", err)
+			s.logError("aiproxy: cache: failed to store response: %v", err)
 		}
 	}
 
@@ -371,7 +405,7 @@ func (s *Server) writeStreamToCache(key string, statusCode int, header http.Head
 		Body:       io.NopCloser(bytes.NewReader(data)),
 	}
 	if err := s.Cache.Set(key, cached); err != nil {
-		s.logf("aiproxy: cache: failed to store response: %v", err)
+		s.logError("aiproxy: cache: failed to store response: %v", err)
 	}
 }
 
@@ -452,23 +486,71 @@ func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 }
 
 func (s *Server) logAllow(method, reqURL string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "allow", Method: method, URL: reqURL})
+		return
+	}
 	s.logf("%s[ALLOW] %s %s%s", ansiGreen, method, reqURL, ansiReset)
 }
 
 func (s *Server) logBlock(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "block", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
 	s.logf("%s[BLOCK] %s %s - Triggered rule: %s%s", ansiBrightRed, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logRateLimited(method, reqURL string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "rate_limited", Method: method, URL: reqURL})
+		return
+	}
 	s.logf("%s[CIRCUIT BREAKER] %s %s - Rate limit exceeded%s", ansiYellow, method, reqURL, ansiReset)
 }
 
 func (s *Server) logUsage(method, reqURL string, totalTokens int) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "usage", Method: method, URL: reqURL, Tokens: totalTokens})
+		return
+	}
 	s.logf("%s[USAGE] %s %s - Tokens used: %d%s", ansiBlue, method, reqURL, totalTokens, ansiReset)
 }
 
 func (s *Server) logCacheHit(method, reqURL string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "cache_hit", Method: method, URL: reqURL})
+		return
+	}
 	s.logf("%s[CACHE HIT] %s %s%s", ansiPurple, method, reqURL, ansiReset)
+}
+
+// logEventJSON marshals ev (stamping the current time) and logs it as a
+// single line, for LogFormatJSON.
+func (s *Server) logEventJSON(ev logEvent) {
+	ev.Time = time.Now().UTC().Format(time.RFC3339)
+	data, err := json.Marshal(ev)
+	if err != nil {
+		// ev is always one of a few fixed, plain shapes, so this should
+		// never actually happen — but silently dropping the event would
+		// be worse than a slightly malformed fallback line.
+		s.logf(`{"level":"error","message":%q}`, err.Error())
+		return
+	}
+	s.logf("%s", data)
+}
+
+// logError logs an internal, non-request-scoped problem (e.g. a failed
+// cache write) — as a JSON line under LogFormatJSON, so it never breaks
+// the guarantee that every line in that mode is valid JSON, or as a
+// plain line otherwise.
+func (s *Server) logError(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "error", Message: msg})
+		return
+	}
+	s.logf("%s", msg)
 }
 
 func copyHeader(dst, src http.Header) {
@@ -533,7 +615,7 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 	payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.CostPer1KTokens)
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		s.logf("aiproxy: stats: failed to encode response: %v", err)
+		s.logError("aiproxy: stats: failed to encode response: %v", err)
 	}
 }
 
@@ -550,6 +632,25 @@ func (s *Server) Summary() string {
 		summary += "\n" + breakdown
 	}
 	return summary
+}
+
+// logSummary logs the shutdown summary in whichever LogFormat is
+// configured: Summary()'s multi-line text block for LogFormatText, or
+// the same data as a single JSON line (the same shape GET /_aiproxy/stats
+// serves) for LogFormatJSON — a multi-line block would otherwise break
+// the guarantee that every line is valid JSON in that mode.
+func (s *Server) logSummary() {
+	if s.LogFormat == LogFormatJSON {
+		payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.CostPer1KTokens)
+		data, err := json.Marshal(payload)
+		if err != nil {
+			s.logError("aiproxy: summary: failed to encode: %v", err)
+			return
+		}
+		s.logf("%s", data)
+		return
+	}
+	s.logf("%s", s.Summary())
 }
 
 // ListenAndServe starts the proxy and blocks until ctx is cancelled or a
@@ -572,7 +673,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err := s.httpServer.Shutdown(shutdownCtx)
-		s.logf("%s", s.Summary())
+		s.logSummary()
 		return err
 	case err := <-errCh:
 		return fmt.Errorf("proxy: %w", err)

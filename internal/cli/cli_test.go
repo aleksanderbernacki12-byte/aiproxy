@@ -52,6 +52,23 @@ func TestRunStart_InvalidCustomRulePattern_FatalsWithClearMessage(t *testing.T) 
 	}
 }
 
+// TestRunStart_InvalidLogFormat_ReturnsErrorExitCode proves -log-format
+// is validated up front, before -target or any config loading — an
+// invalid value should be rejected immediately with a clear message and
+// exit code 2, the same as any other bad flag, never silently falling
+// back to text or json.
+func TestRunStart_InvalidLogFormat_ReturnsErrorExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-log-format", "yaml"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-log-format") {
+		t.Fatalf("stderr missing a clear -log-format error: %q", stderr.String())
+	}
+}
+
 // runValidate never calls log.Fatal/os.Exit — reporting problems via a
 // normal return code is the whole point — so unlike the start tests
 // above, these run directly in-process with no subprocess needed.

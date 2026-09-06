@@ -24,6 +24,8 @@ aiproxy start --target https://api.example.com
 - `--config`: path to a JSON config file (custom rules, rate limit,
   cache, cost estimation, extra target routes; default: `aiproxy.json`
   in the working directory, if present).
+- `--log-format`: `text` (default) or `json` — see
+  [Structured JSON logging](#structured-json-logging).
 
 Point your client at `http://127.0.0.1:8080` instead of the real API.
 Allowed requests are logged in green (`[ALLOW] POST /endpoint`); blocked
@@ -65,6 +67,36 @@ Total tokens used:   0
 
 A single-target run (no `targets` configured) leaves this section out
 entirely — it would just repeat the block above under a different label.
+
+## Structured JSON logging
+
+```
+aiproxy start --target https://api.example.com --log-format json
+```
+
+With `--log-format json`, every event above is logged as one JSON object
+per line on stderr instead of a colored text line — safe to pipe into a
+log aggregator or `jq` without ever hitting a non-JSON line, including
+the shutdown summary (emitted as the same JSON shape `GET /_aiproxy/stats`
+serves, instead of the multi-line text block):
+
+```
+{"time":"2026-01-01T12:00:00Z","level":"allow","method":"GET","url":"/get"}
+{"time":"2026-01-01T12:00:01Z","level":"block","method":"POST","url":"/x","rule":"aws-access-key"}
+{"time":"2026-01-01T12:00:02Z","level":"usage","method":"POST","url":"/chat","tokens":42}
+{"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42,"per_target":{"default":{"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42}}}
+```
+
+`level` is one of `allow`, `block`, `rate_limited`, `usage`, `cache_hit`,
+or `error` (an internal problem unrelated to any specific request, e.g.
+a failed cache write) — `method`/`url`/`rule`/`tokens` appear only where
+relevant. This only affects the ongoing per-request log stream on
+stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
+...`, `aiproxy listening on ...`) still print as plain text on stdout,
+since they're low-volume, human-oriented setup notices rather than part
+of the structured stream a script would actually parse — the two are
+already on separate streams, so piping just stderr gives you a clean,
+pure-JSON feed.
 
 ## Custom rules, rate limiting, caching, and cost estimation
 

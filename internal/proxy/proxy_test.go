@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -1525,5 +1526,234 @@ func TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget(
 	}
 	if limited.RateLimited != 1 {
 		t.Fatalf("PerTarget[/limited].RateLimited = %d, want 1", limited.RateLimited)
+	}
+}
+
+// jsonLogLine mirrors the shape of one LogFormatJSON log line.
+type jsonLogLine struct {
+	Time    string `json:"time"`
+	Level   string `json:"level"`
+	Method  string `json:"method,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Rule    string `json:"rule,omitempty"`
+	Tokens  int    `json:"tokens,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// TestServer_JSONLogging_EmitsOneValidJSONObjectPerEvent drives one
+// request of each outcome (allow-with-usage, block, rate-limited, and a
+// replay that's a cache hit) through a server configured with
+// LogFormatJSON, and proves every single non-empty log line is valid
+// JSON with the right fields — the core contract of the feature: a
+// script can safely `jq` every line without ever hitting a parse error.
+func TestServer_JSONLogging_EmitsOneValidJSONObjectPerEvent(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"usage":{"total_tokens":7}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "test-secret",
+		Pattern: regexp.MustCompile(`SECRET`),
+		Action:  rules.Block,
+	})
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.LogFormat = proxy.LogFormatJSON
+	srv.Logger = log.New(&logBuf, "", 0)
+	srv.Cache = c
+	srv.Limiter = limiter.New(1, time.Minute)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(body string) {
+		resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %q: %v", body, err)
+		}
+		resp.Body.Close()
+	}
+	post(`{"n":1}`) // allowed, uses the limiter's only slot, carries usage, gets cached
+	post(`SECRET`)  // blocked
+	post(`{"n":2}`) // different body: passes rules, then rate-limited
+	post(`{"n":1}`) // same body as the first: cache hit
+
+	rawLines := strings.Split(strings.TrimRight(logBuf.String(), "\n"), "\n")
+	var events []jsonLogLine
+	for i, line := range rawLines {
+		if line == "" {
+			continue
+		}
+		var ev jsonLogLine
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("line %d is not valid JSON: %q: %v", i, line, err)
+		}
+		if ev.Time == "" {
+			t.Fatalf("line %d missing time field: %q", i, line)
+		}
+		if _, err := time.Parse(time.RFC3339, ev.Time); err != nil {
+			t.Fatalf("line %d has an unparseable time %q: %v", i, ev.Time, err)
+		}
+		events = append(events, ev)
+	}
+
+	wantLevels := []string{"allow", "usage", "block", "rate_limited", "cache_hit"}
+	if len(events) != len(wantLevels) {
+		t.Fatalf("got %d log events, want %d: %+v", len(events), len(wantLevels), events)
+	}
+	for i, want := range wantLevels {
+		if events[i].Level != want {
+			t.Errorf("event %d level = %q, want %q (all events: %+v)", i, events[i].Level, want, events)
+		}
+	}
+	if events[1].Tokens != 7 {
+		t.Errorf("usage event tokens = %d, want 7", events[1].Tokens)
+	}
+	if events[2].Rule != "test-secret" {
+		t.Errorf("block event rule = %q, want test-secret", events[2].Rule)
+	}
+}
+
+// TestServer_JSONLogging_ShutdownSummaryIsOneJSONLine proves the
+// shutdown summary is also emitted as a single JSON line (matching what
+// GET /_aiproxy/stats serves) under LogFormatJSON, rather than the
+// multi-line text block — a multi-line block would otherwise be the one
+// place that breaks "every line is valid JSON".
+func TestServer_JSONLogging_ShutdownSummaryIsOneJSONLine(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	addr := freeLoopbackAddr(t)
+	engine := rules.NewEngine(rules.Allow)
+
+	var logBuf syncBuffer
+	srv := proxy.New(addr, targetURL, engine)
+	srv.LogFormat = proxy.LogFormatJSON
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+
+	waitForServerUp(t, addr, time.Second)
+
+	resp, err := http.Get("http://" + addr + "/endpoint")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ListenAndServe returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not shut down in time")
+	}
+
+	rawLines := strings.Split(strings.TrimRight(logBuf.String(), "\n"), "\n")
+	if len(rawLines) != 2 {
+		t.Fatalf("got %d log lines, want 2 (the allow event, then the summary): %q", len(rawLines), rawLines)
+	}
+
+	var summary statsJSONResponse
+	if err := json.Unmarshal([]byte(rawLines[1]), &summary); err != nil {
+		t.Fatalf("summary line is not valid JSON: %q: %v", rawLines[1], err)
+	}
+	if summary.Allowed != 1 {
+		t.Fatalf("summary.Allowed = %d, want 1", summary.Allowed)
+	}
+}
+
+// TestServer_JSONLogging_CacheErrorIsAlsoAJSONLine proves that even an
+// incidental internal error message (not a per-request event) is logged
+// as a JSON line under LogFormatJSON, not a plain string — the whole
+// point of the feature is that a consumer never has to special-case a
+// stray non-JSON line.
+func TestServer_JSONLogging_CacheErrorIsAlsoAJSONLine(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	// Strip write permission from the already-created cache directory so
+	// New() succeeds but a later Set() fails to write its entry —
+	// exercising the real error path instead of faking one.
+	cacheDirPath := dir + "/" + cache.DirName
+	if err := os.Chmod(cacheDirPath, 0o500); err != nil {
+		t.Fatalf("chmod cache dir: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(cacheDirPath, 0o755) })
+
+	var logBuf bytes.Buffer
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.LogFormat = proxy.LogFormatJSON
+	srv.Logger = log.New(&logBuf, "", 0)
+	srv.Cache = c
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	rawLines := strings.Split(strings.TrimRight(logBuf.String(), "\n"), "\n")
+	foundError := false
+	for _, line := range rawLines {
+		var ev jsonLogLine
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("line is not valid JSON: %q: %v", line, err)
+		}
+		if ev.Level == "error" {
+			foundError = true
+			if ev.Message == "" {
+				t.Errorf("error event missing a message: %q", line)
+			}
+		}
+	}
+	if !foundError {
+		t.Fatalf("expected an error-level JSON event for the failed cache write, got: %q", rawLines)
 	}
 }
