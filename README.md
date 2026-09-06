@@ -69,21 +69,23 @@ never reaches the upstream target. `.aiproxy_cache/` is already listed in
 
 ## Installing
 
-`install.sh` doesn't fetch a prebuilt binary from GitHub Releases yet, so
-for now clone the repo and run it — it detects your OS/architecture,
-builds aiproxy from source, and installs it to `/usr/local/bin` (override
-with `AIPROXY_INSTALL_DIR`):
+```
+curl -fsSL https://raw.githubusercontent.com/aleksanderbernacki12-byte/aiproxy/main/install.sh | sh
+```
+
+This detects your OS/architecture, downloads the matching binary from
+the [latest release](https://github.com/aleksanderbernacki12-byte/aiproxy/releases/latest),
+and installs it to `/usr/local/bin` (override with `AIPROXY_INSTALL_DIR`).
+No Go toolchain required.
+
+If you'd rather build from source — or the release download fails for
+some reason — clone the repo and run the same script; it automatically
+falls back to a local build when it detects it's sitting inside a
+checkout with `go` available:
 
 ```
 git clone https://github.com/aleksanderbernacki12-byte/aiproxy && cd aiproxy
 ./install.sh
-```
-
-Once install.sh fetches prebuilt binaries directly from GitHub Releases
-instead of building locally, installing will be a single command:
-
-```
-curl -fsSL https://raw.githubusercontent.com/aleksanderbernacki12-byte/aiproxy/main/install.sh | sh
 ```
 
 ## Building from source

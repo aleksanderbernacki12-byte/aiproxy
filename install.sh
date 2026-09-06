@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Installer for aiproxy.
 #
-# Today there are no published GitHub Releases yet, so this script builds
-# aiproxy from source (requires a local Go toolchain) and installs the
-# resulting binary into a directory on your PATH. It already detects OS
-# and CPU architecture and derives the release asset name/URL that a
-# future `curl | sh` install (see README.md) will fetch directly instead
-# of building locally.
+# Downloads the prebuilt binary for your OS/architecture from the latest
+# GitHub Release and installs it onto your PATH. If that download fails
+# (or curl is unavailable) and this script happens to be running from
+# inside a cloned copy of the repo with a Go toolchain on PATH, it falls
+# back to building aiproxy from source instead.
 set -euo pipefail
 
 REPO="aleksanderbernacki12-byte/aiproxy"
@@ -44,20 +43,40 @@ log "aiproxy installer"
 log "  OS:            ${OS}"
 log "  architecture:  ${ARCH}"
 log "  release asset: ${ASSET_NAME}"
-log "  (future download URL: ${RELEASE_URL})"
 log ""
 
-command -v go >/dev/null 2>&1 ||
-	die "go is required to build aiproxy locally (no release binaries are published yet)"
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "${SCRIPT_DIR}/go.mod" ] || die "go.mod not found next to install.sh (${SCRIPT_DIR}) — run this script from the aiproxy repo"
+# Tries to download the prebuilt release binary. Returns non-zero (never
+# exits the script) on any failure, so the caller can fall back.
+download_release_binary() {
+	command -v curl >/dev/null 2>&1 || return 1
+	log "downloading ${ASSET_NAME} from the latest GitHub release..."
+	curl -fsSL --retry 3 -o "${WORK_DIR}/${BINARY_NAME}" "${RELEASE_URL}"
+}
 
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "${BUILD_DIR}"' EXIT
+# Tries to build from source, only possible when this script is sitting
+# inside a checked-out copy of the repo (as opposed to running via
+# `curl | sh`, where there is no source to build). Returns non-zero on
+# any failure, never exits the script.
+build_from_source() {
+	local self="${BASH_SOURCE[0]:-}"
+	[ -n "${self}" ] || return 1
+	local script_dir
+	script_dir="$(cd "$(dirname "${self}")" && pwd)"
+	[ -f "${script_dir}/go.mod" ] || return 1
+	command -v go >/dev/null 2>&1 || return 1
 
-log "building ${BINARY_NAME} from source for ${OS}/${ARCH}..."
-(cd "${SCRIPT_DIR}" && GOOS="${OS}" GOARCH="${ARCH}" go build -o "${BUILD_DIR}/${BINARY_NAME}" "./cmd/${BINARY_NAME}")
+	log "building ${BINARY_NAME} from source for ${OS}/${ARCH} instead..."
+	(cd "${script_dir}" && GOOS="${OS}" GOARCH="${ARCH}" go build -o "${WORK_DIR}/${BINARY_NAME}" "./cmd/${BINARY_NAME}")
+}
+
+if ! download_release_binary; then
+	log "release download unavailable, falling back to a local build"
+	build_from_source ||
+		die "could not download a release binary for ${ASSET_NAME}, and no local source + Go toolchain was found to build from instead"
+fi
 
 mkdir -p "${INSTALL_DIR}" 2>/dev/null || true
 if [ -w "${INSTALL_DIR}" ]; then
@@ -68,7 +87,7 @@ else
 fi
 
 ${SUDO} mkdir -p "${INSTALL_DIR}"
-${SUDO} install -m 0755 "${BUILD_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+${SUDO} install -m 0755 "${WORK_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 
 log "installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
 
