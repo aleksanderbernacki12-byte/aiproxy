@@ -159,3 +159,71 @@ jobs:
           git add Formula/aiproxy.rb
           git commit -m "aiproxy ${{ github.ref_name }}"
           git push
+
+  update-scoop-bucket:
+    name: Update Scoop bucket
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # Same reasoning as the Homebrew job above: job-level `if:` can't
+      # see secrets, so the check happens in a step whose own `if:` can
+      # reference its output — a release must never fail just because
+      # the bucket token isn't configured yet, only skip the update.
+      - name: Check for Scoop bucket token
+        id: check_token
+        run: |
+          if [ -n "$SCOOP_BUCKET_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "SCOOP_BUCKET_TOKEN is not set — skipping the Scoop bucket update."
+          fi
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+
+      - name: Checkout aiproxy (for the manifest template)
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/checkout@v7
+
+      - name: Download checksums
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: SHA256SUMS
+
+      - name: Checkout scoop-aiproxy
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: aleksanderbernacki12-byte/scoop-aiproxy
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: bucket-repo
+
+      - name: Render manifest from this release's checksums
+        if: steps.check_token.outputs.has_token == 'true'
+        run: |
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          amd64=$(grep ' aiproxy-windows-amd64.exe$' SHA256SUMS | awk '{print $1}')
+          arm64=$(grep ' aiproxy-windows-arm64.exe$' SHA256SUMS | awk '{print $1}')
+
+          sed \
+            -e "s|__VERSION__|${version}|g" \
+            -e "s|__TAG__|${tag}|g" \
+            -e "s|__WINDOWS_AMD64_SHA256__|${amd64}|" \
+            -e "s|__WINDOWS_ARM64_SHA256__|${arm64}|" \
+            .github/scoop/aiproxy.json.tmpl > bucket-repo/bucket/aiproxy.json
+
+      - name: Commit and push, if the manifest actually changed
+        if: steps.check_token.outputs.has_token == 'true'
+        working-directory: bucket-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "manifest already up to date, nothing to commit"
+            exit 0
+          fi
+          git add bucket/aiproxy.json
+          git commit -m "aiproxy ${{ github.ref_name }}"
+          git push

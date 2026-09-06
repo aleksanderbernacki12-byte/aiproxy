@@ -271,6 +271,19 @@ This installs from the [aiproxy tap](https://github.com/aleksanderbernacki12-byt
 which downloads the matching release binary and verifies it against the
 same checksums as `install.sh` below.
 
+On Windows, via [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add aiproxy https://github.com/aleksanderbernacki12-byte/scoop-aiproxy
+scoop install aiproxy
+```
+
+This installs from the [aiproxy bucket](https://github.com/aleksanderbernacki12-byte/scoop-aiproxy),
+which likewise downloads the matching release binary and verifies it
+against a checksum. Both the Homebrew formula and the Scoop manifest are
+regenerated automatically by the release pipeline on every tagged
+release — neither is ever hand-edited.
+
 Otherwise:
 
 ```
