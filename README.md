@@ -209,6 +209,18 @@ error, just a note that aiproxy would run with only its built-in rules.
 
 ## Installing
 
+On macOS or Linux, via [Homebrew](https://brew.sh):
+
+```
+brew install aleksanderbernacki12-byte/aiproxy/aiproxy
+```
+
+This installs from the [aiproxy tap](https://github.com/aleksanderbernacki12-byte/homebrew-aiproxy),
+which downloads the matching release binary and verifies it against the
+same checksums as `install.sh` below.
+
+Otherwise:
+
 ```
 curl -fsSL https://raw.githubusercontent.com/aleksanderbernacki12-byte/aiproxy/main/install.sh | sh
 ```
