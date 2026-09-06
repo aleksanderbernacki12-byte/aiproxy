@@ -54,9 +54,66 @@ jobs:
           path: dist/${{ steps.vars.outputs.binary_name }}
           if-no-files-found: error
 
+  package-linux:
+    name: Package Linux ${{ matrix.arch }} (.deb/.rpm)
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download linux/${{ matrix.arch }} binary
+        uses: actions/download-artifact@v8
+        with:
+          name: aiproxy-linux-${{ matrix.arch }}
+          path: dist
+
+      - name: Make binary executable
+        run: chmod +x dist/aiproxy-linux-${{ matrix.arch }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install nfpm
+        # go install verifies the module against the checksum database
+        # (GOSUMDB) like any other Go dependency — no need to trust a
+        # third-party marketplace action just to fetch a packaging tool.
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Render nfpm config for this version/arch
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed \
+            -e "s|__VERSION__|${version}|g" \
+            -e "s|__ARCH__|${{ matrix.arch }}|g" \
+            .github/nfpm/nfpm.yaml.tmpl > nfpm.yaml
+
+      - name: Build .deb and .rpm
+        run: |
+          nfpm package --config nfpm.yaml --packager deb --target "aiproxy_${GITHUB_REF_NAME#v}_${{ matrix.arch }}.deb"
+          nfpm package --config nfpm.yaml --packager rpm --target "aiproxy_${GITHUB_REF_NAME#v}_${{ matrix.arch }}.rpm"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: aiproxy-linux-${{ matrix.arch }}-packages
+          path: |
+            *.deb
+            *.rpm
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, package-linux]
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts

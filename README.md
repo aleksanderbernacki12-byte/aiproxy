@@ -354,6 +354,23 @@ every tagged release, alongside the `latest` tag; both are built
 directly from that release's own source, not repackaged from one of the
 other install methods.
 
+As a `.deb` or `.rpm` package, downloaded from the
+[releases page](https://github.com/aleksanderbernacki12-byte/aiproxy/releases/latest)
+(`amd64` and `arm64`, for Debian/Ubuntu and Fedora/RHEL respectively):
+
+```
+sudo dpkg -i aiproxy_<version>_amd64.deb   # Debian/Ubuntu
+sudo rpm -i aiproxy_<version>_amd64.rpm    # Fedora/RHEL
+```
+
+Both install the binary to `/usr/bin/aiproxy` and recommend
+`ca-certificates` (needed to verify the upstream's TLS certificate on
+the new HTTPS connection) without hard-requiring it, so installing
+aiproxy itself never fails on a system that happens to already manage
+that some other way. Built and checksummed by the same release pipeline
+as everything else — verify against the release's `SHA256SUMS` the same
+way `install.sh` does below.
+
 Otherwise:
 
 ```

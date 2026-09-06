@@ -1,0 +1,31 @@
+# nfpm config template for aiproxy's .deb and .rpm packages, rendered
+# once per architecture in the release workflow via sed — same pattern
+# as the Homebrew/Scoop .tmpl files, since nfpm's own ${VAR} expansion
+# turned out not to reach glob'd content src paths.
+name: aiproxy
+arch: __ARCH__
+platform: linux
+version: __VERSION__
+section: net
+priority: optional
+maintainer: "aleksanderbernacki12-byte <aleks.bernack@hotmail.com>"
+homepage: https://github.com/aleksanderbernacki12-byte/aiproxy
+license: MIT
+description: |
+  Local reverse proxy that blocks leaked secrets, rate-limits runaway
+  agent loops, caches repeated calls, and tracks token usage/cost for
+  LLM API traffic.
+
+# aiproxy dials the real upstream over HTTPS and needs a CA trust store
+# to verify it; recommends (not a hard depends) since most systems
+# already carry ca-certificates and a handful of minimal/offline ones
+# may not have it available at all — a missing recommendation should
+# never block installing aiproxy itself.
+recommends:
+  - ca-certificates
+
+contents:
+  - src: dist/aiproxy-linux-__ARCH__
+    dst: /usr/bin/aiproxy
+    file_info:
+      mode: 0755
