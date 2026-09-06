@@ -1,0 +1,5 @@
+# Force LF line endings on checkout regardless of platform or a
+# contributor's local core.autocrlf setting. Without this, Git on
+# Windows checks files out with CRLF, which gofmt then reports as
+# "unformatted" even though the content is identical.
+* text=auto eol=lf
