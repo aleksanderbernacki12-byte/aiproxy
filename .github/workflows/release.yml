@@ -83,3 +83,79 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload checksums for the Homebrew tap job
+        uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: release/SHA256SUMS
+
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # Job-level `if:` can't see secrets at all (only github/inputs/needs/vars
+      # are available there), so the check happens here instead, in a step
+      # whose own `if:` can reference this step's own output. A release must
+      # never be blocked by the tap token being unset, only skip the update.
+      - name: Check for Homebrew tap token
+        id: check_token
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN is not set — skipping the Homebrew tap update."
+          fi
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Checkout aiproxy (for the formula template)
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/checkout@v7
+
+      - name: Download checksums
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: SHA256SUMS
+
+      - name: Checkout homebrew-aiproxy
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: aleksanderbernacki12-byte/homebrew-aiproxy
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render formula from this release's checksums
+        if: steps.check_token.outputs.has_token == 'true'
+        run: |
+          version="${{ github.ref_name }}"
+          darwin_arm64=$(grep ' aiproxy-darwin-arm64$' SHA256SUMS | awk '{print $1}')
+          darwin_amd64=$(grep ' aiproxy-darwin-amd64$' SHA256SUMS | awk '{print $1}')
+          linux_arm64=$(grep ' aiproxy-linux-arm64$' SHA256SUMS | awk '{print $1}')
+          linux_amd64=$(grep ' aiproxy-linux-amd64$' SHA256SUMS | awk '{print $1}')
+
+          sed \
+            -e "s|__VERSION__|${version}|g" \
+            -e "s|__DARWIN_ARM64_SHA256__|${darwin_arm64}|" \
+            -e "s|__DARWIN_AMD64_SHA256__|${darwin_amd64}|" \
+            -e "s|__LINUX_ARM64_SHA256__|${linux_arm64}|" \
+            -e "s|__LINUX_AMD64_SHA256__|${linux_amd64}|" \
+            .github/homebrew/aiproxy.rb.tmpl > tap/Formula/aiproxy.rb
+
+      - name: Commit and push, if the formula actually changed
+        if: steps.check_token.outputs.has_token == 'true'
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "formula already up to date, nothing to commit"
+            exit 0
+          fi
+          git add Formula/aiproxy.rb
+          git commit -m "aiproxy ${{ github.ref_name }}"
+          git push

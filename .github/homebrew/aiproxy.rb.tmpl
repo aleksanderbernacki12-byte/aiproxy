@@ -1,0 +1,35 @@
+class Aiproxy < Formula
+  desc "Local reverse proxy that blocks leaked secrets and rate-limits LLM API calls"
+  homepage "https://github.com/aleksanderbernacki12-byte/aiproxy"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/aleksanderbernacki12-byte/aiproxy/releases/download/__VERSION__/aiproxy-darwin-arm64"
+      sha256 "__DARWIN_ARM64_SHA256__"
+    end
+    on_intel do
+      url "https://github.com/aleksanderbernacki12-byte/aiproxy/releases/download/__VERSION__/aiproxy-darwin-amd64"
+      sha256 "__DARWIN_AMD64_SHA256__"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/aleksanderbernacki12-byte/aiproxy/releases/download/__VERSION__/aiproxy-linux-arm64"
+      sha256 "__LINUX_ARM64_SHA256__"
+    end
+    on_intel do
+      url "https://github.com/aleksanderbernacki12-byte/aiproxy/releases/download/__VERSION__/aiproxy-linux-amd64"
+      sha256 "__LINUX_AMD64_SHA256__"
+    end
+  end
+
+  def install
+    bin.install Dir["aiproxy-*"].first => "aiproxy"
+  end
+
+  test do
+    assert_match "usage: aiproxy", shell_output("#{bin}/aiproxy help")
+  end
+end
