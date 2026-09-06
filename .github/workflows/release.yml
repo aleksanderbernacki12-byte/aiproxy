@@ -76,7 +76,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Create release and upload assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: aiproxy ${{ github.ref_name }}
           files: release/*
