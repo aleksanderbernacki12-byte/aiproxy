@@ -833,3 +833,175 @@ func TestServer_SummaryText_IncludesCostLineOnlyWhenConfigured(t *testing.T) {
 		t.Fatalf("summary missing correct cost line for 2500 tokens at 0.02/1K: %q", withCost)
 	}
 }
+
+// TestServer_MultiTargetRouting_RoutesByPathPrefixAndStripsPrefix proves
+// AddRoute's core contract: a request whose path starts with a
+// registered prefix goes to that route's target with the prefix
+// stripped, while anything else falls back to the default Target
+// unmodified.
+func TestServer_MultiTargetRouting_RoutesByPathPrefixAndStripsPrefix(t *testing.T) {
+	var openaiPath, anthropicPath, defaultPath string
+
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openaiPath = r.URL.Path
+		w.Write([]byte("openai response"))
+	}))
+	defer openai.Close()
+
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthropicPath = r.URL.Path
+		w.Write([]byte("anthropic response"))
+	}))
+	defer anthropic.Close()
+
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultPath = r.URL.Path
+		w.Write([]byte("default response"))
+	}))
+	defer defaultUpstream.Close()
+
+	openaiURL, err := url.Parse(openai.URL)
+	if err != nil {
+		t.Fatalf("parse openai url: %v", err)
+	}
+	anthropicURL, err := url.Parse(anthropic.URL)
+	if err != nil {
+		t.Fatalf("parse anthropic url: %v", err)
+	}
+	defaultURL, err := url.Parse(defaultUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse default url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", defaultURL, engine)
+	srv.AddRoute("/openai", openaiURL)
+	srv.AddRoute("/anthropic", anthropicURL)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func(path string) string {
+		resp, err := http.Get(frontend.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("get %s: read body: %v", path, err)
+		}
+		return string(body)
+	}
+
+	if got := get("/openai/v1/chat/completions"); got != "openai response" {
+		t.Fatalf("GET /openai/v1/chat/completions body = %q, want the openai upstream's response", got)
+	}
+	if openaiPath != "/v1/chat/completions" {
+		t.Fatalf("openai upstream saw path %q, want /v1/chat/completions (the /openai prefix should be stripped)", openaiPath)
+	}
+
+	if got := get("/anthropic/v1/messages"); got != "anthropic response" {
+		t.Fatalf("GET /anthropic/v1/messages body = %q, want the anthropic upstream's response", got)
+	}
+	if anthropicPath != "/v1/messages" {
+		t.Fatalf("anthropic upstream saw path %q, want /v1/messages", anthropicPath)
+	}
+
+	if got := get("/something-else"); got != "default response" {
+		t.Fatalf("GET /something-else body = %q, want the default target's response", got)
+	}
+	if defaultPath != "/something-else" {
+		t.Fatalf("default upstream saw path %q, want /something-else unchanged (no prefix matched, nothing to strip)", defaultPath)
+	}
+}
+
+// TestServer_MultiTargetRouting_CacheKeysDifferPerTarget proves the
+// cache is route-aware: an identical body and identical forwarded-path
+// suffix sent to two different target prefixes must be treated as two
+// distinct cache entries, never as a collision that would let one
+// provider's cached response leak out under another's route.
+func TestServer_MultiTargetRouting_CacheKeysDifferPerTarget(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var openaiHits, anthropicHits atomic.Int32
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openaiHits.Add(1)
+		w.Write([]byte("openai"))
+	}))
+	defer openai.Close()
+
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthropicHits.Add(1)
+		w.Write([]byte("anthropic"))
+	}))
+	defer anthropic.Close()
+
+	openaiURL, err := url.Parse(openai.URL)
+	if err != nil {
+		t.Fatalf("parse openai url: %v", err)
+	}
+	anthropicURL, err := url.Parse(anthropic.URL)
+	if err != nil {
+		t.Fatalf("parse anthropic url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", openaiURL, engine)
+	srv.AddRoute("/openai", openaiURL)
+	srv.AddRoute("/anthropic", anthropicURL)
+	srv.Cache = c
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const sharedSuffix = "/v1/x"
+	const body = `{"same":"body"}`
+
+	post := func(path string) string {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		got, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("post %s: read body: %v", path, err)
+		}
+		return string(got)
+	}
+
+	if got := post("/openai" + sharedSuffix); got != "openai" {
+		t.Fatalf("first openai request body = %q, want %q", got, "openai")
+	}
+	if got := post("/anthropic" + sharedSuffix); got != "anthropic" {
+		t.Fatalf("first anthropic request body = %q, want %q (a real response, not a leaked openai cache entry)", got, "anthropic")
+	}
+	if openaiHits.Load() != 1 {
+		t.Fatalf("openai hits = %d, want 1", openaiHits.Load())
+	}
+	if anthropicHits.Load() != 1 {
+		t.Fatalf("anthropic hits = %d, want 1", anthropicHits.Load())
+	}
+
+	// Repeat both: this time each should be its own cache hit.
+	if got := post("/openai" + sharedSuffix); got != "openai" {
+		t.Fatalf("cached openai request body = %q, want %q", got, "openai")
+	}
+	if got := post("/anthropic" + sharedSuffix); got != "anthropic" {
+		t.Fatalf("cached anthropic request body = %q, want %q", got, "anthropic")
+	}
+	if openaiHits.Load() != 1 {
+		t.Fatalf("openai hits after repeat = %d, want still 1 (must be served from cache)", openaiHits.Load())
+	}
+	if anthropicHits.Load() != 1 {
+		t.Fatalf("anthropic hits after repeat = %d, want still 1 (must be served from cache)", anthropicHits.Load())
+	}
+}

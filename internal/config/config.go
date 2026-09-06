@@ -18,6 +18,13 @@ type CustomRule struct {
 	Pattern string `json:"pattern"`
 }
 
+// Target is one path-prefix-to-upstream mapping for multi-target
+// routing, as it appears in the config file, before URL has been parsed.
+type Target struct {
+	Prefix string `json:"prefix"`
+	URL    string `json:"url"`
+}
+
 // Config is the top-level shape of aiproxy.json.
 type Config struct {
 	CustomRules []CustomRule `json:"custom_rules"`
@@ -38,6 +45,13 @@ type Config struct {
 	// is absent) disables cost estimation entirely — aiproxy has no
 	// built-in, inevitably-stale pricing table to fall back on.
 	CostPer1KTokens float64 `json:"cost_per_1k_tokens"`
+
+	// Targets adds path-prefix-routed upstreams on top of the proxy's
+	// default --target. A request whose path starts with a Target's
+	// Prefix is forwarded to that Target's URL instead, with the matched
+	// prefix stripped. An empty slice (the default when the field is
+	// absent) means every request just goes to the default --target.
+	Targets []Target `json:"targets"`
 }
 
 // Load reads and parses the config file at path. If the file does not

@@ -17,10 +17,13 @@ new HTTPS connection to the real target.
 aiproxy start --target https://api.example.com
 ```
 
-- `--target` (required): the HTTPS URL to forward allowed requests to.
+- `--target` (required): the default HTTPS URL to forward allowed
+  requests to — see [Multi-target routing](#multi-target-routing) for
+  sending different paths to different upstreams instead.
 - `--addr`: local address to listen on (default `127.0.0.1:8080`).
-- `--config`: path to a JSON config file for custom rules and/or a rate
-  limit (default: `aiproxy.json` in the working directory, if present).
+- `--config`: path to a JSON config file (custom rules, rate limit,
+  cache, cost estimation, extra target routes; default: `aiproxy.json`
+  in the working directory, if present).
 
 Point your client at `http://127.0.0.1:8080` instead of the real API.
 Allowed requests are logged in green (`[ALLOW] POST /endpoint`); blocked
@@ -82,6 +85,34 @@ all). aiproxy has no built-in, inevitably-stale pricing table — you tell
 it what rate applies to your own usage (whatever your provider actually
 charges you per 1,000 tokens, in whatever currency), and the summary
 just multiplies that by the total tokens tracked during the run.
+
+## Multi-target routing
+
+By default every request goes to `--target`. Add a `targets` list to
+`aiproxy.json` to route specific path prefixes to other upstreams
+instead — useful for putting more than one provider behind a single
+aiproxy instance:
+
+```json
+{
+  "targets": [
+    { "prefix": "/openai", "url": "https://api.openai.com" },
+    { "prefix": "/anthropic", "url": "https://api.anthropic.com" }
+  ]
+}
+```
+
+A request to `/openai/v1/chat/completions` is forwarded to
+`https://api.openai.com/v1/chat/completions` — the matched prefix is
+stripped before the request reaches the upstream. Anything that doesn't
+match any prefix still falls back to `--target`, so `--target` stays
+required even when `targets` is set. Prefixes are checked in the order
+they're listed, first match wins, so list more specific prefixes first
+if any could overlap. Every other feature — rules, rate limiting,
+caching, usage tracking — applies uniformly regardless of which target a
+request was routed to; caching in particular keys on the resolved
+destination, so identical bodies sent to different providers are never
+confused with each other.
 
 ## Installing
 

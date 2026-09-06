@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,22 +49,36 @@ type llmUsageResponse struct {
 }
 
 // requestContextKey is the context key used to carry per-request data
-// (the client-facing method/URL, and the cache key) from ServeHTTP
-// through to ModifyResponse. The method/URL travel this way so usage
-// logging matches the same format as the ALLOW/BLOCK/CIRCUIT BREAKER
-// lines rather than the rewritten, absolute upstream URL; the cache key
-// travels this way so ModifyResponse can store the response under the
-// exact same key ServeHTTP already checked for a hit.
+// (the client-facing method/URL, the cache key, and the resolved route)
+// from ServeHTTP through to ModifyResponse and Rewrite. The method/URL
+// travel this way so usage logging matches the same format as the
+// ALLOW/BLOCK/CIRCUIT BREAKER lines rather than the rewritten, absolute
+// upstream URL; the cache key travels this way so ModifyResponse can
+// store the response under the exact same key ServeHTTP already checked
+// for a hit; the resolved route travels this way so Rewrite forwards to
+// the exact target that key was computed against, instead of resolving
+// routing a second time and risking the two disagreeing.
 type requestContextKey struct{}
 
 type requestContextInfo struct {
-	method   string
-	url      string
-	cacheKey string
+	method      string
+	url         string
+	cacheKey    string
+	target      *url.URL
+	forwardPath string
+}
+
+// route is one path-prefix-to-upstream mapping for multi-target routing.
+type route struct {
+	prefix string
+	target *url.URL
 }
 
 // Server is a reverse proxy that evaluates every request's body against
-// a rules.Engine before forwarding it to Target over HTTPS.
+// a rules.Engine before forwarding it to Target over HTTPS. Additional
+// path-prefix routes (see AddRoute) can send matching requests to other
+// upstreams instead; Target is always the fallback for anything that
+// doesn't match one of those.
 type Server struct {
 	Addr    string
 	Target  *url.URL
@@ -78,12 +93,13 @@ type Server struct {
 	// default) omits the cost line entirely.
 	CostPer1KTokens float64
 
+	routes       []route
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
 }
 
 // New creates a Server that listens on addr, forwards allowed requests to
-// target over HTTPS, and enforces engine on every request.
+// target over HTTPS by default, and enforces engine on every request.
 func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 	s := &Server{
 		Addr:   addr,
@@ -95,6 +111,17 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 
 	s.reverseProxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
+			// ServeHTTP already resolved routing once (to compute the
+			// cache key) and stashed the result in the context that
+			// r.Clone carries through to pr.In; reuse it verbatim so
+			// forwarding can never disagree with what was cache-keyed.
+			reqCtx, _ := pr.In.Context().Value(requestContextKey{}).(requestContextInfo)
+			target := reqCtx.target
+			if target == nil {
+				target = s.Target
+			}
+			pr.Out.URL.Path = reqCtx.forwardPath
+			pr.Out.URL.RawPath = ""
 			pr.SetURL(target)
 		},
 		ModifyResponse: s.modifyResponse,
@@ -108,10 +135,39 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 	return s
 }
 
+// AddRoute registers a path-prefix route: any request whose path starts
+// with prefix is forwarded to target instead of the default Target, with
+// the matched prefix stripped from the forwarded path (a request to
+// prefix "/openai" and path "/openai/v1/chat" forwards to target's host
+// with path "/v1/chat"). Routes are checked in the order they were
+// added; the first matching prefix wins, so add more specific prefixes
+// before more general ones if they could overlap.
+func (s *Server) AddRoute(prefix string, target *url.URL) {
+	s.routes = append(s.routes, route{prefix: prefix, target: target})
+}
+
+// resolveRoute matches path against the registered routes and returns
+// the target to forward to along with the path to forward it as (the
+// matched prefix stripped, if any route matched). It falls back to the
+// default Target, unmodified path, when nothing matches.
+func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string) {
+	for _, r := range s.routes {
+		if strings.HasPrefix(path, r.prefix) {
+			stripped := strings.TrimPrefix(path, r.prefix)
+			if !strings.HasPrefix(stripped, "/") {
+				stripped = "/" + stripped
+			}
+			return r.target, stripped
+		}
+	}
+	return s.Target, path
+}
+
 // ServeHTTP implements http.Handler. It reads the full request body into
 // memory so the rule engine can inspect it in cleartext, evaluates the
 // request, and either blocks it or restores the body and forwards it
-// intact to Target over HTTPS.
+// intact to the resolved target (Target by default, or a path-prefix
+// route added via AddRoute) over HTTPS.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	r.Body.Close()
@@ -120,11 +176,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolved once so the cache key (below) and the actual forwarding
+	// (in Rewrite, via the request context set further down) can never
+	// disagree about which target and path this request maps to.
+	target, forwardPath := s.resolveRoute(r.URL.Path)
+
 	// The cache is checked before rules and the rate limiter: a cache hit
 	// never touches either, and never reaches the upstream target.
 	var cacheKey string
 	if s.Cache != nil {
-		cacheKey = cache.Key(r.Method, s.Target.ResolveReference(r.URL).String(), body)
+		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
+		cacheKey = cache.Key(r.Method, target.ResolveReference(destURL).String(), body)
 		if cached, hit, err := s.Cache.Get(cacheKey); err == nil && hit {
 			defer cached.Body.Close()
 			copyHeader(w.Header(), cached.Header)
@@ -166,12 +228,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.Stats.RecordAllow()
 	s.logAllow(r.Method, r.URL.String())
 
-	// Carry the client-facing method/URL and the cache key through to
-	// modifyResponse via the request context: by the time ModifyResponse
-	// runs, the request it sees has already been rewritten to the
-	// absolute upstream URL, and it needs the exact same cache key
-	// ServeHTTP already checked for a hit in order to store a miss.
-	reqCtx := requestContextInfo{method: r.Method, url: r.URL.String(), cacheKey: cacheKey}
+	// Carry the client-facing method/URL, the cache key, and the resolved
+	// route through to Rewrite and modifyResponse via the request
+	// context: by the time those run, the request has already been
+	// rewritten to the absolute upstream URL, and they need the exact
+	// same target/cache key ServeHTTP already resolved and checked.
+	reqCtx := requestContextInfo{
+		method:      r.Method,
+		url:         r.URL.String(),
+		cacheKey:    cacheKey,
+		target:      target,
+		forwardPath: forwardPath,
+	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
 	s.reverseProxy.ServeHTTP(w, r)

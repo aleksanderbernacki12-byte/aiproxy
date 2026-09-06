@@ -133,6 +133,49 @@ func TestLoad_MaxRequestsPerMinuteDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesTargets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com"},
+		{"prefix": "/anthropic", "url": "https://api.anthropic.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Targets) != 2 {
+		t.Fatalf("len(Targets) = %d, want 2", len(cfg.Targets))
+	}
+	if cfg.Targets[0] != (config.Target{Prefix: "/openai", URL: "https://api.openai.com"}) {
+		t.Errorf("Targets[0] = %+v, want prefix=/openai url=https://api.openai.com", cfg.Targets[0])
+	}
+	if cfg.Targets[1] != (config.Target{Prefix: "/anthropic", URL: "https://api.anthropic.com"}) {
+		t.Errorf("Targets[1] = %+v, want prefix=/anthropic url=https://api.anthropic.com", cfg.Targets[1])
+	}
+}
+
+func TestLoad_TargetsDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": []}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Targets) != 0 {
+		t.Fatalf("len(Targets) = %d, want 0 when absent", len(cfg.Targets))
+	}
+}
+
 func TestLoad_MissingFileReportsNotExist(t *testing.T) {
 	_, err := config.Load(filepath.Join(t.TempDir(), "does-not-exist.json"))
 	if !os.IsNotExist(err) {

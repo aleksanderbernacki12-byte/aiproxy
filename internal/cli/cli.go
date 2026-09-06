@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -61,7 +62,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", "127.0.0.1:8080", "address for the proxy to listen on")
 	target := fs.String("target", "", "HTTPS URL to forward requests to (required)")
-	configPath := fs.String("config", "", "path to a JSON config file (custom rules, rate limit, cache, cost estimation; default: aiproxy.json in the working directory, if present)")
+	configPath := fs.String("config", "", "path to a JSON config file (custom rules, rate limit, cache, cost estimation, extra target routes; default: aiproxy.json in the working directory, if present)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -124,6 +125,18 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if cfg.CostPer1KTokens > 0 {
 			server.CostPer1KTokens = cfg.CostPer1KTokens
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
+		}
+
+		if len(cfg.Targets) > 0 {
+			routes, err := compileTargetRoutes(cfg.Targets)
+			if err != nil {
+				fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+				return 2
+			}
+			for _, r := range routes {
+				server.AddRoute(r.prefix, r.target)
+				fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, r.target)
+			}
 		}
 	}
 
@@ -190,20 +203,60 @@ func parseTarget(raw string) (*url.URL, error) {
 	if raw == "" {
 		return nil, fmt.Errorf("-target is required")
 	}
+	u, err := parseHTTPSURL(raw)
+	if err != nil {
+		return nil, fmt.Errorf("-target %w", err)
+	}
+	return u, nil
+}
+
+// parseHTTPSURL validates raw as an upstream URL: defaulting to https
+// when no scheme is given, and requiring the result to use https with a
+// host. Shared by parseTarget (the --target flag) and
+// compileTargetRoutes (each entry in the config file's targets list).
+func parseHTTPSURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("invalid -target: %w", err)
+		return nil, fmt.Errorf("is not a valid URL: %w", err)
 	}
 	if u.Scheme == "" {
 		u.Scheme = "https"
 	}
 	if u.Scheme != "https" {
-		return nil, fmt.Errorf("-target must use https, got %q", u.Scheme)
+		return nil, fmt.Errorf("must use https, got %q", u.Scheme)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("-target must include a host")
+		return nil, fmt.Errorf("must include a host")
 	}
 	return u, nil
+}
+
+// targetRoute is one compiled entry from the config file's targets list,
+// ready to be added to a proxy.Server via AddRoute.
+type targetRoute struct {
+	prefix string
+	target *url.URL
+}
+
+// compileTargetRoutes validates and parses each targets entry from the
+// config file. A prefix must be non-empty and start with "/"; a URL must
+// pass the same https validation as --target. Any error here is a hard
+// failure — an unresolvable extra route is exactly the kind of thing
+// that should stop the proxy at startup, not fail silently later on the
+// first request that happens to hit it.
+func compileTargetRoutes(targets []config.Target) ([]targetRoute, error) {
+	compiled := make([]targetRoute, 0, len(targets))
+	for _, t := range targets {
+		if t.Prefix == "" || !strings.HasPrefix(t.Prefix, "/") {
+			return nil, fmt.Errorf("targets: prefix %q must be non-empty and start with \"/\"", t.Prefix)
+		}
+		u, err := parseHTTPSURL(t.URL)
+		if err != nil {
+			return nil, fmt.Errorf("targets: prefix %q: url %w", t.Prefix, err)
+		}
+		compiled = append(compiled, targetRoute{prefix: t.Prefix, target: u})
+	}
+	return compiled, nil
 }
 
 func printUsage(w io.Writer) {
