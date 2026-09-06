@@ -47,7 +47,7 @@ jobs:
         run: go build -o "dist/${{ steps.vars.outputs.binary_name }}" ./cmd/aiproxy
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.vars.outputs.binary_name }}
           path: dist/${{ steps.vars.outputs.binary_name }}
