@@ -182,9 +182,24 @@ Every occurrence of the matched pattern in the body is replaced with
 value never reaches the upstream target, and never reaches the log
 either. Redacted requests are counted separately from allowed ones in
 the stats summary, `GET /_aiproxy/stats`, and the `[REDACT]` log line
-(cyan; `"redact"` under `--log-format json`). The three built-in rules
-(AWS, OpenAI, GitHub) always block; `action` only applies to your own
-`custom_rules` entries.
+(cyan; `"redact"` under `--log-format json`).
+
+The three built-in rules (`aws-access-key`, `openai-api-key`,
+`github-token`) block by default too, but each can be switched to redact
+independently via `builtin_rule_actions`:
+
+```json
+{
+  "builtin_rule_actions": {
+    "aws-access-key": "redact"
+  }
+}
+```
+
+Any built-in rule not listed keeps blocking. `builtin_rule_actions` keys
+must be one of the three built-in rule names above (`aiproxy validate`
+catches a typo here the same way it catches a bad regex), and values are
+the same `"block"`/`"redact"` pair as `custom_rules[].action`.
 
 ## Multi-target routing
 
@@ -281,9 +296,11 @@ aiproxy validate --config aiproxy.json
 
 Checks `aiproxy.json` for problems without starting the proxy: every
 `custom_rules` pattern must compile, every `targets` entry needs a
-well-formed, unique prefix and a valid HTTPS URL, and the numeric fields
-can't be negative. It reports every problem it finds in one pass rather
-than stopping at the first, and exits non-zero if there were any. With
+well-formed, unique prefix and a valid HTTPS URL, every
+`builtin_rule_actions` key must name a real built-in rule with a valid
+action, and the numeric fields can't be negative. It reports every
+problem it finds in one pass rather than stopping at the first, and
+exits non-zero if there were any. With
 no `--config` given it checks `aiproxy.json` in the working directory,
 same as `start` — and if that file simply doesn't exist, that's not an
 error, just a note that aiproxy would run with only its built-in rules.

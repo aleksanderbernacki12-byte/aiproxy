@@ -258,35 +258,79 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	return lc, errs
 }
 
-// buildEngine constructs the rule engine used to evaluate every request:
-// the three built-in secret-blocking rules, plus any custom rules from
-// cfg. cfg may be nil (no config file at all), in which case only the
-// built-ins apply.
-func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
-	engine := rules.NewEngine(rules.Allow)
-	engine.AddBodyRegexRule(rules.BodyRegexRule{
-		Name:    "aws-access-key",
-		Pattern: awsAccessKeyPattern,
-		Action:  rules.Block,
-	})
-	engine.AddBodyRegexRule(rules.BodyRegexRule{
-		Name:    "openai-api-key",
-		Pattern: openAIAPIKeyPattern,
-		Action:  rules.Block,
-	})
-	engine.AddBodyRegexRule(rules.BodyRegexRule{
-		Name:    "github-token",
-		Pattern: githubTokenPattern,
-		Action:  rules.Block,
-	})
-	if cfg == nil {
-		return engine, nil
+// builtinRules lists the name and pattern of each of aiproxy's built-in
+// secret-blocking rules, in the order buildEngine adds them to the
+// engine.
+var builtinRules = []struct {
+	name    string
+	pattern *regexp.Regexp
+}{
+	{"aws-access-key", awsAccessKeyPattern},
+	{"openai-api-key", openAIAPIKeyPattern},
+	{"github-token", githubTokenPattern},
+}
+
+// resolveBuiltinRuleActions turns a config file's builtin_rule_actions
+// map into a rule name -> Action lookup, defaulting every built-in rule
+// not mentioned to its long-standing rules.Block behavior. It reports
+// two kinds of config mistakes as errors, collecting both rather than
+// stopping at the first: an action string that is neither "block" nor
+// "redact", and a key that doesn't match any real built-in rule name
+// (almost always a typo).
+func resolveBuiltinRuleActions(overrides map[string]string) (map[string]rules.Action, []error) {
+	actions := make(map[string]rules.Action, len(builtinRules))
+	names := make(map[string]bool, len(builtinRules))
+	for _, b := range builtinRules {
+		actions[b.name] = rules.Block
+		names[b.name] = true
 	}
 
-	customRules, errs := compileCustomRules(cfg.CustomRules)
+	var errs []error
+	for name, raw := range overrides {
+		if !names[name] {
+			errs = append(errs, fmt.Errorf("Fatal error: builtin_rule_actions: %q is not a built-in rule (valid names: aws-access-key, openai-api-key, github-token)", name))
+			continue
+		}
+		action, err := parseRuleAction(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("Fatal error: Invalid action for built-in rule %s: %w", name, err))
+			continue
+		}
+		actions[name] = action
+	}
+	return actions, errs
+}
+
+// buildEngine constructs the rule engine used to evaluate every request:
+// the three built-in secret-blocking rules (each block or redact,
+// depending on cfg.BuiltinRuleActions), plus any custom rules from cfg.
+// cfg may be nil (no config file at all), in which case only the
+// built-ins apply, all blocking.
+func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
+	engine := rules.NewEngine(rules.Allow)
+
+	var overrides map[string]string
+	if cfg != nil {
+		overrides = cfg.BuiltinRuleActions
+	}
+	actions, errs := resolveBuiltinRuleActions(overrides)
+	for _, b := range builtinRules {
+		engine.AddBodyRegexRule(rules.BodyRegexRule{
+			Name:    b.name,
+			Pattern: b.pattern,
+			Action:  actions[b.name],
+		})
+	}
+
+	if cfg == nil {
+		return engine, errs
+	}
+
+	customRules, cErrs := compileCustomRules(cfg.CustomRules)
 	for _, r := range customRules {
 		engine.AddBodyRegexRule(r)
 	}
+	errs = append(errs, cErrs...)
 	return engine, errs
 }
 
@@ -331,6 +375,11 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, e.Error())
 	}
 
+	_, builtinErrs := resolveBuiltinRuleActions(cfg.BuiltinRuleActions)
+	for _, e := range builtinErrs {
+		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
+	}
+
 	if cfg.MaxRequestsPerMinute < 0 {
 		problems = append(problems, fmt.Sprintf("max_requests_per_minute: %d must not be negative", cfg.MaxRequestsPerMinute))
 	}
@@ -352,6 +401,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
+	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
 	return 0
 }
 

@@ -53,6 +53,78 @@ func TestRunStart_InvalidCustomRulePattern_FatalsWithClearMessage(t *testing.T) 
 	}
 }
 
+// TestRunStart_InvalidBuiltinRuleAction_FatalsWithClearMessage proves an
+// unrecognized builtin_rule_actions value is treated exactly like a bad
+// custom rule action or a bad regex: a clean log.Fatal before anything
+// starts serving.
+func TestRunStart_InvalidBuiltinRuleAction_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"builtin_rule_actions": {"aws-access-key": "delete"}}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_InvalidBuiltinRuleAction_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+
+	output := stderr.String()
+	if !strings.Contains(output, "Fatal error: Invalid action for built-in rule aws-access-key") {
+		t.Fatalf("stderr missing expected fatal message: %q", output)
+	}
+}
+
+// TestRunStart_UnknownBuiltinRuleName_FatalsWithClearMessage proves a
+// builtin_rule_actions key that doesn't match any real built-in rule
+// (almost always a typo) fails the same clean way, rather than silently
+// being ignored.
+func TestRunStart_UnknownBuiltinRuleName_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"builtin_rule_actions": {"aws-acess-key": "redact"}}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_UnknownBuiltinRuleName_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+
+	output := stderr.String()
+	if !strings.Contains(output, `"aws-acess-key" is not a built-in rule`) {
+		t.Fatalf("stderr missing expected fatal message: %q", output)
+	}
+}
+
 // TestRunStart_CacheDirectoryCannotBeCreated_FatalsWithClearMessage
 // proves a cache directory that can't be created (here: something else
 // already occupies that path) is treated the same way as a bad regex or
@@ -214,6 +286,65 @@ func TestExecute_Validate_ValidConfig_WithRedactAction_ReturnsZero(t *testing.T)
 
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}
+
+func TestExecute_Validate_InvalidBuiltinRuleAction_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"github-token": "delete"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stdout: %s)", code, stdout.String())
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "github-token") || !strings.Contains(errOut, `"delete"`) {
+		t.Errorf("stderr missing the invalid action problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_UnknownBuiltinRuleName_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"aws-acess-key": "redact"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stdout: %s)", code, stdout.String())
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, `"aws-acess-key" is not a built-in rule`) {
+		t.Errorf("stderr missing the unknown rule name problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithBuiltinRuleRedactAction_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"aws-access-key": "redact"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "built-in rule overrides: 1") {
+		t.Fatalf("stdout missing built-in rule override count: %q", stdout.String())
 	}
 }
 

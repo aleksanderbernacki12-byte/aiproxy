@@ -66,6 +66,15 @@ type Config struct {
 	// prefix stripped. An empty slice (the default when the field is
 	// absent) means every request just goes to the default --target.
 	Targets []Target `json:"targets"`
+
+	// BuiltinRuleActions overrides the action of one or more of aiproxy's
+	// built-in secret-blocking rules, keyed by rule name
+	// ("aws-access-key", "openai-api-key", or "github-token") with the
+	// same values as CustomRule.Action: "block" (every built-in rule's
+	// long-standing default, still applied to any built-in rule not
+	// mentioned here) or "redact". A key that isn't one of those three
+	// rule names is a config error.
+	BuiltinRuleActions map[string]string `json:"builtin_rule_actions,omitempty"`
 }
 
 // Load reads and parses the config file at path. If the file does not

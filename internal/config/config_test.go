@@ -51,6 +51,43 @@ func TestLoad_ParsesCustomRuleAction(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesBuiltinRuleActions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"aws-access-key": "redact"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.BuiltinRuleActions["aws-access-key"]; got != "redact" {
+		t.Fatalf(`BuiltinRuleActions["aws-access-key"] = %q, want "redact"`, got)
+	}
+	if len(cfg.BuiltinRuleActions) != 1 {
+		t.Fatalf("len(BuiltinRuleActions) = %d, want 1", len(cfg.BuiltinRuleActions))
+	}
+}
+
+func TestLoad_BuiltinRuleActionsDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.BuiltinRuleActions) != 0 {
+		t.Fatalf("len(BuiltinRuleActions) = %d, want 0 when absent", len(cfg.BuiltinRuleActions))
+	}
+}
+
 func TestLoad_ParsesMaxRequestsPerMinute(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
