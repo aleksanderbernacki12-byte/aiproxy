@@ -31,6 +31,13 @@ type Config struct {
 	// False (the default when the field is absent) means the cache is
 	// disabled.
 	CacheEnabled bool `json:"cache_enabled"`
+
+	// CostPer1KTokens prices the shutdown summary's total token count at
+	// this rate per 1,000 tokens, in whatever currency and rate the user
+	// knows applies to their own usage. Zero (the default when the field
+	// is absent) disables cost estimation entirely — aiproxy has no
+	// built-in, inevitably-stale pricing table to fall back on.
+	CostPer1KTokens float64 `json:"cost_per_1k_tokens"`
 }
 
 // Load reads and parses the config file at path. If the file does not

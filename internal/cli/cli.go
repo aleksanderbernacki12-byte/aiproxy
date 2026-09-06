@@ -61,7 +61,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", "127.0.0.1:8080", "address for the proxy to listen on")
 	target := fs.String("target", "", "HTTPS URL to forward requests to (required)")
-	configPath := fs.String("config", "", "path to a JSON config file for custom rules and/or a rate limit (default: aiproxy.json in the working directory, if present)")
+	configPath := fs.String("config", "", "path to a JSON config file (custom rules, rate limit, cache, cost estimation; default: aiproxy.json in the working directory, if present)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -119,6 +119,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			}
 			server.Cache = c
 			fmt.Fprintf(stdout, "response cache: enabled (%s/)\n", cache.DirName)
+		}
+
+		if cfg.CostPer1KTokens > 0 {
+			server.CostPer1KTokens = cfg.CostPer1KTokens
+			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
 		}
 	}
 

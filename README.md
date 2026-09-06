@@ -41,16 +41,17 @@ stream cut short by a dropped connection is never cached.
 
 Stopping the proxy (Ctrl+C) prints a session summary: how many requests
 were allowed, blocked, rate-limited, served from cache, and the total
-tokens used across the run.
+tokens used across the run — plus an estimated cost line, if you've set
+`cost_per_1k_tokens`.
 
-## Custom rules, rate limiting, and caching
+## Custom rules, rate limiting, caching, and cost estimation
 
 Drop an `aiproxy.json` file in the working directory (or point `--config`
 at one) to add your own body-content rules on top of the built-in AWS,
 OpenAI, and GitHub token checks, cap how many requests the proxy forwards
 per minute — a local circuit breaker against runaway/looping clients —
-and/or cache responses to disk to save time and API costs on repeated
-calls:
+cache responses to disk to save time and API costs on repeated calls,
+and/or price the shutdown summary's token total in your own currency:
 
 ```json
 {
@@ -58,7 +59,8 @@ calls:
     { "name": "mitt-företag-hemlighet", "pattern": "SECRET_[0-9]+" }
   ],
   "max_requests_per_minute": 60,
-  "cache_enabled": true
+  "cache_enabled": true,
+  "cost_per_1k_tokens": 0.03
 }
 ```
 
@@ -74,6 +76,12 @@ keyed by a SHA256 hash of the request method, target URL, and body. An
 identical request served later is answered straight from that file and
 never reaches the upstream target. `.aiproxy_cache/` is already listed in
 `.gitignore`.
+
+`cost_per_1k_tokens` is optional and off by default (no cost line at
+all). aiproxy has no built-in, inevitably-stale pricing table — you tell
+it what rate applies to your own usage (whatever your provider actually
+charges you per 1,000 tokens, in whatever currency), and the summary
+just multiplies that by the total tokens tracked during the run.
 
 ## Installing
 

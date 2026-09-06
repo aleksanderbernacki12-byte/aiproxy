@@ -69,6 +69,15 @@ func (s *Stats) Snapshot() Snapshot {
 	}
 }
 
+// EstimatedCost prices TotalTokens at costPer1KTokens per 1,000 tokens.
+// This is a plain unit conversion — aiproxy has no opinion on currency,
+// on what the rate actually covers (e.g. a blended input/output rate vs.
+// separate ones), or on whether it is still accurate; the caller
+// supplies the rate and is responsible for what it means.
+func (s Snapshot) EstimatedCost(costPer1KTokens float64) float64 {
+	return float64(s.TotalTokens) / 1000 * costPer1KTokens
+}
+
 // String renders the snapshot as a short, aligned, human-readable block.
 func (s Snapshot) String() string {
 	return fmt.Sprintf(

@@ -802,4 +802,34 @@ func TestServer_ListenAndServe_PrintsStatsSummaryOnShutdown(t *testing.T) {
 	if !strings.Contains(logOutput, "Requests allowed:    1") {
 		t.Fatalf("summary missing correct allowed count: %q", logOutput)
 	}
+	if strings.Contains(logOutput, "Estimated cost") {
+		t.Fatalf("summary must omit the cost line when CostPer1KTokens is unset: %q", logOutput)
+	}
+}
+
+// TestServer_SummaryText_IncludesCostLineOnlyWhenConfigured proves the
+// cost line appears, with the correct value, only once CostPer1KTokens
+// is set above zero — and that tokens tracked before it was set are
+// still priced correctly, since the rate is only applied when the
+// summary is rendered, not when tokens are recorded.
+func TestServer_SummaryText_IncludesCostLineOnlyWhenConfigured(t *testing.T) {
+	targetURL, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+
+	srv.Stats.RecordTokensUsed(2500)
+
+	withoutCost := srv.Summary()
+	if strings.Contains(withoutCost, "Estimated cost") {
+		t.Fatalf("summary must omit the cost line when CostPer1KTokens is unset: %q", withoutCost)
+	}
+
+	srv.CostPer1KTokens = 0.02
+	withCost := srv.Summary()
+	if !strings.Contains(withCost, "Estimated cost:      0.0500") {
+		t.Fatalf("summary missing correct cost line for 2500 tokens at 0.02/1K: %q", withCost)
+	}
 }

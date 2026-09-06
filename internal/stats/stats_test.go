@@ -97,3 +97,26 @@ func TestSnapshot_StringContainsAllCounts(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshot_EstimatedCost(t *testing.T) {
+	cases := []struct {
+		name        string
+		totalTokens int64
+		rate        float64
+		want        float64
+	}{
+		{"1000 tokens at 0.03/1K", 1000, 0.03, 0.03},
+		{"2500 tokens at 0.02/1K", 2500, 0.02, 0.05},
+		{"zero tokens", 0, 0.03, 0},
+		{"zero rate", 1000, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := stats.Snapshot{TotalTokens: tc.totalTokens}
+			got := snap.EstimatedCost(tc.rate)
+			if got != tc.want {
+				t.Errorf("EstimatedCost(%v) = %v, want %v", tc.rate, got, tc.want)
+			}
+		})
+	}
+}

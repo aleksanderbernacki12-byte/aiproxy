@@ -73,6 +73,11 @@ type Server struct {
 	Cache   *cache.Cache     // nil disables the response cache
 	Stats   *stats.Stats     // always present; counts every request outcome
 
+	// CostPer1KTokens, if greater than zero, prices Stats.TotalTokens in
+	// the shutdown summary at this rate per 1,000 tokens. Zero (the
+	// default) omits the cost line entirely.
+	CostPer1KTokens float64
+
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
 }
@@ -378,6 +383,18 @@ func (s *Server) logf(format string, args ...any) {
 	}
 }
 
+// Summary renders the current stats snapshot as the same block of text
+// printed on shutdown, appending an estimated cost line only when
+// CostPer1KTokens has been configured.
+func (s *Server) Summary() string {
+	snap := s.Stats.Snapshot()
+	summary := snap.String()
+	if s.CostPer1KTokens > 0 {
+		summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", snap.EstimatedCost(s.CostPer1KTokens), s.CostPer1KTokens)
+	}
+	return summary
+}
+
 // ListenAndServe starts the proxy and blocks until ctx is cancelled or a
 // fatal server error occurs.
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -398,7 +415,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err := s.httpServer.Shutdown(shutdownCtx)
-		s.logf("%s", s.Stats.Snapshot())
+		s.logf("%s", s.Summary())
 		return err
 	case err := <-errCh:
 		return fmt.Errorf("proxy: %w", err)

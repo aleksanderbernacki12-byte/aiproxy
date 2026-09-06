@@ -48,6 +48,40 @@ func TestLoad_ParsesMaxRequestsPerMinute(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesCostPer1KTokens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CostPer1KTokens != 0.03 {
+		t.Fatalf("CostPer1KTokens = %v, want 0.03", cfg.CostPer1KTokens)
+	}
+}
+
+func TestLoad_CostPer1KTokensDefaultsToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": []}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CostPer1KTokens != 0 {
+		t.Fatalf("CostPer1KTokens = %v, want 0 (disabled) when absent", cfg.CostPer1KTokens)
+	}
+}
+
 func TestLoad_ParsesCacheEnabled(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
