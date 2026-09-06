@@ -69,9 +69,10 @@ never reaches the upstream target. `.aiproxy_cache/` is already listed in
 
 ## Installing
 
-No GitHub Releases exist yet, so for now clone the repo and run the
-installer — it detects your OS/architecture, builds aiproxy from source,
-and installs it to `/usr/local/bin` (override with `AIPROXY_INSTALL_DIR`):
+`install.sh` doesn't fetch a prebuilt binary from GitHub Releases yet, so
+for now clone the repo and run it — it detects your OS/architecture,
+builds aiproxy from source, and installs it to `/usr/local/bin` (override
+with `AIPROXY_INSTALL_DIR`):
 
 ```
 git clone https://github.com/aleksanderbernacki12-byte/aiproxy && cd aiproxy
