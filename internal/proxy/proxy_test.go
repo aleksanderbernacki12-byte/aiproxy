@@ -1145,3 +1145,267 @@ func TestServer_SingleTarget_SummaryOmitsPerTargetBreakdown(t *testing.T) {
 		t.Fatalf("Summary() should omit the per-target breakdown for a single-target run: %q", summary)
 	}
 }
+
+// statsJSONResponse mirrors the wire shape served at GET /_aiproxy/stats,
+// for tests to decode into.
+type statsJSONResponse struct {
+	Allowed       int64                        `json:"allowed"`
+	Blocked       int64                        `json:"blocked"`
+	RateLimited   int64                        `json:"rate_limited"`
+	CacheHits     int64                        `json:"cache_hits"`
+	TotalTokens   int64                        `json:"total_tokens"`
+	EstimatedCost *float64                     `json:"estimated_cost,omitempty"`
+	PerTarget     map[string]statsJSONResponse `json:"per_target,omitempty"`
+}
+
+// TestServer_StatsEndpoint_ReturnsCurrentSnapshotAsJSON drives a request
+// of each outcome through the proxy and proves GET /_aiproxy/stats
+// reports exactly those counts as JSON, live, without needing a
+// shutdown.
+func TestServer_StatsEndpoint_ReturnsCurrentSnapshotAsJSON(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "test-secret",
+		Pattern: regexp.MustCompile(`SECRET`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(body string) {
+		resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %q: %v", body, err)
+		}
+		resp.Body.Close()
+	}
+	post(`{"n":1}`)
+	post(`SECRET`)
+	post(`{"n":2}`)
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+
+	var got statsJSONResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Allowed != 2 {
+		t.Errorf("Allowed = %d, want 2", got.Allowed)
+	}
+	if got.Blocked != 1 {
+		t.Errorf("Blocked = %d, want 1", got.Blocked)
+	}
+}
+
+// TestServer_StatsEndpoint_NeverForwardedUpstreamOrCountedInStats proves
+// statsPath is handled entirely inside the proxy: the upstream never
+// sees a request for it, and answering it does not itself change the
+// counters it reports.
+func TestServer_StatsEndpoint_NeverForwardedUpstreamOrCountedInStats(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+		if err != nil {
+			t.Fatalf("GET /_aiproxy/stats: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	if upstreamHit.Load() {
+		t.Fatal("a request for statsPath must never reach the upstream target")
+	}
+
+	var got statsJSONResponse
+	resp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Allowed != 0 || got.Blocked != 0 {
+		t.Fatalf("stats requests must not themselves be counted: got %+v", got)
+	}
+}
+
+// TestServer_StatsEndpoint_BypassesRulesAndRateLimiter proves statsPath
+// is a true side-channel: it stays reachable even while a
+// block-everything rule and an exhausted rate limiter are actively
+// rejecting every other request.
+func TestServer_StatsEndpoint_BypassesRulesAndRateLimiter(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Block) // blocks everything by default
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Limiter = limiter.New(0, time.Minute) // 0 allowed requests per window
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d even with rules/rate-limiter blocking everything else", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_StatsEndpoint_RejectsNonGetMethod proves the endpoint only
+// answers GET, since it has no meaningful semantics for any other verb.
+func TestServer_StatsEndpoint_RejectsNonGetMethod(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/_aiproxy/stats", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /_aiproxy/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
+// proves the JSON response's estimated_cost field appears only once
+// CostPer1KTokens is set (overall and within each per-target entry), and
+// that per_target always reflects every target actually used so far —
+// unlike the printed Summary(), the JSON endpoint does not hide a
+// single-entry breakdown, since a machine-readable API should stay
+// structurally predictable rather than collapsing below a threshold.
+func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer other.Close()
+
+	defaultURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	otherURL, err := url.Parse(other.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", defaultURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	getStats := func() statsJSONResponse {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+		if err != nil {
+			t.Fatalf("GET /_aiproxy/stats: %v", err)
+		}
+		defer resp.Body.Close()
+		var got statsJSONResponse
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return got
+	}
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("GET /x: %v", err)
+	}
+	resp.Body.Close()
+
+	withoutCost := getStats()
+	if withoutCost.EstimatedCost != nil {
+		t.Fatalf("estimated_cost must be omitted when CostPer1KTokens is unset: %+v", withoutCost)
+	}
+	if len(withoutCost.PerTarget) != 1 {
+		t.Fatalf("per_target = %+v, want exactly the 1 default entry seen so far", withoutCost.PerTarget)
+	}
+	if _, ok := withoutCost.PerTarget["default"]; !ok {
+		t.Fatalf("per_target missing default entry: %+v", withoutCost.PerTarget)
+	}
+
+	srv.CostPer1KTokens = 0.02
+	srv.AddRoute("/other", otherURL)
+	resp2, err := http.Get(frontend.URL + "/other/y")
+	if err != nil {
+		t.Fatalf("GET /other/y: %v", err)
+	}
+	resp2.Body.Close()
+
+	withBoth := getStats()
+	if withBoth.EstimatedCost == nil {
+		t.Fatal("estimated_cost must be present once CostPer1KTokens is set")
+	}
+	if len(withBoth.PerTarget) != 2 {
+		t.Fatalf("per_target = %+v, want 2 entries (default and /other)", withBoth.PerTarget)
+	}
+	if _, ok := withBoth.PerTarget["/other"]; !ok {
+		t.Fatalf("per_target missing /other entry: %+v", withBoth.PerTarget)
+	}
+	if _, ok := withBoth.PerTarget["default"]; !ok {
+		t.Fatalf("per_target missing default entry: %+v", withBoth.PerTarget)
+	}
+}

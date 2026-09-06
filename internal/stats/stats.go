@@ -102,13 +102,13 @@ func (s *Stats) RecordTokensUsed(target string, n int) {
 // breakdown keyed by target name; a Snapshot inside PerTarget never has
 // its own nested PerTarget.
 type Snapshot struct {
-	Allowed     int64
-	Blocked     int64
-	RateLimited int64
-	CacheHits   int64
-	TotalTokens int64
+	Allowed     int64 `json:"allowed"`
+	Blocked     int64 `json:"blocked"`
+	RateLimited int64 `json:"rate_limited"`
+	CacheHits   int64 `json:"cache_hits"`
+	TotalTokens int64 `json:"total_tokens"`
 
-	PerTarget map[string]Snapshot
+	PerTarget map[string]Snapshot `json:"per_target,omitempty"`
 }
 
 // Snapshot returns the current value of every counter, overall and per

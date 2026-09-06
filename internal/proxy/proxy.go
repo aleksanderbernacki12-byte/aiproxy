@@ -75,6 +75,13 @@ type route struct {
 	target *url.URL
 }
 
+// statsPath is a reserved, proxy-internal path: a GET request to it never
+// reaches any upstream target. It is handled directly by ServeHTTP, ahead
+// of caching, rules, and the rate limiter, so it stays reachable for
+// monitoring a long-running proxy even while those are actively blocking
+// or throttling other traffic.
+const statsPath = "/_aiproxy/stats"
+
 // Server is a reverse proxy that evaluates every request's body against
 // a rules.Engine before forwarding it to Target over HTTPS. Additional
 // path-prefix routes (see AddRoute) can send matching requests to other
@@ -172,6 +179,11 @@ func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string,
 // intact to the resolved target (Target by default, or a path-prefix
 // route added via AddRoute) over HTTPS.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == statsPath {
+		s.serveStats(w, r)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	r.Body.Close()
 	if err != nil {
@@ -452,6 +464,58 @@ func copyHeader(dst, src http.Header) {
 func (s *Server) logf(format string, args ...any) {
 	if s.Logger != nil {
 		s.Logger.Printf(format, args...)
+	}
+}
+
+// statsSnapshotJSON is the wire shape served at statsPath: the same
+// counts as stats.Snapshot, plus an estimated cost — computed here, at
+// request time, rather than stored on the snapshot itself, since pricing
+// is a proxy-level concern (CostPer1KTokens) that the stats package has
+// no notion of.
+type statsSnapshotJSON struct {
+	Allowed       int64                        `json:"allowed"`
+	Blocked       int64                        `json:"blocked"`
+	RateLimited   int64                        `json:"rate_limited"`
+	CacheHits     int64                        `json:"cache_hits"`
+	TotalTokens   int64                        `json:"total_tokens"`
+	EstimatedCost *float64                     `json:"estimated_cost,omitempty"`
+	PerTarget     map[string]statsSnapshotJSON `json:"per_target,omitempty"`
+}
+
+func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnapshotJSON {
+	out := statsSnapshotJSON{
+		Allowed:     snap.Allowed,
+		Blocked:     snap.Blocked,
+		RateLimited: snap.RateLimited,
+		CacheHits:   snap.CacheHits,
+		TotalTokens: snap.TotalTokens,
+	}
+	if costPer1KTokens > 0 {
+		cost := snap.EstimatedCost(costPer1KTokens)
+		out.EstimatedCost = &cost
+	}
+	if len(snap.PerTarget) > 0 {
+		out.PerTarget = make(map[string]statsSnapshotJSON, len(snap.PerTarget))
+		for name, t := range snap.PerTarget {
+			out.PerTarget[name] = toStatsSnapshotJSON(t, costPer1KTokens)
+		}
+	}
+	return out
+}
+
+// serveStats answers statsPath with the current Stats snapshot as JSON,
+// letting a long-running proxy be monitored without waiting for Ctrl+C.
+// It never touches rules, the rate limiter, or the cache, and is never
+// itself counted in Stats — it isn't a proxied request.
+func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.CostPer1KTokens)
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		s.logf("aiproxy: stats: failed to encode response: %v", err)
 	}
 }
 

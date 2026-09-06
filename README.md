@@ -133,6 +133,44 @@ request was routed to; caching in particular keys on the resolved
 destination, so identical bodies sent to different providers are never
 confused with each other.
 
+## Live stats
+
+```
+curl http://127.0.0.1:8080/_aiproxy/stats
+```
+
+`GET /_aiproxy/stats` is a reserved, proxy-internal path handled directly
+by aiproxy — it never reaches any upstream target, and answering it is
+never itself counted in the stats it reports. It returns the same
+counters as the shutdown summary, as JSON, live, so a long-running proxy
+can be monitored without waiting for Ctrl+C:
+
+```json
+{
+  "allowed": 42,
+  "blocked": 1,
+  "rate_limited": 0,
+  "cache_hits": 5,
+  "total_tokens": 3100,
+  "estimated_cost": 0.062,
+  "per_target": {
+    "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062 },
+    "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0 }
+  }
+}
+```
+
+`estimated_cost` (overall and per target) is included only when
+`cost_per_1k_tokens` is set. `per_target` always reflects every target
+used so far — unlike the printed shutdown summary, which leaves the
+breakdown out entirely for a single-target run, the JSON endpoint stays
+structurally the same shape regardless of how many targets are in play,
+since that predictability matters more for something meant to be parsed
+by a script or dashboard. Any method other than `GET` gets a 405.
+Because the path is reserved, an upstream that genuinely needs to be
+reached at `/_aiproxy/stats` itself cannot be — route it through a
+different prefix if that ever comes up.
+
 ## Validating a config file
 
 ```
