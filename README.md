@@ -1,5 +1,9 @@
 # aiproxy
 
+[![Test](https://github.com/aleksanderbernacki12-byte/aiproxy/actions/workflows/test.yml/badge.svg)](https://github.com/aleksanderbernacki12-byte/aiproxy/actions/workflows/test.yml)
+[![Release](https://img.shields.io/github/v/release/aleksanderbernacki12-byte/aiproxy)](https://github.com/aleksanderbernacki12-byte/aiproxy/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/aleksanderbernacki12-byte/aiproxy)](LICENSE)
+
 aiproxy is a local reverse proxy that sits between your machine and an
 HTTPS API. It reads every outgoing request in cleartext, checks the body
 against a set of security rules, and blocks anything that looks like a
