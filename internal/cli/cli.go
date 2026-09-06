@@ -47,6 +47,8 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "start":
 		return runStart(args[1:], stdout, stderr)
+	case "validate":
+		return runValidate(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -99,7 +101,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server := proxy.New(*addr, targetURL, engine)
 
 	if cfg != nil {
-		customRules := compileCustomRules(cfg.CustomRules)
+		customRules, ruleErrs := compileCustomRules(cfg.CustomRules)
+		if len(ruleErrs) > 0 {
+			msgs := make([]string, len(ruleErrs))
+			for i, e := range ruleErrs {
+				msgs[i] = e.Error()
+			}
+			log.Fatal(strings.Join(msgs, "\n"))
+		}
 		for _, r := range customRules {
 			engine.AddBodyRegexRule(r)
 		}
@@ -128,9 +137,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 
 		if len(cfg.Targets) > 0 {
-			routes, err := compileTargetRoutes(cfg.Targets)
-			if err != nil {
-				fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+			routes, routeErrs := compileTargetRoutes(cfg.Targets)
+			if len(routeErrs) > 0 {
+				for _, e := range routeErrs {
+					fmt.Fprintf(stderr, "aiproxy: %v\n", e)
+				}
 				return 2
 			}
 			for _, r := range routes {
@@ -148,6 +159,71 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+// runValidate checks a config file for problems without starting the
+// proxy: every custom_rules pattern must compile, every targets entry
+// must have a well-formed, unique prefix and a valid https url, and the
+// numeric fields must be sane. It never calls log.Fatal or otherwise
+// aborts the process — reporting every problem it finds and returning a
+// non-zero exit code is the whole point, as opposed to runStart, which
+// treats the same problems as fatal.
+func runValidate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configPath := fs.String("config", "", "path to the JSON config file to validate (default: aiproxy.json in the working directory)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	cfg, loadedFrom, err := resolveConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+		return 1
+	}
+	if cfg == nil {
+		fmt.Fprintln(stdout, "no config file found — aiproxy would run with just the built-in secret-blocking rules. Nothing to validate.")
+		return 0
+	}
+
+	var problems []string
+
+	_, ruleErrs := compileCustomRules(cfg.CustomRules)
+	for _, e := range ruleErrs {
+		// compileCustomRules' errors are pre-formatted for runStart's
+		// log.Fatal, which validate never calls; drop that "Fatal
+		// error: " framing so the report reads as a list of problems,
+		// not a list of things that supposedly just crashed.
+		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
+	}
+
+	_, routeErrs := compileTargetRoutes(cfg.Targets)
+	for _, e := range routeErrs {
+		problems = append(problems, e.Error())
+	}
+
+	if cfg.MaxRequestsPerMinute < 0 {
+		problems = append(problems, fmt.Sprintf("max_requests_per_minute: %d must not be negative", cfg.MaxRequestsPerMinute))
+	}
+	if cfg.CostPer1KTokens < 0 {
+		problems = append(problems, fmt.Sprintf("cost_per_1k_tokens: %g must not be negative", cfg.CostPer1KTokens))
+	}
+
+	if len(problems) > 0 {
+		fmt.Fprintf(stderr, "aiproxy: %s has %d problem(s):\n", loadedFrom, len(problems))
+		for _, p := range problems {
+			fmt.Fprintf(stderr, "  - %s\n", p)
+		}
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "%s is valid.\n", loadedFrom)
+	fmt.Fprintf(stdout, "  custom rules:            %d\n", len(cfg.CustomRules))
+	fmt.Fprintf(stdout, "  target routes:           %d\n", len(cfg.Targets))
+	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
+	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
+	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	return 0
 }
 
@@ -179,14 +255,17 @@ func resolveConfig(configPath string) (*config.Config, string, error) {
 // file into a BodyRegexRule. Compilation happens once here, at startup,
 // never per request. Unlike the trusted, hardcoded built-in patterns
 // (compiled with regexp.MustCompile), a custom pattern comes from a file
-// a user can mistype, so a pattern that fails to compile exits the
-// process via log.Fatalf with a readable message rather than panicking.
-func compileCustomRules(customRules []config.CustomRule) []rules.BodyRegexRule {
+// a user can mistype, so compilation failures are collected and returned
+// rather than panicking — it's up to the caller whether that's fatal
+// (runStart) or just a reported problem (runValidate).
+func compileCustomRules(customRules []config.CustomRule) ([]rules.BodyRegexRule, []error) {
 	compiled := make([]rules.BodyRegexRule, 0, len(customRules))
+	var errs []error
 	for _, cr := range customRules {
 		pattern, err := regexp.Compile(cr.Pattern)
 		if err != nil {
-			log.Fatalf("Fatal error: Invalid regex pattern in custom rule %s: %v", cr.Name, err)
+			errs = append(errs, fmt.Errorf("Fatal error: Invalid regex pattern in custom rule %s: %w", cr.Name, err))
+			continue
 		}
 		compiled = append(compiled, rules.BodyRegexRule{
 			Name:    cr.Name,
@@ -194,7 +273,7 @@ func compileCustomRules(customRules []config.CustomRule) []rules.BodyRegexRule {
 			Action:  rules.Block,
 		})
 	}
-	return compiled
+	return compiled, errs
 }
 
 // parseTarget validates the --target flag and normalizes it to an HTTPS
@@ -239,30 +318,41 @@ type targetRoute struct {
 }
 
 // compileTargetRoutes validates and parses each targets entry from the
-// config file. A prefix must be non-empty and start with "/"; a URL must
-// pass the same https validation as --target. Any error here is a hard
-// failure — an unresolvable extra route is exactly the kind of thing
-// that should stop the proxy at startup, not fail silently later on the
-// first request that happens to hit it.
-func compileTargetRoutes(targets []config.Target) ([]targetRoute, error) {
+// config file. A prefix must be non-empty, start with "/", and be
+// distinct from every other entry's prefix; a URL must pass the same
+// https validation as --target. Problems are collected and returned
+// rather than stopping at the first one — the caller decides whether
+// that's fatal (runStart) or just a reported problem (runValidate).
+func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 	compiled := make([]targetRoute, 0, len(targets))
+	var errs []error
+	seenPrefixes := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		if t.Prefix == "" || !strings.HasPrefix(t.Prefix, "/") {
-			return nil, fmt.Errorf("targets: prefix %q must be non-empty and start with \"/\"", t.Prefix)
+			errs = append(errs, fmt.Errorf("targets: prefix %q must be non-empty and start with \"/\"", t.Prefix))
+			continue
 		}
+		if seenPrefixes[t.Prefix] {
+			errs = append(errs, fmt.Errorf("targets: duplicate prefix %q (only the first entry with a given prefix is ever reachable)", t.Prefix))
+			continue
+		}
+		seenPrefixes[t.Prefix] = true
+
 		u, err := parseHTTPSURL(t.URL)
 		if err != nil {
-			return nil, fmt.Errorf("targets: prefix %q: url %w", t.Prefix, err)
+			errs = append(errs, fmt.Errorf("targets: prefix %q: url %w", t.Prefix, err))
+			continue
 		}
 		compiled = append(compiled, targetRoute{prefix: t.Prefix, target: u})
 	}
-	return compiled, nil
+	return compiled, errs
 }
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: aiproxy <command> [flags]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "commands:")
-	fmt.Fprintln(w, "  start   start the proxy server")
-	fmt.Fprintln(w, "  help    show this help text")
+	fmt.Fprintln(w, "  start      start the proxy server")
+	fmt.Fprintln(w, "  validate   check a config file for problems without starting the proxy")
+	fmt.Fprintln(w, "  help       show this help text")
 }

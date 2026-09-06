@@ -114,6 +114,21 @@ request was routed to; caching in particular keys on the resolved
 destination, so identical bodies sent to different providers are never
 confused with each other.
 
+## Validating a config file
+
+```
+aiproxy validate --config aiproxy.json
+```
+
+Checks `aiproxy.json` for problems without starting the proxy: every
+`custom_rules` pattern must compile, every `targets` entry needs a
+well-formed, unique prefix and a valid HTTPS URL, and the numeric fields
+can't be negative. It reports every problem it finds in one pass rather
+than stopping at the first, and exits non-zero if there were any. With
+no `--config` given it checks `aiproxy.json` in the working directory,
+same as `start` — and if that file simply doesn't exist, that's not an
+error, just a note that aiproxy would run with only its built-in rules.
+
 ## Installing
 
 ```

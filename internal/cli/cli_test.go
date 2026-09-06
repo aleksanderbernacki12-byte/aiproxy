@@ -51,3 +51,139 @@ func TestRunStart_InvalidCustomRulePattern_FatalsWithClearMessage(t *testing.T) 
 		t.Fatalf("stderr missing expected fatal message: %q", output)
 	}
 }
+
+// runValidate never calls log.Fatal/os.Exit — reporting problems via a
+// normal return code is the whole point — so unlike the start tests
+// above, these run directly in-process with no subprocess needed.
+
+func TestExecute_Validate_ValidConfig_ReturnsZeroAndSummary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"custom_rules": [{"name": "internal-secret", "pattern": "SECRET_[0-9]+"}],
+		"targets": [{"prefix": "/openai", "url": "https://api.openai.com"}],
+		"max_requests_per_minute": 60,
+		"cache_enabled": true,
+		"cost_per_1k_tokens": 0.03
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "is valid") {
+		t.Fatalf("stdout missing valid confirmation: %q", out)
+	}
+	if !strings.Contains(out, "custom rules:            1") {
+		t.Fatalf("stdout missing custom rule count: %q", out)
+	}
+	if !strings.Contains(out, "target routes:           1") {
+		t.Fatalf("stdout missing target route count: %q", out)
+	}
+}
+
+func TestExecute_Validate_InvalidRegexAndBadTargetURL_ReportsBothProblems(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"custom_rules": [{"name": "broken-rule", "pattern": "SECRET_[0-9+"}],
+		"targets": [{"prefix": "/openai", "url": "http://api.openai.com"}]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stdout: %s)", code, stdout.String())
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "broken-rule") {
+		t.Errorf("stderr missing the bad regex problem: %q", errOut)
+	}
+	if !strings.Contains(errOut, "/openai") || !strings.Contains(errOut, "https") {
+		t.Errorf("stderr missing the bad target URL problem (http instead of https): %q", errOut)
+	}
+	if !strings.Contains(errOut, "2 problem(s)") {
+		t.Errorf("stderr should report both problems found, not stop at the first: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_DuplicateTargetPrefix_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com"},
+		{"prefix": "/openai", "url": "https://api.openai.com/v2"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "duplicate prefix") {
+		t.Fatalf("stderr missing duplicate prefix problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"max_requests_per_minute": -5, "cost_per_1k_tokens": -0.1}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "max_requests_per_minute") {
+		t.Errorf("stderr missing negative rate limit problem: %q", errOut)
+	}
+	if !strings.Contains(errOut, "cost_per_1k_tokens") {
+		t.Errorf("stderr missing negative cost problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_NoConfigFile_ReportsNothingToValidate(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Nothing to validate") {
+		t.Fatalf("stdout missing nothing-to-validate message: %q", stdout.String())
+	}
+}
+
+func TestExecute_Validate_ExplicitMissingConfigFile_IsHardError(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", "/does/not/exist/aiproxy.json"}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero for an explicitly-requested missing config file")
+	}
+	if stderr.String() == "" {
+		t.Fatal("stderr should explain why validation failed")
+	}
+}
