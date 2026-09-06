@@ -23,11 +23,17 @@ Allowed requests are logged in green (`[ALLOW] POST /endpoint`); blocked
 ones in bright red (`[BLOCK] POST /endpoint - Triggered rule: <name>`);
 requests rejected by the rate limiter in yellow (`[CIRCUIT BREAKER]
 POST /endpoint - Rate limit exceeded`); responses served from the local
-cache in purple (`[CACHE HIT] POST /endpoint`); and, whenever a JSON
-response carries a `usage.total_tokens` field (as LLM APIs typically do),
-a blue usage line (`[USAGE] POST /endpoint - Tokens used: <n>`). The
-value that matched a rule is never written to the log — only the rule's
-name.
+cache in purple (`[CACHE HIT] POST /endpoint`); and, whenever a response
+carries a `usage.total_tokens` field (as LLM APIs typically do), a blue
+usage line (`[USAGE] POST /endpoint - Tokens used: <n>`). The value that
+matched a rule is never written to the log — only the rule's name.
+
+Streaming responses (`Content-Type: text/event-stream`, the format LLM
+chat APIs use when `stream: true`) are relayed to the client chunk by
+chunk as they arrive, not buffered until the response finishes — usage
+extraction and caching still run once the stream completes, from an
+accumulated copy, without adding any delay to the streaming itself. A
+stream cut short by a dropped connection is never cached.
 
 ## Custom rules, rate limiting, and caching
 

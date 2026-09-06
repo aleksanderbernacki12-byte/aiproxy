@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 
 	"aiproxy/internal/cache"
@@ -88,6 +90,11 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 			pr.SetURL(target)
 		},
 		ModifyResponse: s.modifyResponse,
+		// Flush every write immediately instead of buffering. Without
+		// this, a streamed LLM response would sit in a buffer until it
+		// was large enough (or the connection closed) before the client
+		// saw anything, defeating the point of streaming.
+		FlushInterval: -1,
 	}
 
 	return s
@@ -158,13 +165,36 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.reverseProxy.ServeHTTP(w, r)
 }
 
-// modifyResponse is httputil.ReverseProxy's response hook. It reads the
-// full upstream response body into memory so it can look for an LLM-style
-// token usage payload and, if caching is enabled, store the response for
-// future identical requests. It immediately restores the body so the
-// client still receives it intact — whether or not the body turned out
-// to be parseable JSON.
+// modifyResponse is httputil.ReverseProxy's response hook. Most JSON API
+// responses are handled by bufferResponse, which reads the whole body
+// into memory up front. A response advertised as text/event-stream (the
+// format LLM chat APIs use for streaming completions) instead goes
+// through streamResponse, which lets ReverseProxy copy each chunk to the
+// client as it arrives — usage extraction and caching still happen, but
+// only once the stream has finished, from an accumulated copy, so
+// streaming is never delayed by our own inspection of it.
 func (s *Server) modifyResponse(resp *http.Response) error {
+	reqCtx, _ := resp.Request.Context().Value(requestContextKey{}).(requestContextInfo)
+
+	if isEventStream(resp) {
+		s.streamResponse(resp, reqCtx)
+		return nil
+	}
+	return s.bufferResponse(resp, reqCtx)
+}
+
+// isEventStream reports whether resp is advertised as an SSE stream.
+func isEventStream(resp *http.Response) bool {
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	return mediaType == "text/event-stream"
+}
+
+// bufferResponse reads the full response body into memory so it can look
+// for an LLM-style token usage payload and, if caching is enabled, store
+// the response for future identical requests. It immediately restores
+// the body so the client still receives it intact — whether or not the
+// body turned out to be parseable JSON.
+func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) error {
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
@@ -177,22 +207,133 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 
-	reqCtx, _ := resp.Request.Context().Value(requestContextKey{}).(requestContextInfo)
-
-	var usage llmUsageResponse
-	if err := json.Unmarshal(body, &usage); err == nil && usage.Usage.TotalTokens > 0 {
-		s.logUsage(reqCtx.method, reqCtx.url, usage.Usage.TotalTokens)
-	}
-
 	if s.Cache != nil && resp.StatusCode == http.StatusOK && reqCtx.cacheKey != "" {
 		// httputil.DumpResponse drains and then restores resp.Body itself,
-		// so the client still receives the body intact afterwards.
+		// so the client still receives the body intact afterwards. This
+		// runs before the usage log line so a durable cache write is
+		// never left pending behind an already-visible log line.
 		if err := s.Cache.Set(reqCtx.cacheKey, resp); err != nil {
 			s.logf("aiproxy: cache: failed to store response: %v", err)
 		}
 	}
 
+	s.logUsageFromBody(reqCtx, body)
+
 	return nil
+}
+
+// streamResponse wraps resp.Body in a streamTee so ReverseProxy's own
+// copy loop streams each chunk to the client immediately, exactly as it
+// arrives from upstream, while a copy of every byte is accumulated on
+// the side. Once the stream ends, ReverseProxy closes the body, which
+// triggers usage extraction and — for a clean, complete stream on a 200
+// response — a cache write, both from the accumulated copy.
+func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) {
+	statusCode := resp.StatusCode
+	header := resp.Header
+
+	resp.Body = &streamTee{
+		src: resp.Body,
+		onComplete: func(data []byte, cleanEOF bool) {
+			// Cache first, log second: a caller that observes the log
+			// line (e.g. a test synchronizing on it) can then rely on the
+			// cache write having already landed.
+			if cleanEOF && s.Cache != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
+				s.writeStreamToCache(reqCtx.cacheKey, statusCode, header, data)
+			}
+			s.logUsageFromBody(reqCtx, data)
+		},
+	}
+}
+
+// writeStreamToCache stores a completed stream's accumulated bytes under
+// key. A stream that was cut short (client disconnect, upstream error)
+// must never reach here: a future "hit" would silently replay a
+// truncated response as if it were complete.
+func (s *Server) writeStreamToCache(key string, statusCode int, header http.Header, data []byte) {
+	cached := &http.Response{
+		StatusCode: statusCode,
+		Header:     header,
+		Body:       io.NopCloser(bytes.NewReader(data)),
+	}
+	if err := s.Cache.Set(key, cached); err != nil {
+		s.logf("aiproxy: cache: failed to store response: %v", err)
+	}
+}
+
+// streamTee lets a streaming response body be read normally (so
+// ReverseProxy can copy it straight through to the client) while every
+// byte read is also captured. onComplete runs exactly once, when the
+// stream is closed, with the full accumulated data and whether the
+// stream ended cleanly (io.EOF) rather than by some other read error.
+type streamTee struct {
+	src        io.ReadCloser
+	buf        bytes.Buffer
+	cleanEOF   bool
+	onComplete func(data []byte, cleanEOF bool)
+	once       sync.Once
+}
+
+func (t *streamTee) Read(p []byte) (int, error) {
+	n, err := t.src.Read(p)
+	if n > 0 {
+		t.buf.Write(p[:n])
+	}
+	if err == io.EOF {
+		t.cleanEOF = true
+	}
+	return n, err
+}
+
+func (t *streamTee) Close() error {
+	err := t.src.Close()
+	t.once.Do(func() {
+		if t.onComplete != nil {
+			t.onComplete(t.buf.Bytes(), t.cleanEOF)
+		}
+	})
+	return err
+}
+
+// extractTotalTokens looks for a usage.total_tokens field in body. It
+// handles both a plain JSON response and an SSE stream of "data: {...}"
+// events (as OpenAI-style streaming chat completions send when usage
+// reporting is requested), returning the last positive value found —
+// streamed usage arrives in the final chunk before "data: [DONE]".
+func extractTotalTokens(body []byte) int {
+	if tokens, ok := tryUnmarshalUsage(body); ok {
+		return tokens
+	}
+
+	best := 0
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
+		if !ok {
+			continue
+		}
+		payload = bytes.TrimSpace(payload)
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		if tokens, ok := tryUnmarshalUsage(payload); ok {
+			best = tokens
+		}
+	}
+	return best
+}
+
+func tryUnmarshalUsage(data []byte) (int, bool) {
+	var usage llmUsageResponse
+	if err := json.Unmarshal(data, &usage); err != nil || usage.Usage.TotalTokens <= 0 {
+		return 0, false
+	}
+	return usage.Usage.TotalTokens, true
+}
+
+func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
+	if tokens := extractTotalTokens(body); tokens > 0 {
+		s.logUsage(reqCtx.method, reqCtx.url, tokens)
+	}
 }
 
 func (s *Server) logAllow(method, reqURL string) {

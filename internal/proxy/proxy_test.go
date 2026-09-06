@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +21,46 @@ import (
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
 )
+
+// syncBuffer is a mutex-protected byte buffer safe to use as a
+// *log.Logger's output while a test reads it back concurrently. A plain
+// bytes.Buffer is not concurrency-safe, and streaming responses log from
+// a callback that fires on ReverseProxy's own goroutine — a bare
+// bytes.Buffer shared with the test goroutine would be a real data race,
+// not just a theoretical one (the race detector catches it in practice).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitForLogContains polls buf (safely) until its contents contain
+// substr or timeout elapses, returning whatever was last observed. This
+// is needed because streaming's usage/cache side effects run from a
+// callback fired asynchronously when ReverseProxy closes the response
+// body — there is no other signal available to a test for "that callback
+// has now run" than observing its effects.
+func waitForLogContains(buf *syncBuffer, substr string, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for {
+		got := buf.String()
+		if strings.Contains(got, substr) || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 
 func TestServer_BlockLogging_NeverLeaksMatchedSecret(t *testing.T) {
 	var upstreamHit atomic.Bool
@@ -379,5 +421,231 @@ func TestServer_CacheHit_SecondIdenticalRequestNeverReachesUpstream(t *testing.T
 	}
 	if !strings.Contains(logOutput, "\x1b[35m") {
 		t.Fatalf("log missing purple ANSI code: %q", logOutput)
+	}
+}
+
+// TestServer_StreamingResponse_DeliversChunksProgressively proves the
+// core streaming fix: chunks reach the client as they arrive, instead of
+// only after the full response has been read. If the proxy still
+// buffered the whole body first (the old, broken behavior), the first
+// byte could only reach the client after every chunk delay had already
+// elapsed upstream.
+func TestServer_StreamingResponse_DeliversChunksProgressively(t *testing.T) {
+	const chunkDelay = 80 * time.Millisecond
+	chunks := []string{
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+		"data: {\"usage\":{\"total_tokens\":42}}\n\n",
+		"data: [DONE]\n\n",
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream ResponseWriter does not support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, c := range chunks {
+			w.Write([]byte(c))
+			flusher.Flush()
+			time.Sleep(chunkDelay)
+		}
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	start := time.Now()
+	resp, err := http.Post(frontend.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	firstByteAt := time.Duration(-1)
+	dataLines := 0
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			if firstByteAt < 0 {
+				firstByteAt = time.Since(start)
+			}
+			if strings.HasPrefix(line, "data:") {
+				dataLines++
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if dataLines != len(chunks) {
+		t.Fatalf("client received %d data lines, want %d", dataLines, len(chunks))
+	}
+	if firstByteAt < 0 {
+		t.Fatal("client never received any bytes")
+	}
+	if firstByteAt >= chunkDelay {
+		t.Fatalf("first byte arrived after %v (>= one chunk delay of %v) — response looks buffered, not streamed", firstByteAt, chunkDelay)
+	}
+}
+
+// TestServer_StreamingResponse_LogsUsageAndCachesCompleteStream proves
+// that a completed SSE stream still gets its usage logged (parsed out of
+// the "data: {...}" event that carries it) and gets cached, and that a
+// second identical request is served from that cache without touching
+// upstream again — the same guarantees bufferResponse already gives
+// plain JSON responses, now also honored for streamed ones.
+func TestServer_StreamingResponse_LogsUsageAndCachesCompleteStream(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	const sseBody = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"usage\":{\"total_tokens\":77}}\n\n" +
+		"data: [DONE]\n\n"
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sseBody))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+	srv.Cache = c
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	sendRequest := func(n int) (int, string) {
+		resp, err := http.Post(frontend.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+		if err != nil {
+			t.Fatalf("request %d: %v", n, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("request %d: read body: %v", n, err)
+		}
+		return resp.StatusCode, string(body)
+	}
+
+	status1, body1 := sendRequest(1)
+	if status1 != http.StatusOK {
+		t.Fatalf("request 1: status = %d, want %d", status1, http.StatusOK)
+	}
+	if body1 != sseBody {
+		t.Fatalf("request 1 body = %q, want %q", body1, sseBody)
+	}
+
+	// onComplete fires asynchronously from Close, right as ReverseProxy
+	// finishes copying the response. The cache write happens before the
+	// usage log line in onComplete, so once the log line is observed, the
+	// cache write is guaranteed to have already landed too.
+	logOutput := waitForLogContains(&logBuf, "[USAGE]", time.Second)
+	if !strings.Contains(logOutput, "[USAGE] POST /v1/chat/completions - Tokens used: 77") {
+		t.Fatalf("log missing usage line extracted from the SSE stream: %q", logOutput)
+	}
+
+	status2, body2 := sendRequest(2)
+	if status2 != http.StatusOK {
+		t.Fatalf("request 2 (cached): status = %d, want %d", status2, http.StatusOK)
+	}
+	if body2 != sseBody {
+		t.Fatalf("request 2 (cached) body = %q, want identical to %q", body2, sseBody)
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream received %d requests, want exactly 1 — the second must be served from the cached stream", got)
+	}
+}
+
+// TestServer_StreamingResponse_AbortedStreamIsNeverCached proves that a
+// stream cut short by an abrupt upstream disconnect is never written to
+// the cache — caching a truncated stream would mean silently replaying a
+// broken response as if it were a complete one on every future hit.
+func TestServer_StreamingResponse_AbortedStreamIsNeverCached(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	const requestBody = `{"stream":true}`
+	const requestPath = "/v1/chat/completions"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n\n"))
+		flusher.Flush()
+		// The sanctioned way to simulate an abrupt client/upstream
+		// disconnect in an httptest handler: net/http recognizes this
+		// panic value and closes the connection without a stack trace.
+		panic(http.ErrAbortHandler)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Cache = c
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+requestPath, "application/json", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	// The connection is expected to end abruptly mid-body; draining and
+	// ignoring the resulting read error is the point of this test.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// This check is for an absence (no cache entry), so it fails safe: a
+	// shorter-than-needed wait would only make the assertion trivially
+	// true rather than falsely fail. The margin here is generous purely
+	// so the test is actually exercising onComplete having run, not just
+	// checking too early to know either way.
+	time.Sleep(200 * time.Millisecond)
+
+	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
+	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
+	if _, hit, err := c.Get(key); err != nil {
+		t.Fatalf("cache.Get: %v", err)
+	} else if hit {
+		t.Fatal("an aborted stream must never be cached, but a cache entry was found")
 	}
 }
