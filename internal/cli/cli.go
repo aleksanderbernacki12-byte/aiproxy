@@ -35,6 +35,11 @@ var (
 	openAIAPIKeyPattern    = regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`)
 	githubTokenPattern     = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36}`)
 	anthropicAPIKeyPattern = regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`)
+	privateKeyPattern      = regexp.MustCompile(`-----BEGIN (RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY( BLOCK)?-----`)
+	slackTokenPattern      = regexp.MustCompile(`xox[baprs]-[0-9A-Za-z-]{10,}`)
+	stripeAPIKeyPattern    = regexp.MustCompile(`sk_live_[0-9A-Za-z]{24,}`)
+	googleAPIKeyPattern    = regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`)
+	npmAccessTokenPattern  = regexp.MustCompile(`npm_[A-Za-z0-9]{36}`)
 )
 
 // Execute parses args and runs the requested subcommand, writing output
@@ -270,6 +275,11 @@ var builtinRules = []struct {
 	{"openai-api-key", openAIAPIKeyPattern},
 	{"github-token", githubTokenPattern},
 	{"anthropic-api-key", anthropicAPIKeyPattern},
+	{"private-key", privateKeyPattern},
+	{"slack-token", slackTokenPattern},
+	{"stripe-api-key", stripeAPIKeyPattern},
+	{"google-api-key", googleAPIKeyPattern},
+	{"npm-access-token", npmAccessTokenPattern},
 }
 
 // builtinRuleNames returns every built-in rule's name, in the same
@@ -316,10 +326,10 @@ func resolveBuiltinRuleActions(overrides map[string]string) (map[string]rules.Ac
 }
 
 // buildEngine constructs the rule engine used to evaluate every request:
-// the three built-in secret-blocking rules (each block or redact,
-// depending on cfg.BuiltinRuleActions), plus any custom rules from cfg.
-// cfg may be nil (no config file at all), in which case only the
-// built-ins apply, all blocking.
+// every built-in secret-blocking rule in builtinRules (each block or
+// redact, depending on cfg.BuiltinRuleActions), plus any custom rules
+// from cfg. cfg may be nil (no config file at all), in which case only
+// the built-ins apply, all blocking.
 func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	engine := rules.NewEngine(rules.Allow)
 

@@ -7,9 +7,9 @@
 aiproxy is a local reverse proxy that sits between your machine and an
 HTTPS API. It reads every outgoing request in cleartext, checks the body
 against a set of security rules, and blocks anything that looks like a
-leaked secret — AWS access keys, OpenAI API keys, Anthropic API keys,
-GitHub tokens, and any custom patterns you define — before it ever
-leaves your machine over the new HTTPS connection to the real target.
+leaked secret — cloud and API provider keys, GitHub tokens, private key
+material, and any custom patterns you define — before it ever leaves
+your machine over the new HTTPS connection to the real target.
 
 ## Starting the proxy
 
@@ -71,6 +71,26 @@ Total tokens used:   0
 A single-target run (no `targets` configured) leaves this section out
 entirely — it would just repeat the block above under a different label.
 
+## Built-in secret patterns
+
+No config needed — these block by default the moment aiproxy starts:
+
+| Rule name           | Detects                                                       |
+| -------------------- | -------------------------------------------------------------- |
+| `aws-access-key`     | AWS access key IDs (`AKIA...`)                                  |
+| `openai-api-key`     | OpenAI API keys (`sk-...`)                                      |
+| `anthropic-api-key`  | Anthropic (Claude) API keys (`sk-ant-...`)                      |
+| `github-token`       | GitHub personal access tokens (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_...`) |
+| `private-key`        | PEM private key blocks (RSA, EC, OpenSSH, DSA, encrypted, PGP)  |
+| `slack-token`        | Slack bot/user/app/legacy tokens (`xoxb-`/`xoxp-`/`xoxa-`/`xoxr-`/`xoxs-...`) |
+| `stripe-api-key`     | Stripe live secret keys (`sk_live_...`)                         |
+| `google-api-key`     | Google API keys (`AIza...`)                                     |
+| `npm-access-token`   | npm access tokens (`npm_...`)                                   |
+
+Each one can be switched independently from blocking to
+[redacting](#redacting-instead-of-blocking) via `builtin_rule_actions`;
+there is currently no way to turn a built-in rule off entirely.
+
 ## Structured JSON logging
 
 ```
@@ -124,9 +144,9 @@ reload — those still require a real restart.
 ## Custom rules, rate limiting, caching, and cost estimation
 
 Drop an `aiproxy.json` file in the working directory (or point `--config`
-at one) to add your own body-content rules on top of the built-in AWS,
-OpenAI, Anthropic, and GitHub token checks, cap how many requests the
-proxy forwards per minute — a local circuit breaker against
+at one) to add your own body-content rules on top of the
+[built-in secret patterns](#built-in-secret-patterns), cap how many
+requests the proxy forwards per minute — a local circuit breaker against
 runaway/looping clients — cache responses to disk to save time and API
 costs on repeated calls, and/or price the shutdown summary's token total
 in your own currency:
@@ -185,9 +205,9 @@ either. Redacted requests are counted separately from allowed ones in
 the stats summary, `GET /_aiproxy/stats`, and the `[REDACT]` log line
 (cyan; `"redact"` under `--log-format json`).
 
-The four built-in rules (`aws-access-key`, `openai-api-key`,
-`anthropic-api-key`, `github-token`) block by default too, but each can
-be switched to redact independently via `builtin_rule_actions`:
+The [built-in secret patterns](#built-in-secret-patterns) block by
+default too, but each can be switched to redact independently via
+`builtin_rule_actions`:
 
 ```json
 {
@@ -198,7 +218,7 @@ be switched to redact independently via `builtin_rule_actions`:
 ```
 
 Any built-in rule not listed keeps blocking. `builtin_rule_actions` keys
-must be one of the four built-in rule names above (`aiproxy validate`
+must be one of the built-in rule names listed above (`aiproxy validate`
 catches a typo here the same way it catches a bad regex), and values are
 the same `"block"`/`"redact"` pair as `custom_rules[].action`.
 
