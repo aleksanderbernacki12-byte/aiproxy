@@ -293,6 +293,49 @@ func TestServer_LogsTokenUsageAndDeliversResponseBodyUnchanged(t *testing.T) {
 	}
 }
 
+// TestServer_LogsTokenUsageForAnthropicResponseShape proves usage
+// extraction also understands Anthropic's Messages API shape, which has
+// no total_tokens field at all — only input_tokens and output_tokens —
+// unlike the OpenAI-style total_tokens field
+// TestServer_LogsTokenUsageAndDeliversResponseBodyUnchanged exercises
+// above.
+func TestServer_LogsTokenUsageForAnthropicResponseShape(t *testing.T) {
+	const fakeAnthropicResponse = `{"id":"msg_fake","type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":15,"output_tokens":42}}`
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(fakeAnthropicResponse))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-opus-5"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "[USAGE] POST /v1/messages - Tokens used: 57") {
+		t.Fatalf("log missing usage line summing input_tokens+output_tokens: %q", logOutput)
+	}
+}
+
 // TestServer_NonJSONResponse_NoUsageLogAndBodyStillDeliveredIntact proves
 // the silent-ignore path: a non-JSON upstream response must reach the
 // client unchanged, with no [USAGE] line and no error surfaced anywhere.
@@ -584,6 +627,62 @@ func TestServer_StreamingResponse_LogsUsageAndCachesCompleteStream(t *testing.T)
 	}
 	if got := upstreamHits.Load(); got != 1 {
 		t.Fatalf("upstream received %d requests, want exactly 1 — the second must be served from the cached stream", got)
+	}
+}
+
+// TestServer_StreamingResponse_LogsUsageForAnthropicSSEShape proves
+// streaming usage extraction handles Anthropic's split-across-events
+// shape: input_tokens arrives nested in message_start's message.usage,
+// output_tokens arrives separately in message_delta's top-level usage —
+// neither event alone carries the full total, unlike the OpenAI-style
+// single total_tokens field in the final chunk that
+// TestServer_StreamingResponse_LogsUsageAndCachesCompleteStream above
+// exercises.
+func TestServer_StreamingResponse_LogsUsageForAnthropicSSEShape(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	const sseBody = `event: message_start` + "\n" +
+		`data: {"type":"message_start","message":{"id":"msg_fake","type":"message","usage":{"input_tokens":25,"output_tokens":1}}}` + "\n\n" +
+		`event: content_block_delta` + "\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
+		`event: message_delta` + "\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12}}` + "\n\n" +
+		`event: message_stop` + "\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sseBody))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-opus-5","stream":true}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	// 25 (input_tokens from message_start) + 12 (the final, cumulative
+	// output_tokens from message_delta, not message_start's early 1).
+	logOutput := waitForLogContains(&logBuf, "[USAGE]", time.Second)
+	if !strings.Contains(logOutput, "[USAGE] POST /v1/messages - Tokens used: 37") {
+		t.Fatalf("log missing usage line combining input_tokens and the final output_tokens: %q", logOutput)
 	}
 }
 

@@ -7,9 +7,9 @@
 aiproxy is a local reverse proxy that sits between your machine and an
 HTTPS API. It reads every outgoing request in cleartext, checks the body
 against a set of security rules, and blocks anything that looks like a
-leaked secret — AWS access keys, OpenAI API keys, GitHub tokens, and any
-custom patterns you define — before it ever leaves your machine over the
-new HTTPS connection to the real target.
+leaked secret — AWS access keys, OpenAI API keys, Anthropic API keys,
+GitHub tokens, and any custom patterns you define — before it ever
+leaves your machine over the new HTTPS connection to the real target.
 
 ## Starting the proxy
 
@@ -125,10 +125,11 @@ reload — those still require a real restart.
 
 Drop an `aiproxy.json` file in the working directory (or point `--config`
 at one) to add your own body-content rules on top of the built-in AWS,
-OpenAI, and GitHub token checks, cap how many requests the proxy forwards
-per minute — a local circuit breaker against runaway/looping clients —
-cache responses to disk to save time and API costs on repeated calls,
-and/or price the shutdown summary's token total in your own currency:
+OpenAI, Anthropic, and GitHub token checks, cap how many requests the
+proxy forwards per minute — a local circuit breaker against
+runaway/looping clients — cache responses to disk to save time and API
+costs on repeated calls, and/or price the shutdown summary's token total
+in your own currency:
 
 ```json
 {
@@ -184,9 +185,9 @@ either. Redacted requests are counted separately from allowed ones in
 the stats summary, `GET /_aiproxy/stats`, and the `[REDACT]` log line
 (cyan; `"redact"` under `--log-format json`).
 
-The three built-in rules (`aws-access-key`, `openai-api-key`,
-`github-token`) block by default too, but each can be switched to redact
-independently via `builtin_rule_actions`:
+The four built-in rules (`aws-access-key`, `openai-api-key`,
+`anthropic-api-key`, `github-token`) block by default too, but each can
+be switched to redact independently via `builtin_rule_actions`:
 
 ```json
 {
@@ -197,7 +198,7 @@ independently via `builtin_rule_actions`:
 ```
 
 Any built-in rule not listed keeps blocking. `builtin_rule_actions` keys
-must be one of the three built-in rule names above (`aiproxy validate`
+must be one of the four built-in rule names above (`aiproxy validate`
 catches a typo here the same way it catches a bad regex), and values are
 the same `"block"`/`"redact"` pair as `custom_rules[].action`.
 
@@ -249,6 +250,63 @@ default target, exactly as if `targets[].max_requests_per_minute` didn't
 exist. Omit or set it to 0 for a target that should just share the
 top-level limiter (or share "no limit at all", if the top-level field is
 itself unset).
+
+## Example: proxying Claude traffic
+
+Point `--target` straight at the Anthropic API — nothing Claude-specific
+to configure, the `anthropic-api-key` built-in rule already covers it:
+
+```
+aiproxy start --target https://api.anthropic.com
+```
+
+```json
+{
+  "cache_enabled": true,
+  "cost_per_1k_tokens": 3.0,
+  "max_requests_per_minute": 50
+}
+```
+
+(`cost_per_1k_tokens` is one flat rate applied to input+output combined;
+Claude prices those two separately, so pick a blended estimate for your
+actual input/output mix rather than quoting either rate directly.)
+
+Token usage tracking works out of the box too: `/v1/messages` responses
+report `usage.input_tokens`/`usage.output_tokens` instead of OpenAI's
+single `usage.total_tokens`, and aiproxy sums the two automatically —
+same for a streaming response, where Anthropic splits the same count
+across two different SSE events (`message_start` and `message_delta`)
+instead of repeating a running total in each one like OpenAI's stream
+does. Nothing to configure either way; both provider shapes are just
+recognized.
+
+Running Claude and OpenAI traffic through one instance is the
+[multi-target routing](#multi-target-routing) example above, unchanged:
+
+```json
+{
+  "targets": [
+    { "prefix": "/openai", "url": "https://api.openai.com" },
+    { "prefix": "/anthropic", "url": "https://api.anthropic.com" }
+  ]
+}
+```
+
+**Amazon Bedrock and Google Vertex AI** are a different story, because
+of how each authenticates rather than anything about Claude itself.
+Vertex AI uses a bearer token (`Authorization: Bearer <token>`) — a
+plain header, unaffected by a reverse proxy sitting in the middle — so
+pointing `--target` at your Vertex endpoint works the same as the direct
+API. Bedrock instead uses AWS SigV4, which signs a hash of the exact
+request body the client sends; forwarding that request unmodified
+through any proxy still validates, but a `builtin_rule_actions`/
+`custom_rules` entry set to `"redact"` rewrites the body after the
+client already signed it, and Bedrock will reject the mutated request
+with a signature error. If you proxy Bedrock traffic, either leave every
+rule on the default `"block"` (which never forwards a mutated body — a
+rejected request from aiproxy has nothing to invalidate) or don't run
+redact rules on that route at all.
 
 ## Live stats
 

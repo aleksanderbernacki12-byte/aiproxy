@@ -41,13 +41,44 @@ const (
 	ansiCyan      = "\x1b[36m"
 )
 
-// llmUsageResponse is a minimal, proxy-internal shape for pulling a token
-// usage count out of an LLM provider's JSON response body. Every other
+// usageFields is the shape of a "usage" object as different providers
+// report it: OpenAI-style chat completion APIs report a single
+// total_tokens; Anthropic's Messages API instead splits the same idea
+// into input_tokens and output_tokens, with no total_tokens field at
+// all.
+type usageFields struct {
+	TotalTokens  int `json:"total_tokens"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+// total reports usageFields' combined token count: total_tokens
+// directly when present, otherwise input_tokens+output_tokens — counted
+// as soon as either is nonzero, even before the other has been seen,
+// since Anthropic's own streamed events each report only one of the
+// two (see extractTotalTokens).
+func (u usageFields) total() (int, bool) {
+	if u.TotalTokens > 0 {
+		return u.TotalTokens, true
+	}
+	if u.InputTokens > 0 || u.OutputTokens > 0 {
+		return u.InputTokens + u.OutputTokens, true
+	}
+	return 0, false
+}
+
+// llmUsageResponse is a minimal, proxy-internal shape for pulling a
+// token usage count out of an LLM provider's JSON response body, or one
+// SSE chunk of one. Usage covers every shape seen at the top level
+// (an OpenAI chat completion, or Anthropic's message_delta stream
+// event); Message covers Anthropic's message_start event, whose usage
+// is nested one level deeper inside "message" instead. Every other
 // field in the response is ignored.
 type llmUsageResponse struct {
-	Usage struct {
-		TotalTokens int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage   usageFields `json:"usage"`
+	Message *struct {
+		Usage usageFields `json:"usage"`
+	} `json:"message"`
 }
 
 // requestContextKey is the context key used to carry per-request data
@@ -549,17 +580,25 @@ func (t *streamTee) Close() error {
 	return err
 }
 
-// extractTotalTokens looks for a usage.total_tokens field in body. It
-// handles both a plain JSON response and an SSE stream of "data: {...}"
-// events (as OpenAI-style streaming chat completions send when usage
-// reporting is requested), returning the last positive value found —
-// streamed usage arrives in the final chunk before "data: [DONE]".
+// extractTotalTokens looks for a token usage count in body. It handles
+// both a plain JSON response and an SSE stream of "data: {...}" events,
+// across two different provider shapes: OpenAI-style APIs report a
+// running total_tokens, with the final streamed chunk before
+// "data: [DONE]" carrying the grand total, so the last positive value
+// found wins. Anthropic's Messages API instead splits the count across
+// two different events — input_tokens in message_start's nested
+// message.usage, output_tokens in message_delta's top-level usage — so
+// streaming separately accumulates the best input and output counts
+// seen across every chunk and sums them once nothing reported an
+// explicit total_tokens directly.
 func extractTotalTokens(body []byte) int {
 	if tokens, ok := tryUnmarshalUsage(body); ok {
 		return tokens
 	}
 
-	best := 0
+	var bestTotal, input, output int
+	sawTotal, sawInput, sawOutput := false, false, false
+
 	for _, line := range bytes.Split(body, []byte("\n")) {
 		payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
 		if !ok {
@@ -569,19 +608,45 @@ func extractTotalTokens(body []byte) int {
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 			continue
 		}
-		if tokens, ok := tryUnmarshalUsage(payload); ok {
-			best = tokens
+
+		var chunk llmUsageResponse
+		if err := json.Unmarshal(payload, &chunk); err != nil {
+			continue
+		}
+		if chunk.Usage.TotalTokens > 0 {
+			bestTotal, sawTotal = chunk.Usage.TotalTokens, true
+		}
+		if chunk.Usage.InputTokens > 0 {
+			input, sawInput = chunk.Usage.InputTokens, true
+		}
+		if chunk.Usage.OutputTokens > 0 {
+			output, sawOutput = chunk.Usage.OutputTokens, true
+		}
+		if chunk.Message != nil {
+			if chunk.Message.Usage.InputTokens > 0 {
+				input, sawInput = chunk.Message.Usage.InputTokens, true
+			}
+			if chunk.Message.Usage.OutputTokens > 0 {
+				output, sawOutput = chunk.Message.Usage.OutputTokens, true
+			}
 		}
 	}
-	return best
+
+	if sawTotal {
+		return bestTotal
+	}
+	if sawInput || sawOutput {
+		return input + output
+	}
+	return 0
 }
 
 func tryUnmarshalUsage(data []byte) (int, bool) {
 	var usage llmUsageResponse
-	if err := json.Unmarshal(data, &usage); err != nil || usage.Usage.TotalTokens <= 0 {
+	if err := json.Unmarshal(data, &usage); err != nil {
 		return 0, false
 	}
-	return usage.Usage.TotalTokens, true
+	return usage.Usage.total()
 }
 
 func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {

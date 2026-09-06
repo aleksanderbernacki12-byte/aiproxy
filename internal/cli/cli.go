@@ -31,9 +31,10 @@ const defaultConfigPath = "aiproxy.json"
 // Default body regex rules, compiled once at package init so the cost of
 // compiling them is never paid per request.
 var (
-	awsAccessKeyPattern = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
-	openAIAPIKeyPattern = regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`)
-	githubTokenPattern  = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36}`)
+	awsAccessKeyPattern    = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	openAIAPIKeyPattern    = regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`)
+	githubTokenPattern     = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36}`)
+	anthropicAPIKeyPattern = regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`)
 )
 
 // Execute parses args and runs the requested subcommand, writing output
@@ -268,6 +269,19 @@ var builtinRules = []struct {
 	{"aws-access-key", awsAccessKeyPattern},
 	{"openai-api-key", openAIAPIKeyPattern},
 	{"github-token", githubTokenPattern},
+	{"anthropic-api-key", anthropicAPIKeyPattern},
+}
+
+// builtinRuleNames returns every built-in rule's name, in the same
+// order as builtinRules — used to list valid names in a config error
+// message without that list drifting out of sync with builtinRules
+// itself.
+func builtinRuleNames() []string {
+	names := make([]string, len(builtinRules))
+	for i, b := range builtinRules {
+		names[i] = b.name
+	}
+	return names
 }
 
 // resolveBuiltinRuleActions turns a config file's builtin_rule_actions
@@ -288,7 +302,7 @@ func resolveBuiltinRuleActions(overrides map[string]string) (map[string]rules.Ac
 	var errs []error
 	for name, raw := range overrides {
 		if !names[name] {
-			errs = append(errs, fmt.Errorf("Fatal error: builtin_rule_actions: %q is not a built-in rule (valid names: aws-access-key, openai-api-key, github-token)", name))
+			errs = append(errs, fmt.Errorf("Fatal error: builtin_rule_actions: %q is not a built-in rule (valid names: %s)", name, strings.Join(builtinRuleNames(), ", ")))
 			continue
 		}
 		action, err := parseRuleAction(raw)
