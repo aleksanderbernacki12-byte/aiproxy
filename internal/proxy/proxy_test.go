@@ -820,7 +820,7 @@ func TestServer_SummaryText_IncludesCostLineOnlyWhenConfigured(t *testing.T) {
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", targetURL, engine)
 
-	srv.Stats.RecordTokensUsed(2500)
+	srv.Stats.RecordTokensUsed("default", 2500)
 
 	withoutCost := srv.Summary()
 	if strings.Contains(withoutCost, "Estimated cost") {
@@ -1003,5 +1003,145 @@ func TestServer_MultiTargetRouting_CacheKeysDifferPerTarget(t *testing.T) {
 	}
 	if anthropicHits.Load() != 1 {
 		t.Fatalf("anthropic hits after repeat = %d, want still 1 (must be served from cache)", anthropicHits.Load())
+	}
+}
+
+// TestServer_MultiTargetRouting_StatsBreakDownPerTarget proves requests
+// are attributed to the target they were actually routed to — the
+// matched prefix, or "default" for anything that fell through to the
+// fallback Target — both in Server.Stats.Snapshot().PerTarget and in the
+// rendered Summary() text, and that the overall counts still reflect
+// every request regardless of which target it went to.
+func TestServer_MultiTargetRouting_StatsBreakDownPerTarget(t *testing.T) {
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"usage":{"total_tokens":10}}`))
+	}))
+	defer openai.Close()
+
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"usage":{"total_tokens":30}}`))
+	}))
+	defer anthropic.Close()
+
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer defaultUpstream.Close()
+
+	openaiURL, err := url.Parse(openai.URL)
+	if err != nil {
+		t.Fatalf("parse openai url: %v", err)
+	}
+	anthropicURL, err := url.Parse(anthropic.URL)
+	if err != nil {
+		t.Fatalf("parse anthropic url: %v", err)
+	}
+	defaultURL, err := url.Parse(defaultUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse default url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "test-secret",
+		Pattern: regexp.MustCompile(`SECRET`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", defaultURL, engine)
+	srv.AddRoute("/openai", openaiURL)
+	srv.AddRoute("/anthropic", anthropicURL)
+	srv.CostPer1KTokens = 0.02
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(path, body string) {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	post("/openai/v1/chat", `{"n":1}`)   // allowed, 10 tokens
+	post("/openai/v1/chat", `SECRET`)    // blocked
+	post("/anthropic/v1/msg", `{"n":1}`) // allowed, 30 tokens
+	post("/something-else", `{"n":1}`)   // allowed on the default fallback
+
+	// Let the async usage-extraction goroutine-free path settle: usage is
+	// extracted synchronously in ModifyResponse for a non-streaming
+	// response, so no wait is actually needed here, but Snapshot is taken
+	// only after every post() has returned, which is enough.
+	snap := srv.Stats.Snapshot()
+
+	if snap.Allowed != 3 {
+		t.Fatalf("overall Allowed = %d, want 3", snap.Allowed)
+	}
+	if snap.Blocked != 1 {
+		t.Fatalf("overall Blocked = %d, want 1", snap.Blocked)
+	}
+	if snap.TotalTokens != 40 {
+		t.Fatalf("overall TotalTokens = %d, want 40", snap.TotalTokens)
+	}
+
+	openaiSnap, ok := snap.PerTarget["/openai"]
+	if !ok {
+		t.Fatalf("PerTarget missing /openai entry: %+v", snap.PerTarget)
+	}
+	if openaiSnap.Allowed != 1 || openaiSnap.Blocked != 1 || openaiSnap.TotalTokens != 10 {
+		t.Fatalf("PerTarget[/openai] = %+v, want allowed=1 blocked=1 tokens=10", openaiSnap)
+	}
+
+	anthropicSnap, ok := snap.PerTarget["/anthropic"]
+	if !ok {
+		t.Fatalf("PerTarget missing /anthropic entry: %+v", snap.PerTarget)
+	}
+	if anthropicSnap.Allowed != 1 || anthropicSnap.TotalTokens != 30 {
+		t.Fatalf("PerTarget[/anthropic] = %+v, want allowed=1 tokens=30", anthropicSnap)
+	}
+
+	defaultSnap, ok := snap.PerTarget["default"]
+	if !ok {
+		t.Fatalf("PerTarget missing default entry: %+v", snap.PerTarget)
+	}
+	if defaultSnap.Allowed != 1 {
+		t.Fatalf("PerTarget[default] = %+v, want allowed=1", defaultSnap)
+	}
+
+	summary := srv.Summary()
+	if !strings.Contains(summary, "=== per-target breakdown ===") {
+		t.Fatalf("Summary() missing per-target breakdown header: %q", summary)
+	}
+	if !strings.Contains(summary, "[/openai] allowed=1 blocked=1 rate-limited=0 cache-hits=0 tokens=10 cost=0.0002") {
+		t.Fatalf("Summary() missing correct /openai line: %q", summary)
+	}
+	if !strings.Contains(summary, "[/anthropic] allowed=1 blocked=0 rate-limited=0 cache-hits=0 tokens=30 cost=0.0006") {
+		t.Fatalf("Summary() missing correct /anthropic line: %q", summary)
+	}
+	if !strings.Contains(summary, "[default] allowed=1 blocked=0 rate-limited=0 cache-hits=0 tokens=0 cost=0.0000") {
+		t.Fatalf("Summary() missing correct default line: %q", summary)
+	}
+}
+
+// TestServer_SingleTarget_SummaryOmitsPerTargetBreakdown proves the
+// breakdown section is left out entirely for the common case — no
+// AddRoute calls, everything going to one --target — since it would
+// just repeat the overall block above with a different label.
+func TestServer_SingleTarget_SummaryOmitsPerTargetBreakdown(t *testing.T) {
+	targetURL, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Stats.RecordAllow("default")
+
+	summary := srv.Summary()
+	if strings.Contains(summary, "per-target breakdown") {
+		t.Fatalf("Summary() should omit the per-target breakdown for a single-target run: %q", summary)
 	}
 }

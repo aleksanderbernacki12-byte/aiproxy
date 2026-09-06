@@ -45,7 +45,26 @@ stream cut short by a dropped connection is never cached.
 Stopping the proxy (Ctrl+C) prints a session summary: how many requests
 were allowed, blocked, rate-limited, served from cache, and the total
 tokens used across the run — plus an estimated cost line, if you've set
-`cost_per_1k_tokens`.
+`cost_per_1k_tokens`. If more than one [target](#multi-target-routing)
+was actually used during the run, the summary also breaks those same
+counts down per target (labeled by the matched prefix, or `default` for
+the fallback `--target`), each with its own cost line when
+`cost_per_1k_tokens` is set:
+
+```
+=== aiproxy session summary ===
+Requests allowed:    5
+Requests blocked:    0
+Rate-limited (429):  0
+Cache hits:          0
+Total tokens used:   0
+=== per-target breakdown ===
+[/postman] allowed=3 blocked=0 rate-limited=0 cache-hits=0 tokens=0
+[default] allowed=2 blocked=0 rate-limited=0 cache-hits=0 tokens=0
+```
+
+A single-target run (no `targets` configured) leaves this section out
+entirely — it would just repeat the block above under a different label.
 
 ## Custom rules, rate limiting, caching, and cost estimation
 

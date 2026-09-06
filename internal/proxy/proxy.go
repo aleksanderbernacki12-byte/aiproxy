@@ -66,6 +66,7 @@ type requestContextInfo struct {
 	cacheKey    string
 	target      *url.URL
 	forwardPath string
+	targetLabel string
 }
 
 // route is one path-prefix-to-upstream mapping for multi-target routing.
@@ -148,19 +149,21 @@ func (s *Server) AddRoute(prefix string, target *url.URL) {
 
 // resolveRoute matches path against the registered routes and returns
 // the target to forward to along with the path to forward it as (the
-// matched prefix stripped, if any route matched). It falls back to the
-// default Target, unmodified path, when nothing matches.
-func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string) {
+// matched prefix stripped, if any route matched) and a label identifying
+// the target for the per-target stats breakdown: the matched prefix, or
+// "default" for the fallback Target. It falls back to the default
+// Target, unmodified path, when nothing matches.
+func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string, targetLabel string) {
 	for _, r := range s.routes {
 		if strings.HasPrefix(path, r.prefix) {
 			stripped := strings.TrimPrefix(path, r.prefix)
 			if !strings.HasPrefix(stripped, "/") {
 				stripped = "/" + stripped
 			}
-			return r.target, stripped
+			return r.target, stripped, r.prefix
 		}
 	}
-	return s.Target, path
+	return s.Target, path, "default"
 }
 
 // ServeHTTP implements http.Handler. It reads the full request body into
@@ -179,7 +182,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolved once so the cache key (below) and the actual forwarding
 	// (in Rewrite, via the request context set further down) can never
 	// disagree about which target and path this request maps to.
-	target, forwardPath := s.resolveRoute(r.URL.Path)
+	target, forwardPath, targetLabel := s.resolveRoute(r.URL.Path)
 
 	// The cache is checked before rules and the rate limiter: a cache hit
 	// never touches either, and never reaches the upstream target.
@@ -192,7 +195,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			copyHeader(w.Header(), cached.Header)
 			w.WriteHeader(cached.StatusCode)
 			io.Copy(w, cached.Body)
-			s.Stats.RecordCacheHit()
+			s.Stats.RecordCacheHit(targetLabel)
 			s.logCacheHit(r.Method, r.URL.String())
 			return
 		}
@@ -210,14 +213,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if action == rules.Block {
 		// The matched secret itself must never reach the log, only the
 		// static rule name that identifies which pattern triggered it.
-		s.Stats.RecordBlock()
+		s.Stats.RecordBlock(targetLabel)
 		s.logBlock(r.Method, r.URL.String(), ruleName)
 		http.Error(w, "blocked by aiproxy rules", http.StatusForbidden)
 		return
 	}
 
 	if s.Limiter != nil && !s.Limiter.Allow() {
-		s.Stats.RecordRateLimited()
+		s.Stats.RecordRateLimited(targetLabel)
 		s.logRateLimited(r.Method, r.URL.String())
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
@@ -225,7 +228,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
-	s.Stats.RecordAllow()
+	s.Stats.RecordAllow(targetLabel)
 	s.logAllow(r.Method, r.URL.String())
 
 	// Carry the client-facing method/URL, the cache key, and the resolved
@@ -239,6 +242,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cacheKey:    cacheKey,
 		target:      target,
 		forwardPath: forwardPath,
+		targetLabel: targetLabel,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -412,7 +416,7 @@ func tryUnmarshalUsage(data []byte) (int, bool) {
 
 func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 	if tokens := extractTotalTokens(body); tokens > 0 {
-		s.Stats.RecordTokensUsed(tokens)
+		s.Stats.RecordTokensUsed(reqCtx.targetLabel, tokens)
 		s.logUsage(reqCtx.method, reqCtx.url, tokens)
 	}
 }
@@ -459,6 +463,9 @@ func (s *Server) Summary() string {
 	summary := snap.String()
 	if s.CostPer1KTokens > 0 {
 		summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", snap.EstimatedCost(s.CostPer1KTokens), s.CostPer1KTokens)
+	}
+	if breakdown := snap.PerTargetString(s.CostPer1KTokens); breakdown != "" {
+		summary += "\n" + breakdown
 	}
 	return summary
 }
