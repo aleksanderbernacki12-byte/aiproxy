@@ -288,6 +288,45 @@ Because the path is reserved, an upstream that genuinely needs to be
 reached at `/_aiproxy/stats` itself cannot be — route it through a
 different prefix if that ever comes up.
 
+## Prometheus metrics
+
+The same counters are also available at `GET /_aiproxy/metrics` in
+Prometheus's text exposition format, for scraping instead of polling
+`/_aiproxy/stats`:
+
+```
+aiproxy_requests_allowed_total{target="default"} 42
+aiproxy_requests_blocked_total{target="default"} 1
+aiproxy_requests_redacted_total{target="default"} 0
+aiproxy_requests_rate_limited_total{target="default"} 0
+aiproxy_cache_hits_total{target="default"} 5
+aiproxy_tokens_used_total{target="default"} 3100
+aiproxy_estimated_cost{target="default"} 0.062
+```
+
+(`# HELP`/`# TYPE` lines omitted above for brevity — the real response
+has them.) Every target seen so far gets its own `target="..."` series,
+always, even in a single-target run — a scrape needs the same shape
+every time, unlike the shutdown summary's noise-avoiding suppression.
+`aiproxy_estimated_cost` is included only when `cost_per_1k_tokens` is
+set, same as the JSON endpoint's `estimated_cost`. Point Prometheus at
+it with:
+
+```yaml
+scrape_configs:
+  - job_name: aiproxy
+    metrics_path: /_aiproxy/metrics
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+`metrics_path` has to be set explicitly — the endpoint deliberately
+isn't served at the ecosystem's usual bare `/metrics`, since that's
+exactly the kind of path a self-hosted LLM gateway upstream might
+already be using for its own metrics. Same reserved-path rules as
+`/_aiproxy/stats` apply: never forwarded upstream, never counted in the
+stats it reports, and any method other than `GET` gets a 405.
+
 ## Validating a config file
 
 ```

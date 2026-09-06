@@ -1412,6 +1412,251 @@ func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
 	}
 }
 
+// TestServer_MetricsEndpoint_ReturnsPrometheusFormatWithCurrentCounts
+// proves metricsPath renders the same counters as statsPath, but in
+// Prometheus's text exposition format, labeled by target.
+func TestServer_MetricsEndpoint_ReturnsPrometheusFormatWithCurrentCounts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "test-secret",
+		Pattern: regexp.MustCompile(`SECRET`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(body string) {
+		resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %q: %v", body, err)
+		}
+		resp.Body.Close()
+	}
+	post(`{"n":1}`)
+	post(`SECRET`)
+	post(`{"n":2}`)
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q, want a text/plain prefix", ct)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+
+	if !strings.Contains(out, "# TYPE aiproxy_requests_allowed_total counter") {
+		t.Errorf("missing TYPE line for allowed counter: %q", out)
+	}
+	if !strings.Contains(out, `aiproxy_requests_allowed_total{target="default"} 2`) {
+		t.Errorf("missing allowed=2 for target=default: %q", out)
+	}
+	if !strings.Contains(out, `aiproxy_requests_blocked_total{target="default"} 1`) {
+		t.Errorf("missing blocked=1 for target=default: %q", out)
+	}
+}
+
+// TestServer_MetricsEndpoint_NeverForwardedUpstreamOrCountedInStats
+// mirrors the same guarantee statsPath has: a scrape never reaches the
+// upstream, and never shows up in its own counters.
+func TestServer_MetricsEndpoint_NeverForwardedUpstreamOrCountedInStats(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+		if err != nil {
+			t.Fatalf("GET /_aiproxy/metrics: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	if upstreamHit.Load() {
+		t.Fatal("a request for metricsPath must never reach the upstream target")
+	}
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if strings.Contains(string(body), `target=`) {
+		t.Fatalf("scrapes must not themselves be counted, so no target should have appeared yet: %q", body)
+	}
+}
+
+// TestServer_MetricsEndpoint_BypassesRulesAndRateLimiter proves
+// metricsPath stays reachable even while a block-everything rule and an
+// exhausted rate limiter are actively rejecting every other request —
+// the same side-channel guarantee as statsPath.
+func TestServer_MetricsEndpoint_BypassesRulesAndRateLimiter(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Block) // blocks everything by default
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Limiter = limiter.New(0, time.Minute) // 0 allowed requests per window
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d even with rules/rate-limiter blocking everything else", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_MetricsEndpoint_RejectsNonGetMethod proves the endpoint
+// only answers GET, matching statsPath.
+func TestServer_MetricsEndpoint_RejectsNonGetMethod(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/_aiproxy/metrics", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /_aiproxy/metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestServer_MetricsEndpoint_IncludesCostOnlyWhenConfiguredAndLabelsEveryTarget
+// proves aiproxy_estimated_cost appears only once CostPer1KTokens is
+// set, and that every target seen so far gets its own labeled series —
+// including a single-target run, unlike the printed Summary()'s
+// below-threshold suppression, since a scrape needs a structurally
+// predictable shape every time.
+func TestServer_MetricsEndpoint_IncludesCostOnlyWhenConfiguredAndLabelsEveryTarget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer other.Close()
+
+	defaultURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	otherURL, err := url.Parse(other.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", defaultURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	getMetrics := func() string {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+		if err != nil {
+			t.Fatalf("GET /_aiproxy/metrics: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return string(body)
+	}
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("GET /x: %v", err)
+	}
+	resp.Body.Close()
+
+	withoutCost := getMetrics()
+	if strings.Contains(withoutCost, "aiproxy_estimated_cost") {
+		t.Fatalf("aiproxy_estimated_cost must be omitted when CostPer1KTokens is unset: %q", withoutCost)
+	}
+	if !strings.Contains(withoutCost, `target="default"`) {
+		t.Fatalf("missing target=default series in a single-target run: %q", withoutCost)
+	}
+
+	srv.CostPer1KTokens = 0.02
+	srv.AddRoute("/other", otherURL, nil)
+	resp2, err := http.Get(frontend.URL + "/other/y")
+	if err != nil {
+		t.Fatalf("GET /other/y: %v", err)
+	}
+	resp2.Body.Close()
+
+	withBoth := getMetrics()
+	if !strings.Contains(withBoth, "aiproxy_estimated_cost") {
+		t.Fatalf("aiproxy_estimated_cost must be present once CostPer1KTokens is set: %q", withBoth)
+	}
+	if !strings.Contains(withBoth, `target="default"`) || !strings.Contains(withBoth, `target="/other"`) {
+		t.Fatalf("missing per-target series for both targets: %q", withBoth)
+	}
+}
+
 // TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently proves
 // AddRoute's dedicated-limiter override: a route given its own strict
 // Limiter is throttled by that limit alone, while a second route with no

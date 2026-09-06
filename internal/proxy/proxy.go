@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -86,6 +87,16 @@ type route struct {
 // monitoring a long-running proxy even while those are actively blocking
 // or throttling other traffic.
 const statsPath = "/_aiproxy/stats"
+
+// metricsPath is a second reserved, proxy-internal path alongside
+// statsPath: the same counters, in Prometheus's text exposition format,
+// for scraping instead of polling statsPath. It deliberately isn't the
+// ecosystem's usual bare "/metrics" — aiproxy forwards to an arbitrary
+// upstream, which (unlike statsPath's own collision risk) could easily
+// be a self-hosted LLM gateway that already serves its own metrics at
+// that exact path. Point a Prometheus scrape config at this one with
+// "metrics_path: /_aiproxy/metrics" instead.
+const metricsPath = "/_aiproxy/metrics"
 
 // Server is a reverse proxy that evaluates every request's body against
 // a rules.Engine before forwarding it to Target over HTTPS. Additional
@@ -312,6 +323,10 @@ func (s *Server) LogEvent(level, message string) {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == statsPath {
 		s.serveStats(w, r)
+		return
+	}
+	if r.URL.Path == metricsPath {
+		s.serveMetrics(w, r)
 		return
 	}
 
@@ -718,6 +733,79 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		s.logError("aiproxy: stats: failed to encode response: %v", err)
 	}
+}
+
+// promCounters lists the counters every metricsPath series is built
+// from: one line pairs a metric name/help text with the stats.Snapshot
+// field it reads.
+var promCounters = []struct {
+	name string
+	help string
+	get  func(stats.Snapshot) int64
+}{
+	{"aiproxy_requests_allowed_total", "Total number of requests allowed and forwarded to the upstream target.", func(s stats.Snapshot) int64 { return s.Allowed }},
+	{"aiproxy_requests_blocked_total", "Total number of requests blocked by a rule.", func(s stats.Snapshot) int64 { return s.Blocked }},
+	{"aiproxy_requests_redacted_total", "Total number of requests forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.Redacted }},
+	{"aiproxy_requests_rate_limited_total", "Total number of requests rejected by the rate limiter.", func(s stats.Snapshot) int64 { return s.RateLimited }},
+	{"aiproxy_cache_hits_total", "Total number of requests served from the local response cache.", func(s stats.Snapshot) int64 { return s.CacheHits }},
+	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
+}
+
+// promLabelValue escapes a label value per the Prometheus text
+// exposition format: backslash, double quote, and newline are the only
+// characters that need it.
+func promLabelValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	v = strings.ReplaceAll(v, "\n", `\n`)
+	return v
+}
+
+// writePromMetrics writes one line per target for every counter in
+// promCounters, each labeled target="<name>" — deliberately with no
+// separate unlabeled "grand total" series alongside them, since that
+// would just be sum(aiproxy_requests_allowed_total) by another name and
+// Prometheus users already expect to compute it that way. per_target is
+// always walked in full and never suppressed for a single-target run,
+// same reasoning as the JSON stats endpoint: a metrics scrape needs a
+// structurally predictable shape every time, not a human-friendly
+// summary. targets are sorted for a stable scrape-to-scrape diff.
+func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens float64) {
+	names := make([]string, 0, len(snap.PerTarget))
+	for name := range snap.PerTarget {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, c := range promCounters {
+		fmt.Fprintf(w, "# HELP %s %s\n", c.name, c.help)
+		fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
+		for _, name := range names {
+			fmt.Fprintf(w, "%s{target=%q} %d\n", c.name, promLabelValue(name), c.get(snap.PerTarget[name]))
+		}
+	}
+
+	if costPer1KTokens > 0 {
+		fmt.Fprintln(w, "# HELP aiproxy_estimated_cost Estimated cost of tokens used so far, at the configured cost_per_1k_tokens rate.")
+		fmt.Fprintln(w, "# TYPE aiproxy_estimated_cost counter")
+		for _, name := range names {
+			t := snap.PerTarget[name]
+			fmt.Fprintf(w, "aiproxy_estimated_cost{target=%q} %g\n", promLabelValue(name), t.EstimatedCost(costPer1KTokens))
+		}
+	}
+}
+
+// serveMetrics answers metricsPath with the current Stats snapshot in
+// Prometheus's text exposition format. Like serveStats, it never
+// touches rules, the rate limiter, or the cache, and a scrape is never
+// itself counted in Stats.
+func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	writePromMetrics(w, s.Stats.Snapshot(), s.getCostPer1KTokens())
 }
 
 // Summary renders the current stats snapshot as the same block of text
