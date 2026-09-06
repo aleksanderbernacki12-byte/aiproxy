@@ -1,0 +1,8 @@
+.git
+.github
+bin
+.aiproxy_cache
+*.md
+LICENSE
+Makefile
+install.sh

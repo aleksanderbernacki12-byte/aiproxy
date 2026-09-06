@@ -330,6 +330,30 @@ against a checksum. Both the Homebrew formula and the Scoop manifest are
 regenerated automatically by the release pipeline on every tagged
 release — neither is ever hand-edited.
 
+As a container image, from [GHCR](https://github.com/aleksanderbernacki12-byte/aiproxy/pkgs/container/aiproxy):
+
+```
+docker run --rm -p 8080:8080 \
+  ghcr.io/aleksanderbernacki12-byte/aiproxy:latest \
+  start --target https://api.openai.com --addr 0.0.0.0:8080
+```
+
+`--addr 0.0.0.0:8080` is required — the default `127.0.0.1:8080` only
+listens inside the container's own network namespace, unreachable
+through the `-p` port mapping. To use a config file, mount it into the
+image's working directory (`/config`):
+
+```
+docker run --rm -p 8080:8080 -v "$(pwd)/aiproxy.json:/config/aiproxy.json" \
+  ghcr.io/aleksanderbernacki12-byte/aiproxy:latest \
+  start --target https://api.openai.com --addr 0.0.0.0:8080
+```
+
+Images are built for `linux/amd64` and `linux/arm64` and published on
+every tagged release, alongside the `latest` tag; both are built
+directly from that release's own source, not repackaged from one of the
+other install methods.
+
 Otherwise:
 
 ```
