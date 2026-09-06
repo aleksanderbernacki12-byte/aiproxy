@@ -145,8 +145,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			for _, r := range routes {
-				server.AddRoute(r.prefix, r.target)
-				fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, r.target)
+				server.AddRoute(r.prefix, r.target, r.limiter)
+				if r.maxRequestsPerMinute > 0 {
+					fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %d requests/minute)\n", r.prefix, r.target, r.maxRequestsPerMinute)
+				} else {
+					fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, r.target)
+				}
 			}
 		}
 	}
@@ -311,18 +315,22 @@ func parseHTTPSURL(raw string) (*url.URL, error) {
 }
 
 // targetRoute is one compiled entry from the config file's targets list,
-// ready to be added to a proxy.Server via AddRoute.
+// ready to be added to a proxy.Server via AddRoute. limiter is nil
+// unless the entry set its own max_requests_per_minute override.
 type targetRoute struct {
-	prefix string
-	target *url.URL
+	prefix               string
+	target               *url.URL
+	maxRequestsPerMinute int
+	limiter              *limiter.Limiter
 }
 
 // compileTargetRoutes validates and parses each targets entry from the
 // config file. A prefix must be non-empty, start with "/", and be
 // distinct from every other entry's prefix; a URL must pass the same
-// https validation as --target. Problems are collected and returned
-// rather than stopping at the first one — the caller decides whether
-// that's fatal (runStart) or just a reported problem (runValidate).
+// https validation as --target; max_requests_per_minute, if set, must
+// not be negative. Problems are collected and returned rather than
+// stopping at the first one — the caller decides whether that's fatal
+// (runStart) or just a reported problem (runValidate).
 func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 	compiled := make([]targetRoute, 0, len(targets))
 	var errs []error
@@ -343,7 +351,17 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 			errs = append(errs, fmt.Errorf("targets: prefix %q: url %w", t.Prefix, err))
 			continue
 		}
-		compiled = append(compiled, targetRoute{prefix: t.Prefix, target: u})
+
+		if t.MaxRequestsPerMinute < 0 {
+			errs = append(errs, fmt.Errorf("targets: prefix %q: max_requests_per_minute %d must not be negative", t.Prefix, t.MaxRequestsPerMinute))
+			continue
+		}
+
+		tr := targetRoute{prefix: t.Prefix, target: u, maxRequestsPerMinute: t.MaxRequestsPerMinute}
+		if t.MaxRequestsPerMinute > 0 {
+			tr.limiter = limiter.New(t.MaxRequestsPerMinute, time.Minute)
+		}
+		compiled = append(compiled, tr)
 	}
 	return compiled, errs
 }

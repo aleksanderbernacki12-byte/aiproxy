@@ -23,6 +23,14 @@ type CustomRule struct {
 type Target struct {
 	Prefix string `json:"prefix"`
 	URL    string `json:"url"`
+
+	// MaxRequestsPerMinute, if greater than zero, gives this target its
+	// own dedicated rate limit instead of sharing the top-level
+	// max_requests_per_minute limiter with every other target. Zero (the
+	// default when the field is absent) means this target has no
+	// override and simply shares the top-level limiter, same as before
+	// per-target limits existed.
+	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
 }
 
 // Config is the top-level shape of aiproxy.json.

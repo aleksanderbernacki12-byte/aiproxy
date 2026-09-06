@@ -159,6 +159,29 @@ func TestLoad_ParsesTargets(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesTargetMaxRequestsPerMinute(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "max_requests_per_minute": 30},
+		{"prefix": "/anthropic", "url": "https://api.anthropic.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Targets[0].MaxRequestsPerMinute != 30 {
+		t.Fatalf("Targets[0].MaxRequestsPerMinute = %d, want 30", cfg.Targets[0].MaxRequestsPerMinute)
+	}
+	if cfg.Targets[1].MaxRequestsPerMinute != 0 {
+		t.Fatalf("Targets[1].MaxRequestsPerMinute = %d, want 0 (absent means no override)", cfg.Targets[1].MaxRequestsPerMinute)
+	}
+}
+
 func TestLoad_TargetsDefaultsToEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

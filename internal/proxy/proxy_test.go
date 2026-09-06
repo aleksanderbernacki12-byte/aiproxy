@@ -875,8 +875,8 @@ func TestServer_MultiTargetRouting_RoutesByPathPrefixAndStripsPrefix(t *testing.
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", openaiURL)
-	srv.AddRoute("/anthropic", anthropicURL)
+	srv.AddRoute("/openai", openaiURL, nil)
+	srv.AddRoute("/anthropic", anthropicURL, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -954,8 +954,8 @@ func TestServer_MultiTargetRouting_CacheKeysDifferPerTarget(t *testing.T) {
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", openaiURL, engine)
-	srv.AddRoute("/openai", openaiURL)
-	srv.AddRoute("/anthropic", anthropicURL)
+	srv.AddRoute("/openai", openaiURL, nil)
+	srv.AddRoute("/anthropic", anthropicURL, nil)
 	srv.Cache = c
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -1051,8 +1051,8 @@ func TestServer_MultiTargetRouting_StatsBreakDownPerTarget(t *testing.T) {
 	})
 
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", openaiURL)
-	srv.AddRoute("/anthropic", anthropicURL)
+	srv.AddRoute("/openai", openaiURL, nil)
+	srv.AddRoute("/anthropic", anthropicURL, nil)
 	srv.CostPer1KTokens = 0.02
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -1388,7 +1388,7 @@ func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
 	}
 
 	srv.CostPer1KTokens = 0.02
-	srv.AddRoute("/other", otherURL)
+	srv.AddRoute("/other", otherURL, nil)
 	resp2, err := http.Get(frontend.URL + "/other/y")
 	if err != nil {
 		t.Fatalf("GET /other/y: %v", err)
@@ -1407,5 +1407,123 @@ func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
 	}
 	if _, ok := withBoth.PerTarget["default"]; !ok {
 		t.Fatalf("per_target missing default entry: %+v", withBoth.PerTarget)
+	}
+}
+
+// TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently proves
+// AddRoute's dedicated-limiter override: a route given its own strict
+// Limiter is throttled by that limit alone, while a second route with no
+// override of its own keeps sharing the server-wide Limiter and is
+// unaffected by the first route's traffic — heavy use of one target must
+// never starve another's independent budget, nor bypass the shared one
+// it was never given an exemption from.
+func TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently(t *testing.T) {
+	var strictHits, sharedHits atomic.Int32
+	strict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		strictHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer strict.Close()
+	shared := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sharedHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer shared.Close()
+
+	strictURL, err := url.Parse(strict.URL)
+	if err != nil {
+		t.Fatalf("parse strict url: %v", err)
+	}
+	sharedURL, err := url.Parse(shared.URL)
+	if err != nil {
+		t.Fatalf("parse shared url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", sharedURL, engine)
+	srv.Limiter = limiter.New(5, time.Minute) // generous shared budget
+	srv.AddRoute("/strict", strictURL, limiter.New(1, time.Minute))
+	srv.AddRoute("/shared", sharedURL, nil) // no override: shares srv.Limiter
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func(path string) int {
+		resp, err := http.Get(frontend.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get("/strict/x"); got != http.StatusOK {
+		t.Fatalf("first /strict request status = %d, want %d", got, http.StatusOK)
+	}
+	if got := get("/strict/x"); got != http.StatusTooManyRequests {
+		t.Fatalf("second /strict request status = %d, want %d (its own 1/min limit is exhausted)", got, http.StatusTooManyRequests)
+	}
+	if strictHits.Load() != 1 {
+		t.Fatalf("strict upstream hits = %d, want exactly 1", strictHits.Load())
+	}
+
+	// /shared has no override, so it draws from the full server-wide
+	// budget, entirely unaffected by /strict — /strict's own dedicated
+	// limiter means its traffic never touches srv.Limiter at all.
+	for i := 0; i < 5; i++ {
+		if got := get("/shared/x"); got != http.StatusOK {
+			t.Fatalf("/shared request %d status = %d, want %d", i+1, got, http.StatusOK)
+		}
+	}
+	if got := get("/shared/x"); got != http.StatusTooManyRequests {
+		t.Fatalf("6th /shared request status = %d, want %d (shared 5/min budget exhausted)", got, http.StatusTooManyRequests)
+	}
+	if sharedHits.Load() != 5 {
+		t.Fatalf("shared upstream hits = %d, want exactly 5", sharedHits.Load())
+	}
+}
+
+// TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget
+// proves a 429 from a per-target limiter is recorded under that target's
+// own stats entry, not lumped into the overall count without a target,
+// or attributed to some other target.
+func TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.AddRoute("/limited", targetURL, limiter.New(1, time.Minute))
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Get(frontend.URL + "/limited/x")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.RateLimited != 1 {
+		t.Fatalf("overall RateLimited = %d, want 1", snap.RateLimited)
+	}
+	limited, ok := snap.PerTarget["/limited"]
+	if !ok {
+		t.Fatalf("PerTarget missing /limited entry: %+v", snap.PerTarget)
+	}
+	if limited.RateLimited != 1 {
+		t.Fatalf("PerTarget[/limited].RateLimited = %d, want 1", limited.RateLimited)
 	}
 }

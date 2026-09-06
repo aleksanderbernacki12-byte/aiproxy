@@ -70,9 +70,13 @@ type requestContextInfo struct {
 }
 
 // route is one path-prefix-to-upstream mapping for multi-target routing.
+// limiter is nil unless this route was given its own dedicated rate
+// limit, in which case it applies instead of the server-wide Limiter for
+// this route's traffic only.
 type route struct {
-	prefix string
-	target *url.URL
+	prefix  string
+	target  *url.URL
+	limiter *limiter.Limiter
 }
 
 // statsPath is a reserved, proxy-internal path: a GET request to it never
@@ -150,27 +154,41 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 // with path "/v1/chat"). Routes are checked in the order they were
 // added; the first matching prefix wins, so add more specific prefixes
 // before more general ones if they could overlap.
-func (s *Server) AddRoute(prefix string, target *url.URL) {
-	s.routes = append(s.routes, route{prefix: prefix, target: target})
+//
+// lim, if non-nil, gives this route its own dedicated rate limit instead
+// of sharing the server-wide Limiter with every other target — heavy
+// traffic to one provider then can't throttle the others. Pass nil for a
+// route that should just share whatever Limiter (if any) the server is
+// configured with, same as every route did before per-target limits
+// existed.
+func (s *Server) AddRoute(prefix string, target *url.URL, lim *limiter.Limiter) {
+	s.routes = append(s.routes, route{prefix: prefix, target: target, limiter: lim})
 }
 
 // resolveRoute matches path against the registered routes and returns
 // the target to forward to along with the path to forward it as (the
-// matched prefix stripped, if any route matched) and a label identifying
-// the target for the per-target stats breakdown: the matched prefix, or
-// "default" for the fallback Target. It falls back to the default
-// Target, unmodified path, when nothing matches.
-func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string, targetLabel string) {
+// matched prefix stripped, if any route matched), a label identifying
+// the target for the per-target stats breakdown (the matched prefix, or
+// "default" for the fallback Target), and the rate limiter that applies
+// to this request: the matched route's own limiter if it has one,
+// otherwise the server-wide Limiter (nil if that is unset too, meaning
+// no limiting at all). It falls back to the default Target, unmodified
+// path, when nothing matches.
+func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter) {
 	for _, r := range s.routes {
 		if strings.HasPrefix(path, r.prefix) {
 			stripped := strings.TrimPrefix(path, r.prefix)
 			if !strings.HasPrefix(stripped, "/") {
 				stripped = "/" + stripped
 			}
-			return r.target, stripped, r.prefix
+			effectiveLimiter := r.limiter
+			if effectiveLimiter == nil {
+				effectiveLimiter = s.Limiter
+			}
+			return r.target, stripped, r.prefix, effectiveLimiter
 		}
 	}
-	return s.Target, path, "default"
+	return s.Target, path, "default", s.Limiter
 }
 
 // ServeHTTP implements http.Handler. It reads the full request body into
@@ -194,7 +212,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolved once so the cache key (below) and the actual forwarding
 	// (in Rewrite, via the request context set further down) can never
 	// disagree about which target and path this request maps to.
-	target, forwardPath, targetLabel := s.resolveRoute(r.URL.Path)
+	target, forwardPath, targetLabel, effectiveLimiter := s.resolveRoute(r.URL.Path)
 
 	// The cache is checked before rules and the rate limiter: a cache hit
 	// never touches either, and never reaches the upstream target.
@@ -231,7 +249,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.Limiter != nil && !s.Limiter.Allow() {
+	if effectiveLimiter != nil && !effectiveLimiter.Allow() {
 		s.Stats.RecordRateLimited(targetLabel)
 		s.logRateLimited(r.Method, r.URL.String())
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)

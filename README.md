@@ -127,11 +127,32 @@ stripped before the request reaches the upstream. Anything that doesn't
 match any prefix still falls back to `--target`, so `--target` stays
 required even when `targets` is set. Prefixes are checked in the order
 they're listed, first match wins, so list more specific prefixes first
-if any could overlap. Every other feature — rules, rate limiting,
-caching, usage tracking — applies uniformly regardless of which target a
-request was routed to; caching in particular keys on the resolved
-destination, so identical bodies sent to different providers are never
-confused with each other.
+if any could overlap. Rules, caching, and usage tracking apply uniformly
+regardless of which target a request was routed to; caching in
+particular keys on the resolved destination, so identical bodies sent to
+different providers are never confused with each other.
+
+Each target can also be given its own rate limit, overriding the
+top-level `max_requests_per_minute` for just that target's traffic:
+
+```json
+{
+  "max_requests_per_minute": 60,
+  "targets": [
+    { "prefix": "/openai", "url": "https://api.openai.com", "max_requests_per_minute": 20 },
+    { "prefix": "/anthropic", "url": "https://api.anthropic.com" }
+  ]
+}
+```
+
+Here `/openai` gets its own dedicated 20-requests-per-minute budget,
+independent of everything else — heavy traffic to it can never throttle
+`/anthropic` or the default target. `/anthropic` has no override, so it
+keeps sharing the top-level 60-requests-per-minute limiter with the
+default target, exactly as if `targets[].max_requests_per_minute` didn't
+exist. Omit or set it to 0 for a target that should just share the
+top-level limiter (or share "no limit at all", if the top-level field is
+itself unset).
 
 ## Live stats
 
