@@ -75,8 +75,10 @@ curl -fsSL https://raw.githubusercontent.com/aleksanderbernacki12-byte/aiproxy/m
 
 This detects your OS/architecture, downloads the matching binary from
 the [latest release](https://github.com/aleksanderbernacki12-byte/aiproxy/releases/latest),
-and installs it to `/usr/local/bin` (override with `AIPROXY_INSTALL_DIR`).
-No Go toolchain required.
+verifies it against the release's published `SHA256SUMS` before
+installing (refusing to proceed on a mismatch), and installs it to
+`/usr/local/bin` (override with `AIPROXY_INSTALL_DIR`). No Go toolchain
+required.
 
 If you'd rather build from source — or the release download fails for
 some reason — clone the repo and run the same script; it automatically

@@ -38,6 +38,7 @@ OS="$(detect_os)"
 ARCH="$(detect_arch)"
 ASSET_NAME="${BINARY_NAME}-${OS}-${ARCH}"
 RELEASE_URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}"
+CHECKSUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
 
 log "aiproxy installer"
 log "  OS:            ${OS}"
@@ -56,6 +57,50 @@ download_release_binary() {
 	curl -fsSL --retry 3 -o "${WORK_DIR}/${BINARY_NAME}" "${RELEASE_URL}"
 }
 
+# Prints the sha256 of a file using whichever tool is available. Fails
+# if neither exists.
+sha256_of() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | awk '{print $1}'
+	else
+		return 1
+	fi
+}
+
+# Verifies file against the published SHA256SUMS for this release. A
+# mismatch is a hard failure — refuses to install. Not being able to
+# verify at all (SHA256SUMS missing, e.g. an older release published
+# before this existed, or no sha256 tool installed) only warns, since
+# that is a compatibility gap rather than evidence of tampering.
+verify_checksum() {
+	local file="$1"
+
+	if ! curl -fsSL --retry 3 -o "${WORK_DIR}/SHA256SUMS" "${CHECKSUMS_URL}" 2>/dev/null; then
+		log "warning: could not fetch SHA256SUMS for this release — skipping integrity verification"
+		return 0
+	fi
+
+	local expected
+	expected="$(awk -v name="${ASSET_NAME}" '$2 == name { print $1; exit }' "${WORK_DIR}/SHA256SUMS")"
+	if [ -z "${expected}" ]; then
+		log "warning: SHA256SUMS has no entry for ${ASSET_NAME} — skipping integrity verification"
+		return 0
+	fi
+
+	local actual
+	if ! actual="$(sha256_of "${file}")"; then
+		log "warning: no sha256sum or shasum available — skipping integrity verification"
+		return 0
+	fi
+
+	if [ "${expected}" != "${actual}" ]; then
+		die "checksum mismatch for ${ASSET_NAME}: expected ${expected}, got ${actual} — refusing to install a binary that doesn't match its published checksum"
+	fi
+	log "checksum verified (sha256: ${actual})"
+}
+
 # Tries to build from source, only possible when this script is sitting
 # inside a checked-out copy of the repo (as opposed to running via
 # `curl | sh`, where there is no source to build). Returns non-zero on
@@ -72,7 +117,9 @@ build_from_source() {
 	(cd "${script_dir}" && GOOS="${OS}" GOARCH="${ARCH}" go build -o "${WORK_DIR}/${BINARY_NAME}" "./cmd/${BINARY_NAME}")
 }
 
-if ! download_release_binary; then
+if download_release_binary; then
+	verify_checksum "${WORK_DIR}/${BINARY_NAME}"
+else
 	log "release download unavailable, falling back to a local build"
 	build_from_source ||
 		die "could not download a release binary for ${ASSET_NAME}, and no local source + Go toolchain was found to build from instead"
