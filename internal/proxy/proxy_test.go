@@ -3,9 +3,11 @@ package proxy_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -647,5 +649,157 @@ func TestServer_StreamingResponse_AbortedStreamIsNeverCached(t *testing.T) {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {
 		t.Fatal("an aborted stream must never be cached, but a cache entry was found")
+	}
+}
+
+// TestServer_TracksStatsAcrossRequestOutcomes drives one request through
+// each of the four possible outcomes and proves Server.Stats ends up
+// with exactly the right counts: an allowed request that also carries
+// usage tokens, a blocked one, a rate-limited one, and — replaying the
+// first request's body — a cache hit.
+func TestServer_TracksStatsAcrossRequestOutcomes(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"usage":{"total_tokens":10}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "test-secret",
+		Pattern: regexp.MustCompile(`SECRET`),
+		Action:  rules.Block,
+	})
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Cache = c
+	srv.Limiter = limiter.New(1, time.Minute)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(body string) {
+		resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %q: %v", body, err)
+		}
+		resp.Body.Close()
+	}
+
+	post(`{"n":1}`) // allowed, consumes the rate limiter's only slot, cached, carries usage
+	post(`SECRET`)  // blocked
+	post(`{"n":3}`) // different body (cache miss), passes rules, then rate-limited
+	post(`{"n":1}`) // same body as the first request: cache hit
+
+	snap := srv.Stats.Snapshot()
+	if snap.Allowed != 1 {
+		t.Errorf("Allowed = %d, want 1", snap.Allowed)
+	}
+	if snap.Blocked != 1 {
+		t.Errorf("Blocked = %d, want 1", snap.Blocked)
+	}
+	if snap.RateLimited != 1 {
+		t.Errorf("RateLimited = %d, want 1", snap.RateLimited)
+	}
+	if snap.CacheHits != 1 {
+		t.Errorf("CacheHits = %d, want 1", snap.CacheHits)
+	}
+	if snap.TotalTokens != 10 {
+		t.Errorf("TotalTokens = %d, want 10", snap.TotalTokens)
+	}
+}
+
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find free port: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return addr
+}
+
+func waitForServerUp(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server at %s did not come up in time: %v", addr, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestServer_ListenAndServe_PrintsStatsSummaryOnShutdown proves the
+// feature end to end through the real entry point a running aiproxy
+// process uses: start the server for real, send a request, cancel its
+// context (what a Ctrl+C ultimately does via signal.NotifyContext in the
+// cli package), and check the printed summary reflects that request.
+func TestServer_ListenAndServe_PrintsStatsSummaryOnShutdown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	addr := freeLoopbackAddr(t)
+	engine := rules.NewEngine(rules.Allow)
+
+	var logBuf syncBuffer
+	srv := proxy.New(addr, targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+
+	waitForServerUp(t, addr, time.Second)
+
+	resp, err := http.Get("http://" + addr + "/endpoint")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ListenAndServe returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not shut down in time")
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "=== aiproxy session summary ===") {
+		t.Fatalf("log missing session summary header: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "Requests allowed:    1") {
+		t.Fatalf("summary missing correct allowed count: %q", logOutput)
 	}
 }

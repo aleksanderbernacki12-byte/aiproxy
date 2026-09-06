@@ -23,6 +23,7 @@ import (
 	"aiproxy/internal/cache"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/rules"
+	"aiproxy/internal/stats"
 )
 
 // ANSI escape codes for structured, color-coded proxy logging. These are
@@ -70,6 +71,7 @@ type Server struct {
 	Logger  *log.Logger
 	Limiter *limiter.Limiter // nil disables the circuit breaker
 	Cache   *cache.Cache     // nil disables the response cache
+	Stats   *stats.Stats     // always present; counts every request outcome
 
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
@@ -83,6 +85,7 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 		Target: target,
 		Engine: engine,
 		Logger: log.Default(),
+		Stats:  stats.New(),
 	}
 
 	s.reverseProxy = &httputil.ReverseProxy{
@@ -122,6 +125,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			copyHeader(w.Header(), cached.Header)
 			w.WriteHeader(cached.StatusCode)
 			io.Copy(w, cached.Body)
+			s.Stats.RecordCacheHit()
 			s.logCacheHit(r.Method, r.URL.String())
 			return
 		}
@@ -139,12 +143,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if action == rules.Block {
 		// The matched secret itself must never reach the log, only the
 		// static rule name that identifies which pattern triggered it.
+		s.Stats.RecordBlock()
 		s.logBlock(r.Method, r.URL.String(), ruleName)
 		http.Error(w, "blocked by aiproxy rules", http.StatusForbidden)
 		return
 	}
 
 	if s.Limiter != nil && !s.Limiter.Allow() {
+		s.Stats.RecordRateLimited()
 		s.logRateLimited(r.Method, r.URL.String())
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
@@ -152,6 +158,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
+	s.Stats.RecordAllow()
 	s.logAllow(r.Method, r.URL.String())
 
 	// Carry the client-facing method/URL and the cache key through to
@@ -332,6 +339,7 @@ func tryUnmarshalUsage(data []byte) (int, bool) {
 
 func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 	if tokens := extractTotalTokens(body); tokens > 0 {
+		s.Stats.RecordTokensUsed(tokens)
 		s.logUsage(reqCtx.method, reqCtx.url, tokens)
 	}
 }
@@ -389,7 +397,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return s.httpServer.Shutdown(shutdownCtx)
+		err := s.httpServer.Shutdown(shutdownCtx)
+		s.logf("%s", s.Stats.Snapshot())
+		return err
 	case err := <-errCh:
 		return fmt.Errorf("proxy: %w", err)
 	}

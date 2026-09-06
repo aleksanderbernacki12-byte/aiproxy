@@ -39,6 +39,10 @@ extraction and caching still run once the stream completes, from an
 accumulated copy, without adding any delay to the streaming itself. A
 stream cut short by a dropped connection is never cached.
 
+Stopping the proxy (Ctrl+C) prints a session summary: how many requests
+were allowed, blocked, rate-limited, served from cache, and the total
+tokens used across the run.
+
 ## Custom rules, rate limiting, and caching
 
 Drop an `aiproxy.json` file in the working directory (or point `--config`
