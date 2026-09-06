@@ -16,6 +16,12 @@ import (
 type CustomRule struct {
 	Name    string `json:"name"`
 	Pattern string `json:"pattern"`
+
+	// Action is "block" (the default when the field is absent) or
+	// "redact": block rejects a matching request outright, redact masks
+	// every occurrence of the matched pattern in the body and forwards
+	// the request instead.
+	Action string `json:"action,omitempty"`
 }
 
 // Target is one path-prefix-to-upstream mapping for multi-target

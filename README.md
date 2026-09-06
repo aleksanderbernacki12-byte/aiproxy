@@ -30,9 +30,12 @@ aiproxy start --target https://api.example.com
 Point your client at `http://127.0.0.1:8080` instead of the real API.
 Allowed requests are logged in green (`[ALLOW] POST /endpoint`); blocked
 ones in bright red (`[BLOCK] POST /endpoint - Triggered rule: <name>`);
-requests rejected by the rate limiter in yellow (`[CIRCUIT BREAKER]
-POST /endpoint - Rate limit exceeded`); responses served from the local
-cache in purple (`[CACHE HIT] POST /endpoint`); and, whenever a response
+requests forwarded with a matched secret masked out — see
+[Redacting instead of blocking](#redacting-instead-of-blocking) — in
+cyan (`[REDACT] POST /endpoint - Triggered rule: <name>`); requests
+rejected by the rate limiter in yellow (`[CIRCUIT BREAKER] POST
+/endpoint - Rate limit exceeded`); responses served from the local cache
+in purple (`[CACHE HIT] POST /endpoint`); and, whenever a response
 carries a `usage.total_tokens` field (as LLM APIs typically do), a blue
 usage line (`[USAGE] POST /endpoint - Tokens used: <n>`). The value that
 matched a rule is never written to the log — only the rule's name.
@@ -139,10 +142,11 @@ and/or price the shutdown summary's token total in your own currency:
 ```
 
 Each `pattern` is a Go regular expression, compiled once at startup. Any
-request whose body matches it is blocked with a 403. `max_requests_per_minute`
-is optional; when it is 0 or omitted, the rate limiter is disabled. Once
-the limit is hit, further requests get a 429 until the 1-minute window
-rolls forward.
+request whose body matches it is blocked with a 403 by default — see
+[Redacting instead of blocking](#redacting-instead-of-blocking) for the
+alternative. `max_requests_per_minute` is optional; when it is 0 or
+omitted, the rate limiter is disabled. Once the limit is hit, further
+requests get a 429 until the 1-minute window rolls forward.
 
 `cache_enabled` is optional and off by default. When true, every 200 OK
 response is stored under `.aiproxy_cache/` in the working directory,
@@ -156,6 +160,31 @@ all). aiproxy has no built-in, inevitably-stale pricing table — you tell
 it what rate applies to your own usage (whatever your provider actually
 charges you per 1,000 tokens, in whatever currency), and the summary
 just multiplies that by the total tokens tracked during the run.
+
+## Redacting instead of blocking
+
+A blocked request never reaches the upstream at all — sometimes that's
+too blunt, e.g. a client that occasionally includes a stale test key
+alongside other content you don't want to lose. Give a custom rule
+`"action": "redact"` instead of the default `"block"` to mask the match
+and forward the request rather than rejecting it:
+
+```json
+{
+  "custom_rules": [
+    { "name": "internal-token", "pattern": "TOKEN_[0-9]+", "action": "redact" }
+  ]
+}
+```
+
+Every occurrence of the matched pattern in the body is replaced with
+`[REDACTED:<rule name>]` before the request is forwarded — the original
+value never reaches the upstream target, and never reaches the log
+either. Redacted requests are counted separately from allowed ones in
+the stats summary, `GET /_aiproxy/stats`, and the `[REDACT]` log line
+(cyan; `"redact"` under `--log-format json`). The three built-in rules
+(AWS, OpenAI, GitHub) always block; `action` only applies to your own
+`custom_rules` entries.
 
 ## Multi-target routing
 

@@ -29,6 +29,26 @@ func TestLoad_ParsesCustomRules(t *testing.T) {
 	if got.Name != "mitt-foretag-hemlighet" || got.Pattern != "SECRET_[0-9]+" {
 		t.Fatalf("CustomRules[0] = %+v, want name=mitt-foretag-hemlighet pattern=SECRET_[0-9]+", got)
 	}
+	if got.Action != "" {
+		t.Fatalf("CustomRules[0].Action = %q, want empty when absent", got.Action)
+	}
+}
+
+func TestLoad_ParsesCustomRuleAction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": [{"name": "openai-like-key", "pattern": "sk-[A-Za-z0-9]+", "action": "redact"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CustomRules[0].Action != "redact" {
+		t.Fatalf("CustomRules[0].Action = %q, want redact", cfg.CustomRules[0].Action)
+	}
 }
 
 func TestLoad_ParsesMaxRequestsPerMinute(t *testing.T) {
@@ -240,7 +260,7 @@ func TestLoad_CustomRuleBecomesActiveInEngine(t *testing.T) {
 		})
 	}
 
-	action, ruleName, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`payload=SECRET_98765`),
@@ -255,7 +275,7 @@ func TestLoad_CustomRuleBecomesActiveInEngine(t *testing.T) {
 		t.Fatalf("rule = %q, want %q", ruleName, "mitt-foretag-hemlighet")
 	}
 
-	action2, _, err := engine.Evaluate(rules.Request{
+	action2, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`payload=not-a-secret`),

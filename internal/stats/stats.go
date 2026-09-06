@@ -19,6 +19,7 @@ import (
 type counters struct {
 	allowed     atomic.Int64
 	blocked     atomic.Int64
+	redacted    atomic.Int64
 	rateLimited atomic.Int64
 	cacheHits   atomic.Int64
 	totalTokens atomic.Int64
@@ -28,6 +29,7 @@ func (c *counters) snapshot() Snapshot {
 	return Snapshot{
 		Allowed:     c.allowed.Load(),
 		Blocked:     c.blocked.Load(),
+		Redacted:    c.redacted.Load(),
 		RateLimited: c.rateLimited.Load(),
 		CacheHits:   c.cacheHits.Load(),
 		TotalTokens: c.totalTokens.Load(),
@@ -75,6 +77,13 @@ func (s *Stats) RecordBlock(target string) {
 	s.counterFor(target).blocked.Add(1)
 }
 
+// RecordRedact records one request the rule engine forwarded with a
+// matched secret masked out of its body, rather than blocking outright.
+func (s *Stats) RecordRedact(target string) {
+	s.overall.redacted.Add(1)
+	s.counterFor(target).redacted.Add(1)
+}
+
 // RecordRateLimited records one request the circuit breaker rejected.
 func (s *Stats) RecordRateLimited(target string) {
 	s.overall.rateLimited.Add(1)
@@ -104,6 +113,7 @@ func (s *Stats) RecordTokensUsed(target string, n int) {
 type Snapshot struct {
 	Allowed     int64 `json:"allowed"`
 	Blocked     int64 `json:"blocked"`
+	Redacted    int64 `json:"redacted"`
 	RateLimited int64 `json:"rate_limited"`
 	CacheHits   int64 `json:"cache_hits"`
 	TotalTokens int64 `json:"total_tokens"`
@@ -141,10 +151,11 @@ func (s Snapshot) String() string {
 		"=== aiproxy session summary ===\n"+
 			"Requests allowed:    %d\n"+
 			"Requests blocked:    %d\n"+
+			"Requests redacted:   %d\n"+
 			"Rate-limited (429):  %d\n"+
 			"Cache hits:          %d\n"+
 			"Total tokens used:   %d",
-		s.Allowed, s.Blocked, s.RateLimited, s.CacheHits, s.TotalTokens,
+		s.Allowed, s.Blocked, s.Redacted, s.RateLimited, s.CacheHits, s.TotalTokens,
 	)
 }
 
@@ -168,8 +179,8 @@ func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
 	b.WriteString("=== per-target breakdown ===")
 	for _, name := range names {
 		t := s.PerTarget[name]
-		fmt.Fprintf(&b, "\n[%s] allowed=%d blocked=%d rate-limited=%d cache-hits=%d tokens=%d",
-			name, t.Allowed, t.Blocked, t.RateLimited, t.CacheHits, t.TotalTokens)
+		fmt.Fprintf(&b, "\n[%s] allowed=%d blocked=%d redacted=%d rate-limited=%d cache-hits=%d tokens=%d",
+			name, t.Allowed, t.Blocked, t.Redacted, t.RateLimited, t.CacheHits, t.TotalTokens)
 		if costPer1KTokens > 0 {
 			fmt.Fprintf(&b, " cost=%.4f", t.EstimatedCost(costPer1KTokens))
 		}

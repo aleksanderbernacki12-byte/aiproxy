@@ -181,6 +181,42 @@ func TestExecute_Validate_InvalidRegexAndBadTargetURL_ReportsBothProblems(t *tes
 	}
 }
 
+func TestExecute_Validate_InvalidCustomRuleAction_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": [{"name": "bad-action-rule", "pattern": "SECRET_[0-9]+", "action": "delete"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stdout: %s)", code, stdout.String())
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "bad-action-rule") || !strings.Contains(errOut, `"delete"`) {
+		t.Errorf("stderr missing the invalid action problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithRedactAction_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": [{"name": "openai-like-key", "pattern": "sk-[A-Za-z0-9]+", "action": "redact"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}
+
 func TestExecute_Validate_DuplicateTargetPrefix_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

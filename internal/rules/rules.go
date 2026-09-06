@@ -18,6 +18,15 @@ type Action int
 const (
 	Allow Action = iota
 	Block
+	// Redact matches like Block, but instead of rejecting the request,
+	// every occurrence of the matched pattern in the body is replaced
+	// with a placeholder and the request is forwarded — the leaked
+	// secret never reaches the upstream, but the caller isn't broken by
+	// a 403 for something that doesn't need to stop the whole request.
+	// Only meaningful on a BodyRegexRule, which has a pattern to redact;
+	// on a path Rule it behaves like Allow, since there is no matched
+	// text to replace.
+	Redact
 )
 
 func (a Action) String() string {
@@ -26,6 +35,8 @@ func (a Action) String() string {
 		return "allow"
 	case Block:
 		return "block"
+	case Redact:
+		return "redact"
 	default:
 		return "unknown"
 	}
@@ -95,24 +106,32 @@ func (e *Engine) BodyRegexRules() []BodyRegexRule {
 	return append([]BodyRegexRule(nil), e.bodyRules...)
 }
 
-// Evaluate returns the action for req and the name of the rule that
-// produced it. The rule name is empty when the default action applied.
-func (e *Engine) Evaluate(req Request) (Action, string, error) {
+// Evaluate returns the action for req, the name of the rule that
+// produced it (empty when the default action applied), and the body the
+// caller should actually use going forward: req.Body unchanged, unless
+// the matched rule's Action is Redact, in which case every occurrence of
+// its pattern has been replaced with a "[REDACTED:<rule name>]"
+// placeholder.
+func (e *Engine) Evaluate(req Request) (Action, string, []byte, error) {
 	for _, r := range e.bodyRules {
 		if r.Pattern.Match(req.Body) {
-			return r.Action, r.Name, nil
+			if r.Action == Redact {
+				placeholder := []byte("[REDACTED:" + r.Name + "]")
+				return Redact, r.Name, r.Pattern.ReplaceAll(req.Body, placeholder), nil
+			}
+			return r.Action, r.Name, req.Body, nil
 		}
 	}
 
 	u, err := url.Parse(req.URL)
 	if err != nil {
-		return Block, "", fmt.Errorf("rules: invalid url %q: %w", req.URL, err)
+		return Block, "", req.Body, fmt.Errorf("rules: invalid url %q: %w", req.URL, err)
 	}
 
 	for _, r := range e.rules {
 		if strings.HasPrefix(u.Path, r.PathPrefix) {
-			return r.Action, r.Name, nil
+			return r.Action, r.Name, req.Body, nil
 		}
 	}
-	return e.Default, "", nil
+	return e.Default, "", req.Body, nil
 }

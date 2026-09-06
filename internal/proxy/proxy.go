@@ -37,6 +37,7 @@ const (
 	ansiYellow    = "\x1b[33m"
 	ansiBlue      = "\x1b[34m"
 	ansiPurple    = "\x1b[35m"
+	ansiCyan      = "\x1b[36m"
 )
 
 // llmUsageResponse is a minimal, proxy-internal shape for pulling a token
@@ -327,7 +328,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	target, forwardPath, targetLabel, effectiveLimiter := s.resolveRoute(r.URL.Path)
 
 	// The cache is checked before rules and the rate limiter: a cache hit
-	// never touches either, and never reaches the upstream target.
+	// never touches either, and never reaches the upstream target. The
+	// key is computed from the body as received, before any redaction —
+	// two different secrets that happen to redact to the same
+	// placeholder are still cached separately, which only ever costs an
+	// extra upstream call, never an incorrect one.
 	var cacheKey string
 	if cch := s.getCache(); cch != nil {
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
@@ -343,7 +348,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	action, ruleName, err := s.getEngine().Evaluate(rules.Request{
+	action, ruleName, evaluatedBody, err := s.getEngine().Evaluate(rules.Request{
 		Method: r.Method,
 		URL:    r.URL.String(),
 		Body:   body,
@@ -368,10 +373,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	s.Stats.RecordAllow(targetLabel)
-	s.logAllow(r.Method, r.URL.String())
+	// evaluatedBody is body unchanged unless action is Redact, in which
+	// case it has the matched secret masked out — forwarded either way,
+	// so the client's request only ever fails on Block above.
+	r.Body = io.NopCloser(bytes.NewReader(evaluatedBody))
+	r.ContentLength = int64(len(evaluatedBody))
+	if action == rules.Redact {
+		s.Stats.RecordRedact(targetLabel)
+		s.logRedact(r.Method, r.URL.String(), ruleName)
+	} else {
+		s.Stats.RecordAllow(targetLabel)
+		s.logAllow(r.Method, r.URL.String())
+	}
 
 	// Carry the client-facing method/URL, the cache key, and the resolved
 	// route through to Rewrite and modifyResponse via the request
@@ -603,6 +616,14 @@ func (s *Server) logCacheHit(method, reqURL string) {
 	s.logf("%s[CACHE HIT] %s %s%s", ansiPurple, method, reqURL, ansiReset)
 }
 
+func (s *Server) logRedact(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "redact", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
+	s.logf("%s[REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
+}
+
 // logEventJSON marshals ev (stamping the current time) and logs it as a
 // single line, for LogFormatJSON.
 func (s *Server) logEventJSON(ev logEvent) {
@@ -653,6 +674,7 @@ func (s *Server) logf(format string, args ...any) {
 type statsSnapshotJSON struct {
 	Allowed       int64                        `json:"allowed"`
 	Blocked       int64                        `json:"blocked"`
+	Redacted      int64                        `json:"redacted"`
 	RateLimited   int64                        `json:"rate_limited"`
 	CacheHits     int64                        `json:"cache_hits"`
 	TotalTokens   int64                        `json:"total_tokens"`
@@ -664,6 +686,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 	out := statsSnapshotJSON{
 		Allowed:     snap.Allowed,
 		Blocked:     snap.Blocked,
+		Redacted:    snap.Redacted,
 		RateLimited: snap.RateLimited,
 		CacheHits:   snap.CacheHits,
 		TotalTokens: snap.TotalTokens,

@@ -395,13 +395,34 @@ func compileCustomRules(customRules []config.CustomRule) ([]rules.BodyRegexRule,
 			errs = append(errs, fmt.Errorf("Fatal error: Invalid regex pattern in custom rule %s: %w", cr.Name, err))
 			continue
 		}
+
+		action, err := parseRuleAction(cr.Action)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("Fatal error: Invalid action in custom rule %s: %w", cr.Name, err))
+			continue
+		}
+
 		compiled = append(compiled, rules.BodyRegexRule{
 			Name:    cr.Name,
 			Pattern: pattern,
-			Action:  rules.Block,
+			Action:  action,
 		})
 	}
 	return compiled, errs
+}
+
+// parseRuleAction parses a custom_rules entry's action field: "" (absent)
+// and "block" both mean rules.Block, the long-standing default; "redact"
+// means rules.Redact. Anything else is a config mistake.
+func parseRuleAction(raw string) (rules.Action, error) {
+	switch raw {
+	case "", "block":
+		return rules.Block, nil
+	case "redact":
+		return rules.Redact, nil
+	default:
+		return 0, fmt.Errorf("must be \"block\" or \"redact\", got %q", raw)
+	}
 }
 
 // parseTarget validates the --target flag and normalizes it to an HTTPS

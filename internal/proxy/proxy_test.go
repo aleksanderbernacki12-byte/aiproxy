@@ -1117,13 +1117,13 @@ func TestServer_MultiTargetRouting_StatsBreakDownPerTarget(t *testing.T) {
 	if !strings.Contains(summary, "=== per-target breakdown ===") {
 		t.Fatalf("Summary() missing per-target breakdown header: %q", summary)
 	}
-	if !strings.Contains(summary, "[/openai] allowed=1 blocked=1 rate-limited=0 cache-hits=0 tokens=10 cost=0.0002") {
+	if !strings.Contains(summary, "[/openai] allowed=1 blocked=1 redacted=0 rate-limited=0 cache-hits=0 tokens=10 cost=0.0002") {
 		t.Fatalf("Summary() missing correct /openai line: %q", summary)
 	}
-	if !strings.Contains(summary, "[/anthropic] allowed=1 blocked=0 rate-limited=0 cache-hits=0 tokens=30 cost=0.0006") {
+	if !strings.Contains(summary, "[/anthropic] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=30 cost=0.0006") {
 		t.Fatalf("Summary() missing correct /anthropic line: %q", summary)
 	}
-	if !strings.Contains(summary, "[default] allowed=1 blocked=0 rate-limited=0 cache-hits=0 tokens=0 cost=0.0000") {
+	if !strings.Contains(summary, "[default] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=0 cost=0.0000") {
 		t.Fatalf("Summary() missing correct default line: %q", summary)
 	}
 }
@@ -1152,6 +1152,7 @@ func TestServer_SingleTarget_SummaryOmitsPerTargetBreakdown(t *testing.T) {
 type statsJSONResponse struct {
 	Allowed       int64                        `json:"allowed"`
 	Blocked       int64                        `json:"blocked"`
+	Redacted      int64                        `json:"redacted"`
 	RateLimited   int64                        `json:"rate_limited"`
 	CacheHits     int64                        `json:"cache_hits"`
 	TotalTokens   int64                        `json:"total_tokens"`
@@ -1918,4 +1919,179 @@ func TestServer_LogEvent_RespectsLogFormat(t *testing.T) {
 			t.Errorf("log output = %q, missing the plain message", got)
 		}
 	})
+}
+
+// TestServer_Redact_MasksSecretAndForwardsRequest proves a Redact rule's
+// core contract end to end: the client's request is never blocked, the
+// upstream receives the body with the matched secret masked out (never
+// the original value), Stats.Redacted increments (separately from
+// Allowed), and the [REDACT] log line — cyan, with the rule name —
+// never contains the secret itself either.
+func TestServer_Redact_MasksSecretAndForwardsRequest(t *testing.T) {
+	var upstreamReceivedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		upstreamReceivedBody = b
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	secret := "sk-FAKEKEY1234567890ABCDEFGHIJ"
+	resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"key":"`+secret+`"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a redacted request must still be forwarded and answered)", resp.StatusCode, http.StatusOK)
+	}
+	if strings.Contains(string(upstreamReceivedBody), secret) {
+		t.Fatalf("upstream received the raw secret, redaction failed to strip it: %q", upstreamReceivedBody)
+	}
+	wantBody := `{"key":"[REDACTED:openai-api-key]"}`
+	if string(upstreamReceivedBody) != wantBody {
+		t.Fatalf("upstream received body = %q, want %q", upstreamReceivedBody, wantBody)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Redacted != 1 {
+		t.Fatalf("Stats.Redacted = %d, want 1", snap.Redacted)
+	}
+	if snap.Allowed != 0 {
+		t.Fatalf("Stats.Allowed = %d, want 0 (a redact is its own outcome, not also counted as allowed)", snap.Allowed)
+	}
+
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, secret) {
+		t.Fatalf("log leaked the matched secret value: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "[REDACT]") {
+		t.Fatalf("log missing [REDACT] marker: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "Triggered rule: openai-api-key") {
+		t.Fatalf("log missing triggered rule name: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "\x1b[36m") {
+		t.Fatalf("log missing cyan ANSI code: %q", logOutput)
+	}
+}
+
+// TestServer_Redact_JSONLogging_EmitsRedactLevel proves the redact event
+// participates correctly in --log-format json: a "redact" level with the
+// rule name, and never the secret.
+func TestServer_Redact_JSONLogging_EmitsRedactLevel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.LogFormat = proxy.LogFormatJSON
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"key":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	var ev jsonLogLine
+	if err := json.Unmarshal(bytes.TrimSpace(logBuf.Bytes()), &ev); err != nil {
+		t.Fatalf("log line is not valid JSON: %q: %v", logBuf.String(), err)
+	}
+	if ev.Level != "redact" {
+		t.Errorf("level = %q, want redact", ev.Level)
+	}
+	if ev.Rule != "openai-api-key" {
+		t.Errorf("rule = %q, want openai-api-key", ev.Rule)
+	}
+	if strings.Contains(logBuf.String(), "sk-FAKEKEY1234567890ABCDEFGHIJ") {
+		t.Fatalf("JSON log leaked the matched secret value: %q", logBuf.String())
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsRedactedCount proves the live
+// /_aiproxy/stats endpoint (and, by the same code path, the shutdown
+// summary) actually surfaces the redacted counter — added alongside
+// Redact, easy to forget to wire into the hand-written JSON shape since
+// it isn't derived automatically from stats.Snapshot.
+func TestServer_StatsEndpoint_ReportsRedactedCount(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"key":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Redacted != 1 {
+		t.Fatalf("redacted = %d, want 1: %+v", got.Redacted, got)
+	}
 }
