@@ -93,6 +93,176 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	lc, errs := buildLiveConfig(cfg)
+	if len(errs) > 0 {
+		msgs := make([]string, len(errs))
+		for i, e := range errs {
+			msgs[i] = e.Error()
+		}
+		log.Fatal(strings.Join(msgs, "\n"))
+	}
+
+	server := proxy.New(*addr, targetURL, lc.engine)
+	server.LogFormat = proxyLogFormat
+	if proxyLogFormat == proxy.LogFormatJSON {
+		// The JSON payload already carries its own "time" field; a
+		// prepended timestamp prefix would break every line's JSON.
+		server.Logger = log.New(os.Stderr, "", 0)
+	}
+	server.Limiter = lc.limiter
+	server.Cache = lc.cache
+	server.CostPer1KTokens = lc.cost
+	for _, r := range lc.routes {
+		server.AddRoute(r.prefix, r.target, r.limiter)
+	}
+
+	if cfg != nil {
+		if len(cfg.CustomRules) > 0 {
+			fmt.Fprintf(stdout, "loaded %d custom rule(s) from %s\n", len(cfg.CustomRules), loadedFrom)
+		}
+		if cfg.MaxRequestsPerMinute > 0 {
+			fmt.Fprintf(stdout, "circuit breaker: %d requests/minute\n", cfg.MaxRequestsPerMinute)
+		}
+		if cfg.CacheEnabled {
+			fmt.Fprintf(stdout, "response cache: enabled (%s/)\n", cache.DirName)
+		}
+		if cfg.CostPer1KTokens > 0 {
+			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
+		}
+		for _, r := range lc.routes {
+			if r.maxRequestsPerMinute > 0 {
+				fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %d requests/minute)\n", r.prefix, r.target, r.maxRequestsPerMinute)
+			} else {
+				fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, r.target)
+			}
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	startReloadOnSIGHUP(ctx, server, *configPath)
+
+	fmt.Fprintf(stdout, "aiproxy listening on %s, forwarding to %s\n", *addr, targetURL)
+	if err := server.ListenAndServe(ctx); err != nil {
+		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// startReloadOnSIGHUP starts a goroutine that re-reads the config file at
+// configPath and applies it to server every time the process receives
+// SIGHUP, until ctx is done. A reload that finds any problem — a bad
+// regex, a bad target, a cache directory that can't be created, or the
+// config file itself failing to load — logs the problem and leaves
+// server's current configuration completely untouched: a bad edit
+// followed by a SIGHUP must never blank out a running proxy's rules or
+// crash it, only fail to apply.
+func startReloadOnSIGHUP(ctx context.Context, server *proxy.Server, configPath string) {
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+
+	go func() {
+		defer signal.Stop(hup)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				reloadConfig(server, configPath)
+			}
+		}
+	}()
+}
+
+func reloadConfig(server *proxy.Server, configPath string) {
+	cfg, loadedFrom, err := resolveConfig(configPath)
+	if err != nil {
+		server.LogEvent("reload_error", fmt.Sprintf("aiproxy: reload failed: %v", err))
+		return
+	}
+
+	lc, errs := buildLiveConfig(cfg)
+	if len(errs) > 0 {
+		msgs := make([]string, len(errs))
+		for i, e := range errs {
+			msgs[i] = e.Error()
+		}
+		server.LogEvent("reload_error", fmt.Sprintf(
+			"aiproxy: reload failed, keeping previous config (%d problem(s)): %s",
+			len(errs), strings.Join(msgs, "; "),
+		))
+		return
+	}
+
+	routes := make([]proxy.Route, len(lc.routes))
+	for i, r := range lc.routes {
+		routes[i] = proxy.Route{Prefix: r.prefix, Target: r.target, Limiter: r.limiter}
+	}
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, routes)
+
+	label := loadedFrom
+	if label == "" {
+		label = "built-in rules only (no config file)"
+	}
+	server.LogEvent("reload", fmt.Sprintf("aiproxy: reloaded config from %s", label))
+}
+
+// liveConfig holds every piece of a Server's configuration that can be
+// rebuilt from an aiproxy.json: everything runStart wires in at startup,
+// and everything a SIGHUP reload replaces via Server.ReloadConfig.
+type liveConfig struct {
+	engine  *rules.Engine
+	limiter *limiter.Limiter
+	cache   *cache.Cache
+	cost    float64
+	routes  []targetRoute
+}
+
+// buildLiveConfig builds a liveConfig from cfg, which may be nil (no
+// config file at all, producing just the built-in rules with everything
+// else disabled) — the same construction path for both a cold start and
+// a reload, so a reload can never produce something a cold start
+// couldn't. Every problem found (a bad regex, a bad target, a cache
+// directory that can't be created) is collected and returned together
+// rather than stopping at the first; the caller decides whether that's
+// fatal (a cold start) or just means keeping whatever is already running
+// (a reload).
+func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
+	engine, errs := buildEngine(cfg)
+	lc := &liveConfig{engine: engine}
+	if cfg == nil {
+		return lc, errs
+	}
+
+	if cfg.MaxRequestsPerMinute > 0 {
+		lc.limiter = limiter.New(cfg.MaxRequestsPerMinute, time.Minute)
+	}
+
+	if cfg.CacheEnabled {
+		c, err := cache.New()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("cache: %w", err))
+		} else {
+			lc.cache = c
+		}
+	}
+
+	lc.cost = cfg.CostPer1KTokens
+
+	routes, routeErrs := compileTargetRoutes(cfg.Targets)
+	errs = append(errs, routeErrs...)
+	lc.routes = routes
+
+	return lc, errs
+}
+
+// buildEngine constructs the rule engine used to evaluate every request:
+// the three built-in secret-blocking rules, plus any custom rules from
+// cfg. cfg may be nil (no config file at all), in which case only the
+// built-ins apply.
+func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	engine := rules.NewEngine(rules.Allow)
 	engine.AddBodyRegexRule(rules.BodyRegexRule{
 		Name:    "aws-access-key",
@@ -109,79 +279,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		Pattern: githubTokenPattern,
 		Action:  rules.Block,
 	})
-
-	server := proxy.New(*addr, targetURL, engine)
-	server.LogFormat = proxyLogFormat
-	if proxyLogFormat == proxy.LogFormatJSON {
-		// The JSON payload already carries its own "time" field; a
-		// prepended timestamp prefix would break every line's JSON.
-		server.Logger = log.New(os.Stderr, "", 0)
+	if cfg == nil {
+		return engine, nil
 	}
 
-	if cfg != nil {
-		customRules, ruleErrs := compileCustomRules(cfg.CustomRules)
-		if len(ruleErrs) > 0 {
-			msgs := make([]string, len(ruleErrs))
-			for i, e := range ruleErrs {
-				msgs[i] = e.Error()
-			}
-			log.Fatal(strings.Join(msgs, "\n"))
-		}
-		for _, r := range customRules {
-			engine.AddBodyRegexRule(r)
-		}
-		if len(customRules) > 0 {
-			fmt.Fprintf(stdout, "loaded %d custom rule(s) from %s\n", len(customRules), loadedFrom)
-		}
-
-		if cfg.MaxRequestsPerMinute > 0 {
-			server.Limiter = limiter.New(cfg.MaxRequestsPerMinute, time.Minute)
-			fmt.Fprintf(stdout, "circuit breaker: %d requests/minute\n", cfg.MaxRequestsPerMinute)
-		}
-
-		if cfg.CacheEnabled {
-			c, err := cache.New()
-			if err != nil {
-				fmt.Fprintf(stderr, "aiproxy: %v\n", err)
-				return 2
-			}
-			server.Cache = c
-			fmt.Fprintf(stdout, "response cache: enabled (%s/)\n", cache.DirName)
-		}
-
-		if cfg.CostPer1KTokens > 0 {
-			server.CostPer1KTokens = cfg.CostPer1KTokens
-			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
-		}
-
-		if len(cfg.Targets) > 0 {
-			routes, routeErrs := compileTargetRoutes(cfg.Targets)
-			if len(routeErrs) > 0 {
-				for _, e := range routeErrs {
-					fmt.Fprintf(stderr, "aiproxy: %v\n", e)
-				}
-				return 2
-			}
-			for _, r := range routes {
-				server.AddRoute(r.prefix, r.target, r.limiter)
-				if r.maxRequestsPerMinute > 0 {
-					fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %d requests/minute)\n", r.prefix, r.target, r.maxRequestsPerMinute)
-				} else {
-					fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, r.target)
-				}
-			}
-		}
+	customRules, errs := compileCustomRules(cfg.CustomRules)
+	for _, r := range customRules {
+		engine.AddBodyRegexRule(r)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	fmt.Fprintf(stdout, "aiproxy listening on %s, forwarding to %s\n", *addr, targetURL)
-	if err := server.ListenAndServe(ctx); err != nil {
-		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
-		return 1
-	}
-	return 0
+	return engine, errs
 }
 
 // runValidate checks a config file for problems without starting the

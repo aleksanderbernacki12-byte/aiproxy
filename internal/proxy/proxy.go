@@ -91,26 +91,34 @@ const statsPath = "/_aiproxy/stats"
 // path-prefix routes (see AddRoute) can send matching requests to other
 // upstreams instead; Target is always the fallback for anything that
 // doesn't match one of those.
+//
+// Engine, Limiter, Cache, CostPer1KTokens, and the route table added via
+// AddRoute are safe to set directly before the server starts serving
+// (that's how every constructor caller and test in this codebase already
+// sets them up). Once ServeHTTP is live, changing any of them requires
+// ReloadConfig instead, which swaps all five together under a lock — the
+// mutex below exists only to make that later swap race-free against
+// concurrent requests; it is never involved in the single-threaded setup
+// path.
 type Server struct {
-	Addr    string
-	Target  *url.URL
-	Engine  *rules.Engine
-	Logger  *log.Logger
-	Limiter *limiter.Limiter // nil disables the circuit breaker
-	Cache   *cache.Cache     // nil disables the response cache
-	Stats   *stats.Stats     // always present; counts every request outcome
-
-	// CostPer1KTokens, if greater than zero, prices Stats.TotalTokens in
-	// the shutdown summary at this rate per 1,000 tokens. Zero (the
-	// default) omits the cost line entirely.
-	CostPer1KTokens float64
+	Addr   string
+	Target *url.URL
+	Logger *log.Logger
+	Stats  *stats.Stats // always present; counts every request outcome
 
 	// LogFormat selects how every log line below is rendered. The zero
 	// value behaves as LogFormatText, so existing callers that never set
 	// it see no change in behavior.
 	LogFormat LogFormat
 
-	routes       []route
+	// mu guards every field below it against a concurrent ReloadConfig.
+	mu              sync.RWMutex
+	Engine          *rules.Engine
+	Limiter         *limiter.Limiter // nil disables the circuit breaker
+	Cache           *cache.Cache     // nil disables the response cache
+	CostPer1KTokens float64          // zero omits the shutdown summary's cost line
+	routes          []route
+
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
 }
@@ -209,6 +217,8 @@ func (s *Server) AddRoute(prefix string, target *url.URL, lim *limiter.Limiter) 
 // no limiting at all). It falls back to the default Target, unmodified
 // path, when nothing matches.
 func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, r := range s.routes {
 		if strings.HasPrefix(path, r.prefix) {
 			stripped := strings.TrimPrefix(path, r.prefix)
@@ -223,6 +233,74 @@ func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string,
 		}
 	}
 	return s.Target, path, "default", s.Limiter
+}
+
+// getEngine, getCache, and getCostPer1KTokens are small locked accessors
+// for the fields ReloadConfig can change at runtime, used everywhere
+// they're read outside of resolveRoute (which takes the same lock
+// itself, for Limiter and the route table).
+func (s *Server) getEngine() *rules.Engine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Engine
+}
+
+func (s *Server) getCache() *cache.Cache {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Cache
+}
+
+func (s *Server) getCostPer1KTokens() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CostPer1KTokens
+}
+
+// Route describes one path-prefix-to-upstream mapping for ReloadConfig,
+// mirroring what AddRoute registers before the server starts serving.
+type Route struct {
+	Prefix string
+	Target *url.URL
+	// Limiter, if non-nil, gives this route its own dedicated rate
+	// limit instead of sharing whatever Limiter ReloadConfig sets.
+	Limiter *limiter.Limiter
+}
+
+// ReloadConfig atomically replaces the engine, rate limiter, cache,
+// cost-per-1K-tokens rate, and target routes — e.g. after re-reading
+// aiproxy.json on SIGHUP. All five change together under one lock, so a
+// request in flight never observes a torn mix of old and new
+// configuration; a request takes effect from the moment it's accepted,
+// so anything already being handled keeps running against whatever
+// configuration it started with. Pass nil for limiter/cache to disable
+// them, matching how the corresponding field would be set at startup.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, routes []Route) {
+	newRoutes := make([]route, len(routes))
+	for i, r := range routes {
+		newRoutes[i] = route{prefix: r.Prefix, target: r.Target, limiter: r.Limiter}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Engine = engine
+	s.Limiter = lim
+	s.Cache = cch
+	s.CostPer1KTokens = costPer1KTokens
+	s.routes = newRoutes
+}
+
+// LogEvent logs a one-off, non-request-scoped message from outside the
+// proxy package — e.g. the CLI's SIGHUP reload handler reporting success
+// or failure — through the same LogFormat-aware machinery as every other
+// log line, so it can never break the "every line is valid JSON"
+// guarantee under LogFormatJSON.
+func (s *Server) LogEvent(level, message string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: level, Message: message})
+		return
+	}
+	s.logf("%s", message)
 }
 
 // ServeHTTP implements http.Handler. It reads the full request body into
@@ -251,10 +329,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The cache is checked before rules and the rate limiter: a cache hit
 	// never touches either, and never reaches the upstream target.
 	var cacheKey string
-	if s.Cache != nil {
+	if cch := s.getCache(); cch != nil {
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
 		cacheKey = cache.Key(r.Method, target.ResolveReference(destURL).String(), body)
-		if cached, hit, err := s.Cache.Get(cacheKey); err == nil && hit {
+		if cached, hit, err := cch.Get(cacheKey); err == nil && hit {
 			defer cached.Body.Close()
 			copyHeader(w.Header(), cached.Header)
 			w.WriteHeader(cached.StatusCode)
@@ -265,7 +343,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	action, ruleName, err := s.Engine.Evaluate(rules.Request{
+	action, ruleName, err := s.getEngine().Evaluate(rules.Request{
 		Method: r.Method,
 		URL:    r.URL.String(),
 		Body:   body,
@@ -355,12 +433,12 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 
-	if s.Cache != nil && resp.StatusCode == http.StatusOK && reqCtx.cacheKey != "" {
+	if cch := s.getCache(); cch != nil && resp.StatusCode == http.StatusOK && reqCtx.cacheKey != "" {
 		// httputil.DumpResponse drains and then restores resp.Body itself,
 		// so the client still receives the body intact afterwards. This
 		// runs before the usage log line so a durable cache write is
 		// never left pending behind an already-visible log line.
-		if err := s.Cache.Set(reqCtx.cacheKey, resp); err != nil {
+		if err := cch.Set(reqCtx.cacheKey, resp); err != nil {
 			s.logError("aiproxy: cache: failed to store response: %v", err)
 		}
 	}
@@ -386,8 +464,8 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 			// Cache first, log second: a caller that observes the log
 			// line (e.g. a test synchronizing on it) can then rely on the
 			// cache write having already landed.
-			if cleanEOF && s.Cache != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
-				s.writeStreamToCache(reqCtx.cacheKey, statusCode, header, data)
+			if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
+				s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data)
 			}
 			s.logUsageFromBody(reqCtx, data)
 		},
@@ -395,16 +473,16 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 }
 
 // writeStreamToCache stores a completed stream's accumulated bytes under
-// key. A stream that was cut short (client disconnect, upstream error)
-// must never reach here: a future "hit" would silently replay a
+// key in cch. A stream that was cut short (client disconnect, upstream
+// error) must never reach here: a future "hit" would silently replay a
 // truncated response as if it were complete.
-func (s *Server) writeStreamToCache(key string, statusCode int, header http.Header, data []byte) {
+func (s *Server) writeStreamToCache(cch *cache.Cache, key string, statusCode int, header http.Header, data []byte) {
 	cached := &http.Response{
 		StatusCode: statusCode,
 		Header:     header,
 		Body:       io.NopCloser(bytes.NewReader(data)),
 	}
-	if err := s.Cache.Set(key, cached); err != nil {
+	if err := cch.Set(key, cached); err != nil {
 		s.logError("aiproxy: cache: failed to store response: %v", err)
 	}
 }
@@ -612,7 +690,7 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.CostPer1KTokens)
+	payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens())
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		s.logError("aiproxy: stats: failed to encode response: %v", err)
@@ -623,12 +701,13 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 // printed on shutdown, appending an estimated cost line only when
 // CostPer1KTokens has been configured.
 func (s *Server) Summary() string {
+	cost := s.getCostPer1KTokens()
 	snap := s.Stats.Snapshot()
 	summary := snap.String()
-	if s.CostPer1KTokens > 0 {
-		summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", snap.EstimatedCost(s.CostPer1KTokens), s.CostPer1KTokens)
+	if cost > 0 {
+		summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", snap.EstimatedCost(cost), cost)
 	}
-	if breakdown := snap.PerTargetString(s.CostPer1KTokens); breakdown != "" {
+	if breakdown := snap.PerTargetString(cost); breakdown != "" {
 		summary += "\n" + breakdown
 	}
 	return summary
@@ -641,7 +720,7 @@ func (s *Server) Summary() string {
 // the guarantee that every line is valid JSON in that mode.
 func (s *Server) logSummary() {
 	if s.LogFormat == LogFormatJSON {
-		payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.CostPer1KTokens)
+		payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens())
 		data, err := json.Marshal(payload)
 		if err != nil {
 			s.logError("aiproxy: summary: failed to encode: %v", err)

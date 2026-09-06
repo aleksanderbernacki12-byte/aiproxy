@@ -98,6 +98,26 @@ of the structured stream a script would actually parse — the two are
 already on separate streams, so piping just stderr gives you a clean,
 pure-JSON feed.
 
+## Reloading config without restarting
+
+```
+kill -HUP <aiproxy-pid>
+```
+
+Sending `SIGHUP` re-reads the same config file `--config` (or the
+default `aiproxy.json`) pointed at on startup, and applies it live:
+custom rules, the rate limit, the cache, cost estimation, and target
+routes all take effect for the next request, with no dropped
+connections and no restart. Every one of these is logged (as `reload` on
+success, or `reload_error` on failure, under `--log-format json`).
+
+If the reloaded file has any problem — a bad regex, a bad target, a
+cache directory that can't be created — the reload is refused and the
+proxy keeps running on its last-known-good configuration; it never
+crashes or blanks out its rules because of a bad edit. `--target`,
+`--addr`, and `--log-format` are startup-only and unaffected by a
+reload — those still require a real restart.
+
 ## Custom rules, rate limiting, caching, and cost estimation
 
 Drop an `aiproxy.json` file in the working directory (or point `--config`

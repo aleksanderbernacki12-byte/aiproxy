@@ -1757,3 +1757,165 @@ func TestServer_JSONLogging_CacheErrorIsAlsoAJSONLine(t *testing.T) {
 		t.Fatalf("expected an error-level JSON event for the failed cache write, got: %q", rawLines)
 	}
 }
+
+// TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes proves
+// ReloadConfig actually changes live behavior: a request blocked under
+// the original engine is allowed after a reload with a more permissive
+// one, a rate limit newly applies, a route newly resolves, and the
+// summary picks up the new cost rate — all without restarting the
+// server or touching its listener.
+func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer other.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	otherURL, err := url.Parse(other.URL)
+	if err != nil {
+		t.Fatalf("parse other url: %v", err)
+	}
+
+	blockAll := rules.NewEngine(rules.Block)
+	srv := proxy.New("unused", targetURL, blockAll)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func(path string) int {
+		resp, err := http.Get(frontend.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get("/x"); got != http.StatusForbidden {
+		t.Fatalf("before reload: status = %d, want %d (blockAll engine)", got, http.StatusForbidden)
+	}
+
+	allowAll := rules.NewEngine(rules.Allow)
+	strictLimiter := limiter.New(1, time.Minute)
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, []proxy.Route{
+		{Prefix: "/other", Target: otherURL, Limiter: strictLimiter},
+	})
+
+	if got := get("/x"); got != http.StatusOK {
+		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
+	}
+	if got := get("/other/y"); got != http.StatusOK {
+		t.Fatalf("after reload: /other/y status = %d, want %d (new route, 1st request)", got, http.StatusOK)
+	}
+	if got := get("/other/y"); got != http.StatusTooManyRequests {
+		t.Fatalf("after reload: /other/y status = %d, want %d (new route's own 1/min limit exhausted)", got, http.StatusTooManyRequests)
+	}
+
+	srv.Stats.RecordTokensUsed("default", 1000)
+	if summary := srv.Summary(); !strings.Contains(summary, "Estimated cost:      0.0500") {
+		t.Fatalf("Summary() = %q, want the reloaded cost rate (0.05/1K) reflected", summary)
+	}
+}
+
+// TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces hammers
+// ServeHTTP and ReloadConfig from separate goroutines simultaneously —
+// the actual concurrency safety claim ReloadConfig makes — and relies on
+// `go test -race` to catch any unsynchronized access, since that's the
+// property under test, not any particular observed outcome.
+func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const iterations = 200
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			resp, err := http.Get(frontend.URL + "/x")
+			if err == nil {
+				resp.Body.Close()
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			action := rules.Allow
+			if i%2 == 0 {
+				action = rules.Block
+			}
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, nil)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestServer_LogEvent_RespectsLogFormat proves LogEvent — used by the
+// CLI's SIGHUP reload handler, outside this package — logs a JSON line
+// under LogFormatJSON and a plain line otherwise, exactly like every
+// other event, so a reload notice can never be the one stray non-JSON
+// line in an otherwise-JSON log stream.
+func TestServer_LogEvent_RespectsLogFormat(t *testing.T) {
+	targetURL, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	t.Run("json", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+		srv.LogFormat = proxy.LogFormatJSON
+		srv.Logger = log.New(&logBuf, "", 0)
+
+		srv.LogEvent("reload", "aiproxy: reloaded config from aiproxy.json")
+
+		var ev jsonLogLine
+		if err := json.Unmarshal(bytes.TrimSpace(logBuf.Bytes()), &ev); err != nil {
+			t.Fatalf("LogEvent output is not valid JSON: %q: %v", logBuf.String(), err)
+		}
+		if ev.Level != "reload" {
+			t.Errorf("level = %q, want reload", ev.Level)
+		}
+		if ev.Message != "aiproxy: reloaded config from aiproxy.json" {
+			t.Errorf("message = %q, want the passed message", ev.Message)
+		}
+	})
+
+	t.Run("text", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+		srv.Logger = log.New(&logBuf, "", 0)
+
+		srv.LogEvent("reload", "aiproxy: reloaded config from aiproxy.json")
+
+		if got := logBuf.String(); !strings.Contains(got, "aiproxy: reloaded config from aiproxy.json") {
+			t.Errorf("log output = %q, missing the plain message", got)
+		}
+	})
+}

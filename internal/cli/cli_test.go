@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"aiproxy/internal/cache"
 	"aiproxy/internal/cli"
 )
 
@@ -49,6 +50,52 @@ func TestRunStart_InvalidCustomRulePattern_FatalsWithClearMessage(t *testing.T) 
 	}
 	if !strings.Contains(output, "Fatal error: Invalid regex pattern in custom rule broken-rule") {
 		t.Fatalf("stderr missing expected fatal message: %q", output)
+	}
+}
+
+// TestRunStart_CacheDirectoryCannotBeCreated_FatalsWithClearMessage
+// proves a cache directory that can't be created (here: something else
+// already occupies that path) is treated the same way as a bad regex or
+// bad target — a clean log.Fatal before anything starts serving, not a
+// half-started proxy or a crash. Runs as a subprocess for the same
+// reason as the test above: log.Fatal calls os.Exit.
+func TestRunStart_CacheDirectoryCannotBeCreated_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		cli.Execute([]string{"start", "-target", "https://example.com"}, os.Stdout, os.Stderr)
+		return
+	}
+
+	dir := t.TempDir()
+	// A regular file where the cache expects to create a directory
+	// forces cache.New's os.MkdirAll to fail.
+	if err := os.WriteFile(filepath.Join(dir, cache.DirName), []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write blocking file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "aiproxy.json"), []byte(`{"cache_enabled": true}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_CacheDirectoryCannotBeCreated_FatalsWithClearMessage")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatal's os.Exit(1))", exitErr.ExitCode())
+	}
+
+	output := stderr.String()
+	if strings.Contains(output, "panic:") {
+		t.Fatalf("stderr still contains a panic stack trace, want a clean log.Fatal message: %q", output)
+	}
+	if !strings.Contains(output, "cache:") {
+		t.Fatalf("stderr missing the cache failure message: %q", output)
 	}
 }
 
