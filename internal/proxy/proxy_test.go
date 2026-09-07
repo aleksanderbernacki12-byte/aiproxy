@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -2243,7 +2244,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, []proxy.Route{
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, nil, []proxy.Route{
 		{Prefix: "/other", Target: otherURL, Limiter: strictLimiter},
 	})
 
@@ -2307,7 +2308,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, nil, nil)
 		}
 	}()
 
@@ -2684,6 +2685,244 @@ func TestServer_HeaderSecretScanning_ExemptsXAPIKeyHeader(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d (the client's own upstream credential must never be scanned)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_Webhook_FiresOnBlockWithExpectedPayload proves a configured
+// WebhookURL receives a JSON alert for a blocked request, carrying the
+// event, method, url, and rule name — but never the matched secret,
+// which never appears anywhere in the payload.
+func TestServer_Webhook_FiresOnBlockWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("blocked request must never reach the upstream target")
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.WebhookURL = webhookURL
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	secret := "AKIAABCDEFGHIJKLMNOP"
+	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token="+secret))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "block" {
+			t.Errorf("event = %v, want %q", payload["event"], "block")
+		}
+		if payload["method"] != "POST" {
+			t.Errorf("method = %v, want %q", payload["method"], "POST")
+		}
+		if payload["url"] != "/upload" {
+			t.Errorf("url = %v, want %q", payload["url"], "/upload")
+		}
+		if payload["rule"] != "aws-access-key" {
+			t.Errorf("rule = %v, want %q", payload["rule"], "aws-access-key")
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "BLOCK") || !strings.Contains(text, "aws-access-key") {
+			t.Errorf("text = %q, want it to mention BLOCK and the rule name", text)
+		}
+		if strings.Contains(fmt.Sprintf("%v", payload), secret) {
+			t.Fatalf("webhook payload leaked the matched secret value: %v", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_Webhook_FiresOnRedactWithExpectedPayload is the same proof
+// as the block case, for a redact event.
+func TestServer_Webhook_FiresOnRedactWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.WebhookURL = webhookURL
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"key":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "redact" {
+			t.Errorf("event = %v, want %q", payload["event"], "redact")
+		}
+		if payload["rule"] != "openai-api-key" {
+			t.Errorf("rule = %v, want %q", payload["rule"], "openai-api-key")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_Webhook_NeverFiresOnAllow proves a clean, allowed request
+// never triggers a webhook call at all — alerts are for block/redact
+// events only, not every request.
+func TestServer_Webhook_NeverFiresOnAllow(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	var webhookHit atomic.Bool
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhookHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.WebhookURL = webhookURL
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	// There is no event to wait for here, so give any (wrongly) fired
+	// webhook call a moment to land before asserting its absence.
+	time.Sleep(50 * time.Millisecond)
+	if webhookHit.Load() {
+		t.Fatal("webhook fired for a clean, allowed request")
+	}
+}
+
+// TestServer_Webhook_DeliveryFailureNeverAffectsClientResponse proves an
+// unreachable webhook endpoint doesn't change the outcome of the request
+// that triggered it: the client still gets its normal 403, even though
+// the alert delivery itself fails in the background.
+func TestServer_Webhook_DeliveryFailureNeverAffectsClientResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	// A closed listener's address: nothing is listening there, so the
+	// webhook POST fails outright (connection refused) rather than
+	// merely timing out.
+	deadListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadAddr := deadListener.Addr().String()
+	deadListener.Close()
+	webhookURL, err := url.Parse("http://" + deadAddr)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (an undeliverable webhook must never change the client's response)", resp.StatusCode, http.StatusForbidden)
+	}
+
+	logOutput := waitForLogContains(&logBuf, "webhook", 2*time.Second)
+	if !strings.Contains(logOutput, "webhook") {
+		t.Fatalf("log missing a webhook delivery failure notice: %q", logOutput)
 	}
 }
 

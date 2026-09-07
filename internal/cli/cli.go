@@ -120,6 +120,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.Cache = lc.cache
 	server.CostPer1KTokens = lc.cost
 	server.MaxBodyBytes = lc.maxBodyBytes
+	server.WebhookURL = lc.webhookURL
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.target, r.limiter)
 	}
@@ -139,6 +140,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if cfg.MaxBodyBytes > 0 {
 			fmt.Fprintf(stdout, "max request body size: %d bytes\n", cfg.MaxBodyBytes)
+		}
+		if lc.webhookURL != nil {
+			// Deliberately never prints the URL itself: a webhook URL
+			// (a Slack incoming webhook, in particular) typically embeds
+			// a bearer credential directly in its path, so it gets the
+			// same treatment as every other secret aiproxy handles —
+			// never written to a log or the terminal.
+			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact)")
 		}
 		for _, r := range lc.routes {
 			if r.maxRequestsPerMinute > 0 {
@@ -211,7 +220,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Target: r.target, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.maxBodyBytes, routes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.maxBodyBytes, lc.webhookURL, routes)
 
 	label := loadedFrom
 	if label == "" {
@@ -229,6 +238,7 @@ type liveConfig struct {
 	cache        *cache.Cache
 	cost         float64
 	maxBodyBytes int64
+	webhookURL   *url.URL
 	routes       []targetRoute
 }
 
@@ -263,6 +273,15 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 
 	lc.cost = cfg.CostPer1KTokens
 	lc.maxBodyBytes = cfg.MaxBodyBytes
+
+	if cfg.WebhookURL != "" {
+		webhookURL, err := parseWebhookURL(cfg.WebhookURL)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("webhook_url: %w", err))
+		} else {
+			lc.webhookURL = webhookURL
+		}
+	}
 
 	routes, routeErrs := compileTargetRoutes(cfg.Targets)
 	errs = append(errs, routeErrs...)
@@ -437,6 +456,11 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.MaxBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
 	}
+	if cfg.WebhookURL != "" {
+		if _, err := parseWebhookURL(cfg.WebhookURL); err != nil {
+			problems = append(problems, fmt.Sprintf("webhook_url: %v", err))
+		}
+	}
 
 	if len(problems) > 0 {
 		fmt.Fprintf(stderr, "aiproxy: %s has %d problem(s):\n", loadedFrom, len(problems))
@@ -454,6 +478,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
 	fmt.Fprintf(stdout, "  max request body size:   %d bytes\n", effectiveMaxBodyBytes(cfg.MaxBodyBytes))
+	fmt.Fprintf(stdout, "  webhook alerts:          %v\n", cfg.WebhookURL != "")
 	return 0
 }
 
@@ -566,6 +591,27 @@ func parseHTTPSURL(raw string) (*url.URL, error) {
 	}
 	if u.Scheme != "https" {
 		return nil, fmt.Errorf("must use https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("must include a host")
+	}
+	return u, nil
+}
+
+// parseWebhookURL validates the config file's webhook_url: unlike
+// parseHTTPSURL (used for --target and targets[].url, which always
+// reach a real upstream API and so are always required to be https),
+// this accepts plain http too — a webhook alert only ever carries a
+// method/url/rule name, never a secret, and a common real use is a local
+// or internal-network receiver (a dev script, an internal relay) with no
+// TLS in front of it at all.
+func parseWebhookURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("is not a valid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("must use http or https, got %q", u.Scheme)
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("must include a host")

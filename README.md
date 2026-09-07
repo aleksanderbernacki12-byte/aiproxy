@@ -150,10 +150,10 @@ kill -HUP <aiproxy-pid>
 Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
 custom rules, the rate limit, the cache, cost estimation, the max
-request body size, and target routes all take effect for the next
-request, with no dropped connections and no restart. Every one of these
-is logged (as `reload` on success, or `reload_error` on failure, under
-`--log-format json`).
+request body size, the webhook alert URL, and target routes all take
+effect for the next request, with no dropped connections and no
+restart. Every one of these is logged (as `reload` on success, or
+`reload_error` on failure, under `--log-format json`).
 
 If the reloaded file has any problem — a bad regex, a bad target, a
 cache directory that can't be created — the reload is refused and the
@@ -454,6 +454,53 @@ exactly the kind of path a self-hosted LLM gateway upstream might
 already be using for its own metrics. Same reserved-path rules as
 `/_aiproxy/stats` apply: never forwarded upstream, never counted in the
 stats it reports, and any method other than `GET` gets a 405.
+
+## Webhook alerts
+
+Stats and metrics are pull-based — something has to go and look at them.
+Set `webhook_url` to get pushed a real-time alert instead, the moment a
+rule blocks or redacts a request:
+
+```json
+{
+  "webhook_url": "https://hooks.slack.com/services/T00/B00/XXXXXXXXXXXXXXXXXXXXXXXX"
+}
+```
+
+Every block and redact event POSTs this JSON body to that URL:
+
+```json
+{
+  "text": "[BLOCK] POST /v1/messages - Triggered rule: aws-access-key",
+  "event": "block",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "aws-access-key",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+`text` alone is already a valid Slack incoming webhook payload — point
+`webhook_url` straight at one and it just works, no separate Slack
+integration needed. The rest of the fields serve any other endpoint that
+wants the event structured instead of parsed back out of a sentence.
+Like every log line in this README, the payload carries only the rule
+name that matched — never the secret itself.
+
+Delivery happens on its own goroutine with a 5-second timeout, so a
+slow or unreachable webhook endpoint never delays the request that
+triggered it; a delivery failure is logged as an internal error and
+otherwise ignored — there's no retry. Unlike `--target` and
+`targets[].url`, `webhook_url` accepts plain `http` as well as `https`
+(it still has to be a well-formed URL with a host) — a webhook payload
+never carries a secret, only a method/url/rule name, so a local or
+internal-network receiver with no TLS in front of it is a perfectly
+reasonable target. It's hot-reloadable via
+[SIGHUP](#reloading-config-without-restarting) like everything else in
+this section. Neither the startup notice nor `aiproxy validate`'s
+summary ever print the URL itself — a webhook URL, Slack's especially,
+typically embeds a bearer credential directly in its path, so it gets
+the same treatment as every other secret aiproxy handles.
 
 ## Validating a config file
 

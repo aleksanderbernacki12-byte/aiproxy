@@ -179,8 +179,8 @@ const DefaultMaxBodyBytes = 10 << 20 // 10 MiB
 // AddRoute are safe to set directly before the server starts serving
 // (that's how every constructor caller and test in this codebase already
 // sets them up). Once ServeHTTP is live, changing any of them requires
-// ReloadConfig instead, which swaps all five together under a lock — the
-// mutex below exists only to make that later swap race-free against
+// ReloadConfig instead, which swaps all of them together under a lock —
+// the mutex below exists only to make that later swap race-free against
 // concurrent requests; it is never involved in the single-threaded setup
 // path.
 type Server struct {
@@ -209,6 +209,11 @@ type Server struct {
 	// buffers every request body fully in memory before it can be
 	// inspected must never expose an actually-unbounded size by default.
 	MaxBodyBytes int64
+
+	// WebhookURL, if non-nil, is POSTed a JSON alert every time a rule
+	// blocks or redacts a request — see notifyWebhook. nil (the default)
+	// disables alerting entirely.
+	WebhookURL *url.URL
 
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
@@ -326,10 +331,10 @@ func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string,
 	return s.Target, path, "default", s.Limiter
 }
 
-// getEngine, getCache, and getCostPer1KTokens are small locked accessors
-// for the fields ReloadConfig can change at runtime, used everywhere
-// they're read outside of resolveRoute (which takes the same lock
-// itself, for Limiter and the route table).
+// getEngine, getCache, getCostPer1KTokens, and getWebhookURL are small
+// locked accessors for the fields ReloadConfig can change at runtime,
+// used everywhere they're read outside of resolveRoute (which takes the
+// same lock itself, for Limiter and the route table).
 func (s *Server) getEngine() *rules.Engine {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -357,6 +362,12 @@ func (s *Server) getMaxBodyBytes() int64 {
 	return s.MaxBodyBytes
 }
 
+func (s *Server) getWebhookURL() *url.URL {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.WebhookURL
+}
+
 // Route describes one path-prefix-to-upstream mapping for ReloadConfig,
 // mirroring what AddRoute registers before the server starts serving.
 type Route struct {
@@ -368,16 +379,17 @@ type Route struct {
 }
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
-// cost-per-1K-tokens rate, max request body size, and target routes —
-// e.g. after re-reading aiproxy.json on SIGHUP. All six change together
-// under one lock, so a request in flight never observes a torn mix of
-// old and new configuration; a request takes effect from the moment
-// it's accepted, so anything already being handled keeps running
-// against whatever configuration it started with. Pass nil for
-// limiter/cache to disable them, matching how the corresponding field
-// would be set at startup; pass zero for maxBodyBytes to fall back to
-// DefaultMaxBodyBytes, same as leaving Server.MaxBodyBytes unset.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, maxBodyBytes int64, routes []Route) {
+// cost-per-1K-tokens rate, max request body size, webhook alert URL, and
+// target routes — e.g. after re-reading aiproxy.json on SIGHUP. All of
+// them change together under one lock, so a request in flight never
+// observes a torn mix of old and new configuration; a request takes
+// effect from the moment it's accepted, so anything already being
+// handled keeps running against whatever configuration it started with.
+// Pass nil for limiter/cache/webhookURL to disable them, matching how
+// the corresponding field would be set at startup; pass zero for
+// maxBodyBytes to fall back to DefaultMaxBodyBytes, same as leaving
+// Server.MaxBodyBytes unset.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, maxBodyBytes int64, webhookURL *url.URL, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, target: r.Target, limiter: r.Limiter}
@@ -390,6 +402,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.Cache = cch
 	s.CostPer1KTokens = costPer1KTokens
 	s.MaxBodyBytes = maxBodyBytes
+	s.WebhookURL = webhookURL
 	s.routes = newRoutes
 }
 
@@ -476,6 +489,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// static rule name that identifies which pattern triggered it.
 		s.Stats.RecordBlock(targetLabel)
 		s.logBlock(r.Method, r.URL.String(), ruleName)
+		s.notifyWebhook("block", r.Method, r.URL.String(), ruleName)
 		http.Error(w, "blocked by aiproxy rules", http.StatusForbidden)
 		return
 	}
@@ -502,6 +516,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if action == rules.Redact {
 		s.Stats.RecordRedact(targetLabel)
 		s.logRedact(r.Method, r.URL.String(), ruleName)
+		s.notifyWebhook("redact", r.Method, r.URL.String(), ruleName)
 	} else {
 		s.Stats.RecordAllow(targetLabel)
 		s.logAllow(r.Method, r.URL.String())
@@ -777,6 +792,72 @@ func (s *Server) logRedact(method, reqURL, ruleName string) {
 		return
 	}
 	s.logf("%s[REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
+}
+
+// webhookClient is a dedicated HTTP client for webhook deliveries, kept
+// separate from the reverse proxy's own upstream connections and given a
+// short, fixed timeout: a slow or hanging alert endpoint must never be
+// allowed to pile up goroutines or affect the client-facing request path
+// it's reporting on.
+var webhookClient = &http.Client{Timeout: 5 * time.Second}
+
+// webhookAlert is the JSON body POSTed to Server.WebhookURL for every
+// block or redact event. Text alone is enough for a Slack incoming
+// webhook (which reads exactly that field and ignores the rest); the
+// remaining fields serve a generic JSON webhook consumer that wants the
+// event structured instead of parsed back out of a sentence. Like every
+// other log line in this package, it carries the rule name that matched,
+// never the matched secret itself.
+type webhookAlert struct {
+	Text   string `json:"text"`
+	Event  string `json:"event"`
+	Method string `json:"method"`
+	URL    string `json:"url"`
+	Rule   string `json:"rule"`
+	Time   string `json:"time"`
+}
+
+// notifyWebhook POSTs a webhookAlert to Server.WebhookURL, if configured,
+// for a block or redact event (event is "block" or "redact"). Delivery
+// happens on its own goroutine so a slow or unreachable webhook endpoint
+// never delays the client's actual request — the request has already
+// been decided and logged by the time this runs. A delivery failure (or
+// a non-2xx response) is logged as an internal error and otherwise
+// ignored: there is no retry, and it never changes the outcome of the
+// request that triggered it.
+func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
+	webhookURL := s.getWebhookURL()
+	if webhookURL == nil {
+		return
+	}
+
+	payload := webhookAlert{
+		Text:   fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName),
+		Event:  event,
+		Method: method,
+		URL:    reqURL,
+		Rule:   ruleName,
+		Time:   time.Now().UTC().Format(time.RFC3339),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		// payload is always this one fixed, plain shape, so this should
+		// never actually happen — mirrors logEventJSON's own fallback.
+		s.logError("aiproxy: webhook: failed to encode alert: %v", err)
+		return
+	}
+
+	go func() {
+		resp, err := webhookClient.Post(webhookURL.String(), "application/json", bytes.NewReader(data))
+		if err != nil {
+			s.logError("aiproxy: webhook: delivery failed: %v", err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			s.logError("aiproxy: webhook: endpoint returned status %d", resp.StatusCode)
+		}
+	}()
 }
 
 // logEventJSON marshals ev (stamping the current time) and logs it as a

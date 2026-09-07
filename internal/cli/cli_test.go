@@ -127,6 +127,43 @@ func TestRunStart_UnknownBuiltinRuleName_FatalsWithClearMessage(t *testing.T) {
 	}
 }
 
+// TestRunStart_InvalidWebhookURL_FatalsWithClearMessage proves a
+// webhook_url that fails https validation is treated the same way as a
+// bad --target or a bad targets[].url: a clean log.Fatal before
+// anything starts serving, rather than only failing much later when the
+// first block/redact event tries to deliver it.
+func TestRunStart_InvalidWebhookURL_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"webhook_url": "not a url"}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_InvalidWebhookURL_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+
+	output := stderr.String()
+	if !strings.Contains(output, "webhook_url") {
+		t.Fatalf("stderr missing expected fatal message: %q", output)
+	}
+}
+
 // TestRunStart_CacheDirectoryCannotBeCreated_FatalsWithClearMessage
 // proves a cache directory that can't be created (here: something else
 // already occupies that path) is treated the same way as a bad regex or
@@ -494,6 +531,79 @@ func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "max_body_size_bytes") {
 		t.Errorf("stderr missing negative max body size problem: %q", errOut)
+	}
+}
+
+// TestExecute_Validate_InvalidWebhookURL_ReportsProblem proves a
+// webhook_url with an unsupported scheme is reported as a config
+// problem, not silently ignored or only discovered once a block/redact
+// event tries and fails to deliver it.
+func TestExecute_Validate_InvalidWebhookURL_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhook_url": "ftp://hooks.example.com/alert"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "webhook_url") {
+		t.Errorf("stderr missing webhook_url problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithWebhookURL_ReturnsZero proves a
+// well-formed https webhook_url passes validation and is reflected in
+// the summary, without ever printing the URL itself (it can carry a
+// bearer credential in its path, e.g. a Slack incoming webhook).
+func TestExecute_Validate_ValidConfig_WithWebhookURL_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhook_url": "https://hooks.example.com/services/T0/B0/XXXXXXXX"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "webhook alerts:          true") {
+		t.Fatalf("stdout missing webhook alerts summary line: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "XXXXXXXX") {
+		t.Fatalf("stdout leaked the webhook URL itself: %q", stdout.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithPlainHTTPWebhookURL_ReturnsZero
+// proves webhook_url deliberately accepts plain http, unlike --target
+// and targets[].url: a webhook alert only ever carries a method/url/rule
+// name, never a secret, and a common real receiver is a local or
+// internal-network endpoint with no TLS in front of it at all.
+func TestExecute_Validate_ValidConfig_WithPlainHTTPWebhookURL_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhook_url": "http://127.0.0.1:9000/hook"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "webhook alerts:          true") {
+		t.Fatalf("stdout missing webhook alerts summary line: %q", stdout.String())
 	}
 }
 

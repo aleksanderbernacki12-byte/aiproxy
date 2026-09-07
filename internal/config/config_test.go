@@ -122,6 +122,40 @@ func TestLoad_MaxBodySizeBytesDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesWebhookURL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhook_url": "https://hooks.example.com/alert"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.WebhookURL != "https://hooks.example.com/alert" {
+		t.Fatalf("WebhookURL = %q, want %q", cfg.WebhookURL, "https://hooks.example.com/alert")
+	}
+}
+
+func TestLoad_WebhookURLDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.WebhookURL != "" {
+		t.Fatalf("WebhookURL = %q, want empty when absent", cfg.WebhookURL)
+	}
+}
+
 func TestLoad_ParsesMaxRequestsPerMinute(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

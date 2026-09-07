@@ -87,6 +87,13 @@ type Config struct {
 	// that buffers every request body fully in memory before it can be
 	// inspected must never expose an actually-unbounded size by default.
 	MaxBodyBytes int64 `json:"max_body_size_bytes,omitempty"`
+
+	// WebhookURL, if set, is an HTTPS endpoint aiproxy POSTs a JSON alert
+	// to every time a rule blocks or redacts a request — a Slack incoming
+	// webhook URL, or any other endpoint willing to receive one. Empty
+	// (the default when the field is absent) disables alerting entirely;
+	// nothing is ever POSTed.
+	WebhookURL string `json:"webhook_url,omitempty"`
 }
 
 // Load reads and parses the config file at path. If the file does not
