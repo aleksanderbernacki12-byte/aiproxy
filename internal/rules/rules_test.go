@@ -334,6 +334,131 @@ func TestEngine_EvaluateResponse_AllowsCleanBody(t *testing.T) {
 	}
 }
 
+// TestEngine_PathRule_BlocksMatchingPrefixRegardlessOfContent proves a
+// path rule blocks every request under its prefix outright — even one
+// whose body would otherwise be perfectly clean.
+func TestEngine_PathRule_BlocksMatchingPrefixRegardlessOfContent(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{
+		Name:       "block-admin",
+		PathPrefix: "/admin",
+		Action:     rules.Block,
+	})
+
+	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+		Method: "GET",
+		URL:    "/admin/users",
+		Body:   []byte(`{"hello":"world"}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Block {
+		t.Fatalf("action = %v, want %v", action, rules.Block)
+	}
+	if ruleName != "block-admin" {
+		t.Fatalf("rule = %q, want %q", ruleName, "block-admin")
+	}
+}
+
+// TestEngine_PathRule_AllowExemptsMatchingPrefixFromContentScanning
+// proves an Allow path rule skips body/header scanning entirely for a
+// matching request — even one whose body would otherwise be blocked.
+func TestEngine_PathRule_AllowExemptsMatchingPrefixFromContentScanning(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{
+		Name:       "health-check",
+		PathPrefix: "/health",
+		Action:     rules.Allow,
+	})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	action, ruleName, gotBody, _, err := engine.Evaluate(rules.Request{
+		Method: "GET",
+		URL:    "/health/status",
+		Body:   []byte(`{"note":"AKIAABCDEFGHIJKLMNOP"}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v (the path rule must exempt this request from the aws-access-key rule)", action, rules.Allow)
+	}
+	if ruleName != "health-check" {
+		t.Fatalf("rule = %q, want %q", ruleName, "health-check")
+	}
+	if string(gotBody) != `{"note":"AKIAABCDEFGHIJKLMNOP"}` {
+		t.Fatalf("body = %q, want unchanged", gotBody)
+	}
+}
+
+// TestEngine_PathRule_RedactActionBehavesLikeAllow proves the
+// documented Rule behavior: Redact has no matched text to replace on a
+// path rule, so it is treated exactly like Allow.
+func TestEngine_PathRule_RedactActionBehavesLikeAllow(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{
+		Name:       "legacy-redact-path-rule",
+		PathPrefix: "/legacy",
+		Action:     rules.Redact,
+	})
+
+	body := []byte(`{"hello":"world"}`)
+	action, ruleName, gotBody, _, err := engine.Evaluate(rules.Request{
+		Method: "GET",
+		URL:    "/legacy/x",
+		Body:   body,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v", action, rules.Allow)
+	}
+	if ruleName != "legacy-redact-path-rule" {
+		t.Fatalf("rule = %q, want %q", ruleName, "legacy-redact-path-rule")
+	}
+	if string(gotBody) != string(body) {
+		t.Fatalf("body = %q, want unchanged %q", gotBody, body)
+	}
+}
+
+// TestEngine_PathRule_NonMatchingPrefixFallsThroughToContentScanning
+// proves a path rule that doesn't match the request's path has no
+// effect at all: content scanning still applies normally.
+func TestEngine_PathRule_NonMatchingPrefixFallsThroughToContentScanning(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{
+		Name:       "block-admin",
+		PathPrefix: "/admin",
+		Action:     rules.Block,
+	})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+		Method: "POST",
+		URL:    "/upload",
+		Body:   []byte(`{"config":"AKIAABCDEFGHIJKLMNOP"}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Block {
+		t.Fatalf("action = %v, want %v", action, rules.Block)
+	}
+	if ruleName != "aws-access-key" {
+		t.Fatalf("rule = %q, want %q (the path rule doesn't apply to this path)", ruleName, "aws-access-key")
+	}
+}
+
 func TestEngine_AllowsCleanBody(t *testing.T) {
 	engine := rules.NewEngine(rules.Allow)
 	engine.AddBodyRegexRule(rules.BodyRegexRule{

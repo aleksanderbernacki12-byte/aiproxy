@@ -156,6 +156,49 @@ func TestLoad_WebhookURLDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesPathRules(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [
+		{"name": "block-admin", "prefix": "/admin", "action": "block"},
+		{"name": "health-check", "prefix": "/health", "action": "allow"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.PathRules) != 2 {
+		t.Fatalf("len(PathRules) = %d, want 2: %+v", len(cfg.PathRules), cfg.PathRules)
+	}
+	if cfg.PathRules[0] != (config.PathRule{Name: "block-admin", Prefix: "/admin", Action: "block"}) {
+		t.Fatalf("PathRules[0] = %+v, want block-admin", cfg.PathRules[0])
+	}
+	if cfg.PathRules[1] != (config.PathRule{Name: "health-check", Prefix: "/health", Action: "allow"}) {
+		t.Fatalf("PathRules[1] = %+v, want health-check", cfg.PathRules[1])
+	}
+}
+
+func TestLoad_PathRulesDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.PathRules) != 0 {
+		t.Fatalf("PathRules = %+v, want empty when absent", cfg.PathRules)
+	}
+}
+
 func TestLoad_ParsesMaxRequestsPerMinute(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

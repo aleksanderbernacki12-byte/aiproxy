@@ -24,6 +24,24 @@ type CustomRule struct {
 	Action string `json:"action,omitempty"`
 }
 
+// PathRule is one path-prefix endpoint rule as it appears in the config
+// file: block or explicitly allow every request under Prefix outright,
+// independent of its content.
+type PathRule struct {
+	Name   string `json:"name"`
+	Prefix string `json:"prefix"`
+
+	// Action is "block" (reject every matching request before it's even
+	// scanned) or "allow" (exempt every matching request from every
+	// other rule — built-in, custom, body, and header — entirely; for a
+	// known-safe endpoint, e.g. a health check, that would otherwise
+	// risk a false positive). Unlike CustomRule.Action, there is no
+	// default when the field is absent: block and allow are opposite
+	// intents, so silently defaulting to either could surprise the user
+	// in a way that matters.
+	Action string `json:"action"`
+}
+
 // Target is one path-prefix-to-upstream mapping for multi-target
 // routing, as it appears in the config file, before URL has been parsed.
 type Target struct {
@@ -94,6 +112,14 @@ type Config struct {
 	// (the default when the field is absent) disables alerting entirely;
 	// nothing is ever POSTed.
 	WebhookURL string `json:"webhook_url,omitempty"`
+
+	// PathRules blocks or allows whole endpoints by path prefix,
+	// independent of their content — checked before any body/header
+	// secret scanning, so an "allow" entry exempts everything under its
+	// prefix from every built-in and custom rule. An empty slice (the
+	// default when the field is absent) means no path is treated
+	// specially.
+	PathRules []PathRule `json:"path_rules,omitempty"`
 }
 
 // Load reads and parses the config file at path. If the file does not

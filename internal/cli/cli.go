@@ -129,6 +129,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if len(cfg.CustomRules) > 0 {
 			fmt.Fprintf(stdout, "loaded %d custom rule(s) from %s\n", len(cfg.CustomRules), loadedFrom)
 		}
+		for _, r := range cfg.PathRules {
+			fmt.Fprintf(stdout, "path rule: %s %s\n", r.Prefix, r.Action)
+		}
 		if cfg.MaxRequestsPerMinute > 0 {
 			fmt.Fprintf(stdout, "circuit breaker: %d requests/minute\n", cfg.MaxRequestsPerMinute)
 		}
@@ -368,8 +371,12 @@ func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]
 // buildEngine constructs the rule engine used to evaluate every request:
 // every built-in secret-blocking rule in builtinRules not turned off
 // (each block or redact otherwise, depending on cfg.BuiltinRuleActions),
-// plus any custom rules from cfg. cfg may be nil (no config file at
-// all), in which case only the built-ins apply, all blocking.
+// plus any path_rules and custom_rules from cfg. Engine.Evaluate always
+// checks path rules before any body rule regardless of the order they
+// were added in, so a path_rules "allow" entry exempts a matching
+// request from custom_rules too, not just the built-ins. cfg may be
+// nil (no config file at all), in which case only the built-ins apply,
+// all blocking.
 func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	engine := rules.NewEngine(rules.Allow)
 
@@ -393,6 +400,12 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 		return engine, errs
 	}
 
+	pathRules, pErrs := compilePathRules(cfg.PathRules)
+	for _, r := range pathRules {
+		engine.AddRule(r)
+	}
+	errs = append(errs, pErrs...)
+
 	customRules, cErrs := compileCustomRules(cfg.CustomRules)
 	for _, r := range customRules {
 		engine.AddBodyRegexRule(r)
@@ -401,13 +414,64 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	return engine, errs
 }
 
+// compilePathRules validates and parses each path_rules entry from the
+// config file. A prefix must be non-empty, start with "/", and be
+// distinct from every other path rule's prefix (a duplicate would only
+// ever be reached via the first, dead configuration otherwise); action
+// must be exactly "block" or "allow". Problems are collected and
+// returned rather than stopping at the first one — the caller decides
+// whether that's fatal (runStart) or just a reported problem
+// (runValidate).
+func compilePathRules(pathRules []config.PathRule) ([]rules.Rule, []error) {
+	compiled := make([]rules.Rule, 0, len(pathRules))
+	var errs []error
+	seenPrefixes := make(map[string]bool, len(pathRules))
+	for _, p := range pathRules {
+		if p.Prefix == "" || !strings.HasPrefix(p.Prefix, "/") {
+			errs = append(errs, fmt.Errorf("Fatal error: path_rules: prefix %q must be non-empty and start with \"/\"", p.Prefix))
+			continue
+		}
+		if seenPrefixes[p.Prefix] {
+			errs = append(errs, fmt.Errorf("Fatal error: path_rules: duplicate prefix %q (only the first entry with a given prefix is ever reachable)", p.Prefix))
+			continue
+		}
+		seenPrefixes[p.Prefix] = true
+
+		action, err := parsePathRuleAction(p.Action)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("Fatal error: Invalid action for path rule %s: %w", p.Name, err))
+			continue
+		}
+
+		compiled = append(compiled, rules.Rule{Name: p.Name, PathPrefix: p.Prefix, Action: action})
+	}
+	return compiled, errs
+}
+
+// parsePathRuleAction parses a path_rules entry's action field: "block"
+// or "allow". Unlike parseRuleAction (custom_rules[].action), there is
+// no default for an absent/empty value — block and allow are opposite
+// intents, so silently choosing one could surprise the user in a way
+// that matters.
+func parsePathRuleAction(raw string) (rules.Action, error) {
+	switch raw {
+	case "block":
+		return rules.Block, nil
+	case "allow":
+		return rules.Allow, nil
+	default:
+		return 0, fmt.Errorf("must be \"block\" or \"allow\", got %q", raw)
+	}
+}
+
 // runValidate checks a config file for problems without starting the
-// proxy: every custom_rules pattern must compile, every targets entry
-// must have a well-formed, unique prefix and a valid https url, and the
-// numeric fields must be sane. It never calls log.Fatal or otherwise
-// aborts the process — reporting every problem it finds and returning a
-// non-zero exit code is the whole point, as opposed to runStart, which
-// treats the same problems as fatal.
+// proxy: every custom_rules pattern must compile, every targets and
+// path_rules entry must have a well-formed, unique prefix (and, for
+// path_rules, a valid action), and the numeric fields must be sane. It
+// never calls log.Fatal or otherwise aborts the process — reporting
+// every problem it finds and returning a non-zero exit code is the
+// whole point, as opposed to runStart, which treats the same problems
+// as fatal.
 func runValidate(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -440,6 +504,11 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	_, routeErrs := compileTargetRoutes(cfg.Targets)
 	for _, e := range routeErrs {
 		problems = append(problems, e.Error())
+	}
+
+	_, pathRuleErrs := compilePathRules(cfg.PathRules)
+	for _, e := range pathRuleErrs {
+		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
 	}
 
 	_, _, builtinErrs := resolveBuiltinRuleActions(cfg.BuiltinRuleActions)
@@ -479,6 +548,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
 	fmt.Fprintf(stdout, "  max request body size:   %d bytes\n", effectiveMaxBodyBytes(cfg.MaxBodyBytes))
 	fmt.Fprintf(stdout, "  webhook alerts:          %v\n", cfg.WebhookURL != "")
+	fmt.Fprintf(stdout, "  path rules:              %d\n", len(cfg.PathRules))
 	return 0
 }
 

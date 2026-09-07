@@ -149,9 +149,9 @@ kill -HUP <aiproxy-pid>
 
 Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
-custom rules, the rate limit, the cache, cost estimation, the max
-request body size, the webhook alert URL, and target routes all take
-effect for the next request, with no dropped connections and no
+custom rules, path rules, the rate limit, the cache, cost estimation,
+the max request body size, the webhook alert URL, and target routes all
+take effect for the next request, with no dropped connections and no
 restart. Every one of these is logged (as `reload` on success, or
 `reload_error` on failure, under `--log-format json`).
 
@@ -352,6 +352,34 @@ default target, exactly as if `targets[].max_requests_per_minute` didn't
 exist. Omit or set it to 0 for a target that should just share the
 top-level limiter (or share "no limit at all", if the top-level field is
 itself unset).
+
+## Path-based endpoint rules
+
+`targets` picks which upstream a path goes to; `path_rules` decides
+whether it's allowed through at all, by path alone, independent of what
+it contains:
+
+```json
+{
+  "path_rules": [
+    { "name": "block-admin", "prefix": "/admin", "action": "block" },
+    { "name": "health-check", "prefix": "/health", "action": "allow" }
+  ]
+}
+```
+
+`block` rejects every request under `prefix` outright with a 403,
+before it's even scanned. `allow` does the opposite: it exempts every
+request under `prefix` from every other rule — built-in, custom, and
+response scanning included — for an endpoint you already know is safe
+(a health check, a status page) and don't want tripping a false
+positive. Unlike `custom_rules[].action`, `action` has no default when
+it's absent — block and allow are opposite intents, so `aiproxy
+validate` rejects a `path_rules` entry that doesn't say which one it
+means, rather than silently guessing. Prefixes must be unique (checked
+the same way as `targets[].prefix`) and are matched before any
+body/header content is scanned, so an `allow` entry is a genuine,
+complete opt-out — use it deliberately.
 
 ## Example: proxying Claude traffic
 

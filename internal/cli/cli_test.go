@@ -164,6 +164,42 @@ func TestRunStart_InvalidWebhookURL_FatalsWithClearMessage(t *testing.T) {
 	}
 }
 
+// TestRunStart_InvalidPathRuleAction_FatalsWithClearMessage proves a
+// path_rules entry with a bad action is treated the same way as a bad
+// custom rule action or a bad regex: a clean log.Fatal before anything
+// starts serving.
+func TestRunStart_InvalidPathRuleAction_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"path_rules": [{"name": "bad-action", "prefix": "/admin", "action": "delete"}]}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_InvalidPathRuleAction_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+
+	output := stderr.String()
+	if !strings.Contains(output, "bad-action") {
+		t.Fatalf("stderr missing expected fatal message: %q", output)
+	}
+}
+
 // TestRunStart_CacheDirectoryCannotBeCreated_FatalsWithClearMessage
 // proves a cache directory that can't be created (here: something else
 // already occupies that path) is treated the same way as a bad regex or
@@ -505,6 +541,115 @@ func TestExecute_Validate_ValidConfig_WithPerTargetRateLimit_ReturnsZero(t *test
 
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}
+
+func TestExecute_Validate_PathRuleBadPrefix_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [{"name": "bad", "prefix": "admin", "action": "block"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "path_rules") {
+		t.Fatalf("stderr missing path_rules problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_DuplicatePathRulePrefix_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [
+		{"name": "a", "prefix": "/admin", "action": "block"},
+		{"name": "b", "prefix": "/admin", "action": "allow"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "duplicate prefix") {
+		t.Fatalf("stderr missing duplicate prefix problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_PathRuleInvalidAction_ReportsProblem proves an
+// action other than exactly "block" or "allow" is rejected — including
+// "redact" and "off", which are valid elsewhere (custom_rules,
+// builtin_rule_actions) but have no equivalent meaning for a path rule.
+func TestExecute_Validate_PathRuleInvalidAction_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [{"name": "bad-action", "prefix": "/admin", "action": "redact"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "bad-action") || !strings.Contains(stderr.String(), `"block" or "allow"`) {
+		t.Fatalf("stderr missing the invalid path rule action problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_PathRuleMissingAction_ReportsProblem proves an
+// absent action is a config error rather than silently defaulting —
+// unlike custom_rules[].action, block and allow are opposite intents,
+// so there is no safe default to fall back to.
+func TestExecute_Validate_PathRuleMissingAction_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [{"name": "no-action", "prefix": "/admin"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "no-action") {
+		t.Fatalf("stderr missing the missing-action problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithPathRules_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [
+		{"name": "block-admin", "prefix": "/admin", "action": "block"},
+		{"name": "health-check", "prefix": "/health", "action": "allow"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "path rules:              2") {
+		t.Fatalf("stdout missing path rules summary line: %q", stdout.String())
 	}
 }
 

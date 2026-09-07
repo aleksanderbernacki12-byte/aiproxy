@@ -45,7 +45,14 @@ func (a Action) String() string {
 }
 
 // Rule matches a request by path prefix and assigns an action when it
-// matches.
+// matches, independent of the request's content — checked before any
+// body or header secret scanning (see Engine). Block rejects every
+// matching request outright, before it's even scanned; Allow exempts
+// every matching request from every other rule, body and header
+// scanning included — a deliberate, explicit opt-out for a known-safe
+// endpoint (e.g. a health check) that would otherwise risk a false
+// positive. Redact has no meaning here — there is no matched text to
+// replace — and is treated exactly like Allow if set.
 type Rule struct {
 	Name       string
 	PathPrefix string // "" matches any path
@@ -83,11 +90,14 @@ type Request struct {
 	Headers map[string][]string
 }
 
-// Engine evaluates requests against ordered rule sets. Body regex rules
-// are checked first — against the body, then, if nothing there matched,
-// against every header value in Request.Headers — then path rules;
-// within each set the first match wins. When nothing matches, the
-// engine's Default action applies.
+// Engine evaluates requests against ordered rule sets. Path rules are
+// checked first: a match returns immediately, without ever touching
+// body or header content — Block rejects the whole endpoint outright,
+// Allow exempts it from every other rule entirely (see Rule). If
+// nothing there matches, body regex rules are checked next — against
+// the body, then, if nothing there matched, against every header value
+// in Request.Headers. Within each set the first match wins. When
+// nothing matches at all, the engine's Default action applies.
 type Engine struct {
 	Default Action
 
@@ -129,13 +139,29 @@ func (e *Engine) BodyRegexRules() []BodyRegexRule {
 // occurrence of its pattern — in the body, or in the one header that
 // matched, whichever it was — has been replaced with a
 // "[REDACTED:<rule name>]" placeholder; the other of the two always
-// comes back unchanged. Body rules are checked first (in registration
-// order), then header values (by header name in sorted order, then in
-// registration order within each header) — so a body match always wins
-// over a header match when both are present. Headers is scanned in
-// whatever form req.Headers was given; the caller decides which headers
-// are worth scanning at all (see Request.Headers).
+// comes back unchanged. Path rules are checked first and, on a match,
+// skip body/header scanning entirely (see Rule); otherwise body rules
+// are checked next (in registration order), then header values (by
+// header name in sorted order, then in registration order within each
+// header) — so a body match always wins over a header match when both
+// are present. Headers is scanned in whatever form req.Headers was
+// given; the caller decides which headers are worth scanning at all
+// (see Request.Headers).
 func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]string, error) {
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		return Block, "", req.Body, req.Headers, fmt.Errorf("rules: invalid url %q: %w", req.URL, err)
+	}
+	for _, r := range e.rules {
+		if strings.HasPrefix(u.Path, r.PathPrefix) {
+			action := r.Action
+			if action == Redact {
+				action = Allow
+			}
+			return action, r.Name, req.Body, req.Headers, nil
+		}
+	}
+
 	for _, r := range e.bodyRules {
 		if r.Pattern.Match(req.Body) {
 			if r.Action == Redact {
@@ -150,16 +176,6 @@ func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]str
 		return action, ruleName, req.Body, headers, nil
 	}
 
-	u, err := url.Parse(req.URL)
-	if err != nil {
-		return Block, "", req.Body, req.Headers, fmt.Errorf("rules: invalid url %q: %w", req.URL, err)
-	}
-
-	for _, r := range e.rules {
-		if strings.HasPrefix(u.Path, r.PathPrefix) {
-			return r.Action, r.Name, req.Body, req.Headers, nil
-		}
-	}
 	return e.Default, "", req.Body, req.Headers, nil
 }
 

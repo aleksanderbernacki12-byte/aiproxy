@@ -156,6 +156,93 @@ func TestServer_AllowLogging(t *testing.T) {
 	}
 }
 
+// TestServer_PathRule_BlocksMatchingPrefixRegardlessOfBody proves an
+// end-to-end path rule blocks a whole endpoint outright, even with a
+// perfectly clean body — the request never reaches the upstream target.
+func TestServer_PathRule_BlocksMatchingPrefixRegardlessOfBody(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{Name: "block-admin", PathPrefix: "/admin", Action: rules.Block})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/admin/users", "application/json", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if upstreamHit.Load() {
+		t.Fatal("a path-blocked request must never reach the upstream target")
+	}
+	if !strings.Contains(logBuf.String(), "Triggered rule: block-admin") {
+		t.Fatalf("log missing triggered path rule name: %q", logBuf.String())
+	}
+}
+
+// TestServer_PathRule_AllowExemptsMatchingPrefixFromBuiltinRules proves
+// an "allow" path rule exempts its prefix from secret scanning
+// entirely: a request under it forwards even though its body would
+// otherwise be blocked by a built-in rule.
+func TestServer_PathRule_AllowExemptsMatchingPrefixFromBuiltinRules(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{Name: "health-check", PathPrefix: "/health", Action: rules.Allow})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/health/status", "application/json", strings.NewReader(`{"note":"AKIAABCDEFGHIJKLMNOP"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (the path rule must exempt this request from the aws-access-key rule)", resp.StatusCode, http.StatusOK)
+	}
+	if !upstreamHit.Load() {
+		t.Fatal("an allow-listed request must still reach the upstream target")
+	}
+}
+
 // TestServer_RateLimiting_SixthRequestGets429AndResetsAfterWindow proves
 // the circuit breaker end to end through the real HTTP layer: with the
 // limit set to 5 requests per window, the first 5 requests succeed, the
