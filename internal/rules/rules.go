@@ -163,6 +163,30 @@ func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]str
 	return e.Default, "", req.Body, req.Headers, nil
 }
 
+// EvaluateResponse checks body — an upstream response body, not a
+// request — against the same body regex rules Evaluate uses, entirely
+// ignoring header and path rules: a response has no request path, and
+// its headers are provider metadata, not model-generated content. It
+// returns the action, the name of the rule that produced it (empty when
+// nothing matched, which is always Allow here — there is no Default to
+// fall back to the way Evaluate has for an unmatched request), and the
+// body to actually forward: body unchanged, unless the matched rule's
+// Action is Redact, in which case every occurrence of its pattern has
+// been replaced with a "[REDACTED:<rule name>]" placeholder, same
+// convention as Evaluate.
+func (e *Engine) EvaluateResponse(body []byte) (Action, string, []byte) {
+	for _, r := range e.bodyRules {
+		if r.Pattern.Match(body) {
+			if r.Action == Redact {
+				placeholder := []byte("[REDACTED:" + r.Name + "]")
+				return Redact, r.Name, r.Pattern.ReplaceAll(body, placeholder)
+			}
+			return r.Action, r.Name, body
+		}
+	}
+	return Allow, "", body
+}
+
 // evaluateHeaders runs every body rule against each value of every
 // header in headers, in sorted header-name order, and reports whether
 // any of them matched. A Redact match returns a copy of headers with

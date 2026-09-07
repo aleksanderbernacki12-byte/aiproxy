@@ -268,6 +268,72 @@ func TestEngine_NonMatchingHeaders_ReturnsHeadersUnchanged(t *testing.T) {
 	}
 }
 
+// TestEngine_EvaluateResponse_BlocksMatchedSecret proves EvaluateResponse
+// matches a response body the same way Evaluate matches a request body.
+func TestEngine_EvaluateResponse_BlocksMatchedSecret(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	action, ruleName, _ := engine.EvaluateResponse([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+	if action != rules.Block {
+		t.Fatalf("action = %v, want %v", action, rules.Block)
+	}
+	if ruleName != "aws-access-key" {
+		t.Fatalf("rule = %q, want %q", ruleName, "aws-access-key")
+	}
+}
+
+// TestEngine_EvaluateResponse_RedactsMatchedSecret proves a Redact rule
+// masks every occurrence in the response body, same as Evaluate does
+// for a request body.
+func TestEngine_EvaluateResponse_RedactsMatchedSecret(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	action, ruleName, body := engine.EvaluateResponse([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	if action != rules.Redact {
+		t.Fatalf("action = %v, want %v", action, rules.Redact)
+	}
+	if ruleName != "openai-api-key" {
+		t.Fatalf("rule = %q, want %q", ruleName, "openai-api-key")
+	}
+	want := `{"echo":"[REDACTED:openai-api-key]"}`
+	if string(body) != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+}
+
+// TestEngine_EvaluateResponse_AllowsCleanBody proves a clean response
+// body is returned unchanged with the Allow action and no rule name.
+func TestEngine_EvaluateResponse_AllowsCleanBody(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	body := []byte(`{"echo":"hello"}`)
+	action, ruleName, gotBody := engine.EvaluateResponse(body)
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v", action, rules.Allow)
+	}
+	if ruleName != "" {
+		t.Fatalf("rule = %q, want empty", ruleName)
+	}
+	if string(gotBody) != string(body) {
+		t.Fatalf("body = %q, want unchanged %q", gotBody, body)
+	}
+}
+
 func TestEngine_AllowsCleanBody(t *testing.T) {
 	engine := rules.NewEngine(rules.Allow)
 	engine.AddBodyRegexRule(rules.BodyRegexRule{

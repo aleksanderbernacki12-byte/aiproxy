@@ -20,6 +20,9 @@ func TestStats_RecordsAndSnapshotsCorrectly(t *testing.T) {
 	s.RecordCacheHit("default")
 	s.RecordTokensUsed("default", 100)
 	s.RecordTokensUsed("default", 50)
+	s.RecordResponseBlock("default")
+	s.RecordResponseRedact("default")
+	s.RecordResponseRedact("default")
 
 	snap := s.Snapshot()
 	if snap.Allowed != 2 {
@@ -39,6 +42,12 @@ func TestStats_RecordsAndSnapshotsCorrectly(t *testing.T) {
 	}
 	if snap.TotalTokens != 150 {
 		t.Errorf("TotalTokens = %d, want 150", snap.TotalTokens)
+	}
+	if snap.ResponseBlocked != 1 {
+		t.Errorf("ResponseBlocked = %d, want 1", snap.ResponseBlocked)
+	}
+	if snap.ResponseRedacted != 2 {
+		t.Errorf("ResponseRedacted = %d, want 2", snap.ResponseRedacted)
 	}
 }
 
@@ -241,10 +250,10 @@ func TestSnapshot_PerTargetString_RendersSortedBreakdownWithCost(t *testing.T) {
 	if openaiIdx < anthropicIdx {
 		t.Errorf("PerTargetString() = %q, want /anthropic before /openai (sorted)", rendered)
 	}
-	if !strings.Contains(rendered, "[/openai] allowed=2 blocked=1 redacted=0 rate-limited=0 cache-hits=0 tokens=10 cost=0.0002") {
+	if !strings.Contains(rendered, "[/openai] allowed=2 blocked=1 redacted=0 rate-limited=0 cache-hits=0 tokens=10 response-blocked=0 response-redacted=0 cost=0.0002") {
 		t.Errorf("PerTargetString() missing correct /openai line: %q", rendered)
 	}
-	if !strings.Contains(rendered, "[/anthropic] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=30 cost=0.0006") {
+	if !strings.Contains(rendered, "[/anthropic] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=30 response-blocked=0 response-redacted=0 cost=0.0006") {
 		t.Errorf("PerTargetString() missing correct /anthropic line: %q", rendered)
 	}
 }

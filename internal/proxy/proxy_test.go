@@ -430,6 +430,139 @@ func TestServer_LogsTokenUsageForAnthropicResponseShape(t *testing.T) {
 	}
 }
 
+// TestServer_ResponseSecretScanning_BlocksResponseContainingSecret
+// proves a rule matching the upstream's response — not the client's
+// request — withholds that response from the client entirely: the model
+// echoed something back that matches a Block-actioned rule (a prompt
+// injection, an upstream error message reflecting request data, etc.),
+// so the client gets a 403 with a generic message instead of the real
+// body, the same way an outgoing request would have been blocked.
+func TestServer_ResponseSecretScanning_BlocksResponseContainingSecret(t *testing.T) {
+	secret := "AKIAABCDEFGHIJKLMNOP"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"content":"sure, here is the key: ` + secret + `"}}]}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-4"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if strings.Contains(string(gotBody), secret) {
+		t.Fatalf("client received the raw secret from the response: %q", gotBody)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.ResponseBlocked != 1 {
+		t.Fatalf("Stats.ResponseBlocked = %d, want 1", snap.ResponseBlocked)
+	}
+
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, secret) {
+		t.Fatalf("log leaked the matched secret value: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "[RESPONSE BLOCK]") {
+		t.Fatalf("log missing [RESPONSE BLOCK] marker: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "Triggered rule: aws-access-key") {
+		t.Fatalf("log missing triggered rule name: %q", logOutput)
+	}
+}
+
+// TestServer_ResponseSecretScanning_RedactsResponseContainingSecret
+// proves a Redact-actioned rule matching the response masks the secret
+// in place and still forwards a 200 with the rest of the body intact —
+// including a correct Content-Length for the now-different body size.
+func TestServer_ResponseSecretScanning_RedactsResponseContainingSecret(t *testing.T) {
+	secret := "sk-FAKEKEY1234567890ABCDEFGHIJ"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"content":"here: ` + secret + `"}}]}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-4"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a redacted response must still be forwarded)", resp.StatusCode, http.StatusOK)
+	}
+	wantBody := `{"choices":[{"message":{"content":"here: [REDACTED:openai-api-key]"}}]}`
+	if string(gotBody) != wantBody {
+		t.Fatalf("response body = %q, want %q", gotBody, wantBody)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.ResponseRedacted != 1 {
+		t.Fatalf("Stats.ResponseRedacted = %d, want 1", snap.ResponseRedacted)
+	}
+
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, secret) {
+		t.Fatalf("log leaked the matched secret value: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "[RESPONSE REDACT]") {
+		t.Fatalf("log missing [RESPONSE REDACT] marker: %q", logOutput)
+	}
+}
+
 // TestServer_NonJSONResponse_NoUsageLogAndBodyStillDeliveredIntact proves
 // the silent-ignore path: a non-JSON upstream response must reach the
 // client unchanged, with no [USAGE] line and no error surfaced anywhere.
@@ -843,6 +976,182 @@ func TestServer_StreamingResponse_AbortedStreamIsNeverCached(t *testing.T) {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {
 		t.Fatal("an aborted stream must never be cached, but a cache entry was found")
+	}
+}
+
+// TestServer_ResponseSecretScanning_RedactsSecretInStreamedChunk proves
+// a Redact-actioned rule matching one SSE event within a streamed
+// response masks the secret in that event while every other event
+// (before and after it) is forwarded unchanged — real-time, per-event
+// scanning rather than buffering the whole stream to inspect it.
+func TestServer_ResponseSecretScanning_RedactsSecretInStreamedChunk(t *testing.T) {
+	secret := "sk-FAKEKEY1234567890ABCDEFGHIJ"
+	chunks := []string{
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"" + secret + "\"}}]}\n\n",
+		"data: {\"usage\":{\"total_tokens\":42}}\n\n",
+		"data: [DONE]\n\n",
+	}
+	want := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"[REDACTED:openai-api-key]\"}}]}\n\n" +
+		"data: {\"usage\":{\"total_tokens\":42}}\n\n" +
+		"data: [DONE]\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, c := range chunks {
+			w.Write([]byte(c))
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if string(gotBody) != want {
+		t.Fatalf("client received:\n%q\nwant:\n%q", gotBody, want)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.ResponseRedacted != 1 {
+		t.Fatalf("Stats.ResponseRedacted = %d, want 1", snap.ResponseRedacted)
+	}
+
+	logOutput := waitForLogContains(&logBuf, "[RESPONSE REDACT]", time.Second)
+	if strings.Contains(logOutput, secret) {
+		t.Fatalf("log leaked the matched secret value: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "Triggered rule: openai-api-key") {
+		t.Fatalf("log missing triggered rule name: %q", logOutput)
+	}
+}
+
+// TestServer_ResponseSecretScanning_BlocksStreamOnSecretAndNeverCaches
+// proves a Block-actioned rule matching an SSE event mid-stream ends the
+// stream right there: everything already forwarded before that event
+// stays with the client, but neither the offending event nor anything
+// after it (which the proxy never even reads from upstream) ever
+// reaches the client, and the truncated stream is never cached — the
+// same non-caching guarantee as any other incomplete stream.
+func TestServer_ResponseSecretScanning_BlocksStreamOnSecretAndNeverCaches(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	secret := "AKIAABCDEFGHIJKLMNOP"
+	const requestBody = `{"stream":true}`
+	const requestPath = "/v1/chat/completions"
+	firstChunk := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(firstChunk))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"" + secret + "\"}}]}\n\n"))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+	srv.Cache = c
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+requestPath, "application/json", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	// The connection is expected to end abnormally right after the first
+	// chunk, the same way a genuinely aborted upstream would; capturing
+	// and ignoring that error is the point of this test — what matters is
+	// how much (and which) of the body was received before it happened.
+	gotBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if string(gotBody) != firstChunk {
+		t.Fatalf("client received %q, want exactly the pre-block chunk %q and nothing else", gotBody, firstChunk)
+	}
+	if strings.Contains(string(gotBody), secret) {
+		t.Fatalf("client received the raw secret: %q", gotBody)
+	}
+	if strings.Contains(string(gotBody), "world") {
+		t.Fatalf("client received content that arrived after the blocked event: %q", gotBody)
+	}
+
+	logOutput := waitForLogContains(&logBuf, "[RESPONSE BLOCK]", time.Second)
+	if strings.Contains(logOutput, secret) {
+		t.Fatalf("log leaked the matched secret value: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "Triggered rule: aws-access-key") {
+		t.Fatalf("log missing triggered rule name: %q", logOutput)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.ResponseBlocked != 1 {
+		t.Fatalf("Stats.ResponseBlocked = %d, want 1", snap.ResponseBlocked)
+	}
+
+	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
+	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
+	if _, hit, err := c.Get(key); err != nil {
+		t.Fatalf("cache.Get: %v", err)
+	} else if hit {
+		t.Fatal("a stream cut short by a response Block rule must never be cached, but a cache entry was found")
 	}
 }
 
@@ -1310,13 +1619,13 @@ func TestServer_MultiTargetRouting_StatsBreakDownPerTarget(t *testing.T) {
 	if !strings.Contains(summary, "=== per-target breakdown ===") {
 		t.Fatalf("Summary() missing per-target breakdown header: %q", summary)
 	}
-	if !strings.Contains(summary, "[/openai] allowed=1 blocked=1 redacted=0 rate-limited=0 cache-hits=0 tokens=10 cost=0.0002") {
+	if !strings.Contains(summary, "[/openai] allowed=1 blocked=1 redacted=0 rate-limited=0 cache-hits=0 tokens=10 response-blocked=0 response-redacted=0 cost=0.0002") {
 		t.Fatalf("Summary() missing correct /openai line: %q", summary)
 	}
-	if !strings.Contains(summary, "[/anthropic] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=30 cost=0.0006") {
+	if !strings.Contains(summary, "[/anthropic] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=30 response-blocked=0 response-redacted=0 cost=0.0006") {
 		t.Fatalf("Summary() missing correct /anthropic line: %q", summary)
 	}
-	if !strings.Contains(summary, "[default] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=0 cost=0.0000") {
+	if !strings.Contains(summary, "[default] allowed=1 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=0 response-blocked=0 response-redacted=0 cost=0.0000") {
 		t.Fatalf("Summary() missing correct default line: %q", summary)
 	}
 }
@@ -1343,14 +1652,16 @@ func TestServer_SingleTarget_SummaryOmitsPerTargetBreakdown(t *testing.T) {
 // statsJSONResponse mirrors the wire shape served at GET /_aiproxy/stats,
 // for tests to decode into.
 type statsJSONResponse struct {
-	Allowed       int64                        `json:"allowed"`
-	Blocked       int64                        `json:"blocked"`
-	Redacted      int64                        `json:"redacted"`
-	RateLimited   int64                        `json:"rate_limited"`
-	CacheHits     int64                        `json:"cache_hits"`
-	TotalTokens   int64                        `json:"total_tokens"`
-	EstimatedCost *float64                     `json:"estimated_cost,omitempty"`
-	PerTarget     map[string]statsJSONResponse `json:"per_target,omitempty"`
+	Allowed          int64                        `json:"allowed"`
+	Blocked          int64                        `json:"blocked"`
+	Redacted         int64                        `json:"redacted"`
+	RateLimited      int64                        `json:"rate_limited"`
+	CacheHits        int64                        `json:"cache_hits"`
+	TotalTokens      int64                        `json:"total_tokens"`
+	ResponseBlocked  int64                        `json:"response_blocked"`
+	ResponseRedacted int64                        `json:"response_redacted"`
+	EstimatedCost    *float64                     `json:"estimated_cost,omitempty"`
+	PerTarget        map[string]statsJSONResponse `json:"per_target,omitempty"`
 }
 
 // TestServer_StatsEndpoint_ReturnsCurrentSnapshotAsJSON drives a request
@@ -1670,6 +1981,76 @@ func TestServer_MetricsEndpoint_ReturnsPrometheusFormatWithCurrentCounts(t *test
 	}
 	if !strings.Contains(out, `aiproxy_requests_blocked_total{target="default"} 1`) {
 		t.Errorf("missing blocked=1 for target=default: %q", out)
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsResponseBlockedAndRedactedCounts
+// proves the two response-side counters are wired into the Prometheus
+// endpoint too, not just /_aiproxy/stats — easy to forget since neither
+// promCounters entry is derived automatically from anything else.
+func TestServer_MetricsEndpoint_ReportsResponseBlockedAndRedactedCounts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/block" {
+			w.Write([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+			return
+		}
+		w.Write([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	blockResp, err := http.Post(frontend.URL+"/block", "application/json", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("post (response block): %v", err)
+	}
+	blockResp.Body.Close()
+
+	redactResp, err := http.Post(frontend.URL+"/redact", "application/json", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("post (response redact): %v", err)
+	}
+	redactResp.Body.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+
+	if !strings.Contains(out, `aiproxy_responses_blocked_total{target="default"} 1`) {
+		t.Errorf("missing response-blocked=1 for target=default: %q", out)
+	}
+	if !strings.Contains(out, `aiproxy_responses_redacted_total{target="default"} 1`) {
+		t.Errorf("missing response-redacted=1 for target=default: %q", out)
 	}
 }
 
@@ -2973,5 +3354,79 @@ func TestServer_StatsEndpoint_ReportsRedactedCount(t *testing.T) {
 	}
 	if got.Redacted != 1 {
 		t.Fatalf("redacted = %d, want 1: %+v", got.Redacted, got)
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsResponseBlockedAndRedactedCounts proves
+// the live /_aiproxy/stats endpoint surfaces the two response-side
+// counters — easy to forget to wire into the hand-written JSON shape
+// alongside their request-side counterparts, since neither is derived
+// automatically from stats.Snapshot.
+func TestServer_StatsEndpoint_ReportsResponseBlockedAndRedactedCounts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/block" {
+			w.Write([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+			return
+		}
+		w.Write([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	// Both request bodies are clean — the secret only ever appears in
+	// what the upstream "generated" in its response, so these two
+	// events can only be the response-side counters, never the
+	// request-side ones.
+	blockResp, err := http.Post(frontend.URL+"/block", "application/json", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("post (response block): %v", err)
+	}
+	blockResp.Body.Close()
+
+	redactResp, err := http.Post(frontend.URL+"/redact", "application/json", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("post (response redact): %v", err)
+	}
+	redactResp.Body.Close()
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ResponseBlocked != 1 {
+		t.Fatalf("response_blocked = %d, want 1: %+v", got.ResponseBlocked, got)
+	}
+	if got.ResponseRedacted != 1 {
+		t.Fatalf("response_redacted = %d, want 1: %+v", got.ResponseRedacted, got)
 	}
 }

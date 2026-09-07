@@ -5,12 +5,12 @@
 [![License: MIT](https://img.shields.io/github/license/aleksanderbernacki12-byte/aiproxy)](LICENSE)
 
 aiproxy is a local reverse proxy that sits between your machine and an
-HTTPS API. It reads every outgoing request in cleartext, checks the body
-and headers against a set of security rules, and blocks anything that
-looks like a leaked secret — cloud and API provider keys, GitHub tokens,
-private key material, and any custom patterns you define — before it
-ever leaves your machine over the new HTTPS connection to the real
-target.
+HTTPS API. It reads every outgoing request — and the response coming
+back — in cleartext, checks the body and headers against a set of
+security rules, and blocks or masks anything that looks like a leaked
+secret — cloud and API provider keys, GitHub tokens, private key
+material, and any custom patterns you define — before it ever leaves
+your machine, or ever reaches your client, respectively.
 
 ## Starting the proxy
 
@@ -130,10 +130,10 @@ serves, instead of the multi-line text block):
 {"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42,"per_target":{"default":{"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42}}}
 ```
 
-`level` is one of `allow`, `block`, `rate_limited`, `usage`, `cache_hit`,
-or `error` (an internal problem unrelated to any specific request, e.g.
-a failed cache write) — `method`/`url`/`rule`/`tokens` appear only where
-relevant. This only affects the ongoing per-request log stream on
+`level` is one of `allow`, `block`, `redact`, `response_block`,
+`response_redact`, `rate_limited`, `usage`, `cache_hit`, or `error` (an
+internal problem unrelated to any specific request, e.g. a failed cache
+write) — `method`/`url`/`rule`/`tokens` appear only where relevant. This only affects the ongoing per-request log stream on
 stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
 ...`, `aiproxy listening on ...`) still print as plain text on stdout,
 since they're low-volume, human-oriented setup notices rather than part
@@ -271,6 +271,38 @@ must be one of the built-in rule names listed above (`aiproxy validate`
 catches a typo here the same way it catches a bad regex), and values are
 `"block"`, `"redact"`, or `"off"` — the first two are the same pair as
 `custom_rules[].action`, which has no `"off"` value of its own.
+
+## Scanning responses too
+
+Every built-in pattern and every `custom_rules` entry runs against
+what comes back from the model as well as what goes out to it — no
+separate config, same rules, same `block`/`redact`/`off` actions. This
+guards against a secret leaking the other direction: a model echoing
+something back it shouldn't (a prompt injection, a completion that
+repeats earlier context verbatim), or an upstream error message
+reflecting request data. A response match is a distinct outcome from a
+request match — `response_blocked`/`response_redacted` in
+`GET /_aiproxy/stats` and the Prometheus endpoint, a `[RESPONSE BLOCK]`
+/ `[RESPONSE REDACT]` log line (`"response_block"`/`"response_redact"`
+under `--log-format json`), and its own webhook event — since a leak
+coming back is a meaningfully different signal from one caught going
+out, even though the underlying rule is identical.
+
+A blocked non-streaming response never reaches the client at all — it
+gets a 403 with a generic message in place of the real body, the same
+way a blocked request never reaches the upstream. A streamed (SSE)
+response is scanned one event at a time as it arrives, so a match is
+still caught without buffering the whole reply first: `redact` masks
+the secret in that one event and the stream continues normally, but
+`block` can only end the stream from that point on, not erase what
+already reached the client — by the time a chunk can even be inspected,
+the response's 200 status and headers are already sent. A response a
+`block` rule cut short ends the connection abnormally rather than
+looking like a short-but-complete answer, and — same as any other
+incomplete stream — is never written to the cache. A secret split
+exactly across two streamed chunks is a known limitation of scanning
+one event at a time; in practice a model's individual text deltas are
+almost always more than a couple of bytes.
 
 ## Multi-target routing
 
@@ -459,7 +491,8 @@ stats it reports, and any method other than `GET` gets a 405.
 
 Stats and metrics are pull-based — something has to go and look at them.
 Set `webhook_url` to get pushed a real-time alert instead, the moment a
-rule blocks or redacts a request:
+rule matches — on a request going out or a
+[response](#scanning-responses-too) coming back:
 
 ```json
 {
@@ -467,7 +500,8 @@ rule blocks or redacts a request:
 }
 ```
 
-Every block and redact event POSTs this JSON body to that URL:
+Every block or redact event — `block`, `redact`, `response_block`, or
+`response_redact` — POSTs this JSON body to that URL:
 
 ```json
 {

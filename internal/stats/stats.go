@@ -17,22 +17,26 @@ import (
 // without a mutex. Stats keeps one for the overall total and one per
 // target.
 type counters struct {
-	allowed     atomic.Int64
-	blocked     atomic.Int64
-	redacted    atomic.Int64
-	rateLimited atomic.Int64
-	cacheHits   atomic.Int64
-	totalTokens atomic.Int64
+	allowed          atomic.Int64
+	blocked          atomic.Int64
+	redacted         atomic.Int64
+	rateLimited      atomic.Int64
+	cacheHits        atomic.Int64
+	totalTokens      atomic.Int64
+	responseBlocked  atomic.Int64
+	responseRedacted atomic.Int64
 }
 
 func (c *counters) snapshot() Snapshot {
 	return Snapshot{
-		Allowed:     c.allowed.Load(),
-		Blocked:     c.blocked.Load(),
-		Redacted:    c.redacted.Load(),
-		RateLimited: c.rateLimited.Load(),
-		CacheHits:   c.cacheHits.Load(),
-		TotalTokens: c.totalTokens.Load(),
+		Allowed:          c.allowed.Load(),
+		Blocked:          c.blocked.Load(),
+		Redacted:         c.redacted.Load(),
+		RateLimited:      c.rateLimited.Load(),
+		CacheHits:        c.cacheHits.Load(),
+		TotalTokens:      c.totalTokens.Load(),
+		ResponseBlocked:  c.responseBlocked.Load(),
+		ResponseRedacted: c.responseRedacted.Load(),
 	}
 }
 
@@ -106,6 +110,23 @@ func (s *Stats) RecordTokensUsed(target string, n int) {
 	}
 }
 
+// RecordResponseBlock records one upstream response the rule engine
+// withheld from the client because a rule matched something in it —
+// distinct from RecordBlock, which is a request never sent upstream at
+// all; this is a leak caught coming back instead of going out.
+func (s *Stats) RecordResponseBlock(target string) {
+	s.overall.responseBlocked.Add(1)
+	s.counterFor(target).responseBlocked.Add(1)
+}
+
+// RecordResponseRedact records one upstream response the rule engine
+// forwarded with a matched secret masked out of it, rather than
+// withholding it outright.
+func (s *Stats) RecordResponseRedact(target string) {
+	s.overall.responseRedacted.Add(1)
+	s.counterFor(target).responseRedacted.Add(1)
+}
+
 // Snapshot is a point-in-time copy of the counters, safe to read and
 // print without further synchronization. PerTarget holds the same
 // breakdown keyed by target name; a Snapshot inside PerTarget never has
@@ -117,6 +138,13 @@ type Snapshot struct {
 	RateLimited int64 `json:"rate_limited"`
 	CacheHits   int64 `json:"cache_hits"`
 	TotalTokens int64 `json:"total_tokens"`
+
+	// ResponseBlocked and ResponseRedacted count the same two outcomes
+	// as Blocked and Redacted, but for a rule matching the upstream's
+	// response instead of the client's request — a leak caught coming
+	// back rather than going out.
+	ResponseBlocked  int64 `json:"response_blocked"`
+	ResponseRedacted int64 `json:"response_redacted"`
 
 	PerTarget map[string]Snapshot `json:"per_target,omitempty"`
 }
@@ -154,8 +182,11 @@ func (s Snapshot) String() string {
 			"Requests redacted:   %d\n"+
 			"Rate-limited (429):  %d\n"+
 			"Cache hits:          %d\n"+
-			"Total tokens used:   %d",
+			"Total tokens used:   %d\n"+
+			"Responses blocked:   %d\n"+
+			"Responses redacted:  %d",
 		s.Allowed, s.Blocked, s.Redacted, s.RateLimited, s.CacheHits, s.TotalTokens,
+		s.ResponseBlocked, s.ResponseRedacted,
 	)
 }
 
@@ -179,8 +210,8 @@ func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
 	b.WriteString("=== per-target breakdown ===")
 	for _, name := range names {
 		t := s.PerTarget[name]
-		fmt.Fprintf(&b, "\n[%s] allowed=%d blocked=%d redacted=%d rate-limited=%d cache-hits=%d tokens=%d",
-			name, t.Allowed, t.Blocked, t.Redacted, t.RateLimited, t.CacheHits, t.TotalTokens)
+		fmt.Fprintf(&b, "\n[%s] allowed=%d blocked=%d redacted=%d rate-limited=%d cache-hits=%d tokens=%d response-blocked=%d response-redacted=%d",
+			name, t.Allowed, t.Blocked, t.Redacted, t.RateLimited, t.CacheHits, t.TotalTokens, t.ResponseBlocked, t.ResponseRedacted)
 		if costPer1KTokens > 0 {
 			fmt.Fprintf(&b, " cost=%.4f", t.EstimatedCost(costPer1KTokens))
 		}

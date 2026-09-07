@@ -18,6 +18,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -564,11 +565,13 @@ func isEventStream(resp *http.Response) bool {
 	return mediaType == "text/event-stream"
 }
 
-// bufferResponse reads the full response body into memory so it can look
-// for an LLM-style token usage payload and, if caching is enabled, store
-// the response for future identical requests. It immediately restores
-// the body so the client still receives it intact — whether or not the
-// body turned out to be parseable JSON.
+// bufferResponse reads the full response body into memory, scans it for
+// a leaked secret the same way an outgoing request is scanned (guarding
+// against the model echoing one back — a prompt injection, or an
+// upstream error message reflecting request data — not just what the
+// client sent going out), looks for an LLM-style token usage payload,
+// and, if caching is enabled, stores the response for future identical
+// requests.
 func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) error {
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -577,6 +580,27 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// means there is nothing intact left to hand the client; let
 		// ReverseProxy's normal error handling take over.
 		return err
+	}
+
+	action, ruleName, scannedBody := s.getEngine().EvaluateResponse(body)
+	if action == rules.Block {
+		s.Stats.RecordResponseBlock(reqCtx.targetLabel)
+		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
+		s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
+		msg := []byte("response blocked by aiproxy rules")
+		resp.StatusCode = http.StatusForbidden
+		resp.Status = http.StatusText(http.StatusForbidden)
+		resp.Header.Set("Content-Length", strconv.Itoa(len(msg)))
+		resp.ContentLength = int64(len(msg))
+		resp.Body = io.NopCloser(bytes.NewReader(msg))
+		return nil
+	}
+	if action == rules.Redact {
+		s.Stats.RecordResponseRedact(reqCtx.targetLabel)
+		s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName)
+		s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName)
+		body = scannedBody
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -599,26 +623,43 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 
 // streamResponse wraps resp.Body in a streamTee so ReverseProxy's own
 // copy loop streams each chunk to the client immediately, exactly as it
-// arrives from upstream, while a copy of every byte is accumulated on
-// the side. Once the stream ends, ReverseProxy closes the body, which
-// triggers usage extraction and — for a clean, complete stream on a 200
-// response — a cache write, both from the accumulated copy.
+// arrives from upstream — except a chunk streamTee's engine catches a
+// secret in is redacted (or, for a Block-actioned rule, withheld,
+// ending the stream) before ever reaching that copy loop — while the
+// (post-scan) bytes are accumulated on the side. Once the stream ends,
+// ReverseProxy closes the body, which triggers usage extraction and —
+// for a clean, complete stream on a 200 response — a cache write, both
+// from the accumulated copy.
 func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) {
 	statusCode := resp.StatusCode
 	header := resp.Header
 
-	resp.Body = &streamTee{
-		src: resp.Body,
-		onComplete: func(data []byte, cleanEOF bool) {
-			// Cache first, log second: a caller that observes the log
-			// line (e.g. a test synchronizing on it) can then rely on the
-			// cache write having already landed.
-			if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
-				s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data)
-			}
-			s.logUsageFromBody(reqCtx, data)
+	tee := &streamTee{
+		src:    resp.Body,
+		engine: s.getEngine(),
+		onRedact: func(ruleName string) {
+			s.Stats.RecordResponseRedact(reqCtx.targetLabel)
+			s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName)
+			s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName)
+		},
+		onBlock: func(ruleName string) {
+			s.Stats.RecordResponseBlock(reqCtx.targetLabel)
+			s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
+			s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
 		},
 	}
+	tee.onComplete = func(data []byte, cleanEOF bool) {
+		// Cache first, log second: a caller that observes the log
+		// line (e.g. a test synchronizing on it) can then rely on the
+		// cache write having already landed. A stream a Block rule cut
+		// short is never cached, same as any other incomplete stream:
+		// cleanEOF is false for it too (see streamTee.Read).
+		if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
+			s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data)
+		}
+		s.logUsageFromBody(reqCtx, data)
+	}
+	resp.Body = tee
 }
 
 // writeStreamToCache stores a completed stream's accumulated bytes under
@@ -636,28 +677,153 @@ func (s *Server) writeStreamToCache(cch *cache.Cache, key string, statusCode int
 	}
 }
 
+// errResponseBlocked is returned by streamTee.Read once a Block-actioned
+// rule matches a streamed response chunk: ReverseProxy's copy loop ends
+// on this error rather than a clean EOF, so the connection reads as
+// broken instead of as a normal, complete response. This distinction
+// matters because a streaming response's 200 status and headers are
+// already committed to the client before the first byte of its body is
+// even read — by the time a Block match can be detected, some of the
+// response may already be on its way to the client, so there is no way
+// to withdraw it the way a non-streaming Block (see bufferResponse) can
+// swap in a clean 403 before anything is sent. Ending the connection
+// abnormally at least keeps a truncated-but-silent stream from being
+// mistaken for a short but complete answer.
+var errResponseBlocked = errors.New("aiproxy: response blocked by rule")
+
 // streamTee lets a streaming response body be read normally (so
 // ReverseProxy can copy it straight through to the client) while every
-// byte read is also captured. onComplete runs exactly once, when the
-// stream is closed, with the full accumulated data and whether the
-// stream ended cleanly (io.EOF) rather than by some other read error.
+// byte is also scanned for a leaked secret before being handed back —
+// one accumulated batch at a time, split on the standard SSE event
+// boundary ("\n\n"), so a match is (almost always) caught within
+// whatever text delta it actually arrived in, without buffering the
+// whole response the way bufferResponse does for a non-streaming reply.
+// engine nil disables scanning entirely (chunks pass through untouched,
+// same as before response scanning existed); onRedact/onBlock, if set,
+// fire synchronously — once per matching batch, in real time as it's
+// found — rather than being deferred to onComplete, which instead runs
+// exactly once, when the stream is closed, with the full accumulated
+// (post-scan) data and whether the stream ended cleanly.
+//
+// A secret split exactly across two batches is a known limitation:
+// each is scanned independently, the same trade-off documented for the
+// jwt/off built-in rule and for redacting a Bedrock-signed request body
+// elsewhere in this project — real-world text deltas are practically
+// always more than a couple of bytes, so this only matters in a
+// pathological worst case.
 type streamTee struct {
-	src        io.ReadCloser
-	buf        bytes.Buffer
-	cleanEOF   bool
+	src    io.ReadCloser
+	engine *rules.Engine
+
+	tmp     [32 * 1024]byte
+	pending bytes.Buffer // raw bytes read but not yet a complete batch
+	out     bytes.Buffer // processed bytes still owed to Read's caller
+	buf     bytes.Buffer // full accumulated (post-scan) data, for onComplete
+
+	blocked bool
+
+	onRedact   func(ruleName string)
+	onBlock    func(ruleName string)
 	onComplete func(data []byte, cleanEOF bool)
+	cleanEOF   bool
 	once       sync.Once
 }
 
 func (t *streamTee) Read(p []byte) (int, error) {
-	n, err := t.src.Read(p)
-	if n > 0 {
-		t.buf.Write(p[:n])
+	for t.out.Len() == 0 && !t.blocked {
+		n, err := t.src.Read(t.tmp[:])
+		if n > 0 {
+			t.pending.Write(t.tmp[:n])
+			t.processCompleteBatch()
+		}
+		if t.blocked {
+			// A Block match found in the bytes just read overrides
+			// whatever err src.Read returned alongside them, even
+			// io.EOF: per the io.Reader contract, a reader is allowed to
+			// return its final bytes together with io.EOF in the same
+			// call, and treating that as a clean end here would let a
+			// blocked stream slip through indistinguishable from a
+			// normal one (and, e.g., get cached).
+			break
+		}
+		if err != nil {
+			if err == io.EOF {
+				t.cleanEOF = true
+				t.processRemainder()
+			}
+			if t.out.Len() == 0 {
+				return 0, err
+			}
+			break
+		}
 	}
-	if err == io.EOF {
-		t.cleanEOF = true
+
+	if t.out.Len() > 0 {
+		return t.out.Read(p)
 	}
-	return n, err
+	return 0, errResponseBlocked
+}
+
+// processCompleteBatch scans t.pending up through its last SSE event
+// boundary, if any, and leaves whatever comes after that boundary (a
+// still-incomplete trailing event) in t.pending for a future Read.
+func (t *streamTee) processCompleteBatch() {
+	data := t.pending.Bytes()
+	idx := bytes.LastIndex(data, []byte("\n\n"))
+	if idx == -1 {
+		return
+	}
+	boundary := idx + 2
+	t.scan(data[:boundary])
+	remainder := append([]byte(nil), data[boundary:]...)
+	t.pending.Reset()
+	t.pending.Write(remainder)
+}
+
+// processRemainder flushes whatever is left in t.pending once the
+// source has reached EOF: there is no more data ever coming to
+// complete a trailing partial event, so it is scanned and forwarded
+// as-is now rather than silently dropped.
+func (t *streamTee) processRemainder() {
+	if t.pending.Len() == 0 {
+		return
+	}
+	t.scan(t.pending.Bytes())
+	t.pending.Reset()
+}
+
+// scan runs engine (if any) against one batch of streamed bytes and
+// appends the result to t.out and t.buf — redacted in place for a
+// Redact match, or, for a Block match, not appended at all: t.blocked
+// is set instead, so Read ends the stream once whatever is already in
+// t.out has been handed back.
+func (t *streamTee) scan(batch []byte) {
+	if t.blocked {
+		return
+	}
+	if t.engine == nil {
+		t.out.Write(batch)
+		t.buf.Write(batch)
+		return
+	}
+
+	action, ruleName, scanned := t.engine.EvaluateResponse(batch)
+	switch action {
+	case rules.Block:
+		t.blocked = true
+		if t.onBlock != nil {
+			t.onBlock(ruleName)
+		}
+	case rules.Redact:
+		t.out.Write(scanned)
+		t.buf.Write(scanned)
+		if t.onRedact != nil {
+			t.onRedact(ruleName)
+		}
+	default:
+		t.out.Write(batch)
+		t.buf.Write(batch)
+	}
 }
 
 func (t *streamTee) Close() error {
@@ -794,6 +960,22 @@ func (s *Server) logRedact(method, reqURL, ruleName string) {
 	s.logf("%s[REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
 }
 
+func (s *Server) logResponseBlock(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "response_block", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
+	s.logf("%s[RESPONSE BLOCK] %s %s - Triggered rule: %s%s", ansiBrightRed, method, reqURL, ruleName, ansiReset)
+}
+
+func (s *Server) logResponseRedact(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "response_redact", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
+	s.logf("%s[RESPONSE REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
+}
+
 // webhookClient is a dedicated HTTP client for webhook deliveries, kept
 // separate from the reverse proxy's own upstream connections and given a
 // short, fixed timeout: a slow or hanging alert endpoint must never be
@@ -908,24 +1090,28 @@ func (s *Server) logf(format string, args ...any) {
 // is a proxy-level concern (CostPer1KTokens) that the stats package has
 // no notion of.
 type statsSnapshotJSON struct {
-	Allowed       int64                        `json:"allowed"`
-	Blocked       int64                        `json:"blocked"`
-	Redacted      int64                        `json:"redacted"`
-	RateLimited   int64                        `json:"rate_limited"`
-	CacheHits     int64                        `json:"cache_hits"`
-	TotalTokens   int64                        `json:"total_tokens"`
-	EstimatedCost *float64                     `json:"estimated_cost,omitempty"`
-	PerTarget     map[string]statsSnapshotJSON `json:"per_target,omitempty"`
+	Allowed          int64                        `json:"allowed"`
+	Blocked          int64                        `json:"blocked"`
+	Redacted         int64                        `json:"redacted"`
+	RateLimited      int64                        `json:"rate_limited"`
+	CacheHits        int64                        `json:"cache_hits"`
+	TotalTokens      int64                        `json:"total_tokens"`
+	ResponseBlocked  int64                        `json:"response_blocked"`
+	ResponseRedacted int64                        `json:"response_redacted"`
+	EstimatedCost    *float64                     `json:"estimated_cost,omitempty"`
+	PerTarget        map[string]statsSnapshotJSON `json:"per_target,omitempty"`
 }
 
 func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnapshotJSON {
 	out := statsSnapshotJSON{
-		Allowed:     snap.Allowed,
-		Blocked:     snap.Blocked,
-		Redacted:    snap.Redacted,
-		RateLimited: snap.RateLimited,
-		CacheHits:   snap.CacheHits,
-		TotalTokens: snap.TotalTokens,
+		Allowed:          snap.Allowed,
+		Blocked:          snap.Blocked,
+		Redacted:         snap.Redacted,
+		RateLimited:      snap.RateLimited,
+		CacheHits:        snap.CacheHits,
+		TotalTokens:      snap.TotalTokens,
+		ResponseBlocked:  snap.ResponseBlocked,
+		ResponseRedacted: snap.ResponseRedacted,
 	}
 	if costPer1KTokens > 0 {
 		cost := snap.EstimatedCost(costPer1KTokens)
@@ -970,6 +1156,8 @@ var promCounters = []struct {
 	{"aiproxy_requests_rate_limited_total", "Total number of requests rejected by the rate limiter.", func(s stats.Snapshot) int64 { return s.RateLimited }},
 	{"aiproxy_cache_hits_total", "Total number of requests served from the local response cache.", func(s stats.Snapshot) int64 { return s.CacheHits }},
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
+	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
+	{"aiproxy_responses_redacted_total", "Total number of upstream responses forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.ResponseRedacted }},
 }
 
 // promLabelValue escapes a label value per the Prometheus text
