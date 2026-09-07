@@ -129,6 +129,36 @@ const statsPath = "/_aiproxy/stats"
 // "metrics_path: /_aiproxy/metrics" instead.
 const metricsPath = "/_aiproxy/metrics"
 
+// headerScanExcludes lists, in lowercase, the header names never handed
+// to the rule engine for scanning — see filterHeadersForScanning. These
+// are exactly the headers a client legitimately uses to authenticate to
+// the proxied upstream LLM API on every single request: Anthropic's
+// "x-api-key", the generic bearer-token "Authorization" convention (also
+// how OpenAI and Vertex AI are authenticated), and its
+// "Proxy-Authorization" analogue. Scanning them against the same
+// low-false-positive secret patterns built to catch a *leaked* key would
+// flag every legitimate authenticated request, since the credential is
+// deliberately shaped exactly like what those patterns are built to
+// detect.
+var headerScanExcludes = map[string]bool{
+	"authorization":       true,
+	"proxy-authorization": true,
+	"x-api-key":           true,
+}
+
+// filterHeadersForScanning returns a copy of header with every name in
+// headerScanExcludes removed, for passing to rules.Request.Headers.
+func filterHeadersForScanning(header http.Header) map[string][]string {
+	filtered := make(map[string][]string, len(header))
+	for name, values := range header {
+		if headerScanExcludes[strings.ToLower(name)] {
+			continue
+		}
+		filtered[name] = values
+	}
+	return filtered
+}
+
 // DefaultMaxBodyBytes is the request body size limit applied whenever
 // Server.MaxBodyBytes is zero or negative. 10 MiB comfortably covers a
 // normal LLM chat/completion payload, including a reasonably sized
@@ -431,10 +461,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	action, ruleName, evaluatedBody, err := s.getEngine().Evaluate(rules.Request{
-		Method: r.Method,
-		URL:    r.URL.String(),
-		Body:   body,
+	action, ruleName, evaluatedBody, evaluatedHeaders, err := s.getEngine().Evaluate(rules.Request{
+		Method:  r.Method,
+		URL:     r.URL.String(),
+		Body:    body,
+		Headers: filterHeadersForScanning(r.Header),
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -456,11 +487,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// evaluatedBody is body unchanged unless action is Redact, in which
-	// case it has the matched secret masked out — forwarded either way,
-	// so the client's request only ever fails on Block above.
+	// evaluatedBody and evaluatedHeaders are body/r.Header unchanged
+	// unless action is Redact, in which case whichever of the two the
+	// match was actually found in has the matched secret masked out —
+	// forwarded either way, so the client's request only ever fails on
+	// Block above. Headers are merged back by name rather than replacing
+	// r.Header wholesale, since evaluatedHeaders only ever covers the
+	// subset filterHeadersForScanning handed to the engine.
 	r.Body = io.NopCloser(bytes.NewReader(evaluatedBody))
 	r.ContentLength = int64(len(evaluatedBody))
+	for name, values := range evaluatedHeaders {
+		r.Header[name] = values
+	}
 	if action == rules.Redact {
 		s.Stats.RecordRedact(targetLabel)
 		s.logRedact(r.Method, r.URL.String(), ruleName)

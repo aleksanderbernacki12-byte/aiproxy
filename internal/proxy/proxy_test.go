@@ -2483,6 +2483,210 @@ func TestServer_Redact_JSONLogging_EmitsRedactLevel(t *testing.T) {
 	}
 }
 
+// TestServer_HeaderSecretScanning_BlocksMatchingHeader proves a secret
+// pasted into an arbitrary header, not the body, is still caught: the
+// body is clean, but a custom header carries a leaked AWS key.
+func TestServer_HeaderSecretScanning_BlocksMatchingHeader(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	secret := "AKIAABCDEFGHIJKLMNOP"
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/upload", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Debug-Info", secret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if upstreamHit.Load() {
+		t.Fatal("blocked request must never reach the upstream target")
+	}
+
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, secret) {
+		t.Fatalf("log leaked the matched secret value: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "Triggered rule: aws-access-key") {
+		t.Fatalf("log missing triggered rule name: %q", logOutput)
+	}
+}
+
+// TestServer_HeaderSecretScanning_RedactsMatchingHeaderAndForwardsRequest
+// proves a Redact rule matched in a header masks only that header's
+// value before forwarding — the body and every other header arrive at
+// the upstream unchanged, and the request isn't blocked.
+func TestServer_HeaderSecretScanning_RedactsMatchingHeaderAndForwardsRequest(t *testing.T) {
+	var upstreamReceived http.Header
+	var upstreamReceivedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamReceived = r.Header.Clone()
+		b, _ := io.ReadAll(r.Body)
+		upstreamReceivedBody = b
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	secret := "sk-FAKEKEY1234567890ABCDEFGHIJ"
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Debug-Info", secret)
+	req.Header.Set("X-Other", "unrelated-value")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a redacted request must still be forwarded and answered)", resp.StatusCode, http.StatusOK)
+	}
+	if string(upstreamReceivedBody) != `{"hello":"world"}` {
+		t.Fatalf("upstream received body = %q, want unchanged", upstreamReceivedBody)
+	}
+	if got := upstreamReceived.Get("X-Debug-Info"); got != "[REDACTED:openai-api-key]" {
+		t.Fatalf("upstream received X-Debug-Info = %q, want %q", got, "[REDACTED:openai-api-key]")
+	}
+	if got := upstreamReceived.Get("X-Other"); got != "unrelated-value" {
+		t.Fatalf("upstream received X-Other = %q, want unchanged", got)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Redacted != 1 {
+		t.Fatalf("Stats.Redacted = %d, want 1", snap.Redacted)
+	}
+}
+
+// TestServer_HeaderSecretScanning_ExemptsAuthorizationHeader proves the
+// Authorization header is never scanned: it's exactly where a client
+// legitimately puts its own upstream API key on every request, so
+// scanning it against the same patterns built to catch a *leaked* key
+// would block all normal traffic.
+func TestServer_HeaderSecretScanning_ExemptsAuthorizationHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer sk-FAKEKEY1234567890ABCDEFGHIJ")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (the client's own upstream credential must never be scanned)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_HeaderSecretScanning_ExemptsXAPIKeyHeader is the same
+// exemption proof as TestServer_HeaderSecretScanning_ExemptsAuthorizationHeader,
+// for the header Anthropic's Messages API uses instead of Authorization.
+func TestServer_HeaderSecretScanning_ExemptsXAPIKeyHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "anthropic-api-key",
+		Pattern: regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/v1/messages", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Api-Key", "sk-ant-api03-FAKEKEY1234567890ABCDEFGHIJ")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (the client's own upstream credential must never be scanned)", resp.StatusCode, http.StatusOK)
+	}
+}
+
 // TestServer_StatsEndpoint_ReportsRedactedCount proves the live
 // /_aiproxy/stats endpoint (and, by the same code path, the shutdown
 // summary) actually surfaces the redacted counter — added alongside

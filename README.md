@@ -6,10 +6,11 @@
 
 aiproxy is a local reverse proxy that sits between your machine and an
 HTTPS API. It reads every outgoing request in cleartext, checks the body
-against a set of security rules, and blocks anything that looks like a
-leaked secret — cloud and API provider keys, GitHub tokens, private key
-material, and any custom patterns you define — before it ever leaves
-your machine over the new HTTPS connection to the real target.
+and headers against a set of security rules, and blocks anything that
+looks like a leaked secret — cloud and API provider keys, GitHub tokens,
+private key material, and any custom patterns you define — before it
+ever leaves your machine over the new HTTPS connection to the real
+target.
 
 ## Starting the proxy
 
@@ -96,6 +97,20 @@ request body isn't always a leak the way the others are — it can be a
 legitimate ID token or session token a client is meant to send — so
 turn it off if it's flagging traffic you already know is fine.
 
+Every pattern above — and every `custom_rules` entry — is checked
+against request headers too, not just the body: a secret pasted into an
+`X-...` debug header, for example, is caught exactly the same way as one
+in the JSON payload. Three headers are always exempt from this scanning,
+regardless of rule configuration: `Authorization`, `Proxy-Authorization`,
+and `X-Api-Key`. Those are exactly where a client legitimately puts its
+own credential for the upstream API on every single request (Anthropic's
+Messages API uses `X-Api-Key`; OpenAI, Vertex AI, and most others use a
+bearer token in `Authorization`) — scanning them against patterns built
+to catch a *leaked* key would block all normal traffic, since a real
+credential is deliberately shaped exactly like what those patterns
+detect. A `redact` rule matched in a header masks only that header's
+value, the same way it masks a match in the body.
+
 ## Structured JSON logging
 
 ```
@@ -150,8 +165,9 @@ reload — those still require a real restart.
 ## Custom rules, rate limiting, caching, and cost estimation
 
 Drop an `aiproxy.json` file in the working directory (or point `--config`
-at one) to add your own body-content rules on top of the
-[built-in secret patterns](#built-in-secret-patterns), cap how many
+at one) to add your own content rules — checked against the body and
+headers alike, see [Built-in secret patterns](#built-in-secret-patterns)
+— on top of the built-in ones, cap how many
 requests the proxy forwards per minute — a local circuit breaker against
 runaway/looping clients — cache responses to disk to save time and API
 costs on repeated calls, and/or price the shutdown summary's token total
@@ -169,7 +185,9 @@ in your own currency:
 ```
 
 Each `pattern` is a Go regular expression, compiled once at startup. Any
-request whose body matches it is blocked with a 403 by default — see
+request whose body or headers match it is blocked with a 403 by default
+(the [same three headers](#built-in-secret-patterns) exempt from the
+built-in patterns are exempt here too) — see
 [Redacting instead of blocking](#redacting-instead-of-blocking) for the
 alternative. `max_requests_per_minute` is optional; when it is 0 or
 omitted, the rate limiter is disabled. Once the limit is hit, further
@@ -224,7 +242,8 @@ and forward the request rather than rejecting it:
 }
 ```
 
-Every occurrence of the matched pattern in the body is replaced with
+Every occurrence of the matched pattern — in the body, or in the one
+header the match was actually found in — is replaced with
 `[REDACTED:<rule name>]` before the request is forwarded — the original
 value never reaches the upstream target, and never reaches the log
 either. Redacted requests are counted separately from allowed ones in

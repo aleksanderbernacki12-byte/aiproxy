@@ -331,7 +331,7 @@ func TestLoad_CustomRuleBecomesActiveInEngine(t *testing.T) {
 		})
 	}
 
-	action, ruleName, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`payload=SECRET_98765`),
@@ -346,7 +346,7 @@ func TestLoad_CustomRuleBecomesActiveInEngine(t *testing.T) {
 		t.Fatalf("rule = %q, want %q", ruleName, "mitt-foretag-hemlighet")
 	}
 
-	action2, _, _, err := engine.Evaluate(rules.Request{
+	action2, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`payload=not-a-secret`),
