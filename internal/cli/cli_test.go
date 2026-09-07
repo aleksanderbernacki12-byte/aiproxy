@@ -379,6 +379,33 @@ func TestExecute_Validate_ValidConfig_WithEveryBuiltinRuleOverride_ReturnsZero(t
 	}
 }
 
+// TestExecute_Validate_ValidConfig_WithBuiltinRuleOff_ReturnsZero proves
+// "off" is accepted for builtin_rule_actions — the only way to fully
+// disable a built-in rule, unlike "block"/"redact" which both keep it
+// active. Actual request-handling behavior (that an "off" rule's
+// pattern really is skipped, while every other built-in rule keeps
+// firing) is verified by hand against the compiled binary, the same way
+// as every other built-in pattern's detection — this test covers the
+// config-to-validation wiring only.
+func TestExecute_Validate_ValidConfig_WithBuiltinRuleOff_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"stripe-api-key": "off"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "built-in rule overrides: 1") {
+		t.Fatalf("stdout missing built-in rule override count: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_DuplicateTargetPrefix_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

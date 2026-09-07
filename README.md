@@ -87,9 +87,9 @@ No config needed — these block by default the moment aiproxy starts:
 | `google-api-key`     | Google API keys (`AIza...`)                                     |
 | `npm-access-token`   | npm access tokens (`npm_...`)                                   |
 
-Each one can be switched independently from blocking to
-[redacting](#redacting-instead-of-blocking) via `builtin_rule_actions`;
-there is currently no way to turn a built-in rule off entirely.
+Each one can be switched independently to
+[redact](#redacting-instead-of-blocking) instead of block, or turned off
+entirely, via `builtin_rule_actions` — see that section below.
 
 ## Structured JSON logging
 
@@ -207,12 +207,16 @@ the stats summary, `GET /_aiproxy/stats`, and the `[REDACT]` log line
 
 The [built-in secret patterns](#built-in-secret-patterns) block by
 default too, but each can be switched to redact independently via
-`builtin_rule_actions`:
+`builtin_rule_actions` — or turned off entirely with `"off"`, the one
+action value that only makes sense here (a custom rule you don't want
+is simply left out of `custom_rules`; a built-in rule has no such list
+to leave it out of):
 
 ```json
 {
   "builtin_rule_actions": {
-    "aws-access-key": "redact"
+    "aws-access-key": "redact",
+    "npm-access-token": "off"
   }
 }
 ```
@@ -220,7 +224,8 @@ default too, but each can be switched to redact independently via
 Any built-in rule not listed keeps blocking. `builtin_rule_actions` keys
 must be one of the built-in rule names listed above (`aiproxy validate`
 catches a typo here the same way it catches a bad regex), and values are
-the same `"block"`/`"redact"` pair as `custom_rules[].action`.
+`"block"`, `"redact"`, or `"off"` — the first two are the same pair as
+`custom_rules[].action`, which has no `"off"` value of its own.
 
 ## Multi-target routing
 

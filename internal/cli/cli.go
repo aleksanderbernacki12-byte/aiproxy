@@ -295,41 +295,54 @@ func builtinRuleNames() []string {
 }
 
 // resolveBuiltinRuleActions turns a config file's builtin_rule_actions
-// map into a rule name -> Action lookup, defaulting every built-in rule
-// not mentioned to its long-standing rules.Block behavior. It reports
-// two kinds of config mistakes as errors, collecting both rather than
-// stopping at the first: an action string that is neither "block" nor
-// "redact", and a key that doesn't match any real built-in rule name
-// (almost always a typo).
-func resolveBuiltinRuleActions(overrides map[string]string) (map[string]rules.Action, []error) {
-	actions := make(map[string]rules.Action, len(builtinRules))
+// map into a rule name -> Action lookup plus a set of rule names turned
+// off entirely, defaulting every built-in rule not mentioned to its
+// long-standing rules.Block behavior. "off" is accepted here and only
+// here — never by parseRuleAction, so a custom_rules entry can't be set
+// to "off" (there's no need: omitting a custom rule from the list
+// already does that) — since it's the only way to fully disable a
+// built-in rule, which can't otherwise be removed from the list the way
+// a custom rule can. It reports three kinds of config mistakes as
+// errors, collecting all of them rather than stopping at the first: an
+// action string that is neither "block", "redact", nor "off"; and a key
+// that doesn't match any real built-in rule name (almost always a
+// typo).
+func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]rules.Action, off map[string]bool, errs []error) {
+	actions = make(map[string]rules.Action, len(builtinRules))
 	names := make(map[string]bool, len(builtinRules))
 	for _, b := range builtinRules {
 		actions[b.name] = rules.Block
 		names[b.name] = true
 	}
 
-	var errs []error
+	off = make(map[string]bool)
 	for name, raw := range overrides {
 		if !names[name] {
 			errs = append(errs, fmt.Errorf("Fatal error: builtin_rule_actions: %q is not a built-in rule (valid names: %s)", name, strings.Join(builtinRuleNames(), ", ")))
 			continue
 		}
+		if raw == "off" {
+			off[name] = true
+			continue
+		}
 		action, err := parseRuleAction(raw)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("Fatal error: Invalid action for built-in rule %s: %w", name, err))
+			// Not parseRuleAction's own error message: "off" is valid
+			// here but not for parseRuleAction's other caller
+			// (custom_rules[].action), so its message can't mention it.
+			errs = append(errs, fmt.Errorf("Fatal error: Invalid action for built-in rule %s: must be \"block\", \"redact\", or \"off\", got %q", name, raw))
 			continue
 		}
 		actions[name] = action
 	}
-	return actions, errs
+	return actions, off, errs
 }
 
 // buildEngine constructs the rule engine used to evaluate every request:
-// every built-in secret-blocking rule in builtinRules (each block or
-// redact, depending on cfg.BuiltinRuleActions), plus any custom rules
-// from cfg. cfg may be nil (no config file at all), in which case only
-// the built-ins apply, all blocking.
+// every built-in secret-blocking rule in builtinRules not turned off
+// (each block or redact otherwise, depending on cfg.BuiltinRuleActions),
+// plus any custom rules from cfg. cfg may be nil (no config file at
+// all), in which case only the built-ins apply, all blocking.
 func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	engine := rules.NewEngine(rules.Allow)
 
@@ -337,8 +350,11 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	if cfg != nil {
 		overrides = cfg.BuiltinRuleActions
 	}
-	actions, errs := resolveBuiltinRuleActions(overrides)
+	actions, off, errs := resolveBuiltinRuleActions(overrides)
 	for _, b := range builtinRules {
+		if off[b.name] {
+			continue
+		}
 		engine.AddBodyRegexRule(rules.BodyRegexRule{
 			Name:    b.name,
 			Pattern: b.pattern,
@@ -399,7 +415,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, e.Error())
 	}
 
-	_, builtinErrs := resolveBuiltinRuleActions(cfg.BuiltinRuleActions)
+	_, _, builtinErrs := resolveBuiltinRuleActions(cfg.BuiltinRuleActions)
 	for _, e := range builtinErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
 	}
