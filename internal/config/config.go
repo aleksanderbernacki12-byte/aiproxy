@@ -68,13 +68,25 @@ type Config struct {
 	Targets []Target `json:"targets"`
 
 	// BuiltinRuleActions overrides the action of one or more of aiproxy's
-	// built-in secret-blocking rules, keyed by rule name
-	// ("aws-access-key", "openai-api-key", or "github-token") with the
-	// same values as CustomRule.Action: "block" (every built-in rule's
-	// long-standing default, still applied to any built-in rule not
-	// mentioned here) or "redact". A key that isn't one of those three
-	// rule names is a config error.
+	// built-in secret-blocking rules, keyed by rule name (see the CLI's
+	// builtinRules for the current list). Values are "block" (every
+	// built-in rule's long-standing default, still applied to any
+	// built-in rule not mentioned here), "redact" (same meaning as
+	// CustomRule.Action), or "off" (skip the rule entirely — the one
+	// value CustomRule.Action has no equivalent for, since leaving a
+	// custom rule out of the list already does that). A key that isn't a
+	// real built-in rule name, or a value that isn't one of those three,
+	// is a config error.
 	BuiltinRuleActions map[string]string `json:"builtin_rule_actions,omitempty"`
+
+	// MaxBodyBytes caps how large a single request body aiproxy will
+	// buffer in memory before rejecting it with a 413. Zero (the default
+	// when the field is absent) does not mean "no limit" the way it does
+	// for every other numeric field above — it means
+	// proxy.DefaultMaxBodyBytes applies instead, since a reverse proxy
+	// that buffers every request body fully in memory before it can be
+	// inspected must never expose an actually-unbounded size by default.
+	MaxBodyBytes int64 `json:"max_body_size_bytes,omitempty"`
 }
 
 // Load reads and parses the config file at path. If the file does not

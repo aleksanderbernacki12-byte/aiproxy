@@ -230,6 +230,99 @@ func TestServer_RateLimiting_SixthRequestGets429AndResetsAfterWindow(t *testing.
 	}
 }
 
+// TestServer_MaxBodyBytes_OversizedRequestGets413 proves a request body
+// larger than the configured MaxBodyBytes is rejected before it's fully
+// buffered, never reaching the upstream, while a body within the limit
+// goes through normally.
+func TestServer_MaxBodyBytes_OversizedRequestGets413(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.MaxBodyBytes = 10
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{"this body is way over 10 bytes"}`))
+	if err != nil {
+		t.Fatalf("post oversized body: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	if upstreamHit.Load() {
+		t.Fatal("an oversized request must never reach the upstream target")
+	}
+
+	resp2, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{"n":1}`))
+	if err != nil {
+		t.Fatalf("post within-limit body: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("within-limit request: status = %d, want %d", resp2.StatusCode, http.StatusOK)
+	}
+	if !upstreamHit.Load() {
+		t.Fatal("a within-limit request must reach the upstream target")
+	}
+}
+
+// TestServer_MaxBodyBytes_ZeroFallsBackToDefaultLimit proves an unset
+// (zero) MaxBodyBytes doesn't mean "unlimited" the way it does for
+// every other numeric Server field — DefaultMaxBodyBytes applies
+// instead, and a request comfortably inside it still succeeds.
+func TestServer_MaxBodyBytes_ZeroFallsBackToDefaultLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	// srv.MaxBodyBytes deliberately left at its zero value.
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{"n":1}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (default limit must not block an ordinary small body)", resp.StatusCode, http.StatusOK)
+	}
+
+	oversized := strings.Repeat("a", proxy.DefaultMaxBodyBytes+1)
+	resp2, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(oversized))
+	if err != nil {
+		t.Fatalf("post oversized body: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d (default limit must still apply)", resp2.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+}
+
 // TestServer_LogsTokenUsageAndDeliversResponseBodyUnchanged proves that
 // ModifyResponse's inspection of an LLM-style JSON response is fully
 // transparent to the client: the exact bytes the upstream sent are what
@@ -2150,7 +2243,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, []proxy.Route{
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, []proxy.Route{
 		{Prefix: "/other", Target: otherURL, Limiter: strictLimiter},
 	})
 
@@ -2214,7 +2307,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, nil)
 		}
 	}()
 

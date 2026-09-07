@@ -134,10 +134,11 @@ kill -HUP <aiproxy-pid>
 
 Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
-custom rules, the rate limit, the cache, cost estimation, and target
-routes all take effect for the next request, with no dropped
-connections and no restart. Every one of these is logged (as `reload` on
-success, or `reload_error` on failure, under `--log-format json`).
+custom rules, the rate limit, the cache, cost estimation, the max
+request body size, and target routes all take effect for the next
+request, with no dropped connections and no restart. Every one of these
+is logged (as `reload` on success, or `reload_error` on failure, under
+`--log-format json`).
 
 If the reloaded file has any problem — a bad regex, a bad target, a
 cache directory that can't be created — the reload is refused and the
@@ -186,6 +187,26 @@ all). aiproxy has no built-in, inevitably-stale pricing table — you tell
 it what rate applies to your own usage (whatever your provider actually
 charges you per 1,000 tokens, in whatever currency), and the summary
 just multiplies that by the total tokens tracked during the run.
+
+`max_body_size_bytes` caps how large a single request body aiproxy will
+buffer in memory before rejecting it with a 413 — every request is read
+fully into memory so the rule engine can inspect it, so this bounds the
+worst case for a proxy that's meant to sit in front of untrusted client
+traffic. Unlike every other field above, it does **not** default to
+"disabled" when absent: aiproxy applies a built-in 10 MiB limit instead,
+generous enough for a normal chat/completion payload (including a
+reasonably sized embedded image or document) without leaving the limit
+actually unbounded. Set it explicitly if your traffic needs more:
+
+```json
+{
+  "max_body_size_bytes": 26214400
+}
+```
+
+`aiproxy validate` reports the limit that will actually apply — the
+configured value, or the built-in default if the field is absent — not
+just the raw config.
 
 ## Redacting instead of blocking
 

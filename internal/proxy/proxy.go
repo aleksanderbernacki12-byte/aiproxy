@@ -129,6 +129,16 @@ const statsPath = "/_aiproxy/stats"
 // "metrics_path: /_aiproxy/metrics" instead.
 const metricsPath = "/_aiproxy/metrics"
 
+// DefaultMaxBodyBytes is the request body size limit applied whenever
+// Server.MaxBodyBytes is zero or negative. 10 MiB comfortably covers a
+// normal LLM chat/completion payload, including a reasonably sized
+// embedded image or document, while still bounding the worst case:
+// every request body is fully buffered in memory before the rule
+// engine can inspect it, so an unbounded size is a real
+// memory-exhaustion risk for a proxy whose whole job is inspecting
+// untrusted client traffic.
+const DefaultMaxBodyBytes = 10 << 20 // 10 MiB
+
 // Server is a reverse proxy that evaluates every request's body against
 // a rules.Engine before forwarding it to Target over HTTPS. Additional
 // path-prefix routes (see AddRoute) can send matching requests to other
@@ -161,6 +171,14 @@ type Server struct {
 	Cache           *cache.Cache     // nil disables the response cache
 	CostPer1KTokens float64          // zero omits the shutdown summary's cost line
 	routes          []route
+
+	// MaxBodyBytes caps how large a request body ServeHTTP will buffer in
+	// memory before rejecting it with a 413. Unlike every other field
+	// above, zero (or negative) does not mean "disabled" — it means
+	// DefaultMaxBodyBytes applies instead, since a reverse proxy that
+	// buffers every request body fully in memory before it can be
+	// inspected must never expose an actually-unbounded size by default.
+	MaxBodyBytes int64
 
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
@@ -300,6 +318,15 @@ func (s *Server) getCostPer1KTokens() float64 {
 	return s.CostPer1KTokens
 }
 
+func (s *Server) getMaxBodyBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.MaxBodyBytes <= 0 {
+		return DefaultMaxBodyBytes
+	}
+	return s.MaxBodyBytes
+}
+
 // Route describes one path-prefix-to-upstream mapping for ReloadConfig,
 // mirroring what AddRoute registers before the server starts serving.
 type Route struct {
@@ -311,14 +338,16 @@ type Route struct {
 }
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
-// cost-per-1K-tokens rate, and target routes — e.g. after re-reading
-// aiproxy.json on SIGHUP. All five change together under one lock, so a
-// request in flight never observes a torn mix of old and new
-// configuration; a request takes effect from the moment it's accepted,
-// so anything already being handled keeps running against whatever
-// configuration it started with. Pass nil for limiter/cache to disable
-// them, matching how the corresponding field would be set at startup.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, routes []Route) {
+// cost-per-1K-tokens rate, max request body size, and target routes —
+// e.g. after re-reading aiproxy.json on SIGHUP. All six change together
+// under one lock, so a request in flight never observes a torn mix of
+// old and new configuration; a request takes effect from the moment
+// it's accepted, so anything already being handled keeps running
+// against whatever configuration it started with. Pass nil for
+// limiter/cache to disable them, matching how the corresponding field
+// would be set at startup; pass zero for maxBodyBytes to fall back to
+// DefaultMaxBodyBytes, same as leaving Server.MaxBodyBytes unset.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, maxBodyBytes int64, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, target: r.Target, limiter: r.Limiter}
@@ -330,6 +359,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.Limiter = lim
 	s.Cache = cch
 	s.CostPer1KTokens = costPer1KTokens
+	s.MaxBodyBytes = maxBodyBytes
 	s.routes = newRoutes
 }
 
@@ -347,10 +377,11 @@ func (s *Server) LogEvent(level, message string) {
 }
 
 // ServeHTTP implements http.Handler. It reads the full request body into
-// memory so the rule engine can inspect it in cleartext, evaluates the
-// request, and either blocks it or restores the body and forwards it
-// intact to the resolved target (Target by default, or a path-prefix
-// route added via AddRoute) over HTTPS.
+// memory (rejecting it with a 413 past MaxBodyBytes, before any of it is
+// buffered) so the rule engine can inspect it in cleartext, evaluates
+// the request, and either blocks it or restores the body and forwards
+// it intact to the resolved target (Target by default, or a
+// path-prefix route added via AddRoute) over HTTPS.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == statsPath {
 		s.serveStats(w, r)
@@ -361,9 +392,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	r.Body.Close()
+	limitedBody := http.MaxBytesReader(w, r.Body, s.getMaxBodyBytes())
+	body, err := io.ReadAll(limitedBody)
+	limitedBody.Close()
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

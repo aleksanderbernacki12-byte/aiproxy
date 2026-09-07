@@ -119,6 +119,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.Limiter = lc.limiter
 	server.Cache = lc.cache
 	server.CostPer1KTokens = lc.cost
+	server.MaxBodyBytes = lc.maxBodyBytes
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.target, r.limiter)
 	}
@@ -135,6 +136,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if cfg.CostPer1KTokens > 0 {
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
+		}
+		if cfg.MaxBodyBytes > 0 {
+			fmt.Fprintf(stdout, "max request body size: %d bytes\n", cfg.MaxBodyBytes)
 		}
 		for _, r := range lc.routes {
 			if r.maxRequestsPerMinute > 0 {
@@ -207,7 +211,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Target: r.target, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, routes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.maxBodyBytes, routes)
 
 	label := loadedFrom
 	if label == "" {
@@ -220,11 +224,12 @@ func reloadConfig(server *proxy.Server, configPath string) {
 // rebuilt from an aiproxy.json: everything runStart wires in at startup,
 // and everything a SIGHUP reload replaces via Server.ReloadConfig.
 type liveConfig struct {
-	engine  *rules.Engine
-	limiter *limiter.Limiter
-	cache   *cache.Cache
-	cost    float64
-	routes  []targetRoute
+	engine       *rules.Engine
+	limiter      *limiter.Limiter
+	cache        *cache.Cache
+	cost         float64
+	maxBodyBytes int64
+	routes       []targetRoute
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -257,6 +262,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	}
 
 	lc.cost = cfg.CostPer1KTokens
+	lc.maxBodyBytes = cfg.MaxBodyBytes
 
 	routes, routeErrs := compileTargetRoutes(cfg.Targets)
 	errs = append(errs, routeErrs...)
@@ -428,6 +434,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.CostPer1KTokens < 0 {
 		problems = append(problems, fmt.Sprintf("cost_per_1k_tokens: %g must not be negative", cfg.CostPer1KTokens))
 	}
+	if cfg.MaxBodyBytes < 0 {
+		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
+	}
 
 	if len(problems) > 0 {
 		fmt.Fprintf(stderr, "aiproxy: %s has %d problem(s):\n", loadedFrom, len(problems))
@@ -444,7 +453,20 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
+	fmt.Fprintf(stdout, "  max request body size:   %d bytes\n", effectiveMaxBodyBytes(cfg.MaxBodyBytes))
 	return 0
+}
+
+// effectiveMaxBodyBytes reports what max_body_size_bytes actually
+// resolves to once the proxy applies its own zero-or-negative fallback
+// (proxy.DefaultMaxBodyBytes) — used so "aiproxy validate" reports the
+// real limit that would apply, not just the raw, possibly-absent config
+// value.
+func effectiveMaxBodyBytes(configured int64) int64 {
+	if configured <= 0 {
+		return proxy.DefaultMaxBodyBytes
+	}
+	return configured
 }
 
 // resolveConfig resolves the config file to use (either the explicit

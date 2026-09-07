@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	"aiproxy/internal/cache"
 	"aiproxy/internal/cli"
+	"aiproxy/internal/proxy"
 )
 
 // TestRunStart_InvalidCustomRulePattern_FatalsWithClearMessage proves that
@@ -472,7 +474,7 @@ func TestExecute_Validate_ValidConfig_WithPerTargetRateLimit_ReturnsZero(t *test
 func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
-	raw := `{"max_requests_per_minute": -5, "cost_per_1k_tokens": -0.1}`
+	raw := `{"max_requests_per_minute": -5, "cost_per_1k_tokens": -0.1, "max_body_size_bytes": -1}`
 	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -489,6 +491,55 @@ func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "cost_per_1k_tokens") {
 		t.Errorf("stderr missing negative cost problem: %q", errOut)
+	}
+	if !strings.Contains(errOut, "max_body_size_bytes") {
+		t.Errorf("stderr missing negative max body size problem: %q", errOut)
+	}
+}
+
+// TestExecute_Validate_ReportsEffectiveMaxBodySize proves the summary
+// shows what max_body_size_bytes actually resolves to: the configured
+// value when set, or proxy.DefaultMaxBodyBytes when it's left at its
+// zero-value default — not just the raw (possibly absent) config field.
+func TestExecute_Validate_ReportsEffectiveMaxBodySize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"max_body_size_bytes": 1048576}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "max request body size:   1048576 bytes") {
+		t.Fatalf("stdout missing configured max body size: %q", stdout.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_MaxBodySizeReportsBuiltinDefaultWhenUnset
+// covers max_body_size_bytes left absent: the effective limit shown
+// must be proxy.DefaultMaxBodyBytes, since that's what would actually
+// apply.
+func TestExecute_Validate_ValidConfig_MaxBodySizeReportsBuiltinDefaultWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), fmt.Sprintf("max request body size:   %d bytes", proxy.DefaultMaxBodyBytes)) {
+		t.Fatalf("stdout missing default max body size: %q", stdout.String())
 	}
 }
 
