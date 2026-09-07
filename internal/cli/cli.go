@@ -40,6 +40,7 @@ var (
 	stripeAPIKeyPattern    = regexp.MustCompile(`sk_live_[0-9A-Za-z]{24,}`)
 	googleAPIKeyPattern    = regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`)
 	npmAccessTokenPattern  = regexp.MustCompile(`npm_[A-Za-z0-9]{36}`)
+	jwtPattern             = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`)
 )
 
 // Execute parses args and runs the requested subcommand, writing output
@@ -280,6 +281,7 @@ var builtinRules = []struct {
 	{"stripe-api-key", stripeAPIKeyPattern},
 	{"google-api-key", googleAPIKeyPattern},
 	{"npm-access-token", npmAccessTokenPattern},
+	{"jwt", jwtPattern},
 }
 
 // builtinRuleNames returns every built-in rule's name, in the same

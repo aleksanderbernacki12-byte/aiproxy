@@ -86,10 +86,15 @@ No config needed — these block by default the moment aiproxy starts:
 | `stripe-api-key`     | Stripe live secret keys (`sk_live_...`)                         |
 | `google-api-key`     | Google API keys (`AIza...`)                                     |
 | `npm-access-token`   | npm access tokens (`npm_...`)                                   |
+| `jwt`                | Generic JSON Web Tokens (`eyJ...`.`...`.`...`, three base64url parts) |
 
 Each one can be switched independently to
 [redact](#redacting-instead-of-blocking) instead of block, or turned off
-entirely, via `builtin_rule_actions` — see that section below.
+entirely, via `builtin_rule_actions` — see that section below. `jwt` in
+particular is the one most likely to need `"off"`: a JWT showing up in a
+request body isn't always a leak the way the others are — it can be a
+legitimate ID token or session token a client is meant to send — so
+turn it off if it's flagging traffic you already know is fine.
 
 ## Structured JSON logging
 
@@ -216,7 +221,7 @@ to leave it out of):
 {
   "builtin_rule_actions": {
     "aws-access-key": "redact",
-    "npm-access-token": "off"
+    "jwt": "off"
   }
 }
 ```

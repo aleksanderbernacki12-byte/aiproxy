@@ -350,10 +350,10 @@ func TestExecute_Validate_ValidConfig_WithBuiltinRuleRedactAction_ReturnsZero(t 
 
 // TestExecute_Validate_ValidConfig_WithEveryBuiltinRuleOverride_ReturnsZero
 // proves every entry in the expanded built-in secret catalog (private
-// keys, Slack/Stripe/Google/npm tokens, on top of the original
-// AWS/OpenAI/GitHub/Anthropic four) is actually wired into the same
-// builtin_rule_actions validation path, not just added to builtinRules
-// without being reachable through config.
+// keys, Slack/Stripe/Google/npm tokens, and a generic JWT, on top of
+// the original AWS/OpenAI/GitHub/Anthropic four) is actually wired into
+// the same builtin_rule_actions validation path, not just added to
+// builtinRules without being reachable through config.
 func TestExecute_Validate_ValidConfig_WithEveryBuiltinRuleOverride_ReturnsZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
@@ -362,7 +362,8 @@ func TestExecute_Validate_ValidConfig_WithEveryBuiltinRuleOverride_ReturnsZero(t
 		"slack-token": "redact",
 		"stripe-api-key": "redact",
 		"google-api-key": "redact",
-		"npm-access-token": "redact"
+		"npm-access-token": "redact",
+		"jwt": "redact"
 	}}`
 	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -374,7 +375,7 @@ func TestExecute_Validate_ValidConfig_WithEveryBuiltinRuleOverride_ReturnsZero(t
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "built-in rule overrides: 5") {
+	if !strings.Contains(stdout.String(), "built-in rule overrides: 6") {
 		t.Fatalf("stdout missing built-in rule override count: %q", stdout.String())
 	}
 }
@@ -390,7 +391,7 @@ func TestExecute_Validate_ValidConfig_WithEveryBuiltinRuleOverride_ReturnsZero(t
 func TestExecute_Validate_ValidConfig_WithBuiltinRuleOff_ReturnsZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
-	raw := `{"builtin_rule_actions": {"stripe-api-key": "off"}}`
+	raw := `{"builtin_rule_actions": {"jwt": "off"}}`
 	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
