@@ -519,8 +519,10 @@ stats it reports, and any method other than `GET` gets a 405.
 
 Stats and metrics are pull-based — something has to go and look at them.
 Set `webhook_url` to get pushed a real-time alert instead, the moment a
-rule matches — on a request going out or a
-[response](#scanning-responses-too) coming back:
+rule matches — on a request going out, a
+[response](#scanning-responses-too) coming back, or the
+[rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
+tripping:
 
 ```json
 {
@@ -528,8 +530,8 @@ rule matches — on a request going out or a
 }
 ```
 
-Every block or redact event — `block`, `redact`, `response_block`, or
-`response_redact` — POSTs this JSON body to that URL:
+Every alertable event — `block`, `redact`, `response_block`,
+`response_redact`, or `rate_limited` — POSTs this JSON body to that URL:
 
 ```json
 {
@@ -538,6 +540,21 @@ Every block or redact event — `block`, `redact`, `response_block`, or
   "method": "POST",
   "url": "/v1/messages",
   "rule": "aws-access-key",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+A `rate_limited` alert — fired the moment the circuit breaker rejects a
+request, the same signal you'd want in real time for an agent loop stuck
+retrying — carries an empty `rule`, since no scanning rule was involved:
+
+```json
+{
+  "text": "[RATE_LIMITED] POST /v1/messages - Rate limit exceeded",
+  "event": "rate_limited",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
   "time": "2026-01-01T12:00:00Z"
 }
 ```

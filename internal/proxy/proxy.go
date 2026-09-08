@@ -212,8 +212,8 @@ type Server struct {
 	MaxBodyBytes int64
 
 	// WebhookURL, if non-nil, is POSTed a JSON alert every time a rule
-	// blocks or redacts a request — see notifyWebhook. nil (the default)
-	// disables alerting entirely.
+	// blocks or redacts a request, or the rate limiter rejects one — see
+	// notifyWebhook. nil (the default) disables alerting entirely.
 	WebhookURL *url.URL
 
 	reverseProxy *httputil.ReverseProxy
@@ -498,6 +498,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if effectiveLimiter != nil && !effectiveLimiter.Allow() {
 		s.Stats.RecordRateLimited(targetLabel)
 		s.logRateLimited(r.Method, r.URL.String())
+		s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "")
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
@@ -984,12 +985,13 @@ func (s *Server) logResponseRedact(method, reqURL, ruleName string) {
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
 // webhookAlert is the JSON body POSTed to Server.WebhookURL for every
-// block or redact event. Text alone is enough for a Slack incoming
-// webhook (which reads exactly that field and ignores the rest); the
-// remaining fields serve a generic JSON webhook consumer that wants the
-// event structured instead of parsed back out of a sentence. Like every
-// other log line in this package, it carries the rule name that matched,
-// never the matched secret itself.
+// block, redact, or rate_limited event. Text alone is enough for a
+// Slack incoming webhook (which reads exactly that field and ignores
+// the rest); the remaining fields serve a generic JSON webhook consumer
+// that wants the event structured instead of parsed back out of a
+// sentence. Like every other log line in this package, it carries the
+// rule name that matched, never the matched secret itself; Rule is
+// empty for a rate_limited event, since no scanning rule was involved.
 type webhookAlert struct {
 	Text   string `json:"text"`
 	Event  string `json:"event"`
@@ -1000,11 +1002,13 @@ type webhookAlert struct {
 }
 
 // notifyWebhook POSTs a webhookAlert to Server.WebhookURL, if configured,
-// for a block or redact event (event is "block" or "redact"). Delivery
-// happens on its own goroutine so a slow or unreachable webhook endpoint
-// never delays the client's actual request — the request has already
-// been decided and logged by the time this runs. A delivery failure (or
-// a non-2xx response) is logged as an internal error and otherwise
+// for a block, redact, or rate_limited event. ruleName is the matched
+// rule's name for block/redact, or "" for rate_limited (a circuit
+// breaker trip isn't attributable to any one rule). Delivery happens on
+// its own goroutine so a slow or unreachable webhook endpoint never
+// delays the client's actual request — the request has already been
+// decided and logged by the time this runs. A delivery failure (or a
+// non-2xx response) is logged as an internal error and otherwise
 // ignored: there is no retry, and it never changes the outcome of the
 // request that triggered it.
 func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
@@ -1013,8 +1017,12 @@ func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
 		return
 	}
 
+	text := fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
+	if ruleName == "" {
+		text = fmt.Sprintf("[%s] %s %s - Rate limit exceeded", strings.ToUpper(event), method, reqURL)
+	}
 	payload := webhookAlert{
-		Text:   fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName),
+		Text:   text,
 		Event:  event,
 		Method: method,
 		URL:    reqURL,

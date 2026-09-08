@@ -150,7 +150,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// a bearer credential directly in its path, so it gets the
 			// same treatment as every other secret aiproxy handles —
 			// never written to a log or the terminal.
-			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact)")
+			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited)")
 		}
 		for _, r := range lc.routes {
 			if r.maxRequestsPerMinute > 0 {

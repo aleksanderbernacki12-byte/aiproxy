@@ -3294,6 +3294,76 @@ func TestServer_Webhook_FiresOnRedactWithExpectedPayload(t *testing.T) {
 	}
 }
 
+// TestServer_Webhook_FiresOnRateLimitWithExpectedPayload proves a
+// configured WebhookURL receives a JSON alert when the circuit breaker
+// rejects a request for exceeding its rate limit — the same real-time
+// alerting an agent-loop stuck in a retry storm should trigger, not
+// just a block or redact. Unlike block/redact, there is no rule name
+// attached, since no scanning rule was involved.
+func TestServer_Webhook_FiresOnRateLimitWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("rate-limited request must never reach the upstream target")
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Limiter = limiter.New(0, time.Minute) // 0 allowed requests per window
+	srv.WebhookURL = webhookURL
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "rate_limited" {
+			t.Errorf("event = %v, want %q", payload["event"], "rate_limited")
+		}
+		if payload["method"] != "POST" {
+			t.Errorf("method = %v, want %q", payload["method"], "POST")
+		}
+		if payload["url"] != "/chat" {
+			t.Errorf("url = %v, want %q", payload["url"], "/chat")
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string (a rate limit trip matches no rule)", payload["rule"])
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "RATE_LIMITED") || !strings.Contains(text, "Rate limit exceeded") {
+			t.Errorf("text = %q, want it to mention RATE_LIMITED and the rate limit", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
 // TestServer_Webhook_NeverFiresOnAllow proves a clean, allowed request
 // never triggers a webhook call at all — alerts are for block/redact
 // events only, not every request.
