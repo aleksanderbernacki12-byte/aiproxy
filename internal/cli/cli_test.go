@@ -504,6 +504,92 @@ func TestExecute_Validate_DuplicateTargetPrefix_ReportsProblem(t *testing.T) {
 	}
 }
 
+func TestExecute_Validate_TargetURLAndURLsBothSet_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "urls": ["https://backup.example.com"]}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "mutually exclusive") {
+		t.Fatalf("stderr missing mutually-exclusive problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_TargetNeitherURLNorURLsSet_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [{"prefix": "/openai"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "must set one of url or urls") {
+		t.Fatalf("stderr missing missing-url problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_TargetURLsInvalidEntry_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "urls": ["https://api.openai.com", "not a url"]}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "urls[1]") {
+		t.Fatalf("stderr missing urls[1] problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithFailoverTarget_ReturnsZeroAndReportsCount(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "urls": ["https://api.openai.com", "https://backup.example.com"]},
+		{"prefix": "/anthropic", "url": "https://api.anthropic.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "target routes:           2") {
+		t.Fatalf("stdout missing target routes count: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "routes with failover:    1") {
+		t.Fatalf("stdout missing routes-with-failover count: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_NegativeTargetMaxRequestsPerMinute_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

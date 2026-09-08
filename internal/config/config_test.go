@@ -428,11 +428,38 @@ func TestLoad_ParsesTargets(t *testing.T) {
 	if len(cfg.Targets) != 2 {
 		t.Fatalf("len(Targets) = %d, want 2", len(cfg.Targets))
 	}
-	if cfg.Targets[0] != (config.Target{Prefix: "/openai", URL: "https://api.openai.com"}) {
+	if cfg.Targets[0].Prefix != "/openai" || cfg.Targets[0].URL != "https://api.openai.com" || len(cfg.Targets[0].URLs) != 0 {
 		t.Errorf("Targets[0] = %+v, want prefix=/openai url=https://api.openai.com", cfg.Targets[0])
 	}
-	if cfg.Targets[1] != (config.Target{Prefix: "/anthropic", URL: "https://api.anthropic.com"}) {
+	if cfg.Targets[1].Prefix != "/anthropic" || cfg.Targets[1].URL != "https://api.anthropic.com" || len(cfg.Targets[1].URLs) != 0 {
 		t.Errorf("Targets[1] = %+v, want prefix=/anthropic url=https://api.anthropic.com", cfg.Targets[1])
+	}
+}
+
+func TestLoad_ParsesTargetURLsFailoverList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "urls": ["https://api.openai.com", "https://backup.example.com"]}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Targets) != 1 {
+		t.Fatalf("len(Targets) = %d, want 1", len(cfg.Targets))
+	}
+	got := cfg.Targets[0]
+	if got.URL != "" {
+		t.Errorf("URL = %q, want empty when urls is set", got.URL)
+	}
+	want := []string{"https://api.openai.com", "https://backup.example.com"}
+	if len(got.URLs) != len(want) || got.URLs[0] != want[0] || got.URLs[1] != want[1] {
+		t.Errorf("URLs = %v, want %v", got.URLs, want)
 	}
 }
 

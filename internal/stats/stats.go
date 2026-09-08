@@ -25,6 +25,7 @@ type counters struct {
 	totalTokens      atomic.Int64
 	responseBlocked  atomic.Int64
 	responseRedacted atomic.Int64
+	failover         atomic.Int64
 }
 
 func (c *counters) snapshot() Snapshot {
@@ -37,6 +38,7 @@ func (c *counters) snapshot() Snapshot {
 		TotalTokens:      c.totalTokens.Load(),
 		ResponseBlocked:  c.responseBlocked.Load(),
 		ResponseRedacted: c.responseRedacted.Load(),
+		Failover:         c.failover.Load(),
 	}
 }
 
@@ -182,6 +184,17 @@ func (s *Stats) RecordTokensUsed(target string, n int) {
 	}
 }
 
+// RecordFailover records one candidate URL within target's failover
+// list turning out to be unreachable, causing the request to move on to
+// the next candidate. Attributed to target (the matched route, or
+// "default") like most other counters — unlike RecordUnauthorized/the
+// dry-run counters, a failover is always about one specific route's own
+// candidate list, so there's no reason to keep it target-agnostic.
+func (s *Stats) RecordFailover(target string) {
+	s.overall.failover.Add(1)
+	s.counterFor(target).failover.Add(1)
+}
+
 // RecordResponseBlock records one upstream response the rule engine
 // withheld from the client because a rule matched something in it —
 // distinct from RecordBlock, which is a request never sent upstream at
@@ -307,6 +320,13 @@ type Snapshot struct {
 	// broken down per target — see Stats.RecordUnauthorized.
 	Unauthorized int64 `json:"unauthorized"`
 
+	// Failover counts how many times a request moved on to the next
+	// candidate URL in a target's failover list because an earlier one
+	// was unreachable — see Stats.RecordFailover. Unlike Unauthorized
+	// and the dry-run counters, this is broken down per target: a
+	// failover is always about one specific route's own candidate list.
+	Failover int64 `json:"failover"`
+
 	PerTarget map[string]Snapshot     `json:"per_target,omitempty"`
 	PerRule   map[string]RuleSnapshot `json:"per_rule,omitempty"`
 }
@@ -376,6 +396,11 @@ func (s Snapshot) String() string {
 	if s.Unauthorized > 0 {
 		out += fmt.Sprintf("\nUnauthorized (407):   %d", s.Unauthorized)
 	}
+	// Same reasoning again: 0 for every run that never configured a
+	// multi-URL target, or that did but never needed to actually use it.
+	if s.Failover > 0 {
+		out += fmt.Sprintf("\nFailovers:            %d", s.Failover)
+	}
 	return out
 }
 
@@ -403,6 +428,9 @@ func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
 			name, t.Allowed, t.Blocked, t.Redacted, t.RateLimited, t.CacheHits, t.TotalTokens, t.ResponseBlocked, t.ResponseRedacted)
 		if costPer1KTokens > 0 {
 			fmt.Fprintf(&b, " cost=%.4f", t.EstimatedCost(costPer1KTokens))
+		}
+		if t.Failover > 0 {
+			fmt.Fprintf(&b, " failover=%d", t.Failover)
 		}
 	}
 	return b.String()

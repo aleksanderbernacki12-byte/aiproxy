@@ -1465,8 +1465,8 @@ func TestServer_MultiTargetRouting_RoutesByPathPrefixAndStripsPrefix(t *testing.
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", openaiURL, nil)
-	srv.AddRoute("/anthropic", anthropicURL, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -1544,8 +1544,8 @@ func TestServer_MultiTargetRouting_CacheKeysDifferPerTarget(t *testing.T) {
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", openaiURL, engine)
-	srv.AddRoute("/openai", openaiURL, nil)
-	srv.AddRoute("/anthropic", anthropicURL, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil)
 	srv.Cache = c
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -1641,8 +1641,8 @@ func TestServer_MultiTargetRouting_StatsBreakDownPerTarget(t *testing.T) {
 	})
 
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", openaiURL, nil)
-	srv.AddRoute("/anthropic", anthropicURL, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil)
 	srv.CostPer1KTokens = 0.02
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -1809,6 +1809,7 @@ type statsJSONResponse struct {
 	ResponseDryRunBlocked  int64                        `json:"response_dry_run_blocked"`
 	ResponseDryRunRedacted int64                        `json:"response_dry_run_redacted"`
 	Unauthorized           int64                        `json:"unauthorized"`
+	Failover               int64                        `json:"failover"`
 	EstimatedCost          *float64                     `json:"estimated_cost,omitempty"`
 	CostBudget             *float64                     `json:"cost_budget,omitempty"`
 	PerTarget              map[string]statsJSONResponse `json:"per_target,omitempty"`
@@ -2045,7 +2046,7 @@ func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
 	}
 
 	srv.CostPer1KTokens = 0.02
-	srv.AddRoute("/other", otherURL, nil)
+	srv.AddRoute("/other", []*url.URL{otherURL}, nil)
 	resp2, err := http.Get(frontend.URL + "/other/y")
 	if err != nil {
 		t.Fatalf("GET /other/y: %v", err)
@@ -2435,7 +2436,7 @@ func TestServer_MetricsEndpoint_IncludesCostOnlyWhenConfiguredAndLabelsEveryTarg
 	}
 
 	srv.CostPer1KTokens = 0.02
-	srv.AddRoute("/other", otherURL, nil)
+	srv.AddRoute("/other", []*url.URL{otherURL}, nil)
 	resp2, err := http.Get(frontend.URL + "/other/y")
 	if err != nil {
 		t.Fatalf("GET /other/y: %v", err)
@@ -2483,8 +2484,8 @@ func TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently(t *testing.
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", sharedURL, engine)
 	srv.Limiter = limiter.New(5, time.Minute) // generous shared budget
-	srv.AddRoute("/strict", strictURL, limiter.New(1, time.Minute))
-	srv.AddRoute("/shared", sharedURL, nil) // no override: shares srv.Limiter
+	srv.AddRoute("/strict", []*url.URL{strictURL}, limiter.New(1, time.Minute))
+	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil) // no override: shares srv.Limiter
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -2542,7 +2543,7 @@ func TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget(
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", targetURL, engine)
-	srv.AddRoute("/limited", targetURL, limiter.New(1, time.Minute))
+	srv.AddRoute("/limited", []*url.URL{targetURL}, limiter.New(1, time.Minute))
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -2846,7 +2847,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, "", []proxy.Route{
-		{Prefix: "/other", Target: otherURL, Limiter: strictLimiter},
+		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
 	})
 
 	if got := get("/x"); got != http.StatusOK {
@@ -5168,5 +5169,395 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
+	}
+}
+
+// TestServer_Failover_FailsOverToNextCandidateWhenFirstUnreachable
+// proves the core failover contract: a route with more than one
+// candidate URL moves on to the next candidate, and the client still
+// gets a normal response, when an earlier candidate is completely
+// unreachable (nothing listening on that address at all).
+func TestServer_Failover_FailsOverToNextCandidateWhenFirstUnreachable(t *testing.T) {
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("served by the working backend"))
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse working url: %v", err)
+	}
+
+	unreachableURL, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse unreachable url: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(&logBuf, "", 0)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "served by the working backend" {
+		t.Fatalf("body = %q, want the working backend's response", body)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Failover != 1 {
+		t.Errorf("Failover = %d, want 1", snap.Failover)
+	}
+	if got := snap.PerTarget["/openai"].Failover; got != 1 {
+		t.Errorf("PerTarget[/openai].Failover = %d, want 1", got)
+	}
+
+	if !strings.Contains(logBuf.String(), "[FAILOVER]") {
+		t.Errorf("log missing [FAILOVER] line: %q", logBuf.String())
+	}
+}
+
+// TestServer_Failover_NeverRetriesOnHTTPLevelErrorResponse proves
+// failover is transport-error-only: a candidate that actually answers
+// with a 5xx is never retried against the next candidate, since that
+// backend may have already started acting on the request — the client
+// gets that 5xx exactly as if there were only one candidate.
+func TestServer_Failover_NeverRetriesOnHTTPLevelErrorResponse(t *testing.T) {
+	var secondCandidateHit atomic.Bool
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("upstream error"))
+	}))
+	defer failing.Close()
+	failingURL, err := url.Parse(failing.URL)
+	if err != nil {
+		t.Fatalf("parse failing url: %v", err)
+	}
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCandidateHit.Store(true)
+		w.Write([]byte("second candidate"))
+	}))
+	defer second.Close()
+	secondURL, err := url.Parse(second.URL)
+	if err != nil {
+		t.Fatalf("parse second url: %v", err)
+	}
+
+	srv := proxy.New("unused", failingURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{failingURL, secondURL}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (the first candidate's own 5xx, not failed over)", resp.StatusCode, http.StatusInternalServerError)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "upstream error" {
+		t.Fatalf("body = %q, want the failing candidate's own response body", body)
+	}
+	if secondCandidateHit.Load() {
+		t.Error("second candidate was hit, want failover to never trigger on an HTTP-level 5xx response")
+	}
+	if got := srv.Stats.Snapshot().Failover; got != 0 {
+		t.Errorf("Failover = %d, want 0 (a 5xx must never count as a failover)", got)
+	}
+}
+
+// TestServer_Failover_AllCandidatesUnreachable_StillReturnsAnErrorResponse
+// proves that when every candidate in the list is unreachable, the
+// client still gets a normal (if unsuccessful) HTTP response rather than
+// the connection hanging or the server crashing.
+func TestServer_Failover_AllCandidatesUnreachable_StillReturnsAnErrorResponse(t *testing.T) {
+	firstDead, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	secondDead, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", firstDead, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{firstDead, secondDead}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 500 {
+		t.Fatalf("status = %d, want a 5xx once every candidate is unreachable", resp.StatusCode)
+	}
+	if got := srv.Stats.Snapshot().Failover; got != 1 {
+		t.Errorf("Failover = %d, want 1 (one transition attempted, from the first dead candidate to the second)", got)
+	}
+}
+
+// TestServer_Failover_ReusesBufferedBodyAcrossAttempts proves a POST
+// body survives failover intact: the second candidate must receive the
+// exact same body the client originally sent, not an empty or partial
+// one left over from the first (failed) attempt consuming the reader.
+func TestServer_Failover_ReusesBufferedBodyAcrossAttempts(t *testing.T) {
+	var receivedBody []byte
+	echoing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = b
+		w.Write([]byte("ok"))
+	}))
+	defer echoing.Close()
+	echoingURL, err := url.Parse(echoing.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	unreachableURL, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", echoingURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, echoingURL}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const payload = `{"messages":[{"role":"user","content":"hello, does failover preserve me?"}]}`
+	resp, err := http.Post(frontend.URL+"/openai/v1/chat", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if string(receivedBody) != payload {
+		t.Fatalf("second candidate received body = %q, want %q", receivedBody, payload)
+	}
+}
+
+// TestServer_Webhook_FiresOnFailoverWithExpectedPayload proves the
+// failover webhook event carries the failed and next candidate URLs,
+// with an empty rule (a failover isn't attributable to any scanning
+// rule).
+func TestServer_Webhook_FiresOnFailoverWithExpectedPayload(t *testing.T) {
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	unreachableURL, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "failover" {
+			t.Errorf("event = %v, want %q", payload["event"], "failover")
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string", payload["rule"])
+		}
+		failed, _ := payload["failed_target"].(string)
+		if !strings.Contains(failed, unreachableURL.Host) {
+			t.Errorf("failed_target = %q, want it to mention %q", failed, unreachableURL.Host)
+		}
+		next, _ := payload["next_target"].(string)
+		if !strings.Contains(next, workingURL.Host) {
+			t.Errorf("next_target = %q, want it to mention %q", next, workingURL.Host)
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "FAILOVER") {
+			t.Errorf("text = %q, want it to mention FAILOVER", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsFailoverPerTarget proves GET
+// /_aiproxy/stats surfaces the failover count broken down by target,
+// unlike unauthorized/dry-run — a failover is always attributable to
+// one specific route's own candidate list.
+func TestServer_StatsEndpoint_ReportsFailoverPerTarget(t *testing.T) {
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	unreachableURL, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Failover != 1 {
+		t.Errorf("Failover = %d, want 1", got.Failover)
+	}
+	if got.PerTarget["/openai"].Failover != 1 {
+		t.Errorf("PerTarget[/openai].Failover = %d, want 1", got.PerTarget["/openai"].Failover)
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsFailoverCounter is
+// TestServer_StatsEndpoint_ReportsFailoverPerTarget's Prometheus
+// counterpart.
+func TestServer_MetricsEndpoint_ReportsFailoverCounter(t *testing.T) {
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	unreachableURL, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	metricsResp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("get metrics: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	body, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+	for _, want := range []string{
+		"# HELP aiproxy_failover_total",
+		"# TYPE aiproxy_failover_total counter",
+		`aiproxy_failover_total{target="/openai"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q: %q", want, out)
+		}
+	}
+}
+
+// TestServer_SingleURLTarget_UnaffectedByFailoverTransport is a
+// regression check: a route with exactly one candidate URL — every
+// route before failover existed, and still the overwhelmingly common
+// case — must behave identically to before, including on a genuine
+// upstream failure (still a normal error response, never itself
+// misreported as a "failover").
+func TestServer_SingleURLTarget_UnaffectedByFailoverTransport(t *testing.T) {
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("single target response"))
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/anything")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "single target response" {
+		t.Fatalf("body = %q, want the single target's response", body)
+	}
+	if got := srv.Stats.Snapshot().Failover; got != 0 {
+		t.Errorf("Failover = %d, want 0 for a single-URL target", got)
 	}
 }

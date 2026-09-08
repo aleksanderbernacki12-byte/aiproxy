@@ -64,10 +64,27 @@ type PathRule struct {
 }
 
 // Target is one path-prefix-to-upstream mapping for multi-target
-// routing, as it appears in the config file, before URL has been parsed.
+// routing, as it appears in the config file, before URL/URLs has been
+// parsed.
 type Target struct {
 	Prefix string `json:"prefix"`
-	URL    string `json:"url"`
+
+	// URL is a single upstream — the original, still-supported shape.
+	// Mutually exclusive with URLs: a target sets exactly one of the two.
+	URL string `json:"url,omitempty"`
+
+	// URLs, set instead of URL, gives this target an ordered list of
+	// upstream candidates to fail over across: a request tries the first
+	// URL, and only moves on to the next if that attempt never got a
+	// response at all (a dial/TLS/timeout failure — the candidate was
+	// unreachable). It never retries a different candidate just because
+	// one returned an HTTP-level error response (a 5xx): by the time a
+	// backend has responded at all, it may already have started acting
+	// on the request, and blindly replaying that against a different
+	// backend risks a duplicate side effect — a duplicate, possibly
+	// billed, LLM call being the textbook case for this proxy. At least
+	// one URL is required when this is set.
+	URLs []string `json:"urls,omitempty"`
 
 	// MaxRequestsPerMinute, if greater than zero, gives this target its
 	// own dedicated rate limit instead of sharing the top-level

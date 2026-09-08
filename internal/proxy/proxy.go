@@ -34,14 +34,15 @@ import (
 // the standard terminal codes understood by virtually every terminal
 // emulator; no external logging framework is used.
 const (
-	ansiReset     = "\x1b[0m"
-	ansiGreen     = "\x1b[32m"
-	ansiBrightRed = "\x1b[91m"
-	ansiYellow    = "\x1b[33m"
-	ansiBlue      = "\x1b[34m"
-	ansiPurple    = "\x1b[35m"
-	ansiCyan      = "\x1b[36m"
-	ansiGray      = "\x1b[90m"
+	ansiReset        = "\x1b[0m"
+	ansiGreen        = "\x1b[32m"
+	ansiBrightRed    = "\x1b[91m"
+	ansiYellow       = "\x1b[33m"
+	ansiBlue         = "\x1b[34m"
+	ansiPurple       = "\x1b[35m"
+	ansiCyan         = "\x1b[36m"
+	ansiGray         = "\x1b[90m"
+	ansiBrightYellow = "\x1b[93m"
 )
 
 // usageFields is the shape of a "usage" object as different providers
@@ -100,18 +101,20 @@ type requestContextInfo struct {
 	method      string
 	url         string
 	cacheKey    string
-	target      *url.URL
+	targets     []*url.URL
 	forwardPath string
 	targetLabel string
 }
 
 // route is one path-prefix-to-upstream mapping for multi-target routing.
-// limiter is nil unless this route was given its own dedicated rate
-// limit, in which case it applies instead of the server-wide Limiter for
-// this route's traffic only.
+// targets is always non-empty; more than one entry means the route
+// fails over across them in order — see failoverTransport. limiter is
+// nil unless this route was given its own dedicated rate limit, in
+// which case it applies instead of the server-wide Limiter for this
+// route's traffic only.
 type route struct {
 	prefix  string
-	target  *url.URL
+	targets []*url.URL
 	limiter *limiter.Limiter
 }
 
@@ -267,9 +270,15 @@ type logEvent struct {
 	// Cost and Budget are only set on a budget_exceeded event: the
 	// running total cost at the moment it was logged, and the
 	// cost_budget threshold it crossed.
-	Cost    float64 `json:"cost,omitempty"`
-	Budget  float64 `json:"budget,omitempty"`
-	Message string  `json:"message,omitempty"`
+	Cost   float64 `json:"cost,omitempty"`
+	Budget float64 `json:"budget,omitempty"`
+
+	// FailedTarget and NextTarget are only set on a failover event: the
+	// candidate URL that just turned out to be unreachable, and the one
+	// being tried next.
+	FailedTarget string `json:"failed_target,omitempty"`
+	NextTarget   string `json:"next_target,omitempty"`
+	Message      string `json:"message,omitempty"`
 }
 
 // New creates a Server that listens on addr, forwards allowed requests to
@@ -289,10 +298,13 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 			// cache key) and stashed the result in the context that
 			// r.Clone carries through to pr.In; reuse it verbatim so
 			// forwarding can never disagree with what was cache-keyed.
+			// The rewrite always points at the first (primary) candidate
+			// — failoverTransport is what tries the rest, further down
+			// the pipeline, if that one turns out to be unreachable.
 			reqCtx, _ := pr.In.Context().Value(requestContextKey{}).(requestContextInfo)
-			target := reqCtx.target
-			if target == nil {
-				target = s.Target
+			target := s.Target
+			if len(reqCtx.targets) > 0 {
+				target = reqCtx.targets[0]
 			}
 			pr.Out.URL.Path = reqCtx.forwardPath
 			pr.Out.URL.RawPath = ""
@@ -304,18 +316,85 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 		// was large enough (or the connection closed) before the client
 		// saw anything, defeating the point of streaming.
 		FlushInterval: -1,
+		Transport:     &failoverTransport{base: http.DefaultTransport, server: s},
 	}
 
 	return s
 }
 
+// failoverTransport wraps a base http.RoundTripper to retry a request
+// against each of the resolved route's candidate target URLs in order
+// (see requestContextInfo.targets), stopping at the first one that
+// returns any response at all. It only retries on a transport-level
+// failure — a dial/TLS/timeout error meaning the candidate was never
+// actually reached — never on an HTTP-level error response (a 5xx): by
+// the time a backend has responded at all, it may already have started
+// acting on the request, and blindly replaying that against a different
+// backend risks a duplicate side effect (a duplicate, possibly billed,
+// LLM call being the textbook case for this proxy). A single-candidate
+// target — every route before this feature existed, and still the
+// overwhelmingly common case — costs nothing extra: the loop just runs
+// once, exactly as ReverseProxy would have called base directly.
+type failoverTransport struct {
+	base   http.RoundTripper
+	server *Server
+}
+
+func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	reqCtx, _ := req.Context().Value(requestContextKey{}).(requestContextInfo)
+	candidates := reqCtx.targets
+	if len(candidates) <= 1 {
+		return t.base.RoundTrip(req)
+	}
+
+	var lastErr error
+	for i, candidate := range candidates {
+		attempt := req
+		if i > 0 {
+			attempt = req.Clone(req.Context())
+			attempt.URL = &url.URL{
+				Scheme:   candidate.Scheme,
+				Host:     candidate.Host,
+				Path:     req.URL.Path,
+				RawPath:  req.URL.RawPath,
+				RawQuery: req.URL.RawQuery,
+			}
+			attempt.Host = candidate.Host
+			if req.GetBody != nil {
+				body, err := req.GetBody()
+				if err != nil {
+					return nil, err
+				}
+				attempt.Body = body
+			}
+		}
+
+		resp, err := t.base.RoundTrip(attempt)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+
+		if i+1 < len(candidates) {
+			next := candidates[i+1]
+			t.server.Stats.RecordFailover(reqCtx.targetLabel)
+			t.server.logFailover(reqCtx.method, reqCtx.url, candidate.String(), next.String())
+			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, candidate.String(), next.String())
+		}
+	}
+	return nil, lastErr
+}
+
 // AddRoute registers a path-prefix route: any request whose path starts
-// with prefix is forwarded to target instead of the default Target, with
-// the matched prefix stripped from the forwarded path (a request to
-// prefix "/openai" and path "/openai/v1/chat" forwards to target's host
-// with path "/v1/chat"). Routes are checked in the order they were
-// added; the first matching prefix wins, so add more specific prefixes
-// before more general ones if they could overlap.
+// with prefix is forwarded to the first URL in targets instead of the
+// default Target, with the matched prefix stripped from the forwarded
+// path (a request to prefix "/openai" and path "/openai/v1/chat"
+// forwards with path "/v1/chat"). targets must be non-empty; a second
+// (or later) entry is only ever used as a failover candidate, tried in
+// order, if an earlier one is unreachable — see failoverTransport.
+// Routes are checked in the order they were added; the first matching
+// prefix wins, so add more specific prefixes before more general ones
+// if they could overlap.
 //
 // lim, if non-nil, gives this route its own dedicated rate limit instead
 // of sharing the server-wide Limiter with every other target — heavy
@@ -323,20 +402,22 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 // route that should just share whatever Limiter (if any) the server is
 // configured with, same as every route did before per-target limits
 // existed.
-func (s *Server) AddRoute(prefix string, target *url.URL, lim *limiter.Limiter) {
-	s.routes = append(s.routes, route{prefix: prefix, target: target, limiter: lim})
+func (s *Server) AddRoute(prefix string, targets []*url.URL, lim *limiter.Limiter) {
+	s.routes = append(s.routes, route{prefix: prefix, targets: targets, limiter: lim})
 }
 
 // resolveRoute matches path against the registered routes and returns
-// the target to forward to along with the path to forward it as (the
-// matched prefix stripped, if any route matched), a label identifying
-// the target for the per-target stats breakdown (the matched prefix, or
-// "default" for the fallback Target), and the rate limiter that applies
-// to this request: the matched route's own limiter if it has one,
-// otherwise the server-wide Limiter (nil if that is unset too, meaning
-// no limiting at all). It falls back to the default Target, unmodified
-// path, when nothing matches.
-func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter) {
+// the ordered list of candidate targets to forward to (always
+// non-empty; more than one entry means failover across them) along with
+// the path to forward it as (the matched prefix stripped, if any route
+// matched), a label identifying the target for the per-target stats
+// breakdown (the matched prefix, or "default" for the fallback Target),
+// and the rate limiter that applies to this request: the matched
+// route's own limiter if it has one, otherwise the server-wide Limiter
+// (nil if that is unset too, meaning no limiting at all). It falls back
+// to a single-element list holding the default Target, unmodified path,
+// when nothing matches.
+func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, r := range s.routes {
@@ -349,10 +430,10 @@ func (s *Server) resolveRoute(path string) (target *url.URL, forwardPath string,
 			if effectiveLimiter == nil {
 				effectiveLimiter = s.Limiter
 			}
-			return r.target, stripped, r.prefix, effectiveLimiter
+			return r.targets, stripped, r.prefix, effectiveLimiter
 		}
 	}
-	return s.Target, path, "default", s.Limiter
+	return []*url.URL{s.Target}, path, "default", s.Limiter
 }
 
 // getEngine, getCache, getCostPer1KTokens, and getWebhookURL are small
@@ -406,9 +487,11 @@ func (s *Server) getProxyAPIKey() string {
 
 // Route describes one path-prefix-to-upstream mapping for ReloadConfig,
 // mirroring what AddRoute registers before the server starts serving.
+// Targets must be non-empty; more than one entry means failover across
+// them in order — see failoverTransport.
 type Route struct {
-	Prefix string
-	Target *url.URL
+	Prefix  string
+	Targets []*url.URL
 	// Limiter, if non-nil, gives this route its own dedicated rate
 	// limit instead of sharing whatever Limiter ReloadConfig sets.
 	Limiter *limiter.Limiter
@@ -430,7 +513,7 @@ type Route struct {
 func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, proxyAPIKey string, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
-		newRoutes[i] = route{prefix: r.Prefix, target: r.Target, limiter: r.Limiter}
+		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter}
 	}
 
 	s.mu.Lock()
@@ -524,8 +607,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Resolved once so the cache key (below) and the actual forwarding
 	// (in Rewrite, via the request context set further down) can never
-	// disagree about which target and path this request maps to.
-	target, forwardPath, targetLabel, effectiveLimiter := s.resolveRoute(r.URL.Path)
+	// disagree about which target and path this request maps to. targets
+	// is always non-empty; when it holds more than one candidate (a
+	// failover route), the cache key is still computed against only the
+	// first (primary) one — a stable identity for the route regardless of
+	// which candidate actually ends up serving any one request.
+	targets, forwardPath, targetLabel, effectiveLimiter := s.resolveRoute(r.URL.Path)
 
 	// The cache is checked before rules and the rate limiter: a cache hit
 	// never touches either, and never reaches the upstream target. The
@@ -536,7 +623,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var cacheKey string
 	if cch := s.getCache(); cch != nil {
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
-		cacheKey = cache.Key(r.Method, target.ResolveReference(destURL).String(), body)
+		cacheKey = cache.Key(r.Method, targets[0].ResolveReference(destURL).String(), body)
 		if cached, hit, err := cch.Get(cacheKey); err == nil && hit {
 			defer cached.Body.Close()
 			copyHeader(w.Header(), cached.Header)
@@ -586,6 +673,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// subset filterHeadersForScanning handed to the engine.
 	r.Body = io.NopCloser(bytes.NewReader(evaluatedBody))
 	r.ContentLength = int64(len(evaluatedBody))
+	// GetBody lets failoverTransport re-read the same already-buffered
+	// body for a second (or later) candidate after an earlier one turns
+	// out to be unreachable — evaluatedBody is captured by value here, so
+	// every call returns a fresh reader over the same bytes.
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(evaluatedBody)), nil
+	}
 	for name, values := range evaluatedHeaders {
 		r.Header[name] = values
 	}
@@ -607,7 +701,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		method:      r.Method,
 		url:         r.URL.String(),
 		cacheKey:    cacheKey,
-		target:      target,
+		targets:     targets,
 		forwardPath: forwardPath,
 		targetLabel: targetLabel,
 	}
@@ -1039,6 +1133,14 @@ func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) 
 	s.logf("%s[BUDGET EXCEEDED] %s %s - Estimated cost %.4f exceeds budget %.4f%s", ansiYellow, method, reqURL, cost, budget, ansiReset)
 }
 
+func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "failover", Method: method, URL: reqURL, FailedTarget: failedTarget, NextTarget: nextTarget})
+		return
+	}
+	s.logf("%s[FAILOVER] %s %s - %s unreachable, trying %s%s", ansiBrightYellow, method, reqURL, failedTarget, nextTarget, ansiReset)
+}
+
 func (s *Server) logUsage(method, reqURL string, totalTokens int) {
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(logEvent{Level: "usage", Method: method, URL: reqURL, Tokens: totalTokens})
@@ -1158,27 +1260,30 @@ func (s *Server) handleResponseDryRunHits(hits []rules.DryRunMatch, method, reqU
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
 // webhookAlert is the JSON body POSTed to Server.WebhookURL for every
-// block, redact, rate_limited, unauthorized, budget_exceeded, or
-// dry-run event (dry_run_block, dry_run_redact, response_dry_run_block,
-// response_dry_run_redact). Text alone is enough for a Slack incoming
-// webhook (which reads exactly that field and ignores the rest); the
-// remaining fields serve a generic JSON webhook consumer that wants the
-// event structured instead of parsed back out of a sentence. Like every
-// other log line in this package, it carries the rule name that
-// matched, never the matched secret itself; Rule is empty for a
-// rate_limited, unauthorized, or budget_exceeded event, since none of
-// those is attributable to any one rule. Cost and Budget are set only
-// for budget_exceeded, omitted (via omitempty on the pointer) for every
-// other event.
+// block, redact, rate_limited, unauthorized, budget_exceeded, failover,
+// or dry-run event (dry_run_block, dry_run_redact,
+// response_dry_run_block, response_dry_run_redact). Text alone is
+// enough for a Slack incoming webhook (which reads exactly that field
+// and ignores the rest); the remaining fields serve a generic JSON
+// webhook consumer that wants the event structured instead of parsed
+// back out of a sentence. Like every other log line in this package, it
+// carries the rule name that matched, never the matched secret itself;
+// Rule is empty for a rate_limited, unauthorized, budget_exceeded, or
+// failover event, since none of those is attributable to any one rule.
+// Cost and Budget are set only for budget_exceeded; FailedTarget and
+// NextTarget only for failover; omitted (via omitempty) for every other
+// event.
 type webhookAlert struct {
-	Text   string   `json:"text"`
-	Event  string   `json:"event"`
-	Method string   `json:"method"`
-	URL    string   `json:"url"`
-	Rule   string   `json:"rule"`
-	Time   string   `json:"time"`
-	Cost   *float64 `json:"cost,omitempty"`
-	Budget *float64 `json:"budget,omitempty"`
+	Text         string   `json:"text"`
+	Event        string   `json:"event"`
+	Method       string   `json:"method"`
+	URL          string   `json:"url"`
+	Rule         string   `json:"rule"`
+	Time         string   `json:"time"`
+	Cost         *float64 `json:"cost,omitempty"`
+	Budget       *float64 `json:"budget,omitempty"`
+	FailedTarget string   `json:"failed_target,omitempty"`
+	NextTarget   string   `json:"next_target,omitempty"`
 }
 
 // deliverWebhookPayload marshals payload and POSTs it to Server.WebhookURL
@@ -1261,6 +1366,23 @@ func (s *Server) notifyBudgetWebhook(method, reqURL string, cost, budget float64
 	})
 }
 
+// notifyFailoverWebhook builds and delivers a webhookAlert for the
+// failover event — kept separate from notifyWebhook for the same reason
+// as notifyBudgetWebhook: this event carries a failed/next target pair
+// instead of a rule name.
+func (s *Server) notifyFailoverWebhook(method, reqURL, failedTarget, nextTarget string) {
+	text := fmt.Sprintf("[FAILOVER] %s %s - %s unreachable, trying %s", method, reqURL, failedTarget, nextTarget)
+	s.deliverWebhookPayload(webhookAlert{
+		Text:         text,
+		Event:        "failover",
+		Method:       method,
+		URL:          reqURL,
+		Time:         time.Now().UTC().Format(time.RFC3339),
+		FailedTarget: failedTarget,
+		NextTarget:   nextTarget,
+	})
+}
+
 // logEventJSON marshals ev (stamping the current time) and logs it as a
 // single line, for LogFormatJSON.
 func (s *Server) logEventJSON(ev logEvent) {
@@ -1318,6 +1440,12 @@ type statsSnapshotJSON struct {
 	ResponseBlocked  int64 `json:"response_blocked"`
 	ResponseRedacted int64 `json:"response_redacted"`
 
+	// Failover counts how many times this target's candidate list moved
+	// on to the next URL because an earlier one was unreachable — always
+	// 0 for a single-URL target. Broken down per target like Allowed,
+	// unlike Unauthorized/the dry-run fields below.
+	Failover int64 `json:"failover"`
+
 	// DryRunBlocked, DryRunRedacted, ResponseDryRunBlocked, and
 	// ResponseDryRunRedacted are only meaningful at the top level —
 	// dry-run activity is never broken down per target (see
@@ -1361,6 +1489,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		ResponseDryRunBlocked:  snap.ResponseDryRunBlocked,
 		ResponseDryRunRedacted: snap.ResponseDryRunRedacted,
 		Unauthorized:           snap.Unauthorized,
+		Failover:               snap.Failover,
 	}
 	if costPer1KTokens > 0 {
 		cost := snap.EstimatedCost(costPer1KTokens)
@@ -1420,6 +1549,7 @@ var promCounters = []struct {
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
 	{"aiproxy_responses_redacted_total", "Total number of upstream responses forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.ResponseRedacted }},
+	{"aiproxy_failover_total", "Total number of times this target's candidate list moved on to the next URL because an earlier one was unreachable.", func(s stats.Snapshot) int64 { return s.Failover }},
 }
 
 // promRuleCounters mirrors promCounters for the per-rule breakdown:

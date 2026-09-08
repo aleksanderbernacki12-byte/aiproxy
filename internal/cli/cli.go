@@ -124,7 +124,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.WebhookURL = lc.webhookURL
 	server.ProxyAPIKey = lc.proxyAPIKey
 	for _, r := range lc.routes {
-		server.AddRoute(r.prefix, r.target, r.limiter)
+		server.AddRoute(r.prefix, r.targets, r.limiter)
 	}
 
 	if cfg != nil {
@@ -172,10 +172,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "proxy authentication: required (Proxy-Authorization: Bearer <key>)")
 		}
 		for _, r := range lc.routes {
+			dest := formatTargetsForDisplay(r.targets)
 			if r.maxRequestsPerMinute > 0 {
-				fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %d requests/minute)\n", r.prefix, r.target, r.maxRequestsPerMinute)
+				fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %d requests/minute)\n", r.prefix, dest, r.maxRequestsPerMinute)
 			} else {
-				fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, r.target)
+				fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, dest)
 			}
 		}
 	}
@@ -240,7 +241,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 
 	routes := make([]proxy.Route, len(lc.routes))
 	for i, r := range lc.routes {
-		routes[i] = proxy.Route{Prefix: r.prefix, Target: r.target, Limiter: r.limiter}
+		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter}
 	}
 	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.proxyAPIKey, routes)
 
@@ -577,6 +578,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "%s is valid.\n", loadedFrom)
 	fmt.Fprintf(stdout, "  custom rules:            %d\n", len(cfg.CustomRules))
 	fmt.Fprintf(stdout, "  target routes:           %d\n", len(cfg.Targets))
+	fmt.Fprintf(stdout, "  routes with failover:    %d\n", countFailoverTargets(cfg))
 	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
@@ -588,6 +590,19 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
 	fmt.Fprintf(stdout, "  proxy authentication:    %v\n", cfg.ProxyAPIKey != "")
 	return 0
+}
+
+// countFailoverTargets counts every targets entry configured with more
+// than one urls candidate — a single-URL target (whether via url or a
+// one-element urls) has nothing to fail over to.
+func countFailoverTargets(cfg *config.Config) int {
+	n := 0
+	for _, t := range cfg.Targets {
+		if len(t.URLs) > 1 {
+			n++
+		}
+	}
+	return n
 }
 
 // countDryRunRules counts every custom_rules and path_rules entry with
@@ -747,22 +762,42 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 }
 
 // targetRoute is one compiled entry from the config file's targets list,
-// ready to be added to a proxy.Server via AddRoute. limiter is nil
-// unless the entry set its own max_requests_per_minute override.
+// ready to be added to a proxy.Server via AddRoute. targets is always
+// non-empty; more than one entry means the route fails over across them
+// in the configured order (see proxy.Server's failoverTransport).
+// limiter is nil unless the entry set its own max_requests_per_minute
+// override.
 type targetRoute struct {
 	prefix               string
-	target               *url.URL
+	targets              []*url.URL
 	maxRequestsPerMinute int
 	limiter              *limiter.Limiter
 }
 
+// formatTargetsForDisplay renders a targetRoute's candidate list for the
+// startup notice: just the one URL for the overwhelmingly common
+// single-candidate case (identical to the plain %s output before
+// failover existed), or the full ordered chain, joined by " -> ", when
+// there's more than one.
+func formatTargetsForDisplay(targets []*url.URL) string {
+	if len(targets) == 1 {
+		return targets[0].String()
+	}
+	strs := make([]string, len(targets))
+	for i, u := range targets {
+		strs[i] = u.String()
+	}
+	return strings.Join(strs, " -> ")
+}
+
 // compileTargetRoutes validates and parses each targets entry from the
 // config file. A prefix must be non-empty, start with "/", and be
-// distinct from every other entry's prefix; a URL must pass the same
-// https validation as --target; max_requests_per_minute, if set, must
-// not be negative. Problems are collected and returned rather than
-// stopping at the first one — the caller decides whether that's fatal
-// (runStart) or just a reported problem (runValidate).
+// distinct from every other entry's prefix; each entry's URL(s) must
+// pass the same https validation as --target (see compileTargetURLs);
+// max_requests_per_minute, if set, must not be negative. Problems are
+// collected and returned rather than stopping at the first one — the
+// caller decides whether that's fatal (runStart) or just a reported
+// problem (runValidate).
 func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 	compiled := make([]targetRoute, 0, len(targets))
 	var errs []error
@@ -778,9 +813,9 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 		}
 		seenPrefixes[t.Prefix] = true
 
-		u, err := parseHTTPSURL(t.URL)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("targets: prefix %q: url %w", t.Prefix, err))
+		urls, urlErrs := compileTargetURLs(t.Prefix, t)
+		if len(urlErrs) > 0 {
+			errs = append(errs, urlErrs...)
 			continue
 		}
 
@@ -789,13 +824,50 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 			continue
 		}
 
-		tr := targetRoute{prefix: t.Prefix, target: u, maxRequestsPerMinute: t.MaxRequestsPerMinute}
+		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute}
 		if t.MaxRequestsPerMinute > 0 {
 			tr.limiter = limiter.New(t.MaxRequestsPerMinute, time.Minute)
 		}
 		compiled = append(compiled, tr)
 	}
 	return compiled, errs
+}
+
+// compileTargetURLs resolves one targets entry's url/urls fields into an
+// ordered, non-empty list of upstream URLs. Exactly one of the two must
+// be set — url for a single upstream (the original, still-supported
+// shape), urls for an ordered failover list — and every URL, from
+// either field, must pass the same https validation as --target.
+func compileTargetURLs(prefix string, t config.Target) ([]*url.URL, []error) {
+	if t.URL != "" && len(t.URLs) > 0 {
+		return nil, []error{fmt.Errorf("targets: prefix %q: url and urls are mutually exclusive — set exactly one", prefix)}
+	}
+	if t.URL == "" && len(t.URLs) == 0 {
+		return nil, []error{fmt.Errorf("targets: prefix %q: must set one of url or urls", prefix)}
+	}
+
+	if t.URL != "" {
+		u, err := parseHTTPSURL(t.URL)
+		if err != nil {
+			return nil, []error{fmt.Errorf("targets: prefix %q: url %w", prefix, err)}
+		}
+		return []*url.URL{u}, nil
+	}
+
+	urls := make([]*url.URL, 0, len(t.URLs))
+	var errs []error
+	for i, raw := range t.URLs {
+		u, err := parseHTTPSURL(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("targets: prefix %q: urls[%d] %w", prefix, i, err))
+			continue
+		}
+		urls = append(urls, u)
+	}
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	return urls, nil
 }
 
 func printUsage(w io.Writer) {

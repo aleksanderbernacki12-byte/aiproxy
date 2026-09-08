@@ -193,10 +193,11 @@ serves, instead of the multi-line text block):
 `level` is one of `allow`, `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
 `dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
-`usage`, `budget_exceeded`, `cache_hit`, or `error` (an internal problem
-unrelated to any specific request, e.g. a failed cache write) —
-`method`/`url`/`rule`/`tokens` appear only where relevant, and
-`cost`/`budget` appear only on `budget_exceeded`. This only affects the ongoing per-request log stream on
+`usage`, `budget_exceeded`, `failover`, `cache_hit`, or `error` (an
+internal problem unrelated to any specific request, e.g. a failed cache
+write) — `method`/`url`/`rule`/`tokens` appear only where relevant,
+`cost`/`budget` only on `budget_exceeded`, and `failed_target`/
+`next_target` only on `failover`. This only affects the ongoing per-request log stream on
 stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
 ...`, `aiproxy listening on ...`) still print as plain text on stdout,
 since they're low-volume, human-oriented setup notices rather than part
@@ -484,6 +485,47 @@ exist. Omit or set it to 0 for a target that should just share the
 top-level limiter (or share "no limit at all", if the top-level field is
 itself unset).
 
+### Failover across multiple upstreams
+
+Give a target `urls` instead of `url` for an ordered list of candidate
+upstreams instead of a single one — useful for putting a backup provider
+(or a second region of the same one) behind a route that would otherwise
+go down with its primary:
+
+```json
+{
+  "targets": [
+    { "prefix": "/openai", "urls": ["https://api.openai.com", "https://backup.example.com"] }
+  ]
+}
+```
+
+A request tries the first URL, and only moves on to the next if that
+attempt never got a response at all — a dial, TLS, or timeout failure
+meaning the candidate was genuinely unreachable. It never retries a
+*different* candidate just because one answered with an HTTP-level error
+(a 5xx): by the time a backend has responded at all, it may already have
+started acting on the request, and blindly replaying that against a
+different backend risks a duplicate side effect — a duplicate, possibly
+billed, LLM call being the textbook case for this proxy. `url` and
+`urls` are mutually exclusive; set exactly one per target. This only
+applies to `targets[]` entries — the fallback `--target` stays a single
+URL with no failover of its own.
+
+Each attempt is logged (`[FAILOVER]`, bright yellow;
+`"failover"` under `--log-format json`) and, if `webhook_url` is set,
+[alerted](#webhook-alerts) with the failed and next candidate URLs —
+worth knowing about in real time, since it means a provider is down.
+It's also counted, broken down by target like most other counters (not
+global-only the way `unauthorized` and dry-run are — a failover is
+always about one specific route's own candidate list): `GET
+/_aiproxy/stats`'s `failover` field, and the Prometheus endpoint's
+`aiproxy_failover_total{target="..."}`. A request whose every candidate
+turns out to be unreachable still just gets an error response, the same
+as forwarding to a single, entirely-down target has always produced —
+this adds a chance to recover before that happens, not a guarantee
+against it.
+
 ## Path-based endpoint rules
 
 `targets` picks which upstream a path goes to; `path_rules` decides
@@ -642,11 +684,12 @@ can be monitored without waiting for Ctrl+C:
   "response_dry_run_blocked": 0,
   "response_dry_run_redacted": 0,
   "unauthorized": 0,
+  "failover": 1,
   "estimated_cost": 0.062,
   "cost_budget": 10,
   "per_target": {
-    "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062 },
-    "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0 }
+    "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062, "failover": 1 },
+    "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0, "failover": 0 }
   },
   "per_rule": {
     "aws-access-key": { "blocked": 1, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 0, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 },
@@ -677,7 +720,11 @@ request never resolves either. `cost_budget` (see
 [cost budget alerts](#custom-rules-rate-limiting-caching-and-cost-estimation))
 is included only when it's set, and — unlike `estimated_cost` — never
 repeated inside `per_target`: it's a single whole-proxy-run threshold,
-not something each target has its own copy of. Any method other than `GET` gets a 405.
+not something each target has its own copy of. `failover` (see
+[failover across multiple upstreams](#failover-across-multiple-upstreams))
+is the other way around from `unauthorized`: broken down by target like
+`allowed`/`blocked`, since a failover is always about one specific
+route's own candidate list, not something target-agnostic. Any method other than `GET` gets a 405.
 Once `proxy_api_key` is set, this endpoint requires it too — a request
 missing or failing that check never reaches this handler at all, and
 gets a 407 instead. Because the path
@@ -700,6 +747,8 @@ aiproxy_cache_hits_total{target="default"} 5
 aiproxy_tokens_used_total{target="default"} 3100
 aiproxy_responses_blocked_total{target="default"} 0
 aiproxy_responses_redacted_total{target="default"} 1
+aiproxy_failover_total{target="default"} 0
+aiproxy_failover_total{target="/openai"} 1
 aiproxy_estimated_cost{target="default"} 0.062
 aiproxy_rule_blocked_total{rule="aws-access-key"} 1
 aiproxy_rule_redacted_total{rule="aws-access-key"} 0
@@ -731,7 +780,11 @@ rule-labeled `aiproxy_rule_dry_run_*_total{rule="..."}` counterparts,
 but are themselves unlabeled — dry-run activity is never broken down by
 target. `aiproxy_unauthorized_total` is unlabeled too, and has no
 rule-labeled counterpart at all — a rejected request never resolves a
-target or a rule to label it with. `aiproxy_cost_budget` is a gauge, not
+target or a rule to label it with. `aiproxy_failover_total` is the other
+way around — labeled `target="..."` like the very first series above,
+not unlabeled — since a failover is always about one specific route's
+own candidate list; every target seen so far gets a series here too,
+`0` for one that has never needed to fail over. `aiproxy_cost_budget` is a gauge, not
 a counter — the configured `cost_budget` threshold itself, included only
 when it's set — and unlabeled for a different reason than the series
 above: a single whole-proxy-run value, not something with a per-target
@@ -765,7 +818,8 @@ rule matches — on a request going out, a
 [rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
 tripping, a [dry-run](#dry-run-mode-for-rules) rule matching, a
 request failing [proxy authentication](#authenticating-requests-to-the-proxy),
-or the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-and-cost-estimation):
+the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-and-cost-estimation),
+or a [failover](#failover-across-multiple-upstreams) to the next candidate target:
 
 ```json
 {
@@ -775,8 +829,8 @@ or the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-a
 
 Every alertable event — `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
-`dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`, or
-`budget_exceeded` — POSTs this JSON body to that URL:
+`dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
+`budget_exceeded`, or `failover` — POSTs this JSON body to that URL:
 
 ```json
 {
@@ -839,6 +893,24 @@ running process, not on every request past the threshold:
 }
 ```
 
+A `failover` alert — fired the moment a target's candidate URL turns out
+to be unreachable and the request moves on to the next one — likewise
+carries an empty `rule`, plus `failed_target` and `next_target` fields
+no other event has:
+
+```json
+{
+  "text": "[FAILOVER] POST /openai/v1/chat/completions - https://api.openai.com unreachable, trying https://backup.example.com",
+  "event": "failover",
+  "method": "POST",
+  "url": "/openai/v1/chat/completions",
+  "rule": "",
+  "time": "2026-01-01T12:00:00Z",
+  "failed_target": "https://api.openai.com",
+  "next_target": "https://backup.example.com"
+}
+```
+
 `text` alone is already a valid Slack incoming webhook payload — point
 `webhook_url` straight at one and it just works, no separate Slack
 integration needed. The rest of the fields serve any other endpoint that
@@ -850,7 +922,7 @@ Delivery happens on its own goroutine with a 5-second timeout, so a
 slow or unreachable webhook endpoint never delays the request that
 triggered it; a delivery failure is logged as an internal error and
 otherwise ignored — there's no retry. Unlike `--target` and
-`targets[].url`, `webhook_url` accepts plain `http` as well as `https`
+`targets[].url`/`targets[].urls`, `webhook_url` accepts plain `http` as well as `https`
 (it still has to be a well-formed URL with a host) — a webhook payload
 never carries a secret, only a method/url/rule name, so a local or
 internal-network receiver with no TLS in front of it is a perfectly
@@ -869,7 +941,8 @@ aiproxy validate --config aiproxy.json
 
 Checks `aiproxy.json` for problems without starting the proxy: every
 `custom_rules` pattern must compile, every `targets` entry needs a
-well-formed, unique prefix and a valid HTTPS URL, every
+well-formed, unique prefix and exactly one of a valid HTTPS `url` or a
+non-empty `urls` list of them, every
 `builtin_rule_actions` key must name a real built-in rule with a valid
 action, and the numeric fields can't be negative. It reports every
 problem it finds in one pass rather than stopping at the first, and
