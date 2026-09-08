@@ -142,9 +142,11 @@ serves, instead of the multi-line text block):
 ```
 
 `level` is one of `allow`, `block`, `redact`, `response_block`,
-`response_redact`, `rate_limited`, `usage`, `cache_hit`, or `error` (an
-internal problem unrelated to any specific request, e.g. a failed cache
-write) — `method`/`url`/`rule`/`tokens` appear only where relevant. This only affects the ongoing per-request log stream on
+`response_redact`, `rate_limited`, `dry_run_block`, `dry_run_redact`,
+`response_dry_run_block`, `response_dry_run_redact`, `usage`,
+`cache_hit`, or `error` (an internal problem unrelated to any specific
+request, e.g. a failed cache write) — `method`/`url`/`rule`/`tokens`
+appear only where relevant. This only affects the ongoing per-request log stream on
 stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
 ...`, `aiproxy listening on ...`) still print as plain text on stdout,
 since they're low-volume, human-oriented setup notices rather than part
@@ -392,6 +394,53 @@ the same way as `targets[].prefix`) and are matched before any
 body/header content is scanned, so an `allow` entry is a genuine,
 complete opt-out — use it deliberately.
 
+## Dry-run mode for rules
+
+Adding a new `custom_rules` or `path_rules` entry carries real risk: a
+regex that's slightly too broad, or a prefix that catches more than
+intended, blocks or mangles traffic you didn't mean to touch. Give a
+rule `"dry_run": true` to find that out safely first — it's evaluated
+against every real request exactly as normal, but instead of actually
+blocking or redacting, it only reports what it *would* have done:
+
+```json
+{
+  "custom_rules": [
+    { "name": "candidate-rule", "pattern": "CANDIDATE-[0-9]+", "action": "block", "dry_run": true }
+  ],
+  "path_rules": [
+    { "name": "new-restriction", "prefix": "/beta", "action": "block", "dry_run": true }
+  ]
+}
+```
+
+The request (or response — a `custom_rules` entry is dry-run on both
+sides, same as it's scanned on both) is forwarded completely untouched,
+as if the rule had never matched, while a would-have match is logged
+(`[DRY-RUN BLOCK]` / `[DRY-RUN REDACT]`, gray; or `[RESPONSE DRY-RUN
+BLOCK]` / `[RESPONSE DRY-RUN REDACT]` for a response match), counted
+separately in `GET /_aiproxy/stats` (`dry_run_blocked`,
+`dry_run_redacted`, and their `response_dry_run_*` counterparts, both
+overall and per rule in `per_rule`), exposed on the Prometheus endpoint
+(`aiproxy_dry_run_blocked_total` and friends, plus rule-labeled
+`aiproxy_rule_dry_run_blocked_total`), and — if `webhook_url` is
+set — POSTed as its own event (`dry_run_block`, `dry_run_redact`,
+`response_dry_run_block`, `response_dry_run_redact`), with `text`
+saying "Would have triggered rule" instead of "Triggered rule" so it's
+never mistaken for the real thing. A dry-run match never shadows a
+different, live rule further down the list — evaluation just continues
+past it exactly as if it hadn't matched.
+
+`path_rules[].dry_run` only makes sense combined with `"action":
+"block"` — there's nothing to preview for `"allow"`, which never
+rejects anything to begin with — so `aiproxy validate` rejects the
+combination as a config error. `custom_rules[].dry_run` works with
+either `"block"` or `"redact"`. Unlike every other counter in this
+project, dry-run activity is never broken down per target — a dry-run
+rule's whole point is testing that one rule, not measuring which target
+its traffic happened to route to — so it only appears in the overall
+totals and the per-rule breakdown.
+
 ## Example: proxying Claude traffic
 
 Point `--target` straight at the Anthropic API — nothing Claude-specific
@@ -470,14 +519,18 @@ can be monitored without waiting for Ctrl+C:
   "total_tokens": 3100,
   "response_blocked": 0,
   "response_redacted": 1,
+  "dry_run_blocked": 1,
+  "dry_run_redacted": 0,
+  "response_dry_run_blocked": 0,
+  "response_dry_run_redacted": 0,
   "estimated_cost": 0.062,
   "per_target": {
     "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062 },
     "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0 }
   },
   "per_rule": {
-    "aws-access-key": { "blocked": 1, "redacted": 0, "response_blocked": 0, "response_redacted": 0 },
-    "openai-api-key": { "blocked": 0, "redacted": 0, "response_blocked": 0, "response_redacted": 1 }
+    "aws-access-key": { "blocked": 1, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 0, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 },
+    "candidate-rule": { "blocked": 0, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 1, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 }
   }
 }
 ```
@@ -488,14 +541,18 @@ used so far — unlike the printed shutdown summary, which leaves the
 breakdown out entirely for a single-target run, the JSON endpoint stays
 structurally the same shape regardless of how many targets are in play,
 since that predictability matters more for something meant to be parsed
-by a script or dashboard. `per_rule` breaks the same four block/redact
+by a script or dashboard. `per_rule` breaks the same block/redact
 outcomes down by which named rule (built-in, custom, or path) actually
 matched — combining its request-side and response-side hits under the
 one name, since which target the match happened to route through
 doesn't change which rule is responsible for it — so you can see which
 rule fires the most (worth checking for false positives) or catches the
-most real leaks. Any method other than `GET` gets a 405. Because the
-path is reserved, an upstream that genuinely needs to be reached at
+most real leaks. The four `dry_run_*`/`response_dry_run_*` fields (see
+[dry-run mode](#dry-run-mode-for-rules)) are the one exception to the
+per-target/per-rule split: they appear in the overall totals and inside
+`per_rule`, but are never broken down by target — always `0` inside
+`per_target`. Any method other than `GET` gets a 405. Because the path
+is reserved, an upstream that genuinely needs to be reached at
 `/_aiproxy/stats` itself cannot be — route it through a different
 prefix if that ever comes up.
 
@@ -520,6 +577,12 @@ aiproxy_rule_redacted_total{rule="aws-access-key"} 0
 aiproxy_rule_response_blocked_total{rule="aws-access-key"} 0
 aiproxy_rule_response_redacted_total{rule="aws-access-key"} 0
 aiproxy_rule_response_redacted_total{rule="openai-api-key"} 1
+aiproxy_rule_dry_run_blocked_total{rule="candidate-rule"} 1
+aiproxy_rule_dry_run_redacted_total{rule="candidate-rule"} 0
+aiproxy_dry_run_blocked_total 1
+aiproxy_dry_run_redacted_total 0
+aiproxy_dry_run_response_blocked_total 0
+aiproxy_dry_run_response_redacted_total 0
 ```
 
 (`# HELP`/`# TYPE` lines omitted above for brevity — the real response
@@ -531,7 +594,12 @@ set, same as the JSON endpoint's `estimated_cost`. The `aiproxy_rule_*`
 series mirror `per_rule` from the JSON endpoint: one `rule="<name>"`
 series per rule that has ever matched, for every rule seen so far — not
 tied to any target label, since a rule's identity doesn't depend on
-which target the request routed to. Point Prometheus at it with:
+which target the request routed to. The four `aiproxy_dry_run_*_total`
+series (see [dry-run mode](#dry-run-mode-for-rules)) are the only ones
+in the entire endpoint with no labels at all — dry-run activity is
+never broken down by target OR left unlabeled-per-rule; it gets its own
+`aiproxy_rule_dry_run_*_total{rule="..."}` series for that. Point
+Prometheus at it with:
 
 ```yaml
 scrape_configs:
@@ -553,9 +621,9 @@ stats it reports, and any method other than `GET` gets a 405.
 Stats and metrics are pull-based — something has to go and look at them.
 Set `webhook_url` to get pushed a real-time alert instead, the moment a
 rule matches — on a request going out, a
-[response](#scanning-responses-too) coming back, or the
+[response](#scanning-responses-too) coming back, the
 [rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
-tripping:
+tripping, or a [dry-run](#dry-run-mode-for-rules) rule matching:
 
 ```json
 {
@@ -564,7 +632,9 @@ tripping:
 ```
 
 Every alertable event — `block`, `redact`, `response_block`,
-`response_redact`, or `rate_limited` — POSTs this JSON body to that URL:
+`response_redact`, `rate_limited`, `dry_run_block`, `dry_run_redact`,
+`response_dry_run_block`, or `response_dry_run_redact` — POSTs this
+JSON body to that URL:
 
 ```json
 {

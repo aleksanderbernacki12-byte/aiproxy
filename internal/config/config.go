@@ -22,6 +22,15 @@ type CustomRule struct {
 	// every occurrence of the matched pattern in the body and forwards
 	// the request instead.
 	Action string `json:"action,omitempty"`
+
+	// DryRun, if true, makes this rule only report what it would have
+	// done — via logs, the webhook, and stats — without actually
+	// blocking or redacting anything; the request or response is
+	// forwarded exactly as if the rule had never matched. False (the
+	// default when the field is absent) means the rule is fully live.
+	// Meant for trying a new rule out against real traffic before
+	// trusting it to actually enforce anything.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 // PathRule is one path-prefix endpoint rule as it appears in the config
@@ -40,6 +49,16 @@ type PathRule struct {
 	// intents, so silently defaulting to either could surprise the user
 	// in a way that matters.
 	Action string `json:"action"`
+
+	// DryRun, if true, makes a "block" rule only report what it would
+	// have rejected — via logs, the webhook, and stats — instead of
+	// actually rejecting it; the request is forwarded exactly as if the
+	// rule had never matched. False (the default when the field is
+	// absent) means the rule is fully live. Only meaningful combined
+	// with "block": there is nothing to preview for "allow", which
+	// never rejects anything to begin with, so combining the two is a
+	// config error (see the CLI's path rule validation).
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 // Target is one path-prefix-to-upstream mapping for multi-target

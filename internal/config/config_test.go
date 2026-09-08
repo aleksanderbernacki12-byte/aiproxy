@@ -51,6 +51,29 @@ func TestLoad_ParsesCustomRuleAction(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesCustomRuleDryRun(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": [
+		{"name": "candidate-rule", "pattern": "CANDIDATE-[0-9]+", "dry_run": true},
+		{"name": "live-rule", "pattern": "LIVE-[0-9]+"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if !cfg.CustomRules[0].DryRun {
+		t.Fatalf("CustomRules[0].DryRun = %v, want true", cfg.CustomRules[0].DryRun)
+	}
+	if cfg.CustomRules[1].DryRun {
+		t.Fatalf("CustomRules[1].DryRun = %v, want false when absent", cfg.CustomRules[1].DryRun)
+	}
+}
+
 func TestLoad_ParsesBuiltinRuleActions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
@@ -179,6 +202,23 @@ func TestLoad_ParsesPathRules(t *testing.T) {
 	}
 	if cfg.PathRules[1] != (config.PathRule{Name: "health-check", Prefix: "/health", Action: "allow"}) {
 		t.Fatalf("PathRules[1] = %+v, want health-check", cfg.PathRules[1])
+	}
+}
+
+func TestLoad_ParsesPathRuleDryRun(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [{"name": "candidate-block", "prefix": "/new", "action": "block", "dry_run": true}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.PathRules[0] != (config.PathRule{Name: "candidate-block", Prefix: "/new", Action: "block", DryRun: true}) {
+		t.Fatalf("PathRules[0] = %+v, want DryRun true", cfg.PathRules[0])
 	}
 }
 
@@ -408,7 +448,7 @@ func TestLoad_CustomRuleBecomesActiveInEngine(t *testing.T) {
 		})
 	}
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`payload=SECRET_98765`),
@@ -423,7 +463,7 @@ func TestLoad_CustomRuleBecomesActiveInEngine(t *testing.T) {
 		t.Fatalf("rule = %q, want %q", ruleName, "mitt-foretag-hemlighet")
 	}
 
-	action2, _, _, _, err := engine.Evaluate(rules.Request{
+	action2, _, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`payload=not-a-secret`),

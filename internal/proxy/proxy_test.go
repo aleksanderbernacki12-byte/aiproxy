@@ -1783,26 +1783,34 @@ func TestServer_SummaryText_IncludesPerRuleBreakdown(t *testing.T) {
 // ruleJSONResponse mirrors the wire shape of one entry in per_rule, for
 // tests to decode into.
 type ruleJSONResponse struct {
-	Blocked          int64 `json:"blocked"`
-	Redacted         int64 `json:"redacted"`
-	ResponseBlocked  int64 `json:"response_blocked"`
-	ResponseRedacted int64 `json:"response_redacted"`
+	Blocked                int64 `json:"blocked"`
+	Redacted               int64 `json:"redacted"`
+	ResponseBlocked        int64 `json:"response_blocked"`
+	ResponseRedacted       int64 `json:"response_redacted"`
+	DryRunBlocked          int64 `json:"dry_run_blocked"`
+	DryRunRedacted         int64 `json:"dry_run_redacted"`
+	ResponseDryRunBlocked  int64 `json:"response_dry_run_blocked"`
+	ResponseDryRunRedacted int64 `json:"response_dry_run_redacted"`
 }
 
 // statsJSONResponse mirrors the wire shape served at GET /_aiproxy/stats,
 // for tests to decode into.
 type statsJSONResponse struct {
-	Allowed          int64                        `json:"allowed"`
-	Blocked          int64                        `json:"blocked"`
-	Redacted         int64                        `json:"redacted"`
-	RateLimited      int64                        `json:"rate_limited"`
-	CacheHits        int64                        `json:"cache_hits"`
-	TotalTokens      int64                        `json:"total_tokens"`
-	ResponseBlocked  int64                        `json:"response_blocked"`
-	ResponseRedacted int64                        `json:"response_redacted"`
-	EstimatedCost    *float64                     `json:"estimated_cost,omitempty"`
-	PerTarget        map[string]statsJSONResponse `json:"per_target,omitempty"`
-	PerRule          map[string]ruleJSONResponse  `json:"per_rule,omitempty"`
+	Allowed                int64                        `json:"allowed"`
+	Blocked                int64                        `json:"blocked"`
+	Redacted               int64                        `json:"redacted"`
+	RateLimited            int64                        `json:"rate_limited"`
+	CacheHits              int64                        `json:"cache_hits"`
+	TotalTokens            int64                        `json:"total_tokens"`
+	ResponseBlocked        int64                        `json:"response_blocked"`
+	ResponseRedacted       int64                        `json:"response_redacted"`
+	DryRunBlocked          int64                        `json:"dry_run_blocked"`
+	DryRunRedacted         int64                        `json:"dry_run_redacted"`
+	ResponseDryRunBlocked  int64                        `json:"response_dry_run_blocked"`
+	ResponseDryRunRedacted int64                        `json:"response_dry_run_redacted"`
+	EstimatedCost          *float64                     `json:"estimated_cost,omitempty"`
+	PerTarget              map[string]statsJSONResponse `json:"per_target,omitempty"`
+	PerRule                map[string]ruleJSONResponse  `json:"per_rule,omitempty"`
 }
 
 // TestServer_StatsEndpoint_ReturnsCurrentSnapshotAsJSON drives a request
@@ -3807,6 +3815,517 @@ func TestServer_StatsEndpoint_ReportsPerRuleBreakdown(t *testing.T) {
 	for name, target := range got.PerTarget {
 		if len(target.PerRule) != 0 {
 			t.Errorf("per_target[%q].per_rule = %+v, want it to stay empty (per_rule is a global breakdown only)", name, target.PerRule)
+		}
+	}
+}
+
+// TestServer_DryRunCustomRule_BlockNeverEnforcedRequestForwarded proves
+// a DryRun custom rule matching Block never actually blocks a request —
+// it reaches the upstream and the client gets a normal 200 — while
+// still being logged, stats-recorded, and (if configured) webhooked as
+// a dry_run_block event.
+func TestServer_DryRunCustomRule_BlockNeverEnforcedRequestForwarded(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("key=AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a dry_run rule must never actually block)", resp.StatusCode, http.StatusOK)
+	}
+	if !upstreamHit.Load() {
+		t.Fatal("upstream was never reached — a dry_run block must still forward the request")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Blocked != 0 {
+		t.Fatalf("Blocked = %d, want 0 (nothing was actually blocked)", snap.Blocked)
+	}
+	if snap.DryRunBlocked != 1 {
+		t.Fatalf("DryRunBlocked = %d, want 1", snap.DryRunBlocked)
+	}
+	rule, ok := snap.PerRule["aws-access-key"]
+	if !ok || rule.DryRunBlocked != 1 {
+		t.Fatalf("PerRule[aws-access-key] = %+v, want dry-run-blocked=1", rule)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "[DRY-RUN BLOCK]") {
+		t.Fatalf("log missing [DRY-RUN BLOCK] marker: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "Would have triggered rule: aws-access-key") {
+		t.Fatalf("log missing the would-have-triggered rule name: %q", logOutput)
+	}
+}
+
+// TestServer_DryRunCustomRule_RedactNeverEnforcedBodyReachesUpstreamUnmasked
+// proves a DryRun Redact rule never actually masks anything: the
+// original, unredacted secret reaches the upstream exactly as sent.
+func TestServer_DryRunCustomRule_RedactNeverEnforcedBodyReachesUpstreamUnmasked(t *testing.T) {
+	secret := "sk-FAKEKEY1234567890ABCDEFGHIJ"
+	receivedBody := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBody <- string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+		DryRun:  true,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	body := `{"key":"` + secret + `"}`
+	resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-receivedBody:
+		if got != body {
+			t.Fatalf("upstream received %q, want the original, unmasked body %q", got, body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream was never reached")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Redacted != 0 {
+		t.Fatalf("Redacted = %d, want 0 (nothing was actually redacted)", snap.Redacted)
+	}
+	if snap.DryRunRedacted != 1 {
+		t.Fatalf("DryRunRedacted = %d, want 1", snap.DryRunRedacted)
+	}
+}
+
+// TestServer_DryRunPathRule_BlockNeverEnforcedRequestForwarded is the
+// path-rule equivalent of the custom-rule dry-run block test.
+func TestServer_DryRunPathRule_BlockNeverEnforcedRequestForwarded(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{
+		Name:       "block-admin",
+		PathPrefix: "/admin",
+		Action:     rules.Block,
+		DryRun:     true,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/admin/users")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a dry_run path rule must never actually block)", resp.StatusCode, http.StatusOK)
+	}
+	if !upstreamHit.Load() {
+		t.Fatal("upstream was never reached — a dry_run path block must still forward the request")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.DryRunBlocked != 1 {
+		t.Fatalf("DryRunBlocked = %d, want 1", snap.DryRunBlocked)
+	}
+	if !strings.Contains(logBuf.String(), "[DRY-RUN BLOCK]") {
+		t.Fatalf("log missing [DRY-RUN BLOCK] marker: %q", logBuf.String())
+	}
+}
+
+// TestServer_DryRunResponse_BlockNeverEnforcedClientReceivesFullResponse
+// proves a DryRun rule matching the (non-streaming) response never
+// withholds it: the client receives the full, original body, secret
+// included, exactly as bufferResponse read it from upstream.
+func TestServer_DryRunResponse_BlockNeverEnforcedClientReceivesFullResponse(t *testing.T) {
+	secret := "AKIAABCDEFGHIJKLMNOP"
+	upstreamBody := `{"echo":"` + secret + `"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a dry_run rule must never actually block a response)", resp.StatusCode, http.StatusOK)
+	}
+	if string(gotBody) != upstreamBody {
+		t.Fatalf("client received %q, want the full, unmodified upstream body %q", gotBody, upstreamBody)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.ResponseBlocked != 0 {
+		t.Fatalf("ResponseBlocked = %d, want 0", snap.ResponseBlocked)
+	}
+	if snap.ResponseDryRunBlocked != 1 {
+		t.Fatalf("ResponseDryRunBlocked = %d, want 1", snap.ResponseDryRunBlocked)
+	}
+	if !strings.Contains(logBuf.String(), "[RESPONSE DRY-RUN BLOCK]") {
+		t.Fatalf("log missing [RESPONSE DRY-RUN BLOCK] marker: %q", logBuf.String())
+	}
+}
+
+// TestServer_DryRunStreamingResponse_BlockNeverCutsStreamShort proves a
+// DryRun rule matching a streamed response chunk never ends the stream
+// early: every chunk, including the one after the match, reaches the
+// client exactly as sent.
+func TestServer_DryRunStreamingResponse_BlockNeverCutsStreamShort(t *testing.T) {
+	secret := "AKIAABCDEFGHIJKLMNOP"
+	firstChunk := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n"
+	secretChunk := "data: {\"choices\":[{\"delta\":{\"content\":\"" + secret + "\"}}]}\n\n"
+	lastChunk := "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(firstChunk))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		w.Write([]byte(secretChunk))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		w.Write([]byte(lastChunk))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	gotBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	wantBody := firstChunk + secretChunk + lastChunk
+	if string(gotBody) != wantBody {
+		t.Fatalf("client received %q, want the full stream %q (a dry_run rule must never cut it short)", gotBody, wantBody)
+	}
+
+	logOutput := waitForLogContains(&logBuf, "[RESPONSE DRY-RUN BLOCK]", time.Second)
+	if !strings.Contains(logOutput, "Would have triggered rule: aws-access-key") {
+		t.Fatalf("log missing the would-have-triggered rule name: %q", logOutput)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.ResponseBlocked != 0 {
+		t.Fatalf("ResponseBlocked = %d, want 0", snap.ResponseBlocked)
+	}
+	if snap.ResponseDryRunBlocked != 1 {
+		t.Fatalf("ResponseDryRunBlocked = %d, want 1", snap.ResponseDryRunBlocked)
+	}
+}
+
+// TestServer_Webhook_FiresOnDryRunBlockWithExpectedPayload proves a
+// configured WebhookURL receives a dry_run_block alert, with "Would
+// have triggered rule" wording distinguishing it from a real block.
+func TestServer_Webhook_FiresOnDryRunBlockWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.WebhookURL = webhookURL
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("key=AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "dry_run_block" {
+			t.Errorf("event = %v, want %q", payload["event"], "dry_run_block")
+		}
+		if payload["rule"] != "aws-access-key" {
+			t.Errorf("rule = %v, want %q", payload["rule"], "aws-access-key")
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "DRY_RUN_BLOCK") || !strings.Contains(text, "Would have triggered rule") {
+			t.Errorf("text = %q, want it to mention DRY_RUN_BLOCK and 'Would have triggered rule'", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsDryRunCounts proves the live
+// /_aiproxy/stats endpoint surfaces both the overall dry-run counters
+// and their per-rule breakdown, for both request- and response-side
+// dry-run matches.
+func TestServer_StatsEndpoint_ReportsDryRunCounts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/respblock" {
+			w.Write([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+			return
+		}
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(path, body string) {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	post("/reqblock", `{"key":"AKIAABCDEFGHIJKLMNOP"}`)
+	post("/respblock", `{"hello":"world"}`)
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if got.DryRunBlocked != 1 {
+		t.Errorf("dry_run_blocked = %d, want 1", got.DryRunBlocked)
+	}
+	if got.ResponseDryRunBlocked != 1 {
+		t.Errorf("response_dry_run_blocked = %d, want 1", got.ResponseDryRunBlocked)
+	}
+	rule, ok := got.PerRule["aws-access-key"]
+	if !ok {
+		t.Fatalf("per_rule missing aws-access-key: %+v", got.PerRule)
+	}
+	if rule.DryRunBlocked != 1 || rule.ResponseDryRunBlocked != 1 {
+		t.Errorf("per_rule[aws-access-key] = %+v, want dry_run_blocked=1 response_dry_run_blocked=1", rule)
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsDryRunCounters proves metricsPath
+// exposes both the four overall (unlabeled) aiproxy_dry_run_*_total
+// series and their rule-labeled aiproxy_rule_dry_run_*_total
+// counterparts.
+func TestServer_MetricsEndpoint_ReportsDryRunCounters(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{"key":"AKIAABCDEFGHIJKLMNOP"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	metricsResp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/metrics: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	body, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+
+	for _, want := range []string{
+		"# HELP aiproxy_dry_run_blocked_total",
+		"# TYPE aiproxy_dry_run_blocked_total counter",
+		"aiproxy_dry_run_blocked_total 1",
+		`aiproxy_rule_dry_run_blocked_total{rule="aws-access-key"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q: %q", want, out)
 		}
 	}
 }

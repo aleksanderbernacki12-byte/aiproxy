@@ -20,7 +20,7 @@ func TestEngine_BlocksAWSAccessKeyInBody(t *testing.T) {
 	// arrive at the proxy before being forwarded over HTTPS.
 	body := []byte(`{"config":"AKIAABCDEFGHIJKLMNOP","note":"fake key for test"}`)
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   body,
@@ -47,7 +47,7 @@ func TestEngine_BlocksOpenAIAPIKeyInBody(t *testing.T) {
 	// Fake OpenAI API key, sent as a plaintext body.
 	body := []byte(`OPENAI_API_KEY=sk-FAKEKEY1234567890ABCDEFGHIJ`)
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/env",
 		Body:   body,
@@ -77,7 +77,7 @@ func TestEngine_RedactsMatchedSecretAndForwards(t *testing.T) {
 
 	body := []byte(`{"key":"sk-FAKEKEY1234567890ABCDEFGHIJ","other":"sk-ANOTHERFAKEKEY000000000"}`)
 
-	action, ruleName, redactedBody, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, redactedBody, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/chat",
 		Body:   body,
@@ -113,7 +113,7 @@ func TestEngine_NonMatchingBody_ReturnsBodyUnchanged(t *testing.T) {
 	})
 
 	body := []byte(`{"hello":"world"}`)
-	action, _, gotBody, _, err := engine.Evaluate(rules.Request{
+	action, _, gotBody, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/chat",
 		Body:   body,
@@ -140,7 +140,7 @@ func TestEngine_BlocksSecretFoundInHeaderValue(t *testing.T) {
 		Action:  rules.Block,
 	})
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`{"hello":"world"}`),
@@ -171,7 +171,7 @@ func TestEngine_RedactsSecretFoundInHeaderValue(t *testing.T) {
 	})
 
 	body := []byte(`{"hello":"world"}`)
-	action, ruleName, gotBody, gotHeaders, err := engine.Evaluate(rules.Request{
+	action, ruleName, gotBody, gotHeaders, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/chat",
 		Body:   body,
@@ -217,7 +217,7 @@ func TestEngine_BodyMatchTakesPriorityOverHeaderMatch(t *testing.T) {
 		Action:  rules.Block,
 	})
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`{"config":"AKIAABCDEFGHIJKLMNOP"}`),
@@ -248,7 +248,7 @@ func TestEngine_NonMatchingHeaders_ReturnsHeadersUnchanged(t *testing.T) {
 	})
 
 	headers := map[string][]string{"X-Debug-Info": {"nothing-interesting-here"}}
-	action, ruleName, _, gotHeaders, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, gotHeaders, _, err := engine.Evaluate(rules.Request{
 		Method:  "POST",
 		URL:     "/upload",
 		Body:    []byte(`{"hello":"world"}`),
@@ -278,7 +278,7 @@ func TestEngine_EvaluateResponse_BlocksMatchedSecret(t *testing.T) {
 		Action:  rules.Block,
 	})
 
-	action, ruleName, _ := engine.EvaluateResponse([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+	action, ruleName, _, _ := engine.EvaluateResponse([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
 	if action != rules.Block {
 		t.Fatalf("action = %v, want %v", action, rules.Block)
 	}
@@ -298,7 +298,7 @@ func TestEngine_EvaluateResponse_RedactsMatchedSecret(t *testing.T) {
 		Action:  rules.Redact,
 	})
 
-	action, ruleName, body := engine.EvaluateResponse([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	action, ruleName, body, _ := engine.EvaluateResponse([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
 	if action != rules.Redact {
 		t.Fatalf("action = %v, want %v", action, rules.Redact)
 	}
@@ -322,7 +322,7 @@ func TestEngine_EvaluateResponse_AllowsCleanBody(t *testing.T) {
 	})
 
 	body := []byte(`{"echo":"hello"}`)
-	action, ruleName, gotBody := engine.EvaluateResponse(body)
+	action, ruleName, gotBody, _ := engine.EvaluateResponse(body)
 	if action != rules.Allow {
 		t.Fatalf("action = %v, want %v", action, rules.Allow)
 	}
@@ -345,7 +345,7 @@ func TestEngine_PathRule_BlocksMatchingPrefixRegardlessOfContent(t *testing.T) {
 		Action:     rules.Block,
 	})
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "GET",
 		URL:    "/admin/users",
 		Body:   []byte(`{"hello":"world"}`),
@@ -377,7 +377,7 @@ func TestEngine_PathRule_AllowExemptsMatchingPrefixFromContentScanning(t *testin
 		Action:  rules.Block,
 	})
 
-	action, ruleName, gotBody, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, gotBody, _, _, err := engine.Evaluate(rules.Request{
 		Method: "GET",
 		URL:    "/health/status",
 		Body:   []byte(`{"note":"AKIAABCDEFGHIJKLMNOP"}`),
@@ -408,7 +408,7 @@ func TestEngine_PathRule_RedactActionBehavesLikeAllow(t *testing.T) {
 	})
 
 	body := []byte(`{"hello":"world"}`)
-	action, ruleName, gotBody, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, gotBody, _, _, err := engine.Evaluate(rules.Request{
 		Method: "GET",
 		URL:    "/legacy/x",
 		Body:   body,
@@ -443,7 +443,7 @@ func TestEngine_PathRule_NonMatchingPrefixFallsThroughToContentScanning(t *testi
 		Action:  rules.Block,
 	})
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`{"config":"AKIAABCDEFGHIJKLMNOP"}`),
@@ -467,7 +467,7 @@ func TestEngine_AllowsCleanBody(t *testing.T) {
 		Action:  rules.Block,
 	})
 
-	action, ruleName, _, _, err := engine.Evaluate(rules.Request{
+	action, ruleName, _, _, _, err := engine.Evaluate(rules.Request{
 		Method: "POST",
 		URL:    "/upload",
 		Body:   []byte(`{"hello":"world"}`),
@@ -480,5 +480,239 @@ func TestEngine_AllowsCleanBody(t *testing.T) {
 	}
 	if ruleName != "" {
 		t.Fatalf("rule = %q, want empty", ruleName)
+	}
+}
+
+// TestEngine_DryRunBodyRule_BlockNeverEnforcedButReported proves a
+// DryRun body rule matching Block never actually blocks: the request
+// comes back Allow, with the body untouched, but the match is reported
+// in the returned []DryRunMatch.
+func TestEngine_DryRunBodyRule_BlockNeverEnforcedButReported(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	body := []byte(`{"config":"AKIAABCDEFGHIJKLMNOP"}`)
+	action, ruleName, gotBody, _, dryRunHits, err := engine.Evaluate(rules.Request{
+		Method: "POST",
+		URL:    "/upload",
+		Body:   body,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v (a dry_run rule must never actually block)", action, rules.Allow)
+	}
+	if ruleName != "" {
+		t.Fatalf("rule = %q, want empty (dry-run never becomes the real matched rule)", ruleName)
+	}
+	if string(gotBody) != string(body) {
+		t.Fatalf("body = %q, want unchanged %q", gotBody, body)
+	}
+	if len(dryRunHits) != 1 || dryRunHits[0].RuleName != "aws-access-key" || dryRunHits[0].Action != rules.Block {
+		t.Fatalf("dryRunHits = %+v, want exactly one {aws-access-key, Block}", dryRunHits)
+	}
+}
+
+// TestEngine_DryRunBodyRule_RedactNeverEnforcedButReported is the
+// Redact counterpart: the secret reaches the returned body unmasked,
+// but the would-be redact is still reported.
+func TestEngine_DryRunBodyRule_RedactNeverEnforcedButReported(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+		DryRun:  true,
+	})
+
+	body := []byte(`{"key":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`)
+	action, ruleName, gotBody, _, dryRunHits, err := engine.Evaluate(rules.Request{
+		Method: "POST",
+		URL:    "/chat",
+		Body:   body,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v (a dry_run rule must never actually redact)", action, rules.Allow)
+	}
+	if ruleName != "" {
+		t.Fatalf("rule = %q, want empty", ruleName)
+	}
+	if string(gotBody) != string(body) {
+		t.Fatalf("body = %q, want unchanged (unmasked) %q", gotBody, body)
+	}
+	if len(dryRunHits) != 1 || dryRunHits[0].RuleName != "openai-api-key" || dryRunHits[0].Action != rules.Redact {
+		t.Fatalf("dryRunHits = %+v, want exactly one {openai-api-key, Redact}", dryRunHits)
+	}
+}
+
+// TestEngine_DryRunPathRule_BlockNeverEnforcedButReported is the path
+// rule equivalent of TestEngine_DryRunBodyRule_BlockNeverEnforcedButReported.
+func TestEngine_DryRunPathRule_BlockNeverEnforcedButReported(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{
+		Name:       "block-admin",
+		PathPrefix: "/admin",
+		Action:     rules.Block,
+		DryRun:     true,
+	})
+
+	action, ruleName, _, _, dryRunHits, err := engine.Evaluate(rules.Request{
+		Method: "GET",
+		URL:    "/admin/users",
+		Body:   []byte(`{"hello":"world"}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v (a dry_run path rule must never actually block)", action, rules.Allow)
+	}
+	if ruleName != "" {
+		t.Fatalf("rule = %q, want empty", ruleName)
+	}
+	if len(dryRunHits) != 1 || dryRunHits[0].RuleName != "block-admin" || dryRunHits[0].Action != rules.Block {
+		t.Fatalf("dryRunHits = %+v, want exactly one {block-admin, Block}", dryRunHits)
+	}
+}
+
+// TestEngine_DryRunHeaderRule_NeverEnforcedButReported proves a DryRun
+// body rule matching a header value (not the body) behaves the same
+// way: never enforced, but reported.
+func TestEngine_DryRunHeaderRule_NeverEnforcedButReported(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	headers := map[string][]string{"X-Debug": {"AKIAABCDEFGHIJKLMNOP"}}
+	action, ruleName, _, gotHeaders, dryRunHits, err := engine.Evaluate(rules.Request{
+		Method:  "GET",
+		URL:     "/x",
+		Body:    []byte(`{"hello":"world"}`),
+		Headers: headers,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v", action, rules.Allow)
+	}
+	if ruleName != "" {
+		t.Fatalf("rule = %q, want empty", ruleName)
+	}
+	if gotHeaders["X-Debug"][0] != "AKIAABCDEFGHIJKLMNOP" {
+		t.Fatalf("headers = %+v, want the header value unchanged", gotHeaders)
+	}
+	if len(dryRunHits) != 1 || dryRunHits[0].RuleName != "aws-access-key" {
+		t.Fatalf("dryRunHits = %+v, want exactly one {aws-access-key, Block}", dryRunHits)
+	}
+}
+
+// TestEngine_DryRunRule_EvaluationContinuesToLaterRealRule proves a
+// dry-run match never shadows a later, real rule: evaluation continues
+// past it exactly as if it hadn't matched, so a subsequent real rule
+// still fires normally, in addition to the dry-run hit being reported.
+func TestEngine_DryRunRule_EvaluationContinuesToLaterRealRule(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "dry-run-candidate",
+		Pattern: regexp.MustCompile(`CANDIDATE-[0-9]+`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	body := []byte(`{"a":"CANDIDATE-123","b":"AKIAABCDEFGHIJKLMNOP"}`)
+	action, ruleName, _, _, dryRunHits, err := engine.Evaluate(rules.Request{
+		Method: "POST",
+		URL:    "/x",
+		Body:   body,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Block {
+		t.Fatalf("action = %v, want %v (the real, non-dry-run rule must still enforce)", action, rules.Block)
+	}
+	if ruleName != "aws-access-key" {
+		t.Fatalf("rule = %q, want %q", ruleName, "aws-access-key")
+	}
+	if len(dryRunHits) != 1 || dryRunHits[0].RuleName != "dry-run-candidate" {
+		t.Fatalf("dryRunHits = %+v, want exactly one {dry-run-candidate, Block}", dryRunHits)
+	}
+}
+
+// TestEngine_DryRunMatch_DeduplicatedAcrossBodyAndHeader proves a
+// dry-run rule that matches in both the body and a header is only
+// reported once — a rule either would have fired or it wouldn't; a
+// per-occurrence count would just be noise for something that never
+// actually takes effect anyway.
+func TestEngine_DryRunMatch_DeduplicatedAcrossBodyAndHeader(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	action, _, _, _, dryRunHits, err := engine.Evaluate(rules.Request{
+		Method:  "POST",
+		URL:     "/x",
+		Body:    []byte(`{"a":"AKIAABCDEFGHIJKLMNOP"}`),
+		Headers: map[string][]string{"X-Debug": {"AKIAZZZZZZZZZZZZZZZZ"}},
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v", action, rules.Allow)
+	}
+	if len(dryRunHits) != 1 {
+		t.Fatalf("dryRunHits = %+v, want exactly one deduplicated entry for aws-access-key", dryRunHits)
+	}
+}
+
+// TestEngine_EvaluateResponse_DryRunNeverEnforcedButReported proves
+// EvaluateResponse gives a dry_run rule the same treatment as Evaluate:
+// never actually blocked/redacted, but reported.
+func TestEngine_EvaluateResponse_DryRunNeverEnforcedButReported(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		DryRun:  true,
+	})
+
+	body := []byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`)
+	action, ruleName, gotBody, dryRunHits := engine.EvaluateResponse(body)
+	if action != rules.Allow {
+		t.Fatalf("action = %v, want %v (a dry_run rule must never actually block a response)", action, rules.Allow)
+	}
+	if ruleName != "" {
+		t.Fatalf("rule = %q, want empty", ruleName)
+	}
+	if string(gotBody) != string(body) {
+		t.Fatalf("body = %q, want unchanged %q", gotBody, body)
+	}
+	if len(dryRunHits) != 1 || dryRunHits[0].RuleName != "aws-access-key" || dryRunHits[0].Action != rules.Block {
+		t.Fatalf("dryRunHits = %+v, want exactly one {aws-access-key, Block}", dryRunHits)
 	}
 }

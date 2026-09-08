@@ -40,6 +40,7 @@ const (
 	ansiBlue      = "\x1b[34m"
 	ansiPurple    = "\x1b[35m"
 	ansiCyan      = "\x1b[36m"
+	ansiGray      = "\x1b[90m"
 )
 
 // usageFields is the shape of a "usage" object as different providers
@@ -475,7 +476,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	action, ruleName, evaluatedBody, evaluatedHeaders, err := s.getEngine().Evaluate(rules.Request{
+	action, ruleName, evaluatedBody, evaluatedHeaders, dryRunHits, err := s.getEngine().Evaluate(rules.Request{
 		Method:  r.Method,
 		URL:     r.URL.String(),
 		Body:    body,
@@ -485,6 +486,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.handleRequestDryRunHits(dryRunHits, r.Method, r.URL.String())
 	if action == rules.Block {
 		// The matched secret itself must never reach the log, only the
 		// static rule name that identifies which pattern triggered it.
@@ -583,7 +585,8 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		return err
 	}
 
-	action, ruleName, scannedBody := s.getEngine().EvaluateResponse(body)
+	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body)
+	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url)
 	if action == rules.Block {
 		s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
 		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
@@ -648,6 +651,9 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 			s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
 			s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
 		},
+		onDryRun: func(hits []rules.DryRunMatch) {
+			s.handleResponseDryRunHits(hits, reqCtx.method, reqCtx.url)
+		},
 	}
 	tee.onComplete = func(data []byte, cleanEOF bool) {
 		// Cache first, log second: a caller that observes the log
@@ -700,11 +706,11 @@ var errResponseBlocked = errors.New("aiproxy: response blocked by rule")
 // whatever text delta it actually arrived in, without buffering the
 // whole response the way bufferResponse does for a non-streaming reply.
 // engine nil disables scanning entirely (chunks pass through untouched,
-// same as before response scanning existed); onRedact/onBlock, if set,
-// fire synchronously — once per matching batch, in real time as it's
-// found — rather than being deferred to onComplete, which instead runs
-// exactly once, when the stream is closed, with the full accumulated
-// (post-scan) data and whether the stream ended cleanly.
+// same as before response scanning existed); onRedact/onBlock/onDryRun,
+// if set, fire synchronously — once per matching batch, in real time as
+// it's found — rather than being deferred to onComplete, which instead
+// runs exactly once, when the stream is closed, with the full
+// accumulated (post-scan) data and whether the stream ended cleanly.
 //
 // A secret split exactly across two batches is a known limitation:
 // each is scanned independently, the same trade-off documented for the
@@ -725,6 +731,7 @@ type streamTee struct {
 
 	onRedact   func(ruleName string)
 	onBlock    func(ruleName string)
+	onDryRun   func(hits []rules.DryRunMatch)
 	onComplete func(data []byte, cleanEOF bool)
 	cleanEOF   bool
 	once       sync.Once
@@ -808,7 +815,10 @@ func (t *streamTee) scan(batch []byte) {
 		return
 	}
 
-	action, ruleName, scanned := t.engine.EvaluateResponse(batch)
+	action, ruleName, scanned, dryRunHits := t.engine.EvaluateResponse(batch)
+	if len(dryRunHits) > 0 && t.onDryRun != nil {
+		t.onDryRun(dryRunHits)
+	}
 	switch action {
 	case rules.Block:
 		t.blocked = true
@@ -977,6 +987,77 @@ func (s *Server) logResponseRedact(method, reqURL, ruleName string) {
 	s.logf("%s[RESPONSE REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
 }
 
+func (s *Server) logDryRunBlock(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
+	s.logf("%s[DRY-RUN BLOCK] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
+}
+
+func (s *Server) logDryRunRedact(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
+	s.logf("%s[DRY-RUN REDACT] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
+}
+
+func (s *Server) logResponseDryRunBlock(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "response_dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
+	s.logf("%s[RESPONSE DRY-RUN BLOCK] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
+}
+
+func (s *Server) logResponseDryRunRedact(method, reqURL, ruleName string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "response_dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
+		return
+	}
+	s.logf("%s[RESPONSE DRY-RUN REDACT] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
+}
+
+// handleRequestDryRunHits logs, stats-records, and webhook-alerts every
+// dry-run rule that matched a request (see rules.DryRunMatch) — nothing
+// happens if hits is empty. Called unconditionally, alongside whatever
+// the request's actual (non-dry-run) outcome turns out to be, since a
+// dry-run match never changes that outcome.
+func (s *Server) handleRequestDryRunHits(hits []rules.DryRunMatch, method, reqURL string) {
+	for _, h := range hits {
+		switch h.Action {
+		case rules.Block:
+			s.Stats.RecordDryRunBlock(h.RuleName)
+			s.logDryRunBlock(method, reqURL, h.RuleName)
+			s.notifyWebhook("dry_run_block", method, reqURL, h.RuleName)
+		case rules.Redact:
+			s.Stats.RecordDryRunRedact(h.RuleName)
+			s.logDryRunRedact(method, reqURL, h.RuleName)
+			s.notifyWebhook("dry_run_redact", method, reqURL, h.RuleName)
+		}
+	}
+}
+
+// handleResponseDryRunHits is handleRequestDryRunHits' counterpart for a
+// dry-run rule matching an upstream response instead of the client's
+// request — used by both the non-streaming (bufferResponse) and
+// streaming (streamTee) response paths.
+func (s *Server) handleResponseDryRunHits(hits []rules.DryRunMatch, method, reqURL string) {
+	for _, h := range hits {
+		switch h.Action {
+		case rules.Block:
+			s.Stats.RecordResponseDryRunBlock(h.RuleName)
+			s.logResponseDryRunBlock(method, reqURL, h.RuleName)
+			s.notifyWebhook("response_dry_run_block", method, reqURL, h.RuleName)
+		case rules.Redact:
+			s.Stats.RecordResponseDryRunRedact(h.RuleName)
+			s.logResponseDryRunRedact(method, reqURL, h.RuleName)
+			s.notifyWebhook("response_dry_run_redact", method, reqURL, h.RuleName)
+		}
+	}
+}
+
 // webhookClient is a dedicated HTTP client for webhook deliveries, kept
 // separate from the reverse proxy's own upstream connections and given a
 // short, fixed timeout: a slow or hanging alert endpoint must never be
@@ -985,13 +1066,15 @@ func (s *Server) logResponseRedact(method, reqURL, ruleName string) {
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
 // webhookAlert is the JSON body POSTed to Server.WebhookURL for every
-// block, redact, or rate_limited event. Text alone is enough for a
-// Slack incoming webhook (which reads exactly that field and ignores
-// the rest); the remaining fields serve a generic JSON webhook consumer
-// that wants the event structured instead of parsed back out of a
-// sentence. Like every other log line in this package, it carries the
-// rule name that matched, never the matched secret itself; Rule is
-// empty for a rate_limited event, since no scanning rule was involved.
+// block, redact, rate_limited, or dry-run event (dry_run_block,
+// dry_run_redact, response_dry_run_block, response_dry_run_redact).
+// Text alone is enough for a Slack incoming webhook (which reads
+// exactly that field and ignores the rest); the remaining fields serve
+// a generic JSON webhook consumer that wants the event structured
+// instead of parsed back out of a sentence. Like every other log line
+// in this package, it carries the rule name that matched, never the
+// matched secret itself; Rule is empty for a rate_limited event, since
+// no scanning rule was involved.
 type webhookAlert struct {
 	Text   string `json:"text"`
 	Event  string `json:"event"`
@@ -1002,9 +1085,12 @@ type webhookAlert struct {
 }
 
 // notifyWebhook POSTs a webhookAlert to Server.WebhookURL, if configured,
-// for a block, redact, or rate_limited event. ruleName is the matched
-// rule's name for block/redact, or "" for rate_limited (a circuit
-// breaker trip isn't attributable to any one rule). Delivery happens on
+// for a block, redact, rate_limited, or dry-run event. ruleName is the
+// matched rule's name for every event except rate_limited, which is ""
+// (a circuit breaker trip isn't attributable to any one rule) — a
+// dry-run event's Text says "Would have triggered rule" instead of
+// "Triggered rule", since nothing was actually enforced. Delivery
+// happens on
 // its own goroutine so a slow or unreachable webhook endpoint never
 // delays the client's actual request — the request has already been
 // decided and logged by the time this runs. A delivery failure (or a
@@ -1017,9 +1103,14 @@ func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
 		return
 	}
 
-	text := fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
-	if ruleName == "" {
+	var text string
+	switch {
+	case ruleName == "":
 		text = fmt.Sprintf("[%s] %s %s - Rate limit exceeded", strings.ToUpper(event), method, reqURL)
+	case strings.Contains(event, "dry_run"):
+		text = fmt.Sprintf("[%s] %s %s - Would have triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
+	default:
+		text = fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
 	}
 	payload := webhookAlert{
 		Text:   text,
@@ -1098,29 +1189,44 @@ func (s *Server) logf(format string, args ...any) {
 // is a proxy-level concern (CostPer1KTokens) that the stats package has
 // no notion of.
 type statsSnapshotJSON struct {
-	Allowed          int64                         `json:"allowed"`
-	Blocked          int64                         `json:"blocked"`
-	Redacted         int64                         `json:"redacted"`
-	RateLimited      int64                         `json:"rate_limited"`
-	CacheHits        int64                         `json:"cache_hits"`
-	TotalTokens      int64                         `json:"total_tokens"`
-	ResponseBlocked  int64                         `json:"response_blocked"`
-	ResponseRedacted int64                         `json:"response_redacted"`
-	EstimatedCost    *float64                      `json:"estimated_cost,omitempty"`
-	PerTarget        map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
-	PerRule          map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
+	Allowed          int64 `json:"allowed"`
+	Blocked          int64 `json:"blocked"`
+	Redacted         int64 `json:"redacted"`
+	RateLimited      int64 `json:"rate_limited"`
+	CacheHits        int64 `json:"cache_hits"`
+	TotalTokens      int64 `json:"total_tokens"`
+	ResponseBlocked  int64 `json:"response_blocked"`
+	ResponseRedacted int64 `json:"response_redacted"`
+
+	// DryRunBlocked, DryRunRedacted, ResponseDryRunBlocked, and
+	// ResponseDryRunRedacted are only meaningful at the top level —
+	// dry-run activity is never broken down per target (see
+	// stats.Stats.RecordDryRunBlock), so these are always 0 inside
+	// per_target.
+	DryRunBlocked          int64 `json:"dry_run_blocked"`
+	DryRunRedacted         int64 `json:"dry_run_redacted"`
+	ResponseDryRunBlocked  int64 `json:"response_dry_run_blocked"`
+	ResponseDryRunRedacted int64 `json:"response_dry_run_redacted"`
+
+	EstimatedCost *float64                      `json:"estimated_cost,omitempty"`
+	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
+	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
 }
 
 func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnapshotJSON {
 	out := statsSnapshotJSON{
-		Allowed:          snap.Allowed,
-		Blocked:          snap.Blocked,
-		Redacted:         snap.Redacted,
-		RateLimited:      snap.RateLimited,
-		CacheHits:        snap.CacheHits,
-		TotalTokens:      snap.TotalTokens,
-		ResponseBlocked:  snap.ResponseBlocked,
-		ResponseRedacted: snap.ResponseRedacted,
+		Allowed:                snap.Allowed,
+		Blocked:                snap.Blocked,
+		Redacted:               snap.Redacted,
+		RateLimited:            snap.RateLimited,
+		CacheHits:              snap.CacheHits,
+		TotalTokens:            snap.TotalTokens,
+		ResponseBlocked:        snap.ResponseBlocked,
+		ResponseRedacted:       snap.ResponseRedacted,
+		DryRunBlocked:          snap.DryRunBlocked,
+		DryRunRedacted:         snap.DryRunRedacted,
+		ResponseDryRunBlocked:  snap.ResponseDryRunBlocked,
+		ResponseDryRunRedacted: snap.ResponseDryRunRedacted,
 	}
 	if costPer1KTokens > 0 {
 		cost := snap.EstimatedCost(costPer1KTokens)
@@ -1187,6 +1293,24 @@ var promRuleCounters = []struct {
 	{"aiproxy_rule_redacted_total", "Total number of requests redacted by this rule.", func(r stats.RuleSnapshot) int64 { return r.Redacted }},
 	{"aiproxy_rule_response_blocked_total", "Total number of upstream responses blocked by this rule.", func(r stats.RuleSnapshot) int64 { return r.ResponseBlocked }},
 	{"aiproxy_rule_response_redacted_total", "Total number of upstream responses redacted by this rule.", func(r stats.RuleSnapshot) int64 { return r.ResponseRedacted }},
+	{"aiproxy_rule_dry_run_blocked_total", "Total number of requests this dry_run rule would have blocked.", func(r stats.RuleSnapshot) int64 { return r.DryRunBlocked }},
+	{"aiproxy_rule_dry_run_redacted_total", "Total number of requests this dry_run rule would have redacted.", func(r stats.RuleSnapshot) int64 { return r.DryRunRedacted }},
+	{"aiproxy_rule_dry_run_response_blocked_total", "Total number of upstream responses this dry_run rule would have blocked.", func(r stats.RuleSnapshot) int64 { return r.ResponseDryRunBlocked }},
+	{"aiproxy_rule_dry_run_response_redacted_total", "Total number of upstream responses this dry_run rule would have redacted.", func(r stats.RuleSnapshot) int64 { return r.ResponseDryRunRedacted }},
+}
+
+// promDryRunCounters lists the four overall (never per-target) dry-run
+// counters — see stats.Stats.RecordDryRunBlock for why dry-run activity
+// isn't tracked per target the way every other counter is.
+var promDryRunCounters = []struct {
+	name string
+	help string
+	get  func(stats.Snapshot) int64
+}{
+	{"aiproxy_dry_run_blocked_total", "Total number of requests a dry_run rule would have blocked.", func(s stats.Snapshot) int64 { return s.DryRunBlocked }},
+	{"aiproxy_dry_run_redacted_total", "Total number of requests a dry_run rule would have redacted.", func(s stats.Snapshot) int64 { return s.DryRunRedacted }},
+	{"aiproxy_dry_run_response_blocked_total", "Total number of upstream responses a dry_run rule would have blocked.", func(s stats.Snapshot) int64 { return s.ResponseDryRunBlocked }},
+	{"aiproxy_dry_run_response_redacted_total", "Total number of upstream responses a dry_run rule would have redacted.", func(s stats.Snapshot) int64 { return s.ResponseDryRunRedacted }},
 }
 
 // promLabelValue escapes a label value per the Prometheus text
@@ -1244,6 +1368,12 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens float64)
 		for _, name := range ruleNames {
 			fmt.Fprintf(w, "%s{rule=%q} %d\n", c.name, promLabelValue(name), c.get(snap.PerRule[name]))
 		}
+	}
+
+	for _, c := range promDryRunCounters {
+		fmt.Fprintf(w, "# HELP %s %s\n", c.name, c.help)
+		fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
+		fmt.Fprintf(w, "%s %d\n", c.name, c.get(snap))
 	}
 }
 

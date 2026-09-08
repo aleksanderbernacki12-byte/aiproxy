@@ -653,6 +653,56 @@ func TestExecute_Validate_ValidConfig_WithPathRules_ReturnsZero(t *testing.T) {
 	}
 }
 
+// TestExecute_Validate_PathRuleDryRunWithAllowAction_ReportsProblem
+// proves dry_run combined with action "allow" is rejected: "allow"
+// never rejects anything to begin with, so there is nothing for
+// dry_run to preview.
+func TestExecute_Validate_PathRuleDryRunWithAllowAction_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"path_rules": [{"name": "health-check", "prefix": "/health", "action": "allow", "dry_run": true}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "health-check") || !strings.Contains(stderr.String(), "dry_run") {
+		t.Fatalf("stderr missing the dry_run+allow problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ReportsDryRunRuleCount proves the summary counts
+// dry_run entries across both custom_rules and path_rules together.
+func TestExecute_Validate_ReportsDryRunRuleCount(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"custom_rules": [{"name": "candidate", "pattern": "CANDIDATE-[0-9]+", "dry_run": true}],
+		"path_rules": [
+			{"name": "block-admin", "prefix": "/admin", "action": "block", "dry_run": true},
+			{"name": "block-legacy", "prefix": "/legacy", "action": "block"}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "rules in dry-run:        2") {
+		t.Fatalf("stdout missing dry-run rule count line: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

@@ -42,29 +42,50 @@ func (c *counters) snapshot() Snapshot {
 
 // ruleCounters tracks the block/redact outcomes attributable to one
 // named rule (built-in, custom, or path), for both requests and
-// responses. Unlike counters, it is never nested per target: which rule
-// matched is independent of which target the request happened to route
-// to, so there is exactly one set of these per rule name, globally.
+// responses, live or dry-run. Unlike counters, it is never nested per
+// target: which rule matched is independent of which target the
+// request happened to route to, so there is exactly one set of these
+// per rule name, globally.
 type ruleCounters struct {
+	blocked                atomic.Int64
+	redacted               atomic.Int64
+	responseBlocked        atomic.Int64
+	responseRedacted       atomic.Int64
+	dryRunBlocked          atomic.Int64
+	dryRunRedacted         atomic.Int64
+	responseDryRunBlocked  atomic.Int64
+	responseDryRunRedacted atomic.Int64
+}
+
+func (c *ruleCounters) snapshot() RuleSnapshot {
+	return RuleSnapshot{
+		Blocked:                c.blocked.Load(),
+		Redacted:               c.redacted.Load(),
+		ResponseBlocked:        c.responseBlocked.Load(),
+		ResponseRedacted:       c.responseRedacted.Load(),
+		DryRunBlocked:          c.dryRunBlocked.Load(),
+		DryRunRedacted:         c.dryRunRedacted.Load(),
+		ResponseDryRunBlocked:  c.responseDryRunBlocked.Load(),
+		ResponseDryRunRedacted: c.responseDryRunRedacted.Load(),
+	}
+}
+
+// dryRunCounters tracks how often a dry-run rule matched, overall —
+// never per target, for the same reason as ruleCounters: a dry-run
+// rule's whole point is testing that one rule, not measuring which
+// target its traffic happened to go to.
+type dryRunCounters struct {
 	blocked          atomic.Int64
 	redacted         atomic.Int64
 	responseBlocked  atomic.Int64
 	responseRedacted atomic.Int64
 }
 
-func (c *ruleCounters) snapshot() RuleSnapshot {
-	return RuleSnapshot{
-		Blocked:          c.blocked.Load(),
-		Redacted:         c.redacted.Load(),
-		ResponseBlocked:  c.responseBlocked.Load(),
-		ResponseRedacted: c.responseRedacted.Load(),
-	}
-}
-
 // Stats holds a running proxy's counters. The zero value is not usable;
 // construct one with New.
 type Stats struct {
 	overall counters
+	dryRun  dryRunCounters
 
 	mu        sync.Mutex
 	perTarget map[string]*counters
@@ -170,13 +191,55 @@ func (s *Stats) RecordResponseRedact(target, ruleName string) {
 	s.ruleCounterFor(ruleName).responseRedacted.Add(1)
 }
 
+// RecordDryRunBlock records one request a dry_run rule would have
+// blocked, had it not been in dry-run mode — the request was actually
+// forwarded, unmodified. Unlike RecordBlock, this has no target
+// parameter: a dry-run rule's whole point is testing that one rule, not
+// measuring which target its traffic happened to go to.
+func (s *Stats) RecordDryRunBlock(ruleName string) {
+	s.dryRun.blocked.Add(1)
+	s.ruleCounterFor(ruleName).dryRunBlocked.Add(1)
+}
+
+// RecordDryRunRedact records one request a dry_run rule would have
+// redacted, had it not been in dry-run mode — the request was actually
+// forwarded with nothing masked out.
+func (s *Stats) RecordDryRunRedact(ruleName string) {
+	s.dryRun.redacted.Add(1)
+	s.ruleCounterFor(ruleName).dryRunRedacted.Add(1)
+}
+
+// RecordResponseDryRunBlock is RecordDryRunBlock's counterpart for a
+// dry_run rule matching an upstream response instead of the client's
+// request.
+func (s *Stats) RecordResponseDryRunBlock(ruleName string) {
+	s.dryRun.responseBlocked.Add(1)
+	s.ruleCounterFor(ruleName).responseDryRunBlocked.Add(1)
+}
+
+// RecordResponseDryRunRedact is RecordDryRunRedact's counterpart for a
+// dry_run rule matching an upstream response instead of the client's
+// request.
+func (s *Stats) RecordResponseDryRunRedact(ruleName string) {
+	s.dryRun.responseRedacted.Add(1)
+	s.ruleCounterFor(ruleName).responseDryRunRedacted.Add(1)
+}
+
 // RuleSnapshot is a point-in-time copy of one named rule's block/redact
-// counters, for both requests and responses.
+// counters, for both requests and responses, live and dry-run.
 type RuleSnapshot struct {
 	Blocked          int64 `json:"blocked"`
 	Redacted         int64 `json:"redacted"`
 	ResponseBlocked  int64 `json:"response_blocked"`
 	ResponseRedacted int64 `json:"response_redacted"`
+
+	// DryRunBlocked, DryRunRedacted, ResponseDryRunBlocked, and
+	// ResponseDryRunRedacted count what this rule would have done had
+	// it not been marked dry_run — see Stats.RecordDryRunBlock.
+	DryRunBlocked          int64 `json:"dry_run_blocked"`
+	DryRunRedacted         int64 `json:"dry_run_redacted"`
+	ResponseDryRunBlocked  int64 `json:"response_dry_run_blocked"`
+	ResponseDryRunRedacted int64 `json:"response_dry_run_redacted"`
 }
 
 // Snapshot is a point-in-time copy of the counters, safe to read and
@@ -201,6 +264,15 @@ type Snapshot struct {
 	ResponseBlocked  int64 `json:"response_blocked"`
 	ResponseRedacted int64 `json:"response_redacted"`
 
+	// DryRunBlocked, DryRunRedacted, ResponseDryRunBlocked, and
+	// ResponseDryRunRedacted count what a dry_run rule would have done
+	// had it not been in dry-run mode — never broken down per target,
+	// same reasoning as PerRule; see Stats.RecordDryRunBlock.
+	DryRunBlocked          int64 `json:"dry_run_blocked"`
+	DryRunRedacted         int64 `json:"dry_run_redacted"`
+	ResponseDryRunBlocked  int64 `json:"response_dry_run_blocked"`
+	ResponseDryRunRedacted int64 `json:"response_dry_run_redacted"`
+
 	PerTarget map[string]Snapshot     `json:"per_target,omitempty"`
 	PerRule   map[string]RuleSnapshot `json:"per_rule,omitempty"`
 }
@@ -220,6 +292,10 @@ func (s *Stats) Snapshot() Snapshot {
 	s.mu.Unlock()
 
 	snap := s.overall.snapshot()
+	snap.DryRunBlocked = s.dryRun.blocked.Load()
+	snap.DryRunRedacted = s.dryRun.redacted.Load()
+	snap.ResponseDryRunBlocked = s.dryRun.responseBlocked.Load()
+	snap.ResponseDryRunRedacted = s.dryRun.responseRedacted.Load()
 	snap.PerTarget = perTarget
 	snap.PerRule = perRule
 	return snap
@@ -235,8 +311,11 @@ func (s Snapshot) EstimatedCost(costPer1KTokens float64) float64 {
 }
 
 // String renders the snapshot as a short, aligned, human-readable block.
+// The two dry-run lines are omitted entirely when no dry_run rule has
+// ever matched — most runs have none configured, and four zeroes would
+// just be noise.
 func (s Snapshot) String() string {
-	return fmt.Sprintf(
+	out := fmt.Sprintf(
 		"=== aiproxy session summary ===\n"+
 			"Requests allowed:    %d\n"+
 			"Requests blocked:    %d\n"+
@@ -249,6 +328,14 @@ func (s Snapshot) String() string {
 		s.Allowed, s.Blocked, s.Redacted, s.RateLimited, s.CacheHits, s.TotalTokens,
 		s.ResponseBlocked, s.ResponseRedacted,
 	)
+	if s.DryRunBlocked > 0 || s.DryRunRedacted > 0 || s.ResponseDryRunBlocked > 0 || s.ResponseDryRunRedacted > 0 {
+		out += fmt.Sprintf(
+			"\nDry-run would-block:  %d\n"+
+				"Dry-run would-redact: %d",
+			s.DryRunBlocked+s.ResponseDryRunBlocked, s.DryRunRedacted+s.ResponseDryRunRedacted,
+		)
+	}
+	return out
 }
 
 // PerTargetString renders a per-target breakdown, sorted by target name,
@@ -302,6 +389,10 @@ func (s Snapshot) PerRuleString() string {
 		r := s.PerRule[name]
 		fmt.Fprintf(&b, "\n[%s] blocked=%d redacted=%d response-blocked=%d response-redacted=%d",
 			name, r.Blocked, r.Redacted, r.ResponseBlocked, r.ResponseRedacted)
+		if r.DryRunBlocked > 0 || r.DryRunRedacted > 0 || r.ResponseDryRunBlocked > 0 || r.ResponseDryRunRedacted > 0 {
+			fmt.Fprintf(&b, " dry-run-blocked=%d dry-run-redacted=%d dry-run-response-blocked=%d dry-run-response-redacted=%d",
+				r.DryRunBlocked, r.DryRunRedacted, r.ResponseDryRunBlocked, r.ResponseDryRunRedacted)
+		}
 	}
 	return b.String()
 }

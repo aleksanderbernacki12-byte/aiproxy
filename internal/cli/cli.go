@@ -129,8 +129,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if len(cfg.CustomRules) > 0 {
 			fmt.Fprintf(stdout, "loaded %d custom rule(s) from %s\n", len(cfg.CustomRules), loadedFrom)
 		}
+		for _, cr := range cfg.CustomRules {
+			if cr.DryRun {
+				fmt.Fprintf(stdout, "custom rule: %s (dry-run — logged, never enforced)\n", cr.Name)
+			}
+		}
 		for _, r := range cfg.PathRules {
-			fmt.Fprintf(stdout, "path rule: %s %s\n", r.Prefix, r.Action)
+			if r.DryRun {
+				fmt.Fprintf(stdout, "path rule: %s %s (dry-run — logged, never enforced)\n", r.Prefix, r.Action)
+			} else {
+				fmt.Fprintf(stdout, "path rule: %s %s\n", r.Prefix, r.Action)
+			}
 		}
 		if cfg.MaxRequestsPerMinute > 0 {
 			fmt.Fprintf(stdout, "circuit breaker: %d requests/minute\n", cfg.MaxRequestsPerMinute)
@@ -150,7 +159,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// a bearer credential directly in its path, so it gets the
 			// same treatment as every other secret aiproxy handles —
 			// never written to a log or the terminal.
-			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited)")
+			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/dry-run)")
 		}
 		for _, r := range lc.routes {
 			if r.maxRequestsPerMinute > 0 {
@@ -418,10 +427,11 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 // config file. A prefix must be non-empty, start with "/", and be
 // distinct from every other path rule's prefix (a duplicate would only
 // ever be reached via the first, dead configuration otherwise); action
-// must be exactly "block" or "allow". Problems are collected and
-// returned rather than stopping at the first one — the caller decides
-// whether that's fatal (runStart) or just a reported problem
-// (runValidate).
+// must be exactly "block" or "allow"; dry_run, if set, requires action
+// "block" — there is nothing to preview for "allow", which never
+// rejects anything to begin with. Problems are collected and returned
+// rather than stopping at the first one — the caller decides whether
+// that's fatal (runStart) or just a reported problem (runValidate).
 func compilePathRules(pathRules []config.PathRule) ([]rules.Rule, []error) {
 	compiled := make([]rules.Rule, 0, len(pathRules))
 	var errs []error
@@ -442,8 +452,12 @@ func compilePathRules(pathRules []config.PathRule) ([]rules.Rule, []error) {
 			errs = append(errs, fmt.Errorf("Fatal error: Invalid action for path rule %s: %w", p.Name, err))
 			continue
 		}
+		if p.DryRun && action != rules.Block {
+			errs = append(errs, fmt.Errorf("Fatal error: path_rules: %s: dry_run requires action \"block\" (nothing to preview for \"allow\")", p.Name))
+			continue
+		}
 
-		compiled = append(compiled, rules.Rule{Name: p.Name, PathPrefix: p.Prefix, Action: action})
+		compiled = append(compiled, rules.Rule{Name: p.Name, PathPrefix: p.Prefix, Action: action, DryRun: p.DryRun})
 	}
 	return compiled, errs
 }
@@ -549,7 +563,26 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  max request body size:   %d bytes\n", effectiveMaxBodyBytes(cfg.MaxBodyBytes))
 	fmt.Fprintf(stdout, "  webhook alerts:          %v\n", cfg.WebhookURL != "")
 	fmt.Fprintf(stdout, "  path rules:              %d\n", len(cfg.PathRules))
+	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
 	return 0
+}
+
+// countDryRunRules counts every custom_rules and path_rules entry with
+// dry_run set — rules that are actively configured but not actually
+// enforcing anything yet.
+func countDryRunRules(cfg *config.Config) int {
+	n := 0
+	for _, cr := range cfg.CustomRules {
+		if cr.DryRun {
+			n++
+		}
+	}
+	for _, r := range cfg.PathRules {
+		if r.DryRun {
+			n++
+		}
+	}
+	return n
 }
 
 // effectiveMaxBodyBytes reports what max_body_size_bytes actually
@@ -615,6 +648,7 @@ func compileCustomRules(customRules []config.CustomRule) ([]rules.BodyRegexRule,
 			Name:    cr.Name,
 			Pattern: pattern,
 			Action:  action,
+			DryRun:  cr.DryRun,
 		})
 	}
 	return compiled, errs

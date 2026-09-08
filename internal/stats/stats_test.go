@@ -386,3 +386,96 @@ func TestSnapshot_PerRuleString_RendersSortedBreakdown(t *testing.T) {
 		t.Errorf("PerRuleString() missing correct openai-api-key line: %q", rendered)
 	}
 }
+
+// TestStats_RecordDryRunBlockAndRedact_TracksOverallAndPerRuleOnly
+// proves the dry-run counters land in the overall snapshot and the
+// per-rule breakdown, but — unlike every live counter — are never
+// broken down per target: a dry-run rule's whole point is testing that
+// one rule, not measuring which target its traffic went to.
+func TestStats_RecordDryRunBlockAndRedact_TracksOverallAndPerRuleOnly(t *testing.T) {
+	s := stats.New()
+	s.RecordDryRunBlock("aws-access-key")
+	s.RecordDryRunBlock("aws-access-key")
+	s.RecordDryRunRedact("openai-api-key")
+	s.RecordResponseDryRunBlock("aws-access-key")
+	s.RecordResponseDryRunRedact("openai-api-key")
+	s.RecordResponseDryRunRedact("openai-api-key")
+
+	snap := s.Snapshot()
+	if snap.DryRunBlocked != 2 {
+		t.Errorf("DryRunBlocked = %d, want 2", snap.DryRunBlocked)
+	}
+	if snap.DryRunRedacted != 1 {
+		t.Errorf("DryRunRedacted = %d, want 1", snap.DryRunRedacted)
+	}
+	if snap.ResponseDryRunBlocked != 1 {
+		t.Errorf("ResponseDryRunBlocked = %d, want 1", snap.ResponseDryRunBlocked)
+	}
+	if snap.ResponseDryRunRedacted != 2 {
+		t.Errorf("ResponseDryRunRedacted = %d, want 2", snap.ResponseDryRunRedacted)
+	}
+
+	awsKey, ok := snap.PerRule["aws-access-key"]
+	if !ok {
+		t.Fatalf("PerRule missing aws-access-key: %+v", snap.PerRule)
+	}
+	if awsKey.DryRunBlocked != 2 || awsKey.ResponseDryRunBlocked != 1 {
+		t.Errorf("PerRule[aws-access-key] = %+v, want dry-run-blocked=2 response-dry-run-blocked=1", awsKey)
+	}
+	openaiKey, ok := snap.PerRule["openai-api-key"]
+	if !ok {
+		t.Fatalf("PerRule missing openai-api-key: %+v", snap.PerRule)
+	}
+	if openaiKey.DryRunRedacted != 1 || openaiKey.ResponseDryRunRedacted != 2 {
+		t.Errorf("PerRule[openai-api-key] = %+v, want dry-run-redacted=1 response-dry-run-redacted=2", openaiKey)
+	}
+
+	for target, snapshot := range snap.PerTarget {
+		if snapshot.DryRunBlocked != 0 || snapshot.DryRunRedacted != 0 {
+			t.Errorf("PerTarget[%q] = %+v, want dry-run counters to stay 0 (dry-run is never broken down per target)", target, snapshot)
+		}
+	}
+}
+
+// TestSnapshot_String_OmitsDryRunLinesWhenNoDryRunActivity proves the
+// shutdown summary stays exactly as before when no dry_run rule has
+// ever matched — most runs have none configured, so the lines would
+// just be noise.
+func TestSnapshot_String_OmitsDryRunLinesWhenNoDryRunActivity(t *testing.T) {
+	snap := stats.Snapshot{Allowed: 5}
+	if rendered := snap.String(); strings.Contains(rendered, "Dry-run") {
+		t.Errorf("String() = %q, want no dry-run lines when nothing matched", rendered)
+	}
+}
+
+// TestSnapshot_String_IncludesDryRunLinesWhenNonZero proves the
+// shutdown summary surfaces dry-run activity, combining the request and
+// response counters into the same would-block/would-redact totals.
+func TestSnapshot_String_IncludesDryRunLinesWhenNonZero(t *testing.T) {
+	snap := stats.Snapshot{DryRunBlocked: 2, ResponseDryRunBlocked: 1, DryRunRedacted: 3, ResponseDryRunRedacted: 0}
+	rendered := snap.String()
+	if !strings.Contains(rendered, "Dry-run would-block:  3") {
+		t.Errorf("String() = %q, want would-block total of 3 (2 request + 1 response)", rendered)
+	}
+	if !strings.Contains(rendered, "Dry-run would-redact: 3") {
+		t.Errorf("String() = %q, want would-redact total of 3 (3 request + 0 response)", rendered)
+	}
+}
+
+// TestSnapshot_PerRuleString_IncludesDryRunSuffixWhenNonZero proves a
+// rule with dry-run activity gets the extra dry-run fields appended to
+// its line, while a rule with none stays at the plain live-only line.
+func TestSnapshot_PerRuleString_IncludesDryRunSuffixWhenNonZero(t *testing.T) {
+	snap := stats.Snapshot{PerRule: map[string]stats.RuleSnapshot{
+		"aws-access-key": {Blocked: 1},
+		"candidate-rule": {DryRunBlocked: 4, ResponseDryRunRedacted: 2},
+	}}
+
+	rendered := snap.PerRuleString()
+	if !strings.Contains(rendered, "[aws-access-key] blocked=1 redacted=0 response-blocked=0 response-redacted=0\n") {
+		t.Errorf("PerRuleString() missing plain aws-access-key line (no dry-run suffix expected): %q", rendered)
+	}
+	if !strings.Contains(rendered, "[candidate-rule] blocked=0 redacted=0 response-blocked=0 response-redacted=0 dry-run-blocked=4 dry-run-redacted=0 dry-run-response-blocked=0 dry-run-response-redacted=2") {
+		t.Errorf("PerRuleString() missing candidate-rule line with dry-run suffix: %q", rendered)
+	}
+}
