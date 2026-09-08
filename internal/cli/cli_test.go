@@ -703,6 +703,31 @@ func TestExecute_Validate_ReportsDryRunRuleCount(t *testing.T) {
 	}
 }
 
+// TestExecute_Validate_ReportsProxyAuthenticationStatus proves the
+// summary reports whether proxy_api_key is set, without ever echoing
+// the key's actual value back — same discipline as webhook_url.
+func TestExecute_Validate_ReportsProxyAuthenticationStatus(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "s3cr3t-shared-key"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "proxy authentication:    true") {
+		t.Fatalf("stdout missing proxy authentication summary line: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "s3cr3t-shared-key") {
+		t.Fatalf("stdout leaked the proxy API key: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

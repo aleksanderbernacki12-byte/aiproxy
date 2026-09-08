@@ -179,6 +179,40 @@ func TestLoad_WebhookURLDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesProxyAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "s3cr3t-shared-key"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ProxyAPIKey != "s3cr3t-shared-key" {
+		t.Fatalf("ProxyAPIKey = %q, want %q", cfg.ProxyAPIKey, "s3cr3t-shared-key")
+	}
+}
+
+func TestLoad_ProxyAPIKeyDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ProxyAPIKey != "" {
+		t.Fatalf("ProxyAPIKey = %q, want empty when absent", cfg.ProxyAPIKey)
+	}
+}
+
 func TestLoad_ParsesPathRules(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

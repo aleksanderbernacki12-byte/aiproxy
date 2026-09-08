@@ -83,6 +83,55 @@ when no rule has ever matched at all — even a single rule's own numbers
 are never redundant with the totals above, since those totals already
 conflate every rule together.
 
+## Authenticating requests to the proxy
+
+By default, anyone who can reach the proxy's listen address can use it —
+including as an open relay to whatever upstream you've pointed it at,
+riding on the client's own `Authorization`/`X-Api-Key` credential.
+That's fine on `127.0.0.1` with nothing else on the box, but not once
+the proxy is reachable from anywhere else. Set `proxy_api_key` to
+require a shared secret before a request is even looked at:
+
+```json
+{
+  "proxy_api_key": "a-long-random-string-only-you-and-your-clients-know"
+}
+```
+
+Every caller now has to send it back as a
+`Proxy-Authorization: Bearer <key>` header — the standard HTTP header
+for authenticating *to a proxy itself* (RFC 7235), distinct from
+`Authorization`/`X-Api-Key`, which still carry the client's own
+credential straight through to the real upstream API untouched:
+
+```
+curl https://your-aiproxy-host/v1/chat/completions \
+  -H "Proxy-Authorization: Bearer a-long-random-string-only-you-and-your-clients-know" \
+  -H "Authorization: Bearer sk-your-real-openai-key" \
+  -d '...'
+```
+
+The key is compared in constant time, and the check runs before
+anything else — before rules, the rate limiter, the cache, and even
+`GET /_aiproxy/stats`/`/_aiproxy/metrics`, which need the same header
+too once this is set (a Prometheus scrape config's `authorization:
+{ type: Bearer, credentials: ... }` sends exactly this). A missing or
+wrong key gets a `407 Proxy Authentication Required` with a
+`Proxy-Authenticate: Bearer` response header, logged as `[UNAUTHORIZED]`
+(`"unauthorized"` under `--log-format json`), counted in
+`GET /_aiproxy/stats`'s `unauthorized` field and the Prometheus
+endpoint's `aiproxy_unauthorized_total` (both global-only, like
+[dry-run](#dry-run-mode-for-rules) — a rejected request never gets far
+enough to resolve a target), and — if `webhook_url` is set — POSTed as
+its own `unauthorized` event, with an empty `rule` (no scanning rule was
+involved) and a `text` that never echoes the key back. Empty (the
+default when `proxy_api_key` is absent) disables the check entirely —
+the same fully-open behavior as before this existed. It's hot-reloadable
+via [SIGHUP](#reloading-config-without-restarting) like everything else
+in this section, and, like `webhook_url`, is never printed to the
+terminal or a log line — only whether it's set (`aiproxy validate`'s
+`proxy authentication:` line, the startup notice).
+
 ## Built-in secret patterns
 
 No config needed — these block by default the moment aiproxy starts:
@@ -142,10 +191,10 @@ serves, instead of the multi-line text block):
 ```
 
 `level` is one of `allow`, `block`, `redact`, `response_block`,
-`response_redact`, `rate_limited`, `dry_run_block`, `dry_run_redact`,
-`response_dry_run_block`, `response_dry_run_redact`, `usage`,
-`cache_hit`, or `error` (an internal problem unrelated to any specific
-request, e.g. a failed cache write) — `method`/`url`/`rule`/`tokens`
+`response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
+`dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
+`usage`, `cache_hit`, or `error` (an internal problem unrelated to any
+specific request, e.g. a failed cache write) — `method`/`url`/`rule`/`tokens`
 appear only where relevant. This only affects the ongoing per-request log stream on
 stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
 ...`, `aiproxy listening on ...`) still print as plain text on stdout,
@@ -163,10 +212,10 @@ kill -HUP <aiproxy-pid>
 Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
 custom rules, path rules, the rate limit, the cache, cost estimation,
-the max request body size, the webhook alert URL, and target routes all
-take effect for the next request, with no dropped connections and no
-restart. Every one of these is logged (as `reload` on success, or
-`reload_error` on failure, under `--log-format json`).
+the max request body size, the webhook alert URL, the proxy API key,
+and target routes all take effect for the next request, with no dropped
+connections and no restart. Every one of these is logged (as `reload`
+on success, or `reload_error` on failure, under `--log-format json`).
 
 If the reloaded file has any problem — a bad regex, a bad target, a
 cache directory that can't be created — the reload is refused and the
@@ -523,6 +572,7 @@ can be monitored without waiting for Ctrl+C:
   "dry_run_redacted": 0,
   "response_dry_run_blocked": 0,
   "response_dry_run_redacted": 0,
+  "unauthorized": 0,
   "estimated_cost": 0.062,
   "per_target": {
     "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062 },
@@ -548,10 +598,15 @@ one name, since which target the match happened to route through
 doesn't change which rule is responsible for it — so you can see which
 rule fires the most (worth checking for false positives) or catches the
 most real leaks. The four `dry_run_*`/`response_dry_run_*` fields (see
-[dry-run mode](#dry-run-mode-for-rules)) are the one exception to the
-per-target/per-rule split: they appear in the overall totals and inside
-`per_rule`, but are never broken down by target — always `0` inside
-`per_target`. Any method other than `GET` gets a 405. Because the path
+[dry-run mode](#dry-run-mode-for-rules)) are never broken down by
+target — always `0` inside `per_target`, appearing only in the overall
+totals and inside `per_rule`. `unauthorized` (see
+[authenticating requests](#authenticating-requests-to-the-proxy)) goes
+further still: never broken down by target OR by rule, since a rejected
+request never resolves either. Any method other than `GET` gets a 405.
+Once `proxy_api_key` is set, this endpoint requires it too — a request
+missing or failing that check never reaches this handler at all, and
+gets a 407 instead. Because the path
 is reserved, an upstream that genuinely needs to be reached at
 `/_aiproxy/stats` itself cannot be — route it through a different
 prefix if that ever comes up.
@@ -583,6 +638,7 @@ aiproxy_dry_run_blocked_total 1
 aiproxy_dry_run_redacted_total 0
 aiproxy_dry_run_response_blocked_total 0
 aiproxy_dry_run_response_redacted_total 0
+aiproxy_unauthorized_total 0
 ```
 
 (`# HELP`/`# TYPE` lines omitted above for brevity — the real response
@@ -595,11 +651,16 @@ series mirror `per_rule` from the JSON endpoint: one `rule="<name>"`
 series per rule that has ever matched, for every rule seen so far — not
 tied to any target label, since a rule's identity doesn't depend on
 which target the request routed to. The four `aiproxy_dry_run_*_total`
-series (see [dry-run mode](#dry-run-mode-for-rules)) are the only ones
-in the entire endpoint with no labels at all — dry-run activity is
-never broken down by target OR left unlabeled-per-rule; it gets its own
-`aiproxy_rule_dry_run_*_total{rule="..."}` series for that. Point
-Prometheus at it with:
+series (see [dry-run mode](#dry-run-mode-for-rules)) get their own
+rule-labeled `aiproxy_rule_dry_run_*_total{rule="..."}` counterparts,
+but are themselves unlabeled — dry-run activity is never broken down by
+target. `aiproxy_unauthorized_total` is unlabeled too, and has no
+rule-labeled counterpart at all — a rejected request never resolves a
+target or a rule to label it with. Once `proxy_api_key` is set, a
+scrape has to send it back the same way any other request does (see
+[authenticating requests](#authenticating-requests-to-the-proxy)) — a
+Prometheus `scrape_configs` entry's `authorization: { type: Bearer,
+credentials: ... }` does exactly that. Point Prometheus at it with:
 
 ```yaml
 scrape_configs:
@@ -623,7 +684,8 @@ Set `webhook_url` to get pushed a real-time alert instead, the moment a
 rule matches — on a request going out, a
 [response](#scanning-responses-too) coming back, the
 [rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
-tripping, or a [dry-run](#dry-run-mode-for-rules) rule matching:
+tripping, a [dry-run](#dry-run-mode-for-rules) rule matching, or a
+request failing [proxy authentication](#authenticating-requests-to-the-proxy):
 
 ```json
 {
@@ -632,9 +694,9 @@ tripping, or a [dry-run](#dry-run-mode-for-rules) rule matching:
 ```
 
 Every alertable event — `block`, `redact`, `response_block`,
-`response_redact`, `rate_limited`, `dry_run_block`, `dry_run_redact`,
-`response_dry_run_block`, or `response_dry_run_redact` — POSTs this
-JSON body to that URL:
+`response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
+`dry_run_redact`, `response_dry_run_block`, or `response_dry_run_redact`
+— POSTs this JSON body to that URL:
 
 ```json
 {
@@ -655,6 +717,22 @@ retrying — carries an empty `rule`, since no scanning rule was involved:
 {
   "text": "[RATE_LIMITED] POST /v1/messages - Rate limit exceeded",
   "event": "rate_limited",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+An `unauthorized` alert — someone hitting the proxy without a valid
+`Proxy-Authorization`, worth knowing about in real time the same way —
+likewise carries an empty `rule`, and never echoes the configured
+`proxy_api_key` back in `text`:
+
+```json
+{
+  "text": "[UNAUTHORIZED] POST /v1/messages - Missing or invalid Proxy-Authorization",
+  "event": "unauthorized",
   "method": "POST",
   "url": "/v1/messages",
   "rule": "",

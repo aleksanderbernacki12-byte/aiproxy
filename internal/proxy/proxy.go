@@ -8,6 +8,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -217,6 +218,13 @@ type Server struct {
 	// notifyWebhook. nil (the default) disables alerting entirely.
 	WebhookURL *url.URL
 
+	// ProxyAPIKey, if non-empty, requires every request — including
+	// GET /_aiproxy/stats and /_aiproxy/metrics — to present it as a
+	// "Proxy-Authorization: Bearer <key>" header before ServeHTTP does
+	// anything else with it; see checkProxyAuth. Empty (the default)
+	// disables the check entirely.
+	ProxyAPIKey string
+
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
 }
@@ -370,6 +378,12 @@ func (s *Server) getWebhookURL() *url.URL {
 	return s.WebhookURL
 }
 
+func (s *Server) getProxyAPIKey() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ProxyAPIKey
+}
+
 // Route describes one path-prefix-to-upstream mapping for ReloadConfig,
 // mirroring what AddRoute registers before the server starts serving.
 type Route struct {
@@ -381,17 +395,18 @@ type Route struct {
 }
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
-// cost-per-1K-tokens rate, max request body size, webhook alert URL, and
-// target routes — e.g. after re-reading aiproxy.json on SIGHUP. All of
-// them change together under one lock, so a request in flight never
-// observes a torn mix of old and new configuration; a request takes
-// effect from the moment it's accepted, so anything already being
-// handled keeps running against whatever configuration it started with.
-// Pass nil for limiter/cache/webhookURL to disable them, matching how
-// the corresponding field would be set at startup; pass zero for
-// maxBodyBytes to fall back to DefaultMaxBodyBytes, same as leaving
+// cost-per-1K-tokens rate, max request body size, webhook alert URL,
+// proxy API key, and target routes — e.g. after re-reading aiproxy.json
+// on SIGHUP. All of them change together under one lock, so a request
+// in flight never observes a torn mix of old and new configuration; a
+// request takes effect from the moment it's accepted, so anything
+// already being handled keeps running against whatever configuration it
+// started with. Pass nil for limiter/cache/webhookURL to disable them,
+// matching how the corresponding field would be set at startup; pass ""
+// for proxyAPIKey to disable the auth check; pass zero for maxBodyBytes
+// to fall back to DefaultMaxBodyBytes, same as leaving
 // Server.MaxBodyBytes unset.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, maxBodyBytes int64, webhookURL *url.URL, routes []Route) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, maxBodyBytes int64, webhookURL *url.URL, proxyAPIKey string, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, target: r.Target, limiter: r.Limiter}
@@ -405,6 +420,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.CostPer1KTokens = costPer1KTokens
 	s.MaxBodyBytes = maxBodyBytes
 	s.WebhookURL = webhookURL
+	s.ProxyAPIKey = proxyAPIKey
 	s.routes = newRoutes
 }
 
@@ -421,6 +437,29 @@ func (s *Server) LogEvent(level, message string) {
 	s.logf("%s", message)
 }
 
+// proxyAuthScheme is the credential scheme checkProxyAuth expects in the
+// Proxy-Authorization header, matching how every LLM API in this
+// project's own examples presents a bearer credential.
+const proxyAuthScheme = "Bearer "
+
+// checkProxyAuth reports whether r is allowed to use the proxy at all:
+// true if Server.ProxyAPIKey is unset (the check is disabled), or if r
+// carries a "Proxy-Authorization: Bearer <key>" header whose key exactly
+// matches, compared in constant time so a wrong guess can't be narrowed
+// down by response timing the way a plain == comparison could leak.
+func (s *Server) checkProxyAuth(r *http.Request) bool {
+	want := s.getProxyAPIKey()
+	if want == "" {
+		return true
+	}
+	got := r.Header.Get("Proxy-Authorization")
+	if !strings.HasPrefix(got, proxyAuthScheme) {
+		return false
+	}
+	got = strings.TrimPrefix(got, proxyAuthScheme)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
 // ServeHTTP implements http.Handler. It reads the full request body into
 // memory (rejecting it with a 413 past MaxBodyBytes, before any of it is
 // buffered) so the rule engine can inspect it in cleartext, evaluates
@@ -428,6 +467,17 @@ func (s *Server) LogEvent(level, message string) {
 // it intact to the resolved target (Target by default, or a
 // path-prefix route added via AddRoute) over HTTPS.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.checkProxyAuth(r) {
+		// Checked before statsPath/metricsPath too — an API key, once
+		// configured, gates the whole proxy, monitoring endpoints
+		// included, not just traffic actually forwarded upstream.
+		s.Stats.RecordUnauthorized()
+		s.logUnauthorized(r.Method, r.URL.String())
+		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "")
+		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
+		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+		return
+	}
 	if r.URL.Path == statsPath {
 		s.serveStats(w, r)
 		return
@@ -947,6 +997,14 @@ func (s *Server) logRateLimited(method, reqURL string) {
 	s.logf("%s[CIRCUIT BREAKER] %s %s - Rate limit exceeded%s", ansiYellow, method, reqURL, ansiReset)
 }
 
+func (s *Server) logUnauthorized(method, reqURL string) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "unauthorized", Method: method, URL: reqURL})
+		return
+	}
+	s.logf("%s[UNAUTHORIZED] %s %s - Missing or invalid Proxy-Authorization%s", ansiBrightRed, method, reqURL, ansiReset)
+}
+
 func (s *Server) logUsage(method, reqURL string, totalTokens int) {
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(logEvent{Level: "usage", Method: method, URL: reqURL, Tokens: totalTokens})
@@ -1066,15 +1124,16 @@ func (s *Server) handleResponseDryRunHits(hits []rules.DryRunMatch, method, reqU
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
 // webhookAlert is the JSON body POSTed to Server.WebhookURL for every
-// block, redact, rate_limited, or dry-run event (dry_run_block,
-// dry_run_redact, response_dry_run_block, response_dry_run_redact).
-// Text alone is enough for a Slack incoming webhook (which reads
-// exactly that field and ignores the rest); the remaining fields serve
-// a generic JSON webhook consumer that wants the event structured
-// instead of parsed back out of a sentence. Like every other log line
-// in this package, it carries the rule name that matched, never the
-// matched secret itself; Rule is empty for a rate_limited event, since
-// no scanning rule was involved.
+// block, redact, rate_limited, unauthorized, or dry-run event
+// (dry_run_block, dry_run_redact, response_dry_run_block,
+// response_dry_run_redact). Text alone is enough for a Slack incoming
+// webhook (which reads exactly that field and ignores the rest); the
+// remaining fields serve a generic JSON webhook consumer that wants the
+// event structured instead of parsed back out of a sentence. Like every
+// other log line in this package, it carries the rule name that
+// matched, never the matched secret itself; Rule is empty for a
+// rate_limited or unauthorized event, since no scanning rule was
+// involved in either.
 type webhookAlert struct {
 	Text   string `json:"text"`
 	Event  string `json:"event"`
@@ -1085,14 +1144,14 @@ type webhookAlert struct {
 }
 
 // notifyWebhook POSTs a webhookAlert to Server.WebhookURL, if configured,
-// for a block, redact, rate_limited, or dry-run event. ruleName is the
-// matched rule's name for every event except rate_limited, which is ""
-// (a circuit breaker trip isn't attributable to any one rule) — a
-// dry-run event's Text says "Would have triggered rule" instead of
-// "Triggered rule", since nothing was actually enforced. Delivery
-// happens on
-// its own goroutine so a slow or unreachable webhook endpoint never
-// delays the client's actual request — the request has already been
+// for a block, redact, rate_limited, unauthorized, or dry-run event.
+// ruleName is the matched rule's name for every event except
+// rate_limited and unauthorized, both "" (neither is attributable to
+// any one rule) — a dry-run event's Text says "Would have triggered
+// rule" instead of "Triggered rule", since nothing was actually
+// enforced. Delivery happens on its own goroutine so a slow or
+// unreachable webhook endpoint never delays the client's actual
+// request — the request has already been
 // decided and logged by the time this runs. A delivery failure (or a
 // non-2xx response) is logged as an internal error and otherwise
 // ignored: there is no retry, and it never changes the outcome of the
@@ -1105,8 +1164,10 @@ func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
 
 	var text string
 	switch {
-	case ruleName == "":
+	case event == "rate_limited":
 		text = fmt.Sprintf("[%s] %s %s - Rate limit exceeded", strings.ToUpper(event), method, reqURL)
+	case event == "unauthorized":
+		text = fmt.Sprintf("[%s] %s %s - Missing or invalid Proxy-Authorization", strings.ToUpper(event), method, reqURL)
 	case strings.Contains(event, "dry_run"):
 		text = fmt.Sprintf("[%s] %s %s - Would have triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
 	default:
@@ -1208,6 +1269,11 @@ type statsSnapshotJSON struct {
 	ResponseDryRunBlocked  int64 `json:"response_dry_run_blocked"`
 	ResponseDryRunRedacted int64 `json:"response_dry_run_redacted"`
 
+	// Unauthorized is likewise only meaningful at the top level, and
+	// always 0 inside per_target — a rejected request never gets far
+	// enough to resolve a target.
+	Unauthorized int64 `json:"unauthorized"`
+
 	EstimatedCost *float64                      `json:"estimated_cost,omitempty"`
 	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
 	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
@@ -1227,6 +1293,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		DryRunRedacted:         snap.DryRunRedacted,
 		ResponseDryRunBlocked:  snap.ResponseDryRunBlocked,
 		ResponseDryRunRedacted: snap.ResponseDryRunRedacted,
+		Unauthorized:           snap.Unauthorized,
 	}
 	if costPer1KTokens > 0 {
 		cost := snap.EstimatedCost(costPer1KTokens)
@@ -1375,6 +1442,13 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens float64)
 		fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
 		fmt.Fprintf(w, "%s %d\n", c.name, c.get(snap))
 	}
+
+	// Unlabeled, same reasoning as promDryRunCounters: a rejected
+	// request never gets far enough to resolve a target to label it
+	// with.
+	fmt.Fprintln(w, "# HELP aiproxy_unauthorized_total Total number of requests rejected for a missing or invalid Proxy-Authorization header.")
+	fmt.Fprintln(w, "# TYPE aiproxy_unauthorized_total counter")
+	fmt.Fprintf(w, "aiproxy_unauthorized_total %d\n", snap.Unauthorized)
 }
 
 // serveMetrics answers metricsPath with the current Stats snapshot in

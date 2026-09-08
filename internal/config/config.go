@@ -140,6 +140,21 @@ type Config struct {
 	// default when the field is absent) means no path is treated
 	// specially.
 	PathRules []PathRule `json:"path_rules,omitempty"`
+
+	// ProxyAPIKey, if set, requires every request to the proxy — not
+	// just the ones forwarded upstream, but GET /_aiproxy/stats and
+	// /_aiproxy/metrics too — to present it as a
+	// "Proxy-Authorization: Bearer <key>" header, matched with a
+	// constant-time comparison; anything missing or wrong gets a 407
+	// rather than ever reaching rules, the rate limiter, or an upstream
+	// target. Proxy-Authorization is the standard HTTP header for
+	// authenticating to a proxy itself (RFC 7235) — distinct from
+	// Authorization/X-Api-Key, which carry the client's own credential
+	// for the proxied upstream API and are never touched by this check.
+	// Empty (the default when the field is absent) disables the check
+	// entirely — anyone who can reach the proxy's listen address can use
+	// it, same as before this field existed.
+	ProxyAPIKey string `json:"proxy_api_key,omitempty"`
 }
 
 // Load reads and parses the config file at path. If the file does not

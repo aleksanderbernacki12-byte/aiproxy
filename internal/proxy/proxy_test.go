@@ -1808,6 +1808,7 @@ type statsJSONResponse struct {
 	DryRunRedacted         int64                        `json:"dry_run_redacted"`
 	ResponseDryRunBlocked  int64                        `json:"response_dry_run_blocked"`
 	ResponseDryRunRedacted int64                        `json:"response_dry_run_redacted"`
+	Unauthorized           int64                        `json:"unauthorized"`
 	EstimatedCost          *float64                     `json:"estimated_cost,omitempty"`
 	PerTarget              map[string]statsJSONResponse `json:"per_target,omitempty"`
 	PerRule                map[string]ruleJSONResponse  `json:"per_rule,omitempty"`
@@ -2843,7 +2844,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, nil, []proxy.Route{
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, nil, "", []proxy.Route{
 		{Prefix: "/other", Target: otherURL, Limiter: strictLimiter},
 	})
 
@@ -2907,7 +2908,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, nil, "", nil)
 		}
 	}()
 
@@ -4327,5 +4328,484 @@ func TestServer_MetricsEndpoint_ReportsDryRunCounters(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("metrics output missing %q: %q", want, out)
 		}
+	}
+}
+
+// TestServer_ProxyAuth_DisabledByDefault proves a Server with no
+// ProxyAPIKey set behaves exactly as before this feature existed — no
+// Proxy-Authorization header needed at all.
+func TestServer_ProxyAuth_DisabledByDefault(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_ProxyAuth_RejectsRequestMissingHeader proves a request
+// with no Proxy-Authorization header at all is rejected with 407 and
+// never reaches the upstream, once ProxyAPIKey is set.
+func TestServer_ProxyAuth_RejectsRequestMissingHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthenticated request must never reach the upstream target")
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	var logBuf bytes.Buffer
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+	if got := resp.Header.Get("Proxy-Authenticate"); got != "Bearer" {
+		t.Errorf("Proxy-Authenticate = %q, want %q", got, "Bearer")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Unauthorized != 1 {
+		t.Fatalf("Unauthorized = %d, want 1", snap.Unauthorized)
+	}
+	if !strings.Contains(logBuf.String(), "[UNAUTHORIZED]") {
+		t.Fatalf("log missing [UNAUTHORIZED] marker: %q", logBuf.String())
+	}
+}
+
+// TestServer_ProxyAuth_RejectsWrongKey proves a Proxy-Authorization
+// header carrying the wrong key is rejected the same way a missing one
+// is — not treated as "close enough".
+func TestServer_ProxyAuth_RejectsWrongKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthenticated request must never reach the upstream target")
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer wrong-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+}
+
+// TestServer_ProxyAuth_AllowsCorrectKey proves the correct
+// "Proxy-Authorization: Bearer <key>" header lets a request through
+// normally, and is not itself forwarded upstream (it's aiproxy's own
+// credential, not the client's).
+func TestServer_ProxyAuth_AllowsCorrectKey(t *testing.T) {
+	var gotProxyAuthUpstream string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotProxyAuthUpstream = r.Header.Get("Proxy-Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer s3cr3t-shared-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if gotProxyAuthUpstream != "" {
+		t.Errorf("upstream received Proxy-Authorization = %q, want it stripped by the httputil.ReverseProxy default (hop-by-hop header)", gotProxyAuthUpstream)
+	}
+}
+
+// TestServer_ProxyAuth_IndependentOfClientsUpstreamCredential proves
+// aiproxy's own Proxy-Authorization check is entirely separate from
+// whatever Authorization/X-Api-Key credential the client is sending
+// through to the real upstream API: a valid upstream credential doesn't
+// satisfy the proxy's own auth, and vice versa both are required
+// together when proxy_api_key is set.
+func TestServer_ProxyAuth_IndependentOfClientsUpstreamCredential(t *testing.T) {
+	var gotUpstreamAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUpstreamAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	// A real upstream Authorization header, but no Proxy-Authorization
+	// at all: must still be rejected before ever reaching the upstream.
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer real-upstream-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d (missing Proxy-Authorization must reject regardless of Authorization)", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+
+	// Both headers present: passes the proxy's own check, and the
+	// client's own upstream credential still reaches the target intact.
+	req2, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req2.Header.Set("Authorization", "Bearer real-upstream-key")
+	req2.Header.Set("Proxy-Authorization", "Bearer s3cr3t-shared-key")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp2.StatusCode, http.StatusOK)
+	}
+	if gotUpstreamAuth != "Bearer real-upstream-key" {
+		t.Errorf("upstream Authorization = %q, want the client's own upstream credential untouched", gotUpstreamAuth)
+	}
+}
+
+// TestServer_ProxyAuth_GatesStatsAndMetricsEndpoints proves
+// statsPath/metricsPath require the same Proxy-Authorization as any
+// other request once ProxyAPIKey is set — they are not a side-channel
+// exempt from the check.
+func TestServer_ProxyAuth_GatesStatsAndMetricsEndpoints(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for _, path := range []string{"/_aiproxy/stats", "/_aiproxy/metrics"} {
+		resp, err := http.Get(frontend.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusProxyAuthRequired {
+			t.Errorf("GET %s without key: status = %d, want %d", path, resp.StatusCode, http.StatusProxyAuthRequired)
+		}
+
+		req, err := http.NewRequest(http.MethodGet, frontend.URL+path, nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer s3cr3t-shared-key")
+		authedResp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		authedResp.Body.Close()
+		if authedResp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s with correct key: status = %d, want %d", path, authedResp.StatusCode, http.StatusOK)
+		}
+	}
+}
+
+// TestServer_Webhook_FiresOnUnauthorizedWithExpectedPayload proves a
+// configured WebhookURL receives an unauthorized alert, with an empty
+// rule (no scanning rule was involved) and text that never echoes the
+// configured key.
+func TestServer_Webhook_FiresOnUnauthorizedWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthenticated request must never reach the upstream target")
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "unauthorized" {
+			t.Errorf("event = %v, want %q", payload["event"], "unauthorized")
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string", payload["rule"])
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "UNAUTHORIZED") || !strings.Contains(text, "Proxy-Authorization") {
+			t.Errorf("text = %q, want it to mention UNAUTHORIZED and Proxy-Authorization", text)
+		}
+		if strings.Contains(text, "s3cr3t-shared-key") {
+			t.Errorf("text leaked the configured proxy API key: %q", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsUnauthorizedCount proves the live
+// /_aiproxy/stats endpoint surfaces the unauthorized counter — the
+// stats request itself must present the correct key to be answered at
+// all, exercised alongside two prior unauthenticated attempts.
+func TestServer_StatsEndpoint_ReportsUnauthorizedCount(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func(path string) {
+		resp, err := http.Get(frontend.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+	get("/x")
+	get("/y")
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/_aiproxy/stats", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer s3cr3t-shared-key")
+	statsResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer statsResp.Body.Close()
+
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Unauthorized != 2 {
+		t.Errorf("unauthorized = %d, want 2", got.Unauthorized)
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsUnauthorizedCounter is
+// TestServer_StatsEndpoint_ReportsUnauthorizedCount's Prometheus
+// counterpart.
+func TestServer_MetricsEndpoint_ReportsUnauthorizedCounter(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	unauthed, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	unauthed.Body.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/_aiproxy/metrics", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer s3cr3t-shared-key")
+	metricsResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	body, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+
+	for _, want := range []string{
+		"# HELP aiproxy_unauthorized_total",
+		"# TYPE aiproxy_unauthorized_total counter",
+		"aiproxy_unauthorized_total 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q: %q", want, out)
+		}
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesProxyAPIKey proves ProxyAPIKey is one
+// of the fields SIGHUP-style reload actually replaces: a key that
+// wasn't required before a reload is required after, and a request
+// authenticated with the previous key stops working.
+func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func() int {
+		resp, err := http.Get(frontend.URL + "/x")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
+	}
+
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, nil, "new-key-after-reload", nil)
+
+	if got := get(); got != http.StatusProxyAuthRequired {
+		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer new-key-after-reload")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("after reload with correct new key: status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 }

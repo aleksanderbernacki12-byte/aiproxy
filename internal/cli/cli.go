@@ -121,6 +121,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.CostPer1KTokens = lc.cost
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
+	server.ProxyAPIKey = lc.proxyAPIKey
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.target, r.limiter)
 	}
@@ -159,7 +160,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// a bearer credential directly in its path, so it gets the
 			// same treatment as every other secret aiproxy handles —
 			// never written to a log or the terminal.
-			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/dry-run)")
+			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/unauthorized/dry-run)")
+		}
+		if lc.proxyAPIKey != "" {
+			// Deliberately never prints the key itself, same discipline
+			// as the webhook URL above.
+			fmt.Fprintln(stdout, "proxy authentication: required (Proxy-Authorization: Bearer <key>)")
 		}
 		for _, r := range lc.routes {
 			if r.maxRequestsPerMinute > 0 {
@@ -232,7 +238,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Target: r.target, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.maxBodyBytes, lc.webhookURL, routes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.maxBodyBytes, lc.webhookURL, lc.proxyAPIKey, routes)
 
 	label := loadedFrom
 	if label == "" {
@@ -251,6 +257,7 @@ type liveConfig struct {
 	cost         float64
 	maxBodyBytes int64
 	webhookURL   *url.URL
+	proxyAPIKey  string
 	routes       []targetRoute
 }
 
@@ -294,6 +301,8 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 			lc.webhookURL = webhookURL
 		}
 	}
+
+	lc.proxyAPIKey = cfg.ProxyAPIKey
 
 	routes, routeErrs := compileTargetRoutes(cfg.Targets)
 	errs = append(errs, routeErrs...)
@@ -564,6 +573,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  webhook alerts:          %v\n", cfg.WebhookURL != "")
 	fmt.Fprintf(stdout, "  path rules:              %d\n", len(cfg.PathRules))
 	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
+	fmt.Fprintf(stdout, "  proxy authentication:    %v\n", cfg.ProxyAPIKey != "")
 	return 0
 }
 

@@ -479,3 +479,35 @@ func TestSnapshot_PerRuleString_IncludesDryRunSuffixWhenNonZero(t *testing.T) {
 		t.Errorf("PerRuleString() missing candidate-rule line with dry-run suffix: %q", rendered)
 	}
 }
+
+func TestStats_RecordUnauthorized_TracksOverallOnly(t *testing.T) {
+	s := stats.New()
+	s.RecordUnauthorized()
+	s.RecordUnauthorized()
+	s.RecordAllow("default")
+
+	snap := s.Snapshot()
+	if snap.Unauthorized != 2 {
+		t.Errorf("Unauthorized = %d, want 2", snap.Unauthorized)
+	}
+	for target, t2 := range snap.PerTarget {
+		if t2.Unauthorized != 0 {
+			t.Errorf("PerTarget[%q].Unauthorized = %d, want 0 (never broken down per target)", target, t2.Unauthorized)
+		}
+	}
+}
+
+func TestSnapshot_String_OmitsUnauthorizedLineWhenZero(t *testing.T) {
+	snap := stats.Snapshot{Allowed: 5}
+	if rendered := snap.String(); strings.Contains(rendered, "Unauthorized") {
+		t.Errorf("String() = %q, want no Unauthorized line when nothing was rejected", rendered)
+	}
+}
+
+func TestSnapshot_String_IncludesUnauthorizedLineWhenNonZero(t *testing.T) {
+	snap := stats.Snapshot{Unauthorized: 3}
+	rendered := snap.String()
+	if !strings.Contains(rendered, "Unauthorized (407):   3") {
+		t.Errorf("String() = %q, want the unauthorized count", rendered)
+	}
+}

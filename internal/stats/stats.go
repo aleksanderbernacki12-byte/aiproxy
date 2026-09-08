@@ -84,8 +84,9 @@ type dryRunCounters struct {
 // Stats holds a running proxy's counters. The zero value is not usable;
 // construct one with New.
 type Stats struct {
-	overall counters
-	dryRun  dryRunCounters
+	overall      counters
+	dryRun       dryRunCounters
+	unauthorized atomic.Int64
 
 	mu        sync.Mutex
 	perTarget map[string]*counters
@@ -154,6 +155,14 @@ func (s *Stats) RecordRedact(target, ruleName string) {
 func (s *Stats) RecordRateLimited(target string) {
 	s.overall.rateLimited.Add(1)
 	s.counterFor(target).rateLimited.Add(1)
+}
+
+// RecordUnauthorized records one request rejected for a missing or
+// invalid Proxy-Authorization header, before any target was even
+// resolved — so, unlike every other counter, this has no target
+// parameter at all: there is nothing to attribute it to yet.
+func (s *Stats) RecordUnauthorized() {
+	s.unauthorized.Add(1)
 }
 
 // RecordCacheHit records one request served from the on-disk cache
@@ -273,6 +282,11 @@ type Snapshot struct {
 	ResponseDryRunBlocked  int64 `json:"response_dry_run_blocked"`
 	ResponseDryRunRedacted int64 `json:"response_dry_run_redacted"`
 
+	// Unauthorized counts requests rejected for a missing or invalid
+	// Proxy-Authorization header, when Server.ProxyAPIKey is set. Never
+	// broken down per target — see Stats.RecordUnauthorized.
+	Unauthorized int64 `json:"unauthorized"`
+
 	PerTarget map[string]Snapshot     `json:"per_target,omitempty"`
 	PerRule   map[string]RuleSnapshot `json:"per_rule,omitempty"`
 }
@@ -296,6 +310,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.DryRunRedacted = s.dryRun.redacted.Load()
 	snap.ResponseDryRunBlocked = s.dryRun.responseBlocked.Load()
 	snap.ResponseDryRunRedacted = s.dryRun.responseRedacted.Load()
+	snap.Unauthorized = s.unauthorized.Load()
 	snap.PerTarget = perTarget
 	snap.PerRule = perRule
 	return snap
@@ -334,6 +349,12 @@ func (s Snapshot) String() string {
 				"Dry-run would-redact: %d",
 			s.DryRunBlocked+s.ResponseDryRunBlocked, s.DryRunRedacted+s.ResponseDryRunRedacted,
 		)
+	}
+	// Only shown when nonzero, same reasoning as the dry-run lines: this
+	// is always 0 for the vast majority of runs that never set
+	// proxy_api_key, so printing it unconditionally would just be noise.
+	if s.Unauthorized > 0 {
+		out += fmt.Sprintf("\nUnauthorized (407):   %d", s.Unauthorized)
 	}
 	return out
 }
