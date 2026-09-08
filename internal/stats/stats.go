@@ -84,9 +84,10 @@ type dryRunCounters struct {
 // Stats holds a running proxy's counters. The zero value is not usable;
 // construct one with New.
 type Stats struct {
-	overall      counters
-	dryRun       dryRunCounters
-	unauthorized atomic.Int64
+	overall       counters
+	dryRun        dryRunCounters
+	unauthorized  atomic.Int64
+	budgetAlerted atomic.Bool
 
 	mu        sync.Mutex
 	perTarget map[string]*counters
@@ -232,6 +233,25 @@ func (s *Stats) RecordResponseDryRunBlock(ruleName string) {
 func (s *Stats) RecordResponseDryRunRedact(ruleName string) {
 	s.dryRun.responseRedacted.Add(1)
 	s.ruleCounterFor(ruleName).responseDryRunRedacted.Add(1)
+}
+
+// CrossedBudget reports whether the running total cost — TotalTokens
+// priced at costPer1KTokens — has just reached or passed budget for the
+// first time since this Stats was created, via a one-shot CAS on
+// budgetAlerted so a long-running proxy alerts exactly once rather than
+// on every request past the threshold. budget <= 0 (unset) never
+// crosses. cost is always returned (even when not crossed, or when
+// budget is unset) so a caller with its own reason to log the current
+// cost doesn't need a second call. Once fired, stays fired for the life
+// of the process: a budget alert is meant to be a single "you've gone
+// over" notice, not a recurring one, even if budget is later raised via
+// a config reload.
+func (s *Stats) CrossedBudget(costPer1KTokens, budget float64) (cost float64, crossed bool) {
+	cost = float64(s.overall.totalTokens.Load()) / 1000 * costPer1KTokens
+	if budget <= 0 || cost < budget {
+		return cost, false
+	}
+	return cost, s.budgetAlerted.CompareAndSwap(false, true)
 }
 
 // RuleSnapshot is a point-in-time copy of one named rule's block/redact

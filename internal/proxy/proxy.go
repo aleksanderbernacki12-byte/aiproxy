@@ -205,6 +205,14 @@ type Server struct {
 	CostPer1KTokens float64          // zero omits the shutdown summary's cost line
 	routes          []route
 
+	// CostBudget, if greater than zero, is a threshold in the same units
+	// as CostPer1KTokens; once the running total cost reaches or passes
+	// it, ServeHTTP logs and webhook-alerts a budget_exceeded event once
+	// — see stats.Stats.CrossedBudget. It never blocks or otherwise
+	// changes how a request is handled. Zero (the default) disables the
+	// check entirely.
+	CostBudget float64
+
 	// MaxBodyBytes caps how large a request body ServeHTTP will buffer in
 	// memory before rejecting it with a 413. Unlike every other field
 	// above, zero (or negative) does not mean "disabled" — it means
@@ -249,13 +257,19 @@ const (
 
 // logEvent is the shape of one line logged under LogFormatJSON.
 type logEvent struct {
-	Time    string `json:"time"`
-	Level   string `json:"level"`
-	Method  string `json:"method,omitempty"`
-	URL     string `json:"url,omitempty"`
-	Rule    string `json:"rule,omitempty"`
-	Tokens  int    `json:"tokens,omitempty"`
-	Message string `json:"message,omitempty"`
+	Time   string `json:"time"`
+	Level  string `json:"level"`
+	Method string `json:"method,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Rule   string `json:"rule,omitempty"`
+	Tokens int    `json:"tokens,omitempty"`
+
+	// Cost and Budget are only set on a budget_exceeded event: the
+	// running total cost at the moment it was logged, and the
+	// cost_budget threshold it crossed.
+	Cost    float64 `json:"cost,omitempty"`
+	Budget  float64 `json:"budget,omitempty"`
+	Message string  `json:"message,omitempty"`
 }
 
 // New creates a Server that listens on addr, forwards allowed requests to
@@ -363,6 +377,12 @@ func (s *Server) getCostPer1KTokens() float64 {
 	return s.CostPer1KTokens
 }
 
+func (s *Server) getCostBudget() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CostBudget
+}
+
 func (s *Server) getMaxBodyBytes() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -395,18 +415,19 @@ type Route struct {
 }
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
-// cost-per-1K-tokens rate, max request body size, webhook alert URL,
-// proxy API key, and target routes — e.g. after re-reading aiproxy.json
-// on SIGHUP. All of them change together under one lock, so a request
-// in flight never observes a torn mix of old and new configuration; a
-// request takes effect from the moment it's accepted, so anything
-// already being handled keeps running against whatever configuration it
-// started with. Pass nil for limiter/cache/webhookURL to disable them,
-// matching how the corresponding field would be set at startup; pass ""
-// for proxyAPIKey to disable the auth check; pass zero for maxBodyBytes
-// to fall back to DefaultMaxBodyBytes, same as leaving
-// Server.MaxBodyBytes unset.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens float64, maxBodyBytes int64, webhookURL *url.URL, proxyAPIKey string, routes []Route) {
+// cost-per-1K-tokens rate, cost budget, max request body size, webhook
+// alert URL, proxy API key, and target routes — e.g. after re-reading
+// aiproxy.json on SIGHUP. All of them change together under one lock, so
+// a request in flight never observes a torn mix of old and new
+// configuration; a request takes effect from the moment it's accepted,
+// so anything already being handled keeps running against whatever
+// configuration it started with. Pass nil for limiter/cache/webhookURL
+// to disable them, matching how the corresponding field would be set at
+// startup; pass "" for proxyAPIKey to disable the auth check; pass zero
+// for costBudget to disable the budget check, or maxBodyBytes to fall
+// back to DefaultMaxBodyBytes, same as leaving Server.MaxBodyBytes
+// unset.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, proxyAPIKey string, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, target: r.Target, limiter: r.Limiter}
@@ -418,6 +439,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.Limiter = lim
 	s.Cache = cch
 	s.CostPer1KTokens = costPer1KTokens
+	s.CostBudget = costBudget
 	s.MaxBodyBytes = maxBodyBytes
 	s.WebhookURL = webhookURL
 	s.ProxyAPIKey = proxyAPIKey
@@ -970,6 +992,10 @@ func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 	if tokens := extractTotalTokens(body); tokens > 0 {
 		s.Stats.RecordTokensUsed(reqCtx.targetLabel, tokens)
 		s.logUsage(reqCtx.method, reqCtx.url, tokens)
+		if cost, crossed := s.Stats.CrossedBudget(s.getCostPer1KTokens(), s.getCostBudget()); crossed {
+			s.logBudgetExceeded(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
+			s.notifyBudgetWebhook(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
+		}
 	}
 }
 
@@ -1003,6 +1029,14 @@ func (s *Server) logUnauthorized(method, reqURL string) {
 		return
 	}
 	s.logf("%s[UNAUTHORIZED] %s %s - Missing or invalid Proxy-Authorization%s", ansiBrightRed, method, reqURL, ansiReset)
+}
+
+func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) {
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Cost: cost, Budget: budget})
+		return
+	}
+	s.logf("%s[BUDGET EXCEEDED] %s %s - Estimated cost %.4f exceeds budget %.4f%s", ansiYellow, method, reqURL, cost, budget, ansiReset)
 }
 
 func (s *Server) logUsage(method, reqURL string, totalTokens int) {
@@ -1124,62 +1158,42 @@ func (s *Server) handleResponseDryRunHits(hits []rules.DryRunMatch, method, reqU
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
 // webhookAlert is the JSON body POSTed to Server.WebhookURL for every
-// block, redact, rate_limited, unauthorized, or dry-run event
-// (dry_run_block, dry_run_redact, response_dry_run_block,
+// block, redact, rate_limited, unauthorized, budget_exceeded, or
+// dry-run event (dry_run_block, dry_run_redact, response_dry_run_block,
 // response_dry_run_redact). Text alone is enough for a Slack incoming
 // webhook (which reads exactly that field and ignores the rest); the
 // remaining fields serve a generic JSON webhook consumer that wants the
 // event structured instead of parsed back out of a sentence. Like every
 // other log line in this package, it carries the rule name that
 // matched, never the matched secret itself; Rule is empty for a
-// rate_limited or unauthorized event, since no scanning rule was
-// involved in either.
+// rate_limited, unauthorized, or budget_exceeded event, since none of
+// those is attributable to any one rule. Cost and Budget are set only
+// for budget_exceeded, omitted (via omitempty on the pointer) for every
+// other event.
 type webhookAlert struct {
-	Text   string `json:"text"`
-	Event  string `json:"event"`
-	Method string `json:"method"`
-	URL    string `json:"url"`
-	Rule   string `json:"rule"`
-	Time   string `json:"time"`
+	Text   string   `json:"text"`
+	Event  string   `json:"event"`
+	Method string   `json:"method"`
+	URL    string   `json:"url"`
+	Rule   string   `json:"rule"`
+	Time   string   `json:"time"`
+	Cost   *float64 `json:"cost,omitempty"`
+	Budget *float64 `json:"budget,omitempty"`
 }
 
-// notifyWebhook POSTs a webhookAlert to Server.WebhookURL, if configured,
-// for a block, redact, rate_limited, unauthorized, or dry-run event.
-// ruleName is the matched rule's name for every event except
-// rate_limited and unauthorized, both "" (neither is attributable to
-// any one rule) — a dry-run event's Text says "Would have triggered
-// rule" instead of "Triggered rule", since nothing was actually
-// enforced. Delivery happens on its own goroutine so a slow or
-// unreachable webhook endpoint never delays the client's actual
-// request — the request has already been
-// decided and logged by the time this runs. A delivery failure (or a
-// non-2xx response) is logged as an internal error and otherwise
-// ignored: there is no retry, and it never changes the outcome of the
-// request that triggered it.
-func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
+// deliverWebhookPayload marshals payload and POSTs it to Server.WebhookURL
+// on its own goroutine, if configured — shared by notifyWebhook and
+// notifyBudgetWebhook so the actual delivery mechanics (timeout, error
+// logging, no retry) live in exactly one place. A slow or unreachable
+// webhook endpoint never delays the client's actual request — the
+// request has already been decided and logged by the time this runs. A
+// delivery failure (or a non-2xx response) is logged as an internal
+// error and otherwise ignored: there is no retry, and it never changes
+// the outcome of the request that triggered it.
+func (s *Server) deliverWebhookPayload(payload webhookAlert) {
 	webhookURL := s.getWebhookURL()
 	if webhookURL == nil {
 		return
-	}
-
-	var text string
-	switch {
-	case event == "rate_limited":
-		text = fmt.Sprintf("[%s] %s %s - Rate limit exceeded", strings.ToUpper(event), method, reqURL)
-	case event == "unauthorized":
-		text = fmt.Sprintf("[%s] %s %s - Missing or invalid Proxy-Authorization", strings.ToUpper(event), method, reqURL)
-	case strings.Contains(event, "dry_run"):
-		text = fmt.Sprintf("[%s] %s %s - Would have triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
-	default:
-		text = fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
-	}
-	payload := webhookAlert{
-		Text:   text,
-		Event:  event,
-		Method: method,
-		URL:    reqURL,
-		Rule:   ruleName,
-		Time:   time.Now().UTC().Format(time.RFC3339),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -1200,6 +1214,51 @@ func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
 			s.logError("aiproxy: webhook: endpoint returned status %d", resp.StatusCode)
 		}
 	}()
+}
+
+// notifyWebhook builds and delivers a webhookAlert for a block, redact,
+// rate_limited, unauthorized, or dry-run event. ruleName is the matched
+// rule's name for every event except rate_limited and unauthorized, both
+// "" (neither is attributable to any one rule) — a dry-run event's Text
+// says "Would have triggered rule" instead of "Triggered rule", since
+// nothing was actually enforced.
+func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
+	var text string
+	switch {
+	case event == "rate_limited":
+		text = fmt.Sprintf("[%s] %s %s - Rate limit exceeded", strings.ToUpper(event), method, reqURL)
+	case event == "unauthorized":
+		text = fmt.Sprintf("[%s] %s %s - Missing or invalid Proxy-Authorization", strings.ToUpper(event), method, reqURL)
+	case strings.Contains(event, "dry_run"):
+		text = fmt.Sprintf("[%s] %s %s - Would have triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
+	default:
+		text = fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
+	}
+	s.deliverWebhookPayload(webhookAlert{
+		Text:   text,
+		Event:  event,
+		Method: method,
+		URL:    reqURL,
+		Rule:   ruleName,
+		Time:   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// notifyBudgetWebhook builds and delivers a webhookAlert for the
+// budget_exceeded event — kept separate from notifyWebhook rather than
+// overloading its signature, since this is the only event carrying a
+// cost and a budget instead of a rule name.
+func (s *Server) notifyBudgetWebhook(method, reqURL string, cost, budget float64) {
+	text := fmt.Sprintf("[BUDGET_EXCEEDED] %s %s - Estimated cost %.4f exceeds budget %.4f", method, reqURL, cost, budget)
+	s.deliverWebhookPayload(webhookAlert{
+		Text:   text,
+		Event:  "budget_exceeded",
+		Method: method,
+		URL:    reqURL,
+		Time:   time.Now().UTC().Format(time.RFC3339),
+		Cost:   &cost,
+		Budget: &budget,
+	})
 }
 
 // logEventJSON marshals ev (stamping the current time) and logs it as a
@@ -1277,6 +1336,14 @@ type statsSnapshotJSON struct {
 	EstimatedCost *float64                      `json:"estimated_cost,omitempty"`
 	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
 	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
+
+	// CostBudget is the configured cost_budget threshold, included only
+	// when it's set. Unlike EstimatedCost, it's never repeated inside
+	// PerTarget — a budget is a single whole-proxy-run threshold, not
+	// something each target has its own copy of — so toStatsSnapshotJSON
+	// never sets it; only the top-level caller (serveStats, logSummary)
+	// does, once, after building the rest of the payload.
+	CostBudget *float64 `json:"cost_budget,omitempty"`
 }
 
 func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnapshotJSON {
@@ -1311,6 +1378,16 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 	return out
 }
 
+// withCostBudget sets out.CostBudget when budget is configured — split
+// out of toStatsSnapshotJSON so it only ever runs once, on the top-level
+// payload, never recursed into PerTarget; see statsSnapshotJSON.CostBudget.
+func withCostBudget(out statsSnapshotJSON, budget float64) statsSnapshotJSON {
+	if budget > 0 {
+		out.CostBudget = &budget
+	}
+	return out
+}
+
 // serveStats answers statsPath with the current Stats snapshot as JSON,
 // letting a long-running proxy be monitored without waiting for Ctrl+C.
 // It never touches rules, the rate limiter, or the cache, and is never
@@ -1320,7 +1397,7 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens())
+	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens()), s.getCostBudget())
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		s.logError("aiproxy: stats: failed to encode response: %v", err)
@@ -1399,7 +1476,7 @@ func promLabelValue(v string) string {
 // same reasoning as the JSON stats endpoint: a metrics scrape needs a
 // structurally predictable shape every time, not a human-friendly
 // summary. targets are sorted for a stable scrape-to-scrape diff.
-func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens float64) {
+func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBudget float64) {
 	names := make([]string, 0, len(snap.PerTarget))
 	for name := range snap.PerTarget {
 		names = append(names, name)
@@ -1449,6 +1526,17 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens float64)
 	fmt.Fprintln(w, "# HELP aiproxy_unauthorized_total Total number of requests rejected for a missing or invalid Proxy-Authorization header.")
 	fmt.Fprintln(w, "# TYPE aiproxy_unauthorized_total counter")
 	fmt.Fprintf(w, "aiproxy_unauthorized_total %d\n", snap.Unauthorized)
+
+	// Unlabeled too, but for a different reason than the series above: a
+	// gauge, not a counter (the configured value doesn't accumulate),
+	// and a single whole-proxy-run threshold rather than something with
+	// a per-target or per-rule breakdown to begin with. Omitted entirely
+	// when cost_budget isn't set, same as aiproxy_estimated_cost.
+	if costBudget > 0 {
+		fmt.Fprintln(w, "# HELP aiproxy_cost_budget Configured cost_budget threshold, in the same units as aiproxy_estimated_cost.")
+		fmt.Fprintln(w, "# TYPE aiproxy_cost_budget gauge")
+		fmt.Fprintf(w, "aiproxy_cost_budget %g\n", costBudget)
+	}
 }
 
 // serveMetrics answers metricsPath with the current Stats snapshot in
@@ -1461,18 +1549,27 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	writePromMetrics(w, s.Stats.Snapshot(), s.getCostPer1KTokens())
+	writePromMetrics(w, s.Stats.Snapshot(), s.getCostPer1KTokens(), s.getCostBudget())
 }
 
 // Summary renders the current stats snapshot as the same block of text
 // printed on shutdown, appending an estimated cost line only when
-// CostPer1KTokens has been configured.
+// CostPer1KTokens has been configured, and a cost budget line — flagged
+// "(EXCEEDED)" once crossed — only when CostBudget has been configured.
 func (s *Server) Summary() string {
 	cost := s.getCostPer1KTokens()
+	budget := s.getCostBudget()
 	snap := s.Stats.Snapshot()
 	summary := snap.String()
 	if cost > 0 {
 		summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", snap.EstimatedCost(cost), cost)
+	}
+	if budget > 0 {
+		line := fmt.Sprintf("\nCost budget:         %.4f", budget)
+		if snap.EstimatedCost(cost) >= budget {
+			line += " (EXCEEDED)"
+		}
+		summary += line
 	}
 	if breakdown := snap.PerTargetString(cost); breakdown != "" {
 		summary += "\n" + breakdown
@@ -1490,7 +1587,7 @@ func (s *Server) Summary() string {
 // the guarantee that every line is valid JSON in that mode.
 func (s *Server) logSummary() {
 	if s.LogFormat == LogFormatJSON {
-		payload := toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens())
+		payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens()), s.getCostBudget())
 		data, err := json.Marshal(payload)
 		if err != nil {
 			s.logError("aiproxy: summary: failed to encode: %v", err)

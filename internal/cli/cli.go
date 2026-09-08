@@ -119,6 +119,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.Limiter = lc.limiter
 	server.Cache = lc.cache
 	server.CostPer1KTokens = lc.cost
+	server.CostBudget = lc.costBudget
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
 	server.ProxyAPIKey = lc.proxyAPIKey
@@ -151,6 +152,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if cfg.CostPer1KTokens > 0 {
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
 		}
+		if cfg.CostBudget > 0 {
+			fmt.Fprintf(stdout, "cost budget: %g (alerts once, on/after crossing)\n", cfg.CostBudget)
+		}
 		if cfg.MaxBodyBytes > 0 {
 			fmt.Fprintf(stdout, "max request body size: %d bytes\n", cfg.MaxBodyBytes)
 		}
@@ -160,7 +164,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// a bearer credential directly in its path, so it gets the
 			// same treatment as every other secret aiproxy handles —
 			// never written to a log or the terminal.
-			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/unauthorized/dry-run)")
+			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/unauthorized/dry-run/budget_exceeded)")
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -238,7 +242,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Target: r.target, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.maxBodyBytes, lc.webhookURL, lc.proxyAPIKey, routes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.proxyAPIKey, routes)
 
 	label := loadedFrom
 	if label == "" {
@@ -255,6 +259,7 @@ type liveConfig struct {
 	limiter      *limiter.Limiter
 	cache        *cache.Cache
 	cost         float64
+	costBudget   float64
 	maxBodyBytes int64
 	webhookURL   *url.URL
 	proxyAPIKey  string
@@ -291,6 +296,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	}
 
 	lc.cost = cfg.CostPer1KTokens
+	lc.costBudget = cfg.CostBudget
 	lc.maxBodyBytes = cfg.MaxBodyBytes
 
 	if cfg.WebhookURL != "" {
@@ -545,6 +551,12 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.CostPer1KTokens < 0 {
 		problems = append(problems, fmt.Sprintf("cost_per_1k_tokens: %g must not be negative", cfg.CostPer1KTokens))
 	}
+	if cfg.CostBudget < 0 {
+		problems = append(problems, fmt.Sprintf("cost_budget: %g must not be negative", cfg.CostBudget))
+	}
+	if cfg.CostBudget > 0 && cfg.CostPer1KTokens <= 0 {
+		problems = append(problems, "cost_budget requires cost_per_1k_tokens to be set (there's no rate to price tokens at otherwise)")
+	}
 	if cfg.MaxBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
 	}
@@ -568,6 +580,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
+	fmt.Fprintf(stdout, "  cost budget:             %g\n", cfg.CostBudget)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
 	fmt.Fprintf(stdout, "  max request body size:   %d bytes\n", effectiveMaxBodyBytes(cfg.MaxBodyBytes))
 	fmt.Fprintf(stdout, "  webhook alerts:          %v\n", cfg.WebhookURL != "")

@@ -754,6 +754,63 @@ func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
 	}
 }
 
+func TestExecute_Validate_NegativeCostBudget_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "cost_budget": -1}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cost_budget") {
+		t.Errorf("stderr missing negative cost_budget problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_CostBudgetWithoutCostRate_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_budget": 10}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (cost_budget with no cost_per_1k_tokens set)", code)
+	}
+	if !strings.Contains(stderr.String(), "cost_budget requires cost_per_1k_tokens") {
+		t.Errorf("stderr missing cost_budget-requires-rate problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithCostBudget_ReportsSummary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "cost_budget": 10.5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cost budget:             10.5") {
+		t.Fatalf("stdout missing cost budget summary line: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_InvalidWebhookURL_ReportsProblem proves a
 // webhook_url with an unsupported scheme is reported as a config
 // problem, not silently ignored or only discovered once a block/redact

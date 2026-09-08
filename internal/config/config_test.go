@@ -213,6 +213,40 @@ func TestLoad_ProxyAPIKeyDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesCostBudget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "cost_budget": 10.5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CostBudget != 10.5 {
+		t.Fatalf("CostBudget = %g, want 10.5", cfg.CostBudget)
+	}
+}
+
+func TestLoad_CostBudgetDefaultsToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CostBudget != 0 {
+		t.Fatalf("CostBudget = %g, want 0 when absent", cfg.CostBudget)
+	}
+}
+
 func TestLoad_ParsesPathRules(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

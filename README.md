@@ -193,9 +193,10 @@ serves, instead of the multi-line text block):
 `level` is one of `allow`, `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
 `dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
-`usage`, `cache_hit`, or `error` (an internal problem unrelated to any
-specific request, e.g. a failed cache write) — `method`/`url`/`rule`/`tokens`
-appear only where relevant. This only affects the ongoing per-request log stream on
+`usage`, `budget_exceeded`, `cache_hit`, or `error` (an internal problem
+unrelated to any specific request, e.g. a failed cache write) —
+`method`/`url`/`rule`/`tokens` appear only where relevant, and
+`cost`/`budget` appear only on `budget_exceeded`. This only affects the ongoing per-request log stream on
 stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
 ...`, `aiproxy listening on ...`) still print as plain text on stdout,
 since they're low-volume, human-oriented setup notices rather than part
@@ -212,10 +213,11 @@ kill -HUP <aiproxy-pid>
 Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
 custom rules, path rules, the rate limit, the cache, cost estimation,
-the max request body size, the webhook alert URL, the proxy API key,
-and target routes all take effect for the next request, with no dropped
-connections and no restart. Every one of these is logged (as `reload`
-on success, or `reload_error` on failure, under `--log-format json`).
+the cost budget, the max request body size, the webhook alert URL, the
+proxy API key, and target routes all take effect for the next request,
+with no dropped connections and no restart. Every one of these is logged
+(as `reload` on success, or `reload_error` on failure, under
+`--log-format json`).
 
 If the reloaded file has any problem — a bad regex, a bad target, a
 cache directory that can't be created — the reload is refused and the
@@ -267,6 +269,30 @@ all). aiproxy has no built-in, inevitably-stale pricing table — you tell
 it what rate applies to your own usage (whatever your provider actually
 charges you per 1,000 tokens, in whatever currency), and the summary
 just multiplies that by the total tokens tracked during the run.
+
+Set `cost_budget` alongside it to get notified once the running total
+cost reaches or passes a threshold — a real-time signal for an agent
+loop quietly running up a bill, without waiting for the shutdown summary
+or polling stats yourself:
+
+```json
+{
+  "cost_per_1k_tokens": 0.03,
+  "cost_budget": 10
+}
+```
+
+This is visibility only, never enforcement — a request that pushes the
+cost over budget is still forwarded and answered completely normally.
+Once crossed, it's logged (`[BUDGET EXCEEDED]`, yellow;
+`"budget_exceeded"` under `--log-format json`), [webhook-alerted](#webhook-alerts)
+if `webhook_url` is set, and reported in `GET /_aiproxy/stats`'s
+`cost_budget` field and the Prometheus endpoint's `aiproxy_cost_budget`
+gauge — but only **once** for the life of the running process, not on
+every request past the threshold; a budget alert is meant to be a single
+"you've gone over" notice, not a recurring one. `aiproxy validate`
+rejects `cost_budget` set without `cost_per_1k_tokens` — a budget with no
+rate to price tokens at has nothing to compare against.
 
 `max_body_size_bytes` caps how large a single request body aiproxy will
 buffer in memory before rejecting it with a 413 — every request is read
@@ -574,6 +600,7 @@ can be monitored without waiting for Ctrl+C:
   "response_dry_run_redacted": 0,
   "unauthorized": 0,
   "estimated_cost": 0.062,
+  "cost_budget": 10,
   "per_target": {
     "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062 },
     "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0 }
@@ -603,7 +630,11 @@ target — always `0` inside `per_target`, appearing only in the overall
 totals and inside `per_rule`. `unauthorized` (see
 [authenticating requests](#authenticating-requests-to-the-proxy)) goes
 further still: never broken down by target OR by rule, since a rejected
-request never resolves either. Any method other than `GET` gets a 405.
+request never resolves either. `cost_budget` (see
+[cost budget alerts](#custom-rules-rate-limiting-caching-and-cost-estimation))
+is included only when it's set, and — unlike `estimated_cost` — never
+repeated inside `per_target`: it's a single whole-proxy-run threshold,
+not something each target has its own copy of. Any method other than `GET` gets a 405.
 Once `proxy_api_key` is set, this endpoint requires it too — a request
 missing or failing that check never reaches this handler at all, and
 gets a 407 instead. Because the path
@@ -639,6 +670,7 @@ aiproxy_dry_run_redacted_total 0
 aiproxy_dry_run_response_blocked_total 0
 aiproxy_dry_run_response_redacted_total 0
 aiproxy_unauthorized_total 0
+aiproxy_cost_budget 10
 ```
 
 (`# HELP`/`# TYPE` lines omitted above for brevity — the real response
@@ -656,7 +688,11 @@ rule-labeled `aiproxy_rule_dry_run_*_total{rule="..."}` counterparts,
 but are themselves unlabeled — dry-run activity is never broken down by
 target. `aiproxy_unauthorized_total` is unlabeled too, and has no
 rule-labeled counterpart at all — a rejected request never resolves a
-target or a rule to label it with. Once `proxy_api_key` is set, a
+target or a rule to label it with. `aiproxy_cost_budget` is a gauge, not
+a counter — the configured `cost_budget` threshold itself, included only
+when it's set — and unlabeled for a different reason than the series
+above: a single whole-proxy-run value, not something with a per-target
+or per-rule breakdown to begin with. Once `proxy_api_key` is set, a
 scrape has to send it back the same way any other request does (see
 [authenticating requests](#authenticating-requests-to-the-proxy)) — a
 Prometheus `scrape_configs` entry's `authorization: { type: Bearer,
@@ -684,8 +720,9 @@ Set `webhook_url` to get pushed a real-time alert instead, the moment a
 rule matches — on a request going out, a
 [response](#scanning-responses-too) coming back, the
 [rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
-tripping, a [dry-run](#dry-run-mode-for-rules) rule matching, or a
-request failing [proxy authentication](#authenticating-requests-to-the-proxy):
+tripping, a [dry-run](#dry-run-mode-for-rules) rule matching, a
+request failing [proxy authentication](#authenticating-requests-to-the-proxy),
+or the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-and-cost-estimation):
 
 ```json
 {
@@ -695,8 +732,8 @@ request failing [proxy authentication](#authenticating-requests-to-the-proxy):
 
 Every alertable event — `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
-`dry_run_redact`, `response_dry_run_block`, or `response_dry_run_redact`
-— POSTs this JSON body to that URL:
+`dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`, or
+`budget_exceeded` — POSTs this JSON body to that URL:
 
 ```json
 {
@@ -737,6 +774,25 @@ likewise carries an empty `rule`, and never echoes the configured
   "url": "/v1/messages",
   "rule": "",
   "time": "2026-01-01T12:00:00Z"
+}
+```
+
+A `budget_exceeded` alert — fired once the running total cost reaches or
+passes `cost_budget` — likewise carries an empty `rule`, plus `cost` and
+`budget` fields no other event has: the cost at the moment it fired, and
+the threshold it crossed. It fires exactly once for the life of the
+running process, not on every request past the threshold:
+
+```json
+{
+  "text": "[BUDGET_EXCEEDED] POST /v1/messages - Estimated cost 10.4000 exceeds budget 10.0000",
+  "event": "budget_exceeded",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
+  "time": "2026-01-01T12:00:00Z",
+  "cost": 10.4,
+  "budget": 10
 }
 ```
 

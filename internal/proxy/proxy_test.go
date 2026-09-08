@@ -1810,6 +1810,7 @@ type statsJSONResponse struct {
 	ResponseDryRunRedacted int64                        `json:"response_dry_run_redacted"`
 	Unauthorized           int64                        `json:"unauthorized"`
 	EstimatedCost          *float64                     `json:"estimated_cost,omitempty"`
+	CostBudget             *float64                     `json:"cost_budget,omitempty"`
 	PerTarget              map[string]statsJSONResponse `json:"per_target,omitempty"`
 	PerRule                map[string]ruleJSONResponse  `json:"per_rule,omitempty"`
 }
@@ -2844,7 +2845,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, nil, "", []proxy.Route{
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, "", []proxy.Route{
 		{Prefix: "/other", Target: otherURL, Limiter: strictLimiter},
 	})
 
@@ -2908,7 +2909,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, nil, "", nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, "", nil)
 		}
 	}()
 
@@ -4789,7 +4790,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, nil, "new-key-after-reload", nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, "new-key-after-reload", nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -4807,5 +4808,365 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("after reload with correct new key: status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_CostBudget_NeverBlocksOrAffectsTraffic proves cost_budget is
+// alert-only: a request that pushes the running cost past the budget is
+// still forwarded and answered normally, not rejected — this feature has
+// no enforcement mode, unlike the rate limiter or proxy auth.
+func TestServer_CostBudget_NeverBlocksOrAffectsTraffic(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // cost = 10.0, already over budget on the first request
+	srv.CostBudget = 1.0
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (budget alert must never block traffic)", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "total_tokens") {
+		t.Errorf("body = %q, want the upstream response delivered unchanged", body)
+	}
+}
+
+// TestServer_CostBudget_UnsetNeverFiresWebhook proves that with no
+// cost_budget configured, no amount of usage ever triggers a
+// budget_exceeded alert — same as every other feature in this package,
+// zero/absent means fully off.
+func TestServer_CostBudget_UnsetNeverFiresWebhook(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":1000000}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	webhookCalled := make(chan struct{}, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhookCalled <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // cost_budget left at zero (unset)
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case <-webhookCalled:
+		t.Fatal("webhook fired with no cost_budget configured, want it to never fire")
+	case <-time.After(300 * time.Millisecond):
+		// expected: no call
+	}
+}
+
+// TestServer_Webhook_FiresOnBudgetExceededWithExpectedPayload proves a
+// request that pushes the running cost past cost_budget fires exactly
+// the budget_exceeded webhook event, carrying the cost and budget that
+// were compared, never a rule name.
+func TestServer_Webhook_FiresOnBudgetExceededWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // cost = 10.0
+	srv.CostBudget = 5.0
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "budget_exceeded" {
+			t.Errorf("event = %v, want %q", payload["event"], "budget_exceeded")
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string (a budget alert matches no rule)", payload["rule"])
+		}
+		if cost, ok := payload["cost"].(float64); !ok || cost != 10.0 {
+			t.Errorf("cost = %v, want 10.0", payload["cost"])
+		}
+		if budget, ok := payload["budget"].(float64); !ok || budget != 5.0 {
+			t.Errorf("budget = %v, want 5.0", payload["budget"])
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "BUDGET_EXCEEDED") || !strings.Contains(text, "10.0000") || !strings.Contains(text, "5.0000") {
+			t.Errorf("text = %q, want it to mention BUDGET_EXCEEDED, the cost, and the budget", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_CostBudget_AlertFiresExactlyOnceAcrossManyRequests proves
+// the one-shot latch holds across real HTTP traffic, not just direct
+// Stats calls: several requests each push the cost further over budget,
+// but only the first ever triggers a webhook call.
+func TestServer_CostBudget_AlertFiresExactlyOnceAcrossManyRequests(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	var webhookCalls atomic.Int64
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhookCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // each request adds cost = 10.0
+	srv.CostBudget = 5.0
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 5; i++ {
+		resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	// Give the last request's async webhook delivery goroutine a moment,
+	// then check the count settled at exactly one.
+	time.Sleep(300 * time.Millisecond)
+	if got := webhookCalls.Load(); got != 1 {
+		t.Errorf("webhook calls = %d, want exactly 1 across 5 budget-crossing requests", got)
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsCostBudgetOnlyWhenConfigured proves
+// GET /_aiproxy/stats surfaces the configured cost_budget threshold at
+// the top level, and omits it entirely when unset — same convention as
+// estimated_cost.
+func TestServer_StatsEndpoint_ReportsCostBudgetOnlyWhenConfigured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	fetchStats := func() statsJSONResponse {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+		if err != nil {
+			t.Fatalf("get stats: %v", err)
+		}
+		defer resp.Body.Close()
+		var got statsJSONResponse
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return got
+	}
+
+	if got := fetchStats(); got.CostBudget != nil {
+		t.Errorf("CostBudget = %v, want nil when unset", *got.CostBudget)
+	}
+
+	srv.CostBudget = 25.5
+	got := fetchStats()
+	if got.CostBudget == nil {
+		t.Fatal("CostBudget = nil, want 25.5 once configured")
+	}
+	if *got.CostBudget != 25.5 {
+		t.Errorf("CostBudget = %g, want 25.5", *got.CostBudget)
+	}
+	for target, t2 := range got.PerTarget {
+		if t2.CostBudget != nil {
+			t.Errorf("PerTarget[%q].CostBudget = %v, want nil (a budget is a whole-run threshold, never repeated per target)", target, *t2.CostBudget)
+		}
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsCostBudgetGaugeOnlyWhenConfigured is
+// TestServer_StatsEndpoint_ReportsCostBudgetOnlyWhenConfigured's
+// Prometheus counterpart.
+func TestServer_MetricsEndpoint_ReportsCostBudgetGaugeOnlyWhenConfigured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	fetchMetrics := func() string {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+		if err != nil {
+			t.Fatalf("get metrics: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return string(body)
+	}
+
+	if out := fetchMetrics(); strings.Contains(out, "aiproxy_cost_budget") {
+		t.Errorf("metrics output has aiproxy_cost_budget with no budget configured: %q", out)
+	}
+
+	srv.CostBudget = 25.5
+	out := fetchMetrics()
+	for _, want := range []string{
+		"# HELP aiproxy_cost_budget",
+		"# TYPE aiproxy_cost_budget gauge",
+		"aiproxy_cost_budget 25.5",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q: %q", want, out)
+		}
+	}
+}
+
+// TestServer_SummaryText_IncludesCostBudgetLineAndFlagsWhenExceeded
+// proves the shutdown summary shows the configured budget, and flags it
+// "(EXCEEDED)" only once the running cost has actually crossed it.
+func TestServer_SummaryText_IncludesCostBudgetLineAndFlagsWhenExceeded(t *testing.T) {
+	targetURL, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+
+	withoutBudget := srv.Summary()
+	if strings.Contains(withoutBudget, "Cost budget") {
+		t.Fatalf("summary must omit the cost budget line when CostBudget is unset: %q", withoutBudget)
+	}
+
+	srv.CostPer1KTokens = 1.0
+	srv.CostBudget = 100.0
+	srv.Stats.RecordTokensUsed("default", 5000) // cost = 5.0, under budget
+
+	underBudget := srv.Summary()
+	if !strings.Contains(underBudget, "Cost budget:         100") {
+		t.Fatalf("summary missing cost budget line: %q", underBudget)
+	}
+	if strings.Contains(underBudget, "EXCEEDED") {
+		t.Fatalf("summary flagged EXCEEDED while under budget: %q", underBudget)
+	}
+
+	srv.Stats.RecordTokensUsed("default", 100000) // cost now well over 100
+
+	overBudget := srv.Summary()
+	if !strings.Contains(overBudget, "Cost budget:         100") || !strings.Contains(overBudget, "(EXCEEDED)") {
+		t.Fatalf("summary missing EXCEEDED flag once over budget: %q", overBudget)
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesCostBudget proves CostBudget is one of
+// the fields SIGHUP-style reload actually replaces.
+func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
+	targetURL, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0
+
+	if got := srv.Summary(); strings.Contains(got, "Cost budget") {
+		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
+	}
+
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, "", nil)
+
+	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
+		t.Fatalf("summary missing cost budget line after reload: %q", got)
 	}
 }

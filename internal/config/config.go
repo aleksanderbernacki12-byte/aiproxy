@@ -141,6 +141,20 @@ type Config struct {
 	// specially.
 	PathRules []PathRule `json:"path_rules,omitempty"`
 
+	// CostBudget, if set, is a threshold in the same currency/rate as
+	// CostPer1KTokens — once the running total cost (TotalTokens priced
+	// at CostPer1KTokens) reaches or passes it, aiproxy logs a
+	// budget_exceeded event, alerts WebhookURL if set, and reports it in
+	// GET /_aiproxy/stats and the Prometheus endpoint. It never blocks or
+	// otherwise affects traffic — this is visibility only, not
+	// enforcement. Fires once per process lifetime, not on every request
+	// past the threshold. Only meaningful alongside CostPer1KTokens: a
+	// budget with no rate to price tokens at has nothing to compare
+	// against, so setting this without CostPer1KTokens is a config error.
+	// Zero (the default when the field is absent) disables the check
+	// entirely.
+	CostBudget float64 `json:"cost_budget,omitempty"`
+
 	// ProxyAPIKey, if set, requires every request to the proxy — not
 	// just the ones forwarded upstream, but GET /_aiproxy/stats and
 	// /_aiproxy/metrics too — to present it as a

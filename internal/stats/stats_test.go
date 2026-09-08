@@ -511,3 +511,54 @@ func TestSnapshot_String_IncludesUnauthorizedLineWhenNonZero(t *testing.T) {
 		t.Errorf("String() = %q, want the unauthorized count", rendered)
 	}
 }
+
+func TestStats_CrossedBudget_UnsetBudgetNeverCrosses(t *testing.T) {
+	s := stats.New()
+	s.RecordTokensUsed("default", 1_000_000)
+
+	if _, crossed := s.CrossedBudget(1.0, 0); crossed {
+		t.Error("CrossedBudget with budget=0 (unset) reported crossed, want never")
+	}
+}
+
+func TestStats_CrossedBudget_BelowBudgetNeverCrosses(t *testing.T) {
+	s := stats.New()
+	s.RecordTokensUsed("default", 1000) // cost = 1000/1000*0.01 = 0.01
+
+	cost, crossed := s.CrossedBudget(0.01, 10.0)
+	if crossed {
+		t.Error("CrossedBudget reported crossed while cost is well under budget")
+	}
+	if cost != 0.01 {
+		t.Errorf("cost = %g, want 0.01", cost)
+	}
+}
+
+func TestStats_CrossedBudget_FiresExactlyOnce(t *testing.T) {
+	s := stats.New()
+	s.RecordTokensUsed("default", 10_000) // cost = 10_000/1000*1.0 = 10.0
+
+	cost, crossed := s.CrossedBudget(1.0, 5.0)
+	if !crossed {
+		t.Fatal("first CrossedBudget call over budget reported crossed=false, want true")
+	}
+	if cost != 10.0 {
+		t.Errorf("cost = %g, want 10.0", cost)
+	}
+
+	// Further requests keep pushing the cost up, but the alert must not
+	// fire again — it's a one-time notice, not a recurring one.
+	s.RecordTokensUsed("default", 10_000)
+	if _, crossed := s.CrossedBudget(1.0, 5.0); crossed {
+		t.Error("second CrossedBudget call reported crossed=true, want the one-shot latch to suppress it")
+	}
+}
+
+func TestStats_CrossedBudget_ExactlyAtBudgetCounts(t *testing.T) {
+	s := stats.New()
+	s.RecordTokensUsed("default", 5_000) // cost = 5.0, exactly at budget
+
+	if _, crossed := s.CrossedBudget(1.0, 5.0); !crossed {
+		t.Error("CrossedBudget at exactly the threshold reported crossed=false, want true (>=, not >)")
+	}
+}
