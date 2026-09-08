@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2750,6 +2751,15 @@ func TestServer_JSONLogging_ShutdownSummaryIsOneJSONLine(t *testing.T) {
 // point of the feature is that a consumer never has to special-case a
 // stray non-JSON line.
 func TestServer_JSONLogging_CacheErrorIsAlsoAJSONLine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows' ACL-based permission model means os.Chmod doesn't
+		// reliably block writes into a directory the way removing the
+		// POSIX write bit does on Unix — the write below would just
+		// silently succeed, so there's no portable way to force this
+		// specific failure on Windows. Same reasoning the Go standard
+		// library itself uses to skip permission-based tests there.
+		t.Skip("permission-based write failure injection isn't portable to Windows")
+	}
 	dir := t.TempDir()
 	t.Chdir(dir)
 
