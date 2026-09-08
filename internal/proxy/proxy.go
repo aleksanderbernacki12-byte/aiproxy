@@ -488,7 +488,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if action == rules.Block {
 		// The matched secret itself must never reach the log, only the
 		// static rule name that identifies which pattern triggered it.
-		s.Stats.RecordBlock(targetLabel)
+		s.Stats.RecordBlock(targetLabel, ruleName)
 		s.logBlock(r.Method, r.URL.String(), ruleName)
 		s.notifyWebhook("block", r.Method, r.URL.String(), ruleName)
 		http.Error(w, "blocked by aiproxy rules", http.StatusForbidden)
@@ -516,7 +516,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Header[name] = values
 	}
 	if action == rules.Redact {
-		s.Stats.RecordRedact(targetLabel)
+		s.Stats.RecordRedact(targetLabel, ruleName)
 		s.logRedact(r.Method, r.URL.String(), ruleName)
 		s.notifyWebhook("redact", r.Method, r.URL.String(), ruleName)
 	} else {
@@ -585,7 +585,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 
 	action, ruleName, scannedBody := s.getEngine().EvaluateResponse(body)
 	if action == rules.Block {
-		s.Stats.RecordResponseBlock(reqCtx.targetLabel)
+		s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
 		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
 		s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
 		msg := []byte("response blocked by aiproxy rules")
@@ -597,7 +597,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		return nil
 	}
 	if action == rules.Redact {
-		s.Stats.RecordResponseRedact(reqCtx.targetLabel)
+		s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
 		s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName)
 		s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName)
 		body = scannedBody
@@ -639,12 +639,12 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		src:    resp.Body,
 		engine: s.getEngine(),
 		onRedact: func(ruleName string) {
-			s.Stats.RecordResponseRedact(reqCtx.targetLabel)
+			s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
 			s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName)
 			s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName)
 		},
 		onBlock: func(ruleName string) {
-			s.Stats.RecordResponseBlock(reqCtx.targetLabel)
+			s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
 			s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
 			s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
 		},
@@ -1098,16 +1098,17 @@ func (s *Server) logf(format string, args ...any) {
 // is a proxy-level concern (CostPer1KTokens) that the stats package has
 // no notion of.
 type statsSnapshotJSON struct {
-	Allowed          int64                        `json:"allowed"`
-	Blocked          int64                        `json:"blocked"`
-	Redacted         int64                        `json:"redacted"`
-	RateLimited      int64                        `json:"rate_limited"`
-	CacheHits        int64                        `json:"cache_hits"`
-	TotalTokens      int64                        `json:"total_tokens"`
-	ResponseBlocked  int64                        `json:"response_blocked"`
-	ResponseRedacted int64                        `json:"response_redacted"`
-	EstimatedCost    *float64                     `json:"estimated_cost,omitempty"`
-	PerTarget        map[string]statsSnapshotJSON `json:"per_target,omitempty"`
+	Allowed          int64                         `json:"allowed"`
+	Blocked          int64                         `json:"blocked"`
+	Redacted         int64                         `json:"redacted"`
+	RateLimited      int64                         `json:"rate_limited"`
+	CacheHits        int64                         `json:"cache_hits"`
+	TotalTokens      int64                         `json:"total_tokens"`
+	ResponseBlocked  int64                         `json:"response_blocked"`
+	ResponseRedacted int64                         `json:"response_redacted"`
+	EstimatedCost    *float64                      `json:"estimated_cost,omitempty"`
+	PerTarget        map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
+	PerRule          map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
 }
 
 func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnapshotJSON {
@@ -1130,6 +1131,9 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		for name, t := range snap.PerTarget {
 			out.PerTarget[name] = toStatsSnapshotJSON(t, costPer1KTokens)
 		}
+	}
+	if len(snap.PerRule) > 0 {
+		out.PerRule = snap.PerRule
 	}
 	return out
 }
@@ -1166,6 +1170,23 @@ var promCounters = []struct {
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
 	{"aiproxy_responses_redacted_total", "Total number of upstream responses forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.ResponseRedacted }},
+}
+
+// promRuleCounters mirrors promCounters for the per-rule breakdown:
+// which named rule (built-in, custom, or path) is actually responsible
+// for a block/redact, independent of which target it happened on. There
+// is no rule-labeled equivalent of allowed/rate-limited/cache-hits/
+// tokens, since stats.RuleSnapshot only tracks the four outcomes a rule
+// match can directly cause.
+var promRuleCounters = []struct {
+	name string
+	help string
+	get  func(stats.RuleSnapshot) int64
+}{
+	{"aiproxy_rule_blocked_total", "Total number of requests blocked by this rule.", func(r stats.RuleSnapshot) int64 { return r.Blocked }},
+	{"aiproxy_rule_redacted_total", "Total number of requests redacted by this rule.", func(r stats.RuleSnapshot) int64 { return r.Redacted }},
+	{"aiproxy_rule_response_blocked_total", "Total number of upstream responses blocked by this rule.", func(r stats.RuleSnapshot) int64 { return r.ResponseBlocked }},
+	{"aiproxy_rule_response_redacted_total", "Total number of upstream responses redacted by this rule.", func(r stats.RuleSnapshot) int64 { return r.ResponseRedacted }},
 }
 
 // promLabelValue escapes a label value per the Prometheus text
@@ -1210,6 +1231,20 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens float64)
 			fmt.Fprintf(w, "aiproxy_estimated_cost{target=%q} %g\n", promLabelValue(name), t.EstimatedCost(costPer1KTokens))
 		}
 	}
+
+	ruleNames := make([]string, 0, len(snap.PerRule))
+	for name := range snap.PerRule {
+		ruleNames = append(ruleNames, name)
+	}
+	sort.Strings(ruleNames)
+
+	for _, c := range promRuleCounters {
+		fmt.Fprintf(w, "# HELP %s %s\n", c.name, c.help)
+		fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
+		for _, name := range ruleNames {
+			fmt.Fprintf(w, "%s{rule=%q} %d\n", c.name, promLabelValue(name), c.get(snap.PerRule[name]))
+		}
+	}
 }
 
 // serveMetrics answers metricsPath with the current Stats snapshot in
@@ -1236,6 +1271,9 @@ func (s *Server) Summary() string {
 		summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", snap.EstimatedCost(cost), cost)
 	}
 	if breakdown := snap.PerTargetString(cost); breakdown != "" {
+		summary += "\n" + breakdown
+	}
+	if breakdown := snap.PerRuleString(); breakdown != "" {
 		summary += "\n" + breakdown
 	}
 	return summary

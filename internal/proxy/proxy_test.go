@@ -1736,6 +1736,59 @@ func TestServer_SingleTarget_SummaryOmitsPerTargetBreakdown(t *testing.T) {
 	}
 }
 
+// TestServer_SummaryText_IncludesPerRuleBreakdown proves the shutdown
+// summary shows which rule actually fired and how often, unlike the
+// per-target breakdown this shows even for a single rule — the overall
+// totals above already conflate every rule together, so a lone rule's
+// own numbers are never redundant with them.
+func TestServer_SummaryText_IncludesPerRuleBreakdown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{"key":"AKIAABCDEFGHIJKLMNOP"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	summary := srv.Summary()
+	if !strings.Contains(summary, "=== per-rule breakdown ===") {
+		t.Fatalf("Summary() missing per-rule breakdown header: %q", summary)
+	}
+	if !strings.Contains(summary, "[aws-access-key] blocked=1 redacted=0 response-blocked=0 response-redacted=0") {
+		t.Fatalf("Summary() missing correct aws-access-key line: %q", summary)
+	}
+}
+
+// ruleJSONResponse mirrors the wire shape of one entry in per_rule, for
+// tests to decode into.
+type ruleJSONResponse struct {
+	Blocked          int64 `json:"blocked"`
+	Redacted         int64 `json:"redacted"`
+	ResponseBlocked  int64 `json:"response_blocked"`
+	ResponseRedacted int64 `json:"response_redacted"`
+}
+
 // statsJSONResponse mirrors the wire shape served at GET /_aiproxy/stats,
 // for tests to decode into.
 type statsJSONResponse struct {
@@ -1749,6 +1802,7 @@ type statsJSONResponse struct {
 	ResponseRedacted int64                        `json:"response_redacted"`
 	EstimatedCost    *float64                     `json:"estimated_cost,omitempty"`
 	PerTarget        map[string]statsJSONResponse `json:"per_target,omitempty"`
+	PerRule          map[string]ruleJSONResponse  `json:"per_rule,omitempty"`
 }
 
 // TestServer_StatsEndpoint_ReturnsCurrentSnapshotAsJSON drives a request
@@ -2138,6 +2192,75 @@ func TestServer_MetricsEndpoint_ReportsResponseBlockedAndRedactedCounts(t *testi
 	}
 	if !strings.Contains(out, `aiproxy_responses_redacted_total{target="default"} 1`) {
 		t.Errorf("missing response-redacted=1 for target=default: %q", out)
+	}
+	if !strings.Contains(out, `aiproxy_rule_response_blocked_total{rule="aws-access-key"} 1`) {
+		t.Errorf("missing rule-labeled response-blocked=1 for aws-access-key: %q", out)
+	}
+	if !strings.Contains(out, `aiproxy_rule_response_redacted_total{rule="openai-api-key"} 1`) {
+		t.Errorf("missing rule-labeled response-redacted=1 for openai-api-key: %q", out)
+	}
+	if !strings.Contains(out, `aiproxy_rule_blocked_total{rule="aws-access-key"} 0`) {
+		t.Errorf("missing rule-labeled blocked=0 for aws-access-key (that axis was never hit): %q", out)
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsPerRuleLabeledCounters proves
+// metricsPath exposes the four aiproxy_rule_*_total series, each
+// labeled rule="<name>", combining a rule's request- and response-side
+// hits under its own name the same way TestServer_StatsEndpoint_
+// ReportsPerRuleBreakdown proves for the JSON endpoint.
+func TestServer_MetricsEndpoint_ReportsPerRuleLabeledCounters(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{"key":"AKIAABCDEFGHIJKLMNOP"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	metricsResp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/metrics: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	body, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+
+	for _, want := range []string{
+		"# HELP aiproxy_rule_blocked_total",
+		"# TYPE aiproxy_rule_blocked_total counter",
+		`aiproxy_rule_blocked_total{rule="aws-access-key"} 1`,
+		`aiproxy_rule_redacted_total{rule="aws-access-key"} 0`,
+		`aiproxy_rule_response_blocked_total{rule="aws-access-key"} 0`,
+		`aiproxy_rule_response_redacted_total{rule="aws-access-key"} 0`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q: %q", want, out)
+		}
 	}
 }
 
@@ -3585,5 +3708,105 @@ func TestServer_StatsEndpoint_ReportsResponseBlockedAndRedactedCounts(t *testing
 	}
 	if got.ResponseRedacted != 1 {
 		t.Fatalf("response_redacted = %d, want 1: %+v", got.ResponseRedacted, got)
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsPerRuleBreakdown proves per_rule
+// aggregates a named rule's hits across all four outcomes it can cause
+// (request block, request redact, response block, response redact) —
+// which rule is actually responsible for a match, independent of
+// whether it fired going out or coming back. Response-side hits use
+// clean request bodies with path-routed canned responses, same
+// discipline as TestServer_StatsEndpoint_ReportsResponseBlockedAndRedactedCounts,
+// so the request-side rule never fires first and masks what's being
+// tested.
+func TestServer_StatsEndpoint_ReportsPerRuleBreakdown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		switch r.URL.Path {
+		case "/respblock":
+			w.Write([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+		case "/respredact":
+			w.Write([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+		default:
+			w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "openai-api-key",
+		Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+		Action:  rules.Redact,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(path, body string) {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	post("/reqblock", `{"key":"AKIAABCDEFGHIJKLMNOP"}`)
+	post("/reqredact", `{"key":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`)
+	post("/respblock", `{"hello":"world"}`)
+	post("/respredact", `{"hello":"world"}`)
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	awsKey, ok := got.PerRule["aws-access-key"]
+	if !ok {
+		t.Fatalf("per_rule missing aws-access-key: %+v", got.PerRule)
+	}
+	if awsKey.Blocked != 1 || awsKey.ResponseBlocked != 1 {
+		t.Errorf("per_rule[aws-access-key] = %+v, want blocked=1 response_blocked=1", awsKey)
+	}
+	if awsKey.Redacted != 0 || awsKey.ResponseRedacted != 0 {
+		t.Errorf("per_rule[aws-access-key] = %+v, want no redact counts", awsKey)
+	}
+
+	openaiKey, ok := got.PerRule["openai-api-key"]
+	if !ok {
+		t.Fatalf("per_rule missing openai-api-key: %+v", got.PerRule)
+	}
+	if openaiKey.Redacted != 1 || openaiKey.ResponseRedacted != 1 {
+		t.Errorf("per_rule[openai-api-key] = %+v, want redacted=1 response_redacted=1", openaiKey)
+	}
+	if openaiKey.Blocked != 0 || openaiKey.ResponseBlocked != 0 {
+		t.Errorf("per_rule[openai-api-key] = %+v, want no block counts", openaiKey)
+	}
+
+	for name, target := range got.PerTarget {
+		if len(target.PerRule) != 0 {
+			t.Errorf("per_target[%q].per_rule = %+v, want it to stay empty (per_rule is a global breakdown only)", name, target.PerRule)
+		}
 	}
 }

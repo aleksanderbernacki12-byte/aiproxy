@@ -55,22 +55,33 @@ tokens used across the run — plus an estimated cost line, if you've set
 was actually used during the run, the summary also breaks those same
 counts down per target (labeled by the matched prefix, or `default` for
 the fallback `--target`), each with its own cost line when
-`cost_per_1k_tokens` is set:
+`cost_per_1k_tokens` is set; if any rule ever matched, it's also broken
+down per rule name — which rule is actually responsible, across both
+requests and [responses](#scanning-responses-too):
 
 ```
 === aiproxy session summary ===
 Requests allowed:    5
-Requests blocked:    0
+Requests blocked:    1
+Requests redacted:   0
 Rate-limited (429):  0
 Cache hits:          0
 Total tokens used:   0
+Responses blocked:   0
+Responses redacted:  0
 === per-target breakdown ===
-[/postman] allowed=3 blocked=0 rate-limited=0 cache-hits=0 tokens=0
-[default] allowed=2 blocked=0 rate-limited=0 cache-hits=0 tokens=0
+[/postman] allowed=3 blocked=1 redacted=0 rate-limited=0 cache-hits=0 tokens=0 response-blocked=0 response-redacted=0
+[default] allowed=2 blocked=0 redacted=0 rate-limited=0 cache-hits=0 tokens=0 response-blocked=0 response-redacted=0
+=== per-rule breakdown ===
+[aws-access-key] blocked=1 redacted=0 response-blocked=0 response-redacted=0
 ```
 
-A single-target run (no `targets` configured) leaves this section out
-entirely — it would just repeat the block above under a different label.
+A single-target run (no `targets` configured) leaves the per-target
+section out entirely — it would just repeat the block above under a
+different label. The per-rule section, unlike that one, is left out only
+when no rule has ever matched at all — even a single rule's own numbers
+are never redundant with the totals above, since those totals already
+conflate every rule together.
 
 ## Built-in secret patterns
 
@@ -457,10 +468,16 @@ can be monitored without waiting for Ctrl+C:
   "rate_limited": 0,
   "cache_hits": 5,
   "total_tokens": 3100,
+  "response_blocked": 0,
+  "response_redacted": 1,
   "estimated_cost": 0.062,
   "per_target": {
     "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062 },
     "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0 }
+  },
+  "per_rule": {
+    "aws-access-key": { "blocked": 1, "redacted": 0, "response_blocked": 0, "response_redacted": 0 },
+    "openai-api-key": { "blocked": 0, "redacted": 0, "response_blocked": 0, "response_redacted": 1 }
   }
 }
 ```
@@ -471,10 +488,16 @@ used so far — unlike the printed shutdown summary, which leaves the
 breakdown out entirely for a single-target run, the JSON endpoint stays
 structurally the same shape regardless of how many targets are in play,
 since that predictability matters more for something meant to be parsed
-by a script or dashboard. Any method other than `GET` gets a 405.
-Because the path is reserved, an upstream that genuinely needs to be
-reached at `/_aiproxy/stats` itself cannot be — route it through a
-different prefix if that ever comes up.
+by a script or dashboard. `per_rule` breaks the same four block/redact
+outcomes down by which named rule (built-in, custom, or path) actually
+matched — combining its request-side and response-side hits under the
+one name, since which target the match happened to route through
+doesn't change which rule is responsible for it — so you can see which
+rule fires the most (worth checking for false positives) or catches the
+most real leaks. Any method other than `GET` gets a 405. Because the
+path is reserved, an upstream that genuinely needs to be reached at
+`/_aiproxy/stats` itself cannot be — route it through a different
+prefix if that ever comes up.
 
 ## Prometheus metrics
 
@@ -489,7 +512,14 @@ aiproxy_requests_redacted_total{target="default"} 0
 aiproxy_requests_rate_limited_total{target="default"} 0
 aiproxy_cache_hits_total{target="default"} 5
 aiproxy_tokens_used_total{target="default"} 3100
+aiproxy_responses_blocked_total{target="default"} 0
+aiproxy_responses_redacted_total{target="default"} 1
 aiproxy_estimated_cost{target="default"} 0.062
+aiproxy_rule_blocked_total{rule="aws-access-key"} 1
+aiproxy_rule_redacted_total{rule="aws-access-key"} 0
+aiproxy_rule_response_blocked_total{rule="aws-access-key"} 0
+aiproxy_rule_response_redacted_total{rule="aws-access-key"} 0
+aiproxy_rule_response_redacted_total{rule="openai-api-key"} 1
 ```
 
 (`# HELP`/`# TYPE` lines omitted above for brevity — the real response
@@ -497,8 +527,11 @@ has them.) Every target seen so far gets its own `target="..."` series,
 always, even in a single-target run — a scrape needs the same shape
 every time, unlike the shutdown summary's noise-avoiding suppression.
 `aiproxy_estimated_cost` is included only when `cost_per_1k_tokens` is
-set, same as the JSON endpoint's `estimated_cost`. Point Prometheus at
-it with:
+set, same as the JSON endpoint's `estimated_cost`. The `aiproxy_rule_*`
+series mirror `per_rule` from the JSON endpoint: one `rule="<name>"`
+series per rule that has ever matched, for every rule seen so far — not
+tied to any target label, since a rule's identity doesn't depend on
+which target the request routed to. Point Prometheus at it with:
 
 ```yaml
 scrape_configs:

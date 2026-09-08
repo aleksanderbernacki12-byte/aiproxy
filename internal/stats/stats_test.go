@@ -12,17 +12,17 @@ func TestStats_RecordsAndSnapshotsCorrectly(t *testing.T) {
 	s := stats.New()
 	s.RecordAllow("default")
 	s.RecordAllow("default")
-	s.RecordBlock("default")
-	s.RecordRedact("default")
+	s.RecordBlock("default", "aws-access-key")
+	s.RecordRedact("default", "openai-api-key")
 	s.RecordRateLimited("default")
 	s.RecordCacheHit("default")
 	s.RecordCacheHit("default")
 	s.RecordCacheHit("default")
 	s.RecordTokensUsed("default", 100)
 	s.RecordTokensUsed("default", 50)
-	s.RecordResponseBlock("default")
-	s.RecordResponseRedact("default")
-	s.RecordResponseRedact("default")
+	s.RecordResponseBlock("default", "aws-access-key")
+	s.RecordResponseRedact("default", "openai-api-key")
+	s.RecordResponseRedact("default", "openai-api-key")
 
 	snap := s.Snapshot()
 	if snap.Allowed != 2 {
@@ -48,6 +48,21 @@ func TestStats_RecordsAndSnapshotsCorrectly(t *testing.T) {
 	}
 	if snap.ResponseRedacted != 2 {
 		t.Errorf("ResponseRedacted = %d, want 2", snap.ResponseRedacted)
+	}
+
+	awsKey, ok := snap.PerRule["aws-access-key"]
+	if !ok {
+		t.Fatalf("PerRule missing aws-access-key: %+v", snap.PerRule)
+	}
+	if awsKey.Blocked != 1 || awsKey.ResponseBlocked != 1 || awsKey.Redacted != 0 || awsKey.ResponseRedacted != 0 {
+		t.Fatalf("PerRule[aws-access-key] = %+v, want blocked=1 response-blocked=1", awsKey)
+	}
+	openaiKey, ok := snap.PerRule["openai-api-key"]
+	if !ok {
+		t.Fatalf("PerRule missing openai-api-key: %+v", snap.PerRule)
+	}
+	if openaiKey.Redacted != 1 || openaiKey.ResponseRedacted != 2 || openaiKey.Blocked != 0 || openaiKey.ResponseBlocked != 0 {
+		t.Fatalf("PerRule[openai-api-key] = %+v, want redacted=1 response-redacted=2", openaiKey)
 	}
 }
 
@@ -75,8 +90,8 @@ func TestStats_ConcurrentRecordingIsAccurate(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s.RecordAllow("default")
-			s.RecordBlock("default")
-			s.RecordRedact("default")
+			s.RecordBlock("default", "test-rule")
+			s.RecordRedact("default", "test-rule")
 			s.RecordRateLimited("default")
 			s.RecordCacheHit("default")
 			s.RecordTokensUsed("default", 1)
@@ -102,6 +117,13 @@ func TestStats_ConcurrentRecordingIsAccurate(t *testing.T) {
 	}
 	if snap.TotalTokens != n {
 		t.Errorf("TotalTokens = %d, want %d", snap.TotalTokens, n)
+	}
+	testRule, ok := snap.PerRule["test-rule"]
+	if !ok {
+		t.Fatalf("PerRule missing test-rule: %+v", snap.PerRule)
+	}
+	if testRule.Blocked != n || testRule.Redacted != n {
+		t.Errorf("PerRule[test-rule] = %+v, want blocked=%d redacted=%d", testRule, n, n)
 	}
 }
 
@@ -150,12 +172,57 @@ func TestStats_ConcurrentRecordingAcrossTargetsIsAccurate(t *testing.T) {
 	}
 }
 
+// TestStats_ConcurrentRecordingAcrossRulesIsAccurate is
+// TestStats_ConcurrentRecordingAcrossTargetsIsAccurate's counterpart for
+// the per-rule map: several distinct rule names are hammered
+// concurrently, proving the map lookup that creates a rule's counters
+// on first use is race-free and never drops an update.
+func TestStats_ConcurrentRecordingAcrossRulesIsAccurate(t *testing.T) {
+	const perRule = 200
+	ruleNames := []string{"aws-access-key", "openai-api-key", "custom-rule"}
+	s := stats.New()
+
+	var wg sync.WaitGroup
+	for _, ruleName := range ruleNames {
+		for i := 0; i < perRule; i++ {
+			wg.Add(1)
+			go func(ruleName string) {
+				defer wg.Done()
+				s.RecordBlock("default", ruleName)
+				s.RecordResponseRedact("default", ruleName)
+			}(ruleName)
+		}
+	}
+	wg.Wait()
+
+	snap := s.Snapshot()
+	wantOverall := int64(perRule * len(ruleNames))
+	if snap.Blocked != wantOverall {
+		t.Errorf("overall Blocked = %d, want %d", snap.Blocked, wantOverall)
+	}
+	if snap.ResponseRedacted != wantOverall {
+		t.Errorf("overall ResponseRedacted = %d, want %d", snap.ResponseRedacted, wantOverall)
+	}
+	for _, ruleName := range ruleNames {
+		got, ok := snap.PerRule[ruleName]
+		if !ok {
+			t.Fatalf("PerRule missing %q: %+v", ruleName, snap.PerRule)
+		}
+		if got.Blocked != perRule {
+			t.Errorf("PerRule[%q].Blocked = %d, want %d", ruleName, got.Blocked, perRule)
+		}
+		if got.ResponseRedacted != perRule {
+			t.Errorf("PerRule[%q].ResponseRedacted = %d, want %d", ruleName, got.ResponseRedacted, perRule)
+		}
+	}
+}
+
 func TestStats_PerTargetTracksSeparatelyFromOverall(t *testing.T) {
 	s := stats.New()
 	s.RecordAllow("/openai")
 	s.RecordAllow("/openai")
 	s.RecordAllow("/anthropic")
-	s.RecordBlock("/openai")
+	s.RecordBlock("/openai", "test-rule")
 	s.RecordTokensUsed("/openai", 10)
 	s.RecordTokensUsed("/anthropic", 30)
 
@@ -267,5 +334,55 @@ func TestSnapshot_PerTargetString_OmitsCostWhenRateIsZero(t *testing.T) {
 	rendered := snap.PerTargetString(0)
 	if strings.Contains(rendered, "cost=") {
 		t.Errorf("PerTargetString(0) = %q, want no cost field when the rate is zero", rendered)
+	}
+}
+
+func TestSnapshot_PerRuleString_EmptyWithNoRules(t *testing.T) {
+	empty := stats.Snapshot{}
+	if got := empty.PerRuleString(); got != "" {
+		t.Errorf("PerRuleString() with no rules = %q, want \"\"", got)
+	}
+}
+
+// TestSnapshot_PerRuleString_RendersSingleRule proves PerRuleString
+// shows a breakdown even for exactly one rule — unlike PerTargetString,
+// which suppresses a single target as redundant with the totals above,
+// a single rule's own numbers are never redundant: the overall totals
+// still conflate whatever other rules exist.
+func TestSnapshot_PerRuleString_RendersSingleRule(t *testing.T) {
+	snap := stats.Snapshot{PerRule: map[string]stats.RuleSnapshot{
+		"aws-access-key": {Blocked: 3},
+	}}
+
+	rendered := snap.PerRuleString()
+	if !strings.HasPrefix(rendered, "=== per-rule breakdown ===") {
+		t.Fatalf("PerRuleString() = %q, want it to start with the breakdown header", rendered)
+	}
+	if !strings.Contains(rendered, "[aws-access-key] blocked=3 redacted=0 response-blocked=0 response-redacted=0") {
+		t.Errorf("PerRuleString() missing correct aws-access-key line: %q", rendered)
+	}
+}
+
+func TestSnapshot_PerRuleString_RendersSortedBreakdown(t *testing.T) {
+	snap := stats.Snapshot{PerRule: map[string]stats.RuleSnapshot{
+		"openai-api-key": {Redacted: 2, ResponseRedacted: 1},
+		"aws-access-key": {Blocked: 5, ResponseBlocked: 2},
+	}}
+
+	rendered := snap.PerRuleString()
+
+	awsIdx := strings.Index(rendered, "[aws-access-key]")
+	openaiIdx := strings.Index(rendered, "[openai-api-key]")
+	if awsIdx == -1 || openaiIdx == -1 {
+		t.Fatalf("PerRuleString() = %q, missing one of the rule lines", rendered)
+	}
+	if openaiIdx < awsIdx {
+		t.Errorf("PerRuleString() = %q, want aws-access-key before openai-api-key (sorted)", rendered)
+	}
+	if !strings.Contains(rendered, "[aws-access-key] blocked=5 redacted=0 response-blocked=2 response-redacted=0") {
+		t.Errorf("PerRuleString() missing correct aws-access-key line: %q", rendered)
+	}
+	if !strings.Contains(rendered, "[openai-api-key] blocked=0 redacted=2 response-blocked=0 response-redacted=1") {
+		t.Errorf("PerRuleString() missing correct openai-api-key line: %q", rendered)
 	}
 }
