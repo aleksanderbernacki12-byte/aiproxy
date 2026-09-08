@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"aiproxy/internal/config"
@@ -541,5 +542,129 @@ func TestLoad_CustomRuleBecomesActiveInEngine(t *testing.T) {
 	}
 	if action2 != rules.Allow {
 		t.Fatalf("action = %v, want %v", action2, rules.Allow)
+	}
+}
+
+func TestLoad_ExpandsEnvVarReferences(t *testing.T) {
+	t.Setenv("AIPROXY_TEST_KEY", "s3cr3t-from-env")
+	t.Setenv("AIPROXY_TEST_WEBHOOK", "https://hooks.example.com/incoming/abc123")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "${AIPROXY_TEST_KEY}", "webhook_url": "${AIPROXY_TEST_WEBHOOK}"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ProxyAPIKey != "s3cr3t-from-env" {
+		t.Fatalf("ProxyAPIKey = %q, want %q", cfg.ProxyAPIKey, "s3cr3t-from-env")
+	}
+	if cfg.WebhookURL != "https://hooks.example.com/incoming/abc123" {
+		t.Fatalf("WebhookURL = %q, want %q", cfg.WebhookURL, "https://hooks.example.com/incoming/abc123")
+	}
+}
+
+func TestLoad_UnsetEnvVarReference_ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "${AIPROXY_TEST_DEFINITELY_NOT_SET}"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load returned no error for a reference to an unset environment variable, want an error")
+	}
+	if !strings.Contains(err.Error(), "AIPROXY_TEST_DEFINITELY_NOT_SET") {
+		t.Fatalf("error = %q, want it to name the missing variable", err.Error())
+	}
+}
+
+func TestLoad_MalformedEnvVarReference_MissingClosingBrace_ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "${UNCLOSED"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load returned no error for an unclosed ${ reference, want an error")
+	}
+}
+
+func TestLoad_MalformedEnvVarReference_InvalidName_ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "${1NOT-VALID}"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load returned no error for an invalid variable name, want an error")
+	}
+}
+
+func TestLoad_EscapedDollarSign_ProducesLiteralBraceWithNoSubstitution(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	// $$ escapes to a literal $, so this must load successfully and keep
+	// the literal text even though AIPROXY_TEST_ESCAPED is never set —
+	// proving no substitution was attempted.
+	raw := `{"custom_rules": [{"name": "env-leak", "pattern": "$${AIPROXY_TEST_ESCAPED}"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.CustomRules) != 1 || cfg.CustomRules[0].Pattern != "${AIPROXY_TEST_ESCAPED}" {
+		t.Fatalf("CustomRules = %+v, want pattern literal \"${AIPROXY_TEST_ESCAPED}\"", cfg.CustomRules)
+	}
+}
+
+func TestLoad_BareDollarSign_PassesThroughUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	// A regex end-of-line anchor ($) not followed by "{" or another "$"
+	// must never be treated as the start of a variable reference.
+	raw := `{"custom_rules": [{"name": "ends-with-secret", "pattern": "SECRET$"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.CustomRules) != 1 || cfg.CustomRules[0].Pattern != "SECRET$" {
+		t.Fatalf("CustomRules = %+v, want pattern unchanged \"SECRET$\"", cfg.CustomRules)
+	}
+}
+
+func TestLoad_NoEnvVarReferences_BehavesExactlyAsBefore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "plain-key-no-substitution"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ProxyAPIKey != "plain-key-no-substitution" {
+		t.Fatalf("ProxyAPIKey = %q, want %q", cfg.ProxyAPIKey, "plain-key-no-substitution")
 	}
 }

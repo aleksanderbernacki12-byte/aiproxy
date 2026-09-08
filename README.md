@@ -226,6 +226,49 @@ crashes or blanks out its rules because of a bad edit. `--target`,
 `--addr`, and `--log-format` are startup-only and unaffected by a
 reload — those still require a real restart.
 
+## Referencing environment variables in config
+
+Any string field in `aiproxy.json` — `proxy_api_key` and `webhook_url`
+are the obvious candidates, but nothing is special-cased — can reference
+an environment variable instead of embedding the actual value in the
+file, so a secret never has to be committed to a repo alongside the rest
+of the config:
+
+```json
+{
+  "proxy_api_key": "${AIPROXY_KEY}",
+  "webhook_url": "${AIPROXY_WEBHOOK_URL}"
+}
+```
+
+`${NAME}` is replaced with the current process's environment variable
+`NAME` before the file is even parsed as JSON, so it works the same way
+in every field. A reference to a variable that isn't set is a hard
+error, the same class of problem as a config file that isn't valid
+JSON — `aiproxy start` refuses to start and `aiproxy validate` reports it
+immediately, rather than silently substituting an empty string, which
+could quietly turn `proxy_api_key`'s entire auth check off or break a
+webhook URL without any obvious sign anything was wrong.
+
+Double the dollar sign (`$$`) to get a literal `$` without attempting
+substitution — the way to stop a field from being treated as a reference
+at all. A `custom_rules` pattern that actually wants to match a literal
+`${` in request bodies (catching an env-var-style secret reference
+leaking through, for example) doesn't need this: writing the dollar sign
+regex-escaped as `\$\{...\}`, which a Go regex needs anyway since a bare
+`$` is an end-of-string anchor and not a literal character, already
+keeps the `$` from being immediately followed by `{` in the raw file, so
+it's left untouched on its own. Every other bare `$` — the common case,
+an end-of-line regex anchor — is likewise never touched; only `${` and
+`$$` are ever treated specially.
+
+Values are resolved once, from whatever environment the process was
+actually started in — [SIGHUP](#reloading-config-without-restarting)
+re-reads and re-expands the config file, but reads it against that same
+original environment, since a running process's own environment can't
+be changed out from under it. Changing what a `${...}` reference
+resolves to always needs a real restart, not just a reload.
+
 ## Custom rules, rate limiting, caching, and cost estimation
 
 Drop an `aiproxy.json` file in the working directory (or point `--config`

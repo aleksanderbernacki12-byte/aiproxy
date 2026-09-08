@@ -955,3 +955,56 @@ func TestExecute_Validate_ExplicitMissingConfigFile_IsHardError(t *testing.T) {
 		t.Fatal("stderr should explain why validation failed")
 	}
 }
+
+// TestExecute_Validate_UnsetEnvVarReference_IsHardError proves a
+// ${VAR}-referencing field pointing at an environment variable that
+// isn't set surfaces through "validate" as a hard failure — the same
+// class of error as a config file that isn't valid JSON at all — rather
+// than being folded into the "N problem(s)" summary, since the file
+// can't even be turned into a Config without it.
+func TestExecute_Validate_UnsetEnvVarReference_IsHardError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "${AIPROXY_CLI_TEST_DEFINITELY_NOT_SET}"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero for an unset env var reference")
+	}
+	if !strings.Contains(stderr.String(), "AIPROXY_CLI_TEST_DEFINITELY_NOT_SET") {
+		t.Fatalf("stderr = %q, want it to name the missing variable", stderr.String())
+	}
+}
+
+// TestExecute_Validate_EnvVarReference_ExpandsAndValidatesNormally proves
+// the happy path end to end through the CLI: a config referencing a set
+// environment variable validates successfully, and the resolved value is
+// never printed back out.
+func TestExecute_Validate_EnvVarReference_ExpandsAndValidatesNormally(t *testing.T) {
+	t.Setenv("AIPROXY_CLI_TEST_KEY", "s3cr3t-from-env")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_key": "${AIPROXY_CLI_TEST_KEY}"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "proxy authentication:    true") {
+		t.Fatalf("stdout missing proxy authentication summary line: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "s3cr3t-from-env") {
+		t.Fatalf("stdout leaked the resolved env var value: %q", stdout.String())
+	}
+}

@@ -6,9 +6,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 )
 
 // CustomRule is one user-defined rule as it appears in the config file,
@@ -174,15 +176,86 @@ type Config struct {
 // Load reads and parses the config file at path. If the file does not
 // exist, the returned error satisfies os.IsNotExist so callers can treat
 // a missing config file as "nothing configured" rather than fatal.
+//
+// Before parsing, the raw file is passed through expandEnvVars, so any
+// field — proxy_api_key and webhook_url are the obvious candidates, but
+// nothing is special-cased — can reference an environment variable
+// instead of embedding it in the file directly.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
+	expanded, err := expandEnvVars(data)
+	if err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
+	}
+
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := json.Unmarshal(expanded, &cfg); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// envVarNamePattern is what expandEnvVars accepts between "${" and "}":
+// the same identifier shape every shell accepts for a variable name.
+var envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// expandEnvVars replaces every "${NAME}" reference in raw with the
+// current process's environment variable NAME, before the file is ever
+// parsed as JSON — so substitution works uniformly across the whole
+// file, not just in fields aiproxy specifically knows are secrets.
+// "$$" escapes to a literal "$" without attempting substitution — the
+// way to stop any field from being treated as a reference at all. A
+// custom_rules pattern that wants to actually match a literal "${" in
+// request bodies (detecting an env-var-style secret reference leaking
+// through) doesn't need this escape: regex-escaping the dollar sign as
+// "\$\{...\}" (required anyway, since bare "$" is a regex end-of-string
+// anchor, not a literal character) already keeps the "$" from being
+// immediately followed by "{" in the raw file, so expandEnvVars leaves
+// it untouched on its own. A bare "$" not immediately followed by "{" or
+// another "$" (an end-of-line regex anchor is by far the most common case) is
+// left untouched.
+//
+// A referenced variable that isn't set is an error, same as malformed
+// JSON: silently substituting an empty string could quietly disable
+// proxy_api_key's entire auth check or break a webhook URL, and aiproxy
+// would rather refuse to start than run with a config that silently
+// isn't what was intended.
+func expandEnvVars(raw []byte) ([]byte, error) {
+	var out bytes.Buffer
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c != '$' {
+			out.WriteByte(c)
+			continue
+		}
+		if i+1 < len(raw) && raw[i+1] == '$' {
+			out.WriteByte('$')
+			i++
+			continue
+		}
+		if i+1 >= len(raw) || raw[i+1] != '{' {
+			out.WriteByte(c)
+			continue
+		}
+
+		closeOffset := bytes.IndexByte(raw[i+2:], '}')
+		if closeOffset == -1 {
+			return nil, fmt.Errorf("malformed ${...} reference at byte %d: missing closing '}'", i)
+		}
+		name := string(raw[i+2 : i+2+closeOffset])
+		if !envVarNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("malformed reference ${%s}: not a valid environment variable name", name)
+		}
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			return nil, fmt.Errorf("environment variable %q is not set", name)
+		}
+		out.WriteString(value)
+		i += 2 + closeOffset // advance to the closing '}'; the loop's i++ steps past it
+	}
+	return out.Bytes(), nil
 }
