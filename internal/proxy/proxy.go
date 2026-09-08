@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -235,6 +236,21 @@ type Server struct {
 	// anything else with it; see checkProxyAuth. Empty (the default)
 	// disables the check entirely.
 	ProxyAPIKey string
+
+	// LogFile, if non-nil, is an open, append-mode file every log event
+	// (including the shutdown summary) is also written to as one JSON
+	// line, independent of LogFormat — see recordLogEvent. Opening,
+	// reopening on reload, and closing the previous handle are the
+	// caller's responsibility (see the cli package's openLogFile); a
+	// write failure is reported once via logError and otherwise ignored,
+	// same discipline as a webhook delivery failure.
+	LogFile *os.File
+
+	// logFileMu serializes writes to LogFile — separate from mu (which
+	// guards ReloadConfig's swaps) because this lock is held only for
+	// the duration of a single append, from any request-handling
+	// goroutine, far more often than a reload ever runs.
+	logFileMu sync.Mutex
 
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
@@ -485,6 +501,12 @@ func (s *Server) getProxyAPIKey() string {
 	return s.ProxyAPIKey
 }
 
+func (s *Server) getLogFile() *os.File {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LogFile
+}
+
 // Route describes one path-prefix-to-upstream mapping for ReloadConfig,
 // mirroring what AddRoute registers before the server starts serving.
 // Targets must be non-empty; more than one entry means failover across
@@ -499,25 +521,34 @@ type Route struct {
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
 // cost-per-1K-tokens rate, cost budget, max request body size, webhook
-// alert URL, proxy API key, and target routes — e.g. after re-reading
-// aiproxy.json on SIGHUP. All of them change together under one lock, so
-// a request in flight never observes a torn mix of old and new
-// configuration; a request takes effect from the moment it's accepted,
-// so anything already being handled keeps running against whatever
-// configuration it started with. Pass nil for limiter/cache/webhookURL
-// to disable them, matching how the corresponding field would be set at
-// startup; pass "" for proxyAPIKey to disable the auth check; pass zero
-// for costBudget to disable the budget check, or maxBodyBytes to fall
-// back to DefaultMaxBodyBytes, same as leaving Server.MaxBodyBytes
-// unset.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, proxyAPIKey string, routes []Route) {
+// alert URL, proxy API key, log file, and target routes — e.g. after
+// re-reading aiproxy.json on SIGHUP. All of them change together under
+// one lock, so a request in flight never observes a torn mix of old and
+// new configuration; a request takes effect from the moment it's
+// accepted, so anything already being handled keeps running against
+// whatever configuration it started with. Pass nil for
+// limiter/cache/webhookURL/logFile to disable them, matching how the
+// corresponding field would be set at startup; pass "" for proxyAPIKey
+// to disable the auth check; pass zero for costBudget to disable the
+// budget check, or maxBodyBytes to fall back to DefaultMaxBodyBytes,
+// same as leaving Server.MaxBodyBytes unset.
+//
+// logFile is always swapped in, even if the caller reopened the exact
+// same path — the caller (the cli package's reloadConfig) is expected
+// to open a fresh handle on every call regardless, which is exactly
+// what makes SIGHUP-driven log rotation work: a tool like logrotate
+// renames the current file out of the way and signals the process, and
+// the next reload's fresh handle creates a new file at that same path.
+// The old handle, if any, is closed after the swap — never left open —
+// so a long-running proxy reloaded repeatedly never leaks descriptors.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, proxyAPIKey string, logFile *os.File, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter}
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	oldLogFile := s.LogFile
 	s.Engine = engine
 	s.Limiter = lim
 	s.Cache = cch
@@ -526,7 +557,13 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.MaxBodyBytes = maxBodyBytes
 	s.WebhookURL = webhookURL
 	s.ProxyAPIKey = proxyAPIKey
+	s.LogFile = logFile
 	s.routes = newRoutes
+	s.mu.Unlock()
+
+	if oldLogFile != nil {
+		oldLogFile.Close()
+	}
 }
 
 // LogEvent logs a one-off, non-request-scoped message from outside the
@@ -535,8 +572,9 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 // log line, so it can never break the "every line is valid JSON"
 // guarantee under LogFormatJSON.
 func (s *Server) LogEvent(level, message string) {
+	ev := s.recordLogEvent(logEvent{Level: level, Message: message})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: level, Message: message})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s", message)
@@ -1094,120 +1132,135 @@ func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 }
 
 func (s *Server) logAllow(method, reqURL string) {
+	ev := s.recordLogEvent(logEvent{Level: "allow", Method: method, URL: reqURL})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "allow", Method: method, URL: reqURL})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[ALLOW] %s %s%s", ansiGreen, method, reqURL, ansiReset)
 }
 
 func (s *Server) logBlock(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "block", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "block", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[BLOCK] %s %s - Triggered rule: %s%s", ansiBrightRed, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logRateLimited(method, reqURL string) {
+	ev := s.recordLogEvent(logEvent{Level: "rate_limited", Method: method, URL: reqURL})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "rate_limited", Method: method, URL: reqURL})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[CIRCUIT BREAKER] %s %s - Rate limit exceeded%s", ansiYellow, method, reqURL, ansiReset)
 }
 
 func (s *Server) logUnauthorized(method, reqURL string) {
+	ev := s.recordLogEvent(logEvent{Level: "unauthorized", Method: method, URL: reqURL})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "unauthorized", Method: method, URL: reqURL})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[UNAUTHORIZED] %s %s - Missing or invalid Proxy-Authorization%s", ansiBrightRed, method, reqURL, ansiReset)
 }
 
 func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) {
+	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Cost: cost, Budget: budget})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Cost: cost, Budget: budget})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[BUDGET EXCEEDED] %s %s - Estimated cost %.4f exceeds budget %.4f%s", ansiYellow, method, reqURL, cost, budget, ansiReset)
 }
 
 func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
+	ev := s.recordLogEvent(logEvent{Level: "failover", Method: method, URL: reqURL, FailedTarget: failedTarget, NextTarget: nextTarget})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "failover", Method: method, URL: reqURL, FailedTarget: failedTarget, NextTarget: nextTarget})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[FAILOVER] %s %s - %s unreachable, trying %s%s", ansiBrightYellow, method, reqURL, failedTarget, nextTarget, ansiReset)
 }
 
 func (s *Server) logUsage(method, reqURL string, totalTokens int) {
+	ev := s.recordLogEvent(logEvent{Level: "usage", Method: method, URL: reqURL, Tokens: totalTokens})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "usage", Method: method, URL: reqURL, Tokens: totalTokens})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[USAGE] %s %s - Tokens used: %d%s", ansiBlue, method, reqURL, totalTokens, ansiReset)
 }
 
 func (s *Server) logCacheHit(method, reqURL string) {
+	ev := s.recordLogEvent(logEvent{Level: "cache_hit", Method: method, URL: reqURL})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "cache_hit", Method: method, URL: reqURL})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[CACHE HIT] %s %s%s", ansiPurple, method, reqURL, ansiReset)
 }
 
 func (s *Server) logRedact(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "redact", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "redact", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logResponseBlock(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_block", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "response_block", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[RESPONSE BLOCK] %s %s - Triggered rule: %s%s", ansiBrightRed, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logResponseRedact(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_redact", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "response_redact", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[RESPONSE REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logDryRunBlock(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[DRY-RUN BLOCK] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logDryRunRedact(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[DRY-RUN REDACT] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logResponseDryRunBlock(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "response_dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[RESPONSE DRY-RUN BLOCK] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
 }
 
 func (s *Server) logResponseDryRunRedact(method, reqURL, ruleName string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "response_dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s[RESPONSE DRY-RUN REDACT] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
@@ -1386,7 +1439,9 @@ func (s *Server) notifyFailoverWebhook(method, reqURL, failedTarget, nextTarget 
 // logEventJSON marshals ev (stamping the current time) and logs it as a
 // single line, for LogFormatJSON.
 func (s *Server) logEventJSON(ev logEvent) {
-	ev.Time = time.Now().UTC().Format(time.RFC3339)
+	if ev.Time == "" {
+		ev.Time = time.Now().UTC().Format(time.RFC3339)
+	}
 	data, err := json.Marshal(ev)
 	if err != nil {
 		// ev is always one of a few fixed, plain shapes, so this should
@@ -1398,14 +1453,52 @@ func (s *Server) logEventJSON(ev logEvent) {
 	s.logf("%s", data)
 }
 
+// appendToLogFile writes data plus a trailing newline to Server.LogFile,
+// if configured, serialized against concurrent writers by logFileMu. A
+// write failure is reported to the terminal only, via logf directly —
+// never routed back through logError/recordLogEvent, which would
+// recurse into this exact same failing write on every subsequent event.
+func (s *Server) appendToLogFile(data []byte) {
+	f := s.getLogFile()
+	if f == nil {
+		return
+	}
+	line := append(append([]byte(nil), data...), '\n')
+	s.logFileMu.Lock()
+	_, err := f.Write(line)
+	s.logFileMu.Unlock()
+	if err != nil {
+		s.logf("aiproxy: log_file: write failed: %v", err)
+	}
+}
+
+// recordLogEvent stamps ev's Time if not already set and appends it to
+// Server.LogFile as one JSON line (see appendToLogFile) — independent
+// of LogFormat, so a durable on-disk record exists even when the
+// terminal is showing colored text, not JSON. It returns the (now
+// time-stamped) event so the caller can pass the exact same value on to
+// logEventJSON for LogFormatJSON's own terminal output, keeping both
+// records' timestamps identical instead of two independent, slightly
+// different ones.
+func (s *Server) recordLogEvent(ev logEvent) logEvent {
+	if ev.Time == "" {
+		ev.Time = time.Now().UTC().Format(time.RFC3339)
+	}
+	if data, err := json.Marshal(ev); err == nil {
+		s.appendToLogFile(data)
+	}
+	return ev
+}
+
 // logError logs an internal, non-request-scoped problem (e.g. a failed
 // cache write) — as a JSON line under LogFormatJSON, so it never breaks
 // the guarantee that every line in that mode is valid JSON, or as a
 // plain line otherwise.
 func (s *Server) logError(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
+	ev := s.recordLogEvent(logEvent{Level: "error", Message: msg})
 	if s.LogFormat == LogFormatJSON {
-		s.logEventJSON(logEvent{Level: "error", Message: msg})
+		s.logEventJSON(ev)
 		return
 	}
 	s.logf("%s", msg)
@@ -1716,13 +1809,18 @@ func (s *Server) Summary() string {
 // serves) for LogFormatJSON — a multi-line block would otherwise break
 // the guarantee that every line is valid JSON in that mode.
 func (s *Server) logSummary() {
+	// The JSON shape is computed and written to LogFile unconditionally
+	// — a durable on-disk record should include the session's own final
+	// summary regardless of what --log-format the terminal is showing.
+	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens()), s.getCostBudget())
+	data, err := json.Marshal(payload)
+	if err != nil {
+		s.logError("aiproxy: summary: failed to encode: %v", err)
+		return
+	}
+	s.appendToLogFile(data)
+
 	if s.LogFormat == LogFormatJSON {
-		payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens()), s.getCostBudget())
-		data, err := json.Marshal(payload)
-		if err != nil {
-			s.logError("aiproxy: summary: failed to encode: %v", err)
-			return
-		}
 		s.logf("%s", data)
 		return
 	}

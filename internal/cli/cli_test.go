@@ -897,6 +897,65 @@ func TestExecute_Validate_ValidConfig_WithCostBudget_ReportsSummary(t *testing.T
 	}
 }
 
+func TestExecute_Validate_ValidConfig_WithLogFile_ReportsPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	logPath := filepath.Join(dir, "aiproxy.log")
+	raw := fmt.Sprintf(`{"log_file": %q}`, logPath)
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "log file:                "+logPath) {
+		t.Fatalf("stdout missing log file summary line: %q", stdout.String())
+	}
+}
+
+func TestExecute_Validate_NoLogFile_ReportsDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "log file:                disabled") {
+		t.Fatalf("stdout missing disabled log file summary line: %q", stdout.String())
+	}
+}
+
+func TestExecute_Validate_LogFileUnwritablePath_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	// A path under a directory that doesn't exist can never be opened.
+	badLogPath := filepath.Join(dir, "no-such-directory", "aiproxy.log")
+	raw := fmt.Sprintf(`{"log_file": %q}`, badLogPath)
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "log_file") {
+		t.Fatalf("stderr missing log_file problem: %q", stderr.String())
+	}
+}
+
 // TestExecute_Validate_InvalidWebhookURL_ReportsProblem proves a
 // webhook_url with an unsupported scheme is reported as a config
 // problem, not silently ignored or only discovered once a block/redact

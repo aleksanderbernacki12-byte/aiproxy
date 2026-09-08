@@ -188,6 +188,22 @@ type Config struct {
 	// entirely — anyone who can reach the proxy's listen address can use
 	// it, same as before this field existed.
 	ProxyAPIKey string `json:"proxy_api_key,omitempty"`
+
+	// LogFile, if set, is a path every log event — the same ones printed
+	// to stdout/stderr, plus the shutdown summary — is also appended to,
+	// always as one JSON object per line regardless of --log-format,
+	// since a durable on-disk record is meant to be grepped/parsed
+	// later, not read live in a terminal. The file is opened in append
+	// mode and reopened on every SIGHUP reload, whether or not this path
+	// actually changed — the same convention nginx and PostgreSQL use so
+	// external log rotation (rename the file, then signal the process)
+	// works without aiproxy needing any rotation logic of its own: a
+	// tool like logrotate renames the current file out of the way and
+	// sends SIGHUP, and the next reload's reopen creates a fresh file at
+	// this same path. Empty (the default when the field is absent)
+	// disables file logging entirely — the same behavior as before this
+	// field existed.
+	LogFile string `json:"log_file,omitempty"`
 }
 
 // Load reads and parses the config file at path. If the file does not

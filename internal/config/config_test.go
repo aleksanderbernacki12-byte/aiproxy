@@ -695,3 +695,37 @@ func TestLoad_NoEnvVarReferences_BehavesExactlyAsBefore(t *testing.T) {
 		t.Fatalf("ProxyAPIKey = %q, want %q", cfg.ProxyAPIKey, "plain-key-no-substitution")
 	}
 }
+
+func TestLoad_ParsesLogFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"log_file": "/var/log/aiproxy.jsonl"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.LogFile != "/var/log/aiproxy.jsonl" {
+		t.Fatalf("LogFile = %q, want %q", cfg.LogFile, "/var/log/aiproxy.jsonl")
+	}
+}
+
+func TestLoad_LogFileDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.LogFile != "" {
+		t.Fatalf("LogFile = %q, want empty when absent", cfg.LogFile)
+	}
+}

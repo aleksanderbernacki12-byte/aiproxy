@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -2846,7 +2847,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, "", []proxy.Route{
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, "", nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
 	})
 
@@ -2910,7 +2911,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, "", nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, "", nil, nil)
 		}
 	}()
 
@@ -4791,7 +4792,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, "new-key-after-reload", nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, "new-key-after-reload", nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -5165,7 +5166,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, "", nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, "", nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -5559,5 +5560,325 @@ func TestServer_SingleURLTarget_UnaffectedByFailoverTransport(t *testing.T) {
 	}
 	if got := srv.Stats.Snapshot().Failover; got != 0 {
 		t.Errorf("Failover = %d, want 0 for a single-URL target", got)
+	}
+}
+
+// logFileLines reads path and returns each non-empty line decoded as a
+// generic JSON object, in order.
+func logFileLines(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	var lines []map[string]any
+	for _, raw := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if raw == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("log file line is not valid JSON: %q: %v", raw, err)
+		}
+		lines = append(lines, m)
+	}
+	return lines
+}
+
+// TestServer_LogFile_WritesJSONLLineForEachEventIndependentOfLogFormat
+// proves Server.LogFile always receives one JSON line per event — even
+// under LogFormatText, where the terminal itself shows colored,
+// human-readable lines instead. The on-disk record is meant to be
+// grepped/parsed later, so its shape can't depend on what the terminal
+// happens to be configured to show.
+func TestServer_LogFile_WritesJSONLLineForEachEventIndependentOfLogFormat(t *testing.T) {
+	for _, format := range []proxy.LogFormat{proxy.LogFormatText, proxy.LogFormatJSON} {
+		t.Run(string(format), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+			targetURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatalf("parse url: %v", err)
+			}
+
+			logPath := filepath.Join(t.TempDir(), "aiproxy.log")
+			logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				t.Fatalf("open log file: %v", err)
+			}
+			defer logFile.Close()
+
+			engine := rules.NewEngine(rules.Allow)
+			engine.AddBodyRegexRule(rules.BodyRegexRule{
+				Name:    "aws-access-key",
+				Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+				Action:  rules.Block,
+			})
+
+			srv := proxy.New("unused", targetURL, engine)
+			srv.LogFormat = format
+			srv.LogFile = logFile
+			srv.Logger = log.New(io.Discard, "", 0)
+			frontend := httptest.NewServer(srv)
+			defer frontend.Close()
+
+			allowedResp, err := http.Get(frontend.URL + "/ok")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			allowedResp.Body.Close()
+
+			blockedResp, err := http.Post(frontend.URL+"/x", "text/plain", strings.NewReader("AKIAABCDEFGHIJKLMNOP"))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			blockedResp.Body.Close()
+
+			lines := logFileLines(t, logPath)
+			if len(lines) != 2 {
+				t.Fatalf("log file has %d line(s), want 2: %+v", len(lines), lines)
+			}
+			if lines[0]["level"] != "allow" {
+				t.Errorf("lines[0][level] = %v, want %q", lines[0]["level"], "allow")
+			}
+			if lines[1]["level"] != "block" {
+				t.Errorf("lines[1][level] = %v, want %q", lines[1]["level"], "block")
+			}
+			if lines[1]["rule"] != "aws-access-key" {
+				t.Errorf("lines[1][rule] = %v, want %q", lines[1]["rule"], "aws-access-key")
+			}
+		})
+	}
+}
+
+// TestServer_LogFile_SharesExactTimestampWithJSONTerminalOutput proves
+// recordLogEvent's contract: under LogFormatJSON, the line written to
+// LogFile and the line written to the terminal for the very same event
+// carry the identical "time" value, rather than two independent
+// timestamps taken microseconds apart.
+func TestServer_LogFile_SharesExactTimestampWithJSONTerminalOutput(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "aiproxy.log")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	var termBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.LogFormat = proxy.LogFormatJSON
+	srv.LogFile = logFile
+	srv.Logger = log.New(&termBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	fileLines := logFileLines(t, logPath)
+	if len(fileLines) != 1 {
+		t.Fatalf("log file has %d line(s), want 1", len(fileLines))
+	}
+
+	var termEvent map[string]any
+	termLine := strings.TrimSpace(termBuf.String())
+	if err := json.Unmarshal([]byte(termLine), &termEvent); err != nil {
+		t.Fatalf("terminal line is not valid JSON: %q: %v", termLine, err)
+	}
+
+	fileTime, _ := fileLines[0]["time"].(string)
+	termTime, _ := termEvent["time"].(string)
+	if fileTime == "" || termTime == "" {
+		t.Fatalf("missing time field: file=%q terminal=%q", fileTime, termTime)
+	}
+	if fileTime != termTime {
+		t.Errorf("file time = %q, terminal time = %q, want identical", fileTime, termTime)
+	}
+}
+
+// TestServer_LogFile_IncludesShutdownSummary proves the persistent log
+// gets the session's own final summary too — driven through the real
+// ListenAndServe shutdown path, the same one a Ctrl+C ultimately
+// triggers via signal.NotifyContext in the cli package.
+func TestServer_LogFile_IncludesShutdownSummary(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "aiproxy.log")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	addr := freeLoopbackAddr(t)
+	srv := proxy.New(addr, targetURL, rules.NewEngine(rules.Allow))
+	srv.LogFile = logFile
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+
+	waitForServerUp(t, addr, time.Second)
+
+	resp, err := http.Get("http://" + addr + "/ok")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ListenAndServe returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe never returned after cancel")
+	}
+
+	lines := logFileLines(t, logPath)
+	if len(lines) != 2 {
+		t.Fatalf("log file has %d line(s), want 2 (the request, then the shutdown summary): %+v", len(lines), lines)
+	}
+	summary := lines[1]
+	if _, ok := summary["allowed"]; !ok {
+		t.Errorf("last line = %+v, want the stats-snapshot shape (an \"allowed\" field)", summary)
+	}
+}
+
+// TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle proves
+// LogFile is one of the fields SIGHUP-style reload actually replaces,
+// and that the previous handle is genuinely closed afterward — not
+// leaked — the exact mechanics external log rotation (rename, then
+// SIGHUP) depends on.
+func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.log")
+	newPath := filepath.Join(dir, "new.log")
+
+	oldFile, err := os.OpenFile(oldPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open old log file: %v", err)
+	}
+	newFile, err := os.OpenFile(newPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open new log file: %v", err)
+	}
+	defer newFile.Close()
+
+	targetURL, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.LogFile = oldFile
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	srv.LogEvent("before_reload", "first event, goes to the old file")
+
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, "", newFile, nil)
+
+	srv.LogEvent("after_reload", "second event, goes to the new file")
+
+	oldLines := logFileLines(t, oldPath)
+	if len(oldLines) != 1 || oldLines[0]["level"] != "before_reload" {
+		t.Errorf("old file lines = %+v, want exactly the pre-reload event", oldLines)
+	}
+	newLines := logFileLines(t, newPath)
+	if len(newLines) != 1 || newLines[0]["level"] != "after_reload" {
+		t.Errorf("new file lines = %+v, want exactly the post-reload event", newLines)
+	}
+
+	if _, err := oldFile.Write([]byte("x")); err == nil {
+		t.Error("write to the old file handle succeeded after reload, want it closed by ReloadConfig")
+	}
+}
+
+// TestServer_LogFile_NilByDefault_NeverWritesAFile proves that with no
+// LogFile configured (the default, and every test in this file besides
+// the ones explicitly about this feature), nothing about request
+// handling changes and no file is ever touched.
+func TestServer_LogFile_NilByDefault_NeverWritesAFile(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_LogFile_WriteFailureNeverAffectsClientResponse proves a
+// broken log file (here, simulated by closing the handle out from under
+// the server, standing in for a real-world disk-full or permission
+// failure) never propagates to the client — the request is still
+// answered normally, same discipline as a failed webhook delivery.
+func TestServer_LogFile_WriteFailureNeverAffectsClientResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "aiproxy.log")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	logFile.Close() // broken on purpose: every subsequent write to it fails
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.LogFile = logFile
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a broken log file must never affect the client response)", resp.StatusCode, http.StatusOK)
 	}
 }

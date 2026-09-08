@@ -123,6 +123,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
 	server.ProxyAPIKey = lc.proxyAPIKey
+	server.LogFile = lc.logFile
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.targets, r.limiter)
 	}
@@ -170,6 +171,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// Deliberately never prints the key itself, same discipline
 			// as the webhook URL above.
 			fmt.Fprintln(stdout, "proxy authentication: required (Proxy-Authorization: Bearer <key>)")
+		}
+		if cfg.LogFile != "" {
+			fmt.Fprintf(stdout, "log file: %s (JSON lines, reopened on SIGHUP)\n", cfg.LogFile)
 		}
 		for _, r := range lc.routes {
 			dest := formatTargetsForDisplay(r.targets)
@@ -228,6 +232,13 @@ func reloadConfig(server *proxy.Server, configPath string) {
 
 	lc, errs := buildLiveConfig(cfg)
 	if len(errs) > 0 {
+		if lc.logFile != nil {
+			// buildLiveConfig already opened a fresh handle before some
+			// other field failed validation; the reload is being
+			// discarded entirely, so this one would otherwise never be
+			// closed by anything.
+			lc.logFile.Close()
+		}
 		msgs := make([]string, len(errs))
 		for i, e := range errs {
 			msgs[i] = e.Error()
@@ -243,7 +254,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.proxyAPIKey, routes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.proxyAPIKey, lc.logFile, routes)
 
 	label := loadedFrom
 	if label == "" {
@@ -264,6 +275,7 @@ type liveConfig struct {
 	maxBodyBytes int64
 	webhookURL   *url.URL
 	proxyAPIKey  string
+	logFile      *os.File
 	routes       []targetRoute
 }
 
@@ -311,11 +323,33 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 
 	lc.proxyAPIKey = cfg.ProxyAPIKey
 
+	if cfg.LogFile != "" {
+		logFile, err := openLogFile(cfg.LogFile)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			lc.logFile = logFile
+		}
+	}
+
 	routes, routeErrs := compileTargetRoutes(cfg.Targets)
 	errs = append(errs, routeErrs...)
 	lc.routes = routes
 
 	return lc, errs
+}
+
+// openLogFile opens path in append mode, creating it if it doesn't
+// exist, for Config.LogFile. Called fresh on every cold start and every
+// reload — see ReloadConfig's doc comment for why an unconditional
+// reopen (rather than only when the path actually changed) is what
+// makes SIGHUP-driven external log rotation work.
+func openLogFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("log_file: %w", err)
+	}
+	return f, nil
 }
 
 // builtinRules lists the name and pattern of each of aiproxy's built-in
@@ -566,6 +600,13 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 			problems = append(problems, fmt.Sprintf("webhook_url: %v", err))
 		}
 	}
+	if cfg.LogFile != "" {
+		if f, err := openLogFile(cfg.LogFile); err != nil {
+			problems = append(problems, err.Error())
+		} else {
+			f.Close()
+		}
+	}
 
 	if len(problems) > 0 {
 		fmt.Fprintf(stderr, "aiproxy: %s has %d problem(s):\n", loadedFrom, len(problems))
@@ -589,7 +630,18 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  path rules:              %d\n", len(cfg.PathRules))
 	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
 	fmt.Fprintf(stdout, "  proxy authentication:    %v\n", cfg.ProxyAPIKey != "")
+	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
+}
+
+// logFileDisplay renders log_file for the validate summary — unlike
+// webhook_url and proxy_api_key, a file path isn't a secret, so it's
+// shown in full rather than masked to a bare true/false.
+func logFileDisplay(path string) string {
+	if path == "" {
+		return "disabled"
+	}
+	return path
 }
 
 // countFailoverTargets counts every targets entry configured with more

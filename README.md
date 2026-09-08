@@ -205,6 +205,38 @@ of the structured stream a script would actually parse — the two are
 already on separate streams, so piping just stderr gives you a clean,
 pure-JSON feed.
 
+## Persistent log file
+
+`--log-format` only controls what the terminal shows for as long as
+aiproxy is actually running. Set `log_file` to also get every event —
+including the shutdown summary — durably appended to a file on disk, so
+there's still something to go back and grep through after the process
+has exited or been restarted:
+
+```json
+{
+  "log_file": "/var/log/aiproxy.jsonl"
+}
+```
+
+The file always gets one JSON object per line, in the exact same shape
+`--log-format json` prints to the terminal — regardless of what
+`--log-format` is actually set to. A durable record meant to be
+`grep`/`jq`-ed later has no use for colored, human-oriented text, so
+this doesn't follow the terminal's own formatting choice the way
+everything else does. The file is opened in append mode (created if it
+doesn't already exist) and never truncated.
+
+aiproxy has no log rotation logic of its own — `log_file` is reopened
+on every [SIGHUP](#reloading-config-without-restarting) reload,
+*unconditionally*, even when the path hasn't changed, which is exactly
+what lets an external tool like `logrotate` handle rotation instead: it
+renames the current file out of the way and signals the process, and
+the next reload's fresh handle creates a new file at that same path,
+with the previous handle closed right after the swap so a long-running
+proxy reloaded repeatedly never leaks file descriptors. This is the same
+convention nginx and PostgreSQL use for their own log files.
+
 ## Reloading config without restarting
 
 ```
@@ -215,7 +247,9 @@ Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
 custom rules, path rules, the rate limit, the cache, cost estimation,
 the cost budget, the max request body size, the webhook alert URL, the
-proxy API key, and target routes all take effect for the next request,
+proxy API key, `log_file` (see [persistent log file](#persistent-log-file)
+for why this one is reopened unconditionally, not just when its path
+changes), and target routes all take effect for the next request,
 with no dropped connections and no restart. Every one of these is logged
 (as `reload` on success, or `reload_error` on failure, under
 `--log-format json`).
@@ -942,7 +976,8 @@ aiproxy validate --config aiproxy.json
 Checks `aiproxy.json` for problems without starting the proxy: every
 `custom_rules` pattern must compile, every `targets` entry needs a
 well-formed, unique prefix and exactly one of a valid HTTPS `url` or a
-non-empty `urls` list of them, every
+non-empty `urls` list of them, `log_file` (if set) must actually be
+possible to open, every
 `builtin_rule_actions` key must name a real built-in rule with a valid
 action, and the numeric fields can't be negative. It reports every
 problem it finds in one pass rather than stopping at the first, and
