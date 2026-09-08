@@ -719,11 +719,12 @@ can be monitored without waiting for Ctrl+C:
   "response_dry_run_redacted": 0,
   "unauthorized": 0,
   "failover": 1,
+  "latency": { "count": 42, "sum_seconds": 3.31, "buckets": [ { "le": "0.005", "count": 0 }, { "le": "0.01", "count": 12 }, { "le": "+Inf", "count": 42 } ] },
   "estimated_cost": 0.062,
   "cost_budget": 10,
   "per_target": {
-    "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062, "failover": 1 },
-    "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0, "failover": 0 }
+    "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062, "failover": 1, "latency": { "count": 30, "sum_seconds": 2.9 } },
+    "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0, "failover": 0, "latency": { "count": 12, "sum_seconds": 0.41 } }
   },
   "per_rule": {
     "aws-access-key": { "blocked": 1, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 0, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 },
@@ -758,7 +759,12 @@ not something each target has its own copy of. `failover` (see
 [failover across multiple upstreams](#failover-across-multiple-upstreams))
 is the other way around from `unauthorized`: broken down by target like
 `allowed`/`blocked`, since a failover is always about one specific
-route's own candidate list, not something target-agnostic. Any method other than `GET` gets a 405.
+route's own candidate list, not something target-agnostic. `latency`
+(see [Prometheus metrics](#prometheus-metrics) for the full histogram
+shape and what it measures) is broken down by target too, for the same
+reason — `count` and `sum_seconds` alone are enough to compute a mean
+latency (`sum_seconds / count * 1000` for milliseconds) without needing
+the full `buckets` list. Any method other than `GET` gets a 405.
 Once `proxy_api_key` is set, this endpoint requires it too — a request
 missing or failing that check never reaches this handler at all, and
 gets a 407 instead. Because the path
@@ -796,6 +802,20 @@ aiproxy_dry_run_redacted_total 0
 aiproxy_dry_run_response_blocked_total 0
 aiproxy_dry_run_response_redacted_total 0
 aiproxy_unauthorized_total 0
+aiproxy_upstream_latency_seconds_bucket{target="default",le="0.005"} 0
+aiproxy_upstream_latency_seconds_bucket{target="default",le="0.01"} 12
+aiproxy_upstream_latency_seconds_bucket{target="default",le="0.025"} 30
+aiproxy_upstream_latency_seconds_bucket{target="default",le="0.05"} 40
+aiproxy_upstream_latency_seconds_bucket{target="default",le="0.1"} 42
+aiproxy_upstream_latency_seconds_bucket{target="default",le="0.25"} 42
+aiproxy_upstream_latency_seconds_bucket{target="default",le="0.5"} 42
+aiproxy_upstream_latency_seconds_bucket{target="default",le="1"} 42
+aiproxy_upstream_latency_seconds_bucket{target="default",le="2.5"} 42
+aiproxy_upstream_latency_seconds_bucket{target="default",le="5"} 42
+aiproxy_upstream_latency_seconds_bucket{target="default",le="10"} 42
+aiproxy_upstream_latency_seconds_bucket{target="default",le="+Inf"} 42
+aiproxy_upstream_latency_seconds_sum{target="default"} 3.31
+aiproxy_upstream_latency_seconds_count{target="default"} 42
 aiproxy_cost_budget 10
 ```
 
@@ -818,7 +838,26 @@ target or a rule to label it with. `aiproxy_failover_total` is the other
 way around — labeled `target="..."` like the very first series above,
 not unlabeled — since a failover is always about one specific route's
 own candidate list; every target seen so far gets a series here too,
-`0` for one that has never needed to fail over. `aiproxy_cost_budget` is a gauge, not
+`0` for one that has never needed to fail over.
+
+`aiproxy_upstream_latency_seconds` is a genuine Prometheus histogram
+(`_bucket`/`_sum`/`_count`, not a plain counter), labeled `target="..."`
+like `aiproxy_failover_total` — it measures how long each successful
+forwarded request took, from the first candidate attempt to the
+response that actually came back. A single-URL target just times its
+one attempt; a [failover](#failover-across-multiple-upstreams) target's
+timer starts before the very first (unreachable) candidate, so the time
+spent retrying is counted as real latency rather than hidden — a target
+that's failing over a lot will show up here as slow even if the
+candidate that finally answers is fast. Buckets use Prometheus's own
+default boundaries (5ms up to 10s) and are cumulative, so
+`histogram_quantile(0.95, rate(aiproxy_upstream_latency_seconds_bucket[5m]))`
+works out of the box for a p95 latency panel. A request the rule engine
+blocks or redacts outright never reaches the upstream, so it's never
+timed; the same numbers (`count`, `sum_seconds`, and the full bucket
+list) are also in `/_aiproxy/stats`' `latency` field, both at the top
+level and inside each `per_target` entry, for polling instead of
+scraping. `aiproxy_cost_budget` is a gauge, not
 a counter — the configured `cost_budget` threshold itself, included only
 when it's set — and unlabeled for a different reason than the series
 above: a single whole-proxy-run value, not something with a per-target

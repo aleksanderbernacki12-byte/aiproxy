@@ -1811,10 +1811,21 @@ type statsJSONResponse struct {
 	ResponseDryRunRedacted int64                        `json:"response_dry_run_redacted"`
 	Unauthorized           int64                        `json:"unauthorized"`
 	Failover               int64                        `json:"failover"`
+	Latency                latencyJSONResponse          `json:"latency"`
 	EstimatedCost          *float64                     `json:"estimated_cost,omitempty"`
 	CostBudget             *float64                     `json:"cost_budget,omitempty"`
 	PerTarget              map[string]statsJSONResponse `json:"per_target,omitempty"`
 	PerRule                map[string]ruleJSONResponse  `json:"per_rule,omitempty"`
+}
+
+// latencyJSONResponse mirrors stats.LatencySnapshot's wire shape.
+type latencyJSONResponse struct {
+	Count      int64   `json:"count"`
+	SumSeconds float64 `json:"sum_seconds"`
+	Buckets    []struct {
+		Le    string `json:"le"`
+		Count int64  `json:"count"`
+	} `json:"buckets,omitempty"`
 }
 
 // TestServer_StatsEndpoint_ReturnsCurrentSnapshotAsJSON drives a request
@@ -5522,6 +5533,202 @@ func TestServer_MetricsEndpoint_ReportsFailoverCounter(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("metrics output missing %q: %q", want, out)
 		}
+	}
+}
+
+// TestServer_StatsEndpoint_ReportsLatency proves a successful forwarded
+// request is timed and shows up both in the overall Latency histogram
+// and inside its target's own PerTarget entry — see
+// stats.Stats.RecordLatency.
+func TestServer_StatsEndpoint_ReportsLatency(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Latency.Count != 1 {
+		t.Errorf("overall Latency.Count = %d, want 1", got.Latency.Count)
+	}
+	if got.Latency.SumSeconds <= 0 {
+		t.Errorf("overall Latency.SumSeconds = %g, want > 0", got.Latency.SumSeconds)
+	}
+	if len(got.Latency.Buckets) == 0 {
+		t.Error("overall Latency.Buckets is empty, want the full fixed bucket set")
+	}
+	def, ok := got.PerTarget["default"]
+	if !ok {
+		t.Fatalf("PerTarget missing default: %+v", got.PerTarget)
+	}
+	if def.Latency.Count != 1 {
+		t.Errorf("PerTarget[default].Latency.Count = %d, want 1", def.Latency.Count)
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsLatencyHistogram is
+// TestServer_StatsEndpoint_ReportsLatency's Prometheus counterpart:
+// checks the aiproxy_upstream_latency_seconds histogram is emitted in
+// the shape histogram_quantile() expects, including the mandatory
+// le="+Inf" bucket and the _sum/_count series.
+func TestServer_MetricsEndpoint_ReportsLatencyHistogram(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	metricsResp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("get metrics: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	body, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+
+	for _, want := range []string{
+		"# HELP aiproxy_upstream_latency_seconds",
+		"# TYPE aiproxy_upstream_latency_seconds histogram",
+		`aiproxy_upstream_latency_seconds_bucket{target="default",le="10"} 1`,
+		`aiproxy_upstream_latency_seconds_bucket{target="default",le="+Inf"} 1`,
+		`aiproxy_upstream_latency_seconds_count{target="default"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q: %q", want, out)
+		}
+	}
+	if !strings.Contains(out, `aiproxy_upstream_latency_seconds_sum{target="default"} `) {
+		t.Errorf("metrics output missing the sum series: %q", out)
+	}
+}
+
+// TestServer_Latency_NotRecordedForBlockedRequest proves a request the
+// rule engine rejects outright — never forwarded upstream — leaves the
+// latency histogram untouched: there is no upstream RoundTrip to time.
+func TestServer_Latency_NotRecordedForBlockedRequest(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "test-secret",
+		Pattern: regexp.MustCompile(`SECRET`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`SECRET`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Latency.Count != 0 {
+		t.Errorf("Latency.Count = %d, want 0 (a blocked request never reaches the upstream RoundTrip)", got.Latency.Count)
+	}
+}
+
+// TestServer_Latency_RecordedOnceEvenAfterFailover proves a request
+// that fails over across one unreachable candidate before succeeding is
+// still counted as exactly one latency observation, not one per
+// attempt — see failoverTransport.RoundTrip's comment on why the timer
+// starts before the first attempt rather than the successful one.
+func TestServer_Latency_RecordedOnceEvenAfterFailover(t *testing.T) {
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	unreachableURL, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.PerTarget["/openai"].Latency.Count != 1 {
+		t.Errorf("PerTarget[/openai].Latency.Count = %d, want 1 (one observation per request, regardless of failover attempts)", got.PerTarget["/openai"].Latency.Count)
 	}
 }
 

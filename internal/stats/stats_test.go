@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"aiproxy/internal/stats"
 )
@@ -560,5 +561,105 @@ func TestStats_CrossedBudget_ExactlyAtBudgetCounts(t *testing.T) {
 
 	if _, crossed := s.CrossedBudget(1.0, 5.0); !crossed {
 		t.Error("CrossedBudget at exactly the threshold reported crossed=false, want true (>=, not >)")
+	}
+}
+
+func TestStats_RecordLatency_TracksOverallAndPerTarget(t *testing.T) {
+	s := stats.New()
+	s.RecordLatency("default", 20*time.Millisecond)
+	s.RecordLatency("default", 60*time.Millisecond)
+	s.RecordLatency("other", 4*time.Second)
+
+	snap := s.Snapshot()
+	if snap.Latency.Count != 3 {
+		t.Errorf("overall Latency.Count = %d, want 3", snap.Latency.Count)
+	}
+	wantSum := 0.020 + 0.060 + 4.0
+	if diff := snap.Latency.SumSeconds - wantSum; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("overall Latency.SumSeconds = %g, want %g", snap.Latency.SumSeconds, wantSum)
+	}
+
+	def := snap.PerTarget["default"]
+	if def.Latency.Count != 2 {
+		t.Errorf("PerTarget[default].Latency.Count = %d, want 2", def.Latency.Count)
+	}
+	other := snap.PerTarget["other"]
+	if other.Latency.Count != 1 {
+		t.Errorf("PerTarget[other].Latency.Count = %d, want 1", other.Latency.Count)
+	}
+}
+
+func TestStats_RecordLatency_BucketsAreCumulative(t *testing.T) {
+	s := stats.New()
+	s.RecordLatency("default", 3*time.Millisecond)  // falls in the 0.005 bucket
+	s.RecordLatency("default", 20*time.Millisecond) // falls in the 0.025 bucket
+	s.RecordLatency("default", 20*time.Second)      // past every finite bound
+
+	snap := s.Snapshot()
+	buckets := snap.PerTarget["default"].Latency.Buckets
+	if len(buckets) == 0 {
+		t.Fatal("Buckets is empty, want the full fixed set")
+	}
+
+	byLe := make(map[string]int64, len(buckets))
+	for _, b := range buckets {
+		byLe[b.Le] = b.Count
+	}
+
+	if byLe["0.005"] != 1 {
+		t.Errorf(`bucket le="0.005" = %d, want 1 (cumulative: just the 3ms observation)`, byLe["0.005"])
+	}
+	if byLe["0.01"] != 1 {
+		t.Errorf(`bucket le="0.01" = %d, want 1 (cumulative, still just the 3ms observation)`, byLe["0.01"])
+	}
+	if byLe["0.025"] != 2 {
+		t.Errorf(`bucket le="0.025" = %d, want 2 (cumulative: 3ms and 20ms both included)`, byLe["0.025"])
+	}
+	if byLe["10"] != 2 {
+		t.Errorf(`bucket le="10" = %d, want 2 (the 20s observation is past every finite bound)`, byLe["10"])
+	}
+	if byLe["+Inf"] != 3 {
+		t.Errorf(`bucket le="+Inf" = %d, want 3 (must always equal Count)`, byLe["+Inf"])
+	}
+}
+
+func TestSnapshot_AvgLatencyMillis(t *testing.T) {
+	l := stats.LatencySnapshot{Count: 0}
+	if got := l.AvgLatencyMillis(); got != 0 {
+		t.Errorf("AvgLatencyMillis with Count=0 = %g, want 0", got)
+	}
+
+	l = stats.LatencySnapshot{Count: 2, SumSeconds: 0.300}
+	if got := l.AvgLatencyMillis(); got != 150 {
+		t.Errorf("AvgLatencyMillis = %g, want 150", got)
+	}
+}
+
+func TestSnapshot_String_OmitsLatencyLineWhenZero(t *testing.T) {
+	snap := stats.Snapshot{Allowed: 5}
+	if rendered := snap.String(); strings.Contains(rendered, "latency") {
+		t.Errorf("String() = %q, want no latency line when nothing was recorded", rendered)
+	}
+}
+
+func TestSnapshot_String_IncludesLatencyLineWhenNonZero(t *testing.T) {
+	snap := stats.Snapshot{Latency: stats.LatencySnapshot{Count: 4, SumSeconds: 0.4}}
+	rendered := snap.String()
+	if !strings.Contains(rendered, "Avg upstream latency: 100.0ms (n=4)") {
+		t.Errorf("String() = %q, want the avg latency line", rendered)
+	}
+}
+
+func TestSnapshot_PerTargetString_IncludesAvgLatency(t *testing.T) {
+	snap := stats.Snapshot{PerTarget: map[string]stats.Snapshot{
+		"a": {Allowed: 1, Latency: stats.LatencySnapshot{Count: 2, SumSeconds: 0.2}},
+		"b": {Allowed: 1},
+	}}
+	rendered := snap.PerTargetString(0)
+	if !strings.Contains(rendered, "[a]") || !strings.Contains(rendered, "avg-latency=100.0ms") {
+		t.Errorf("PerTargetString() = %q, want target a's avg-latency", rendered)
+	}
+	if strings.Contains(rendered, "[b] ") && strings.Contains(rendered[strings.Index(rendered, "[b]"):], "avg-latency") {
+		t.Errorf("PerTargetString() = %q, want target b (no observations) to omit avg-latency", rendered)
 	}
 }

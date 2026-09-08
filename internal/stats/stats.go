@@ -8,10 +8,21 @@ package stats
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// latencyBucketsSeconds are the upper bounds of the histogram buckets
+// RecordLatency sorts an observation into — Prometheus's own default
+// client-library buckets, a reasonable spread from sub-10ms up to 10s
+// for typical HTTP latencies. An observation past the last bound is
+// still counted (in Count/SumSeconds and the final "+Inf" bucket) but
+// not in any finite one. Declared as a fixed-size array, not a slice,
+// so len() is a compile-time constant usable to size counters.latencyBuckets.
+var latencyBucketsSeconds = [...]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 // counters is one set of atomic counters, safe for concurrent use
 // without a mutex. Stats keeps one for the overall total and one per
@@ -26,6 +37,10 @@ type counters struct {
 	responseBlocked  atomic.Int64
 	responseRedacted atomic.Int64
 	failover         atomic.Int64
+
+	latencyBuckets  [len(latencyBucketsSeconds)]atomic.Int64
+	latencyCount    atomic.Int64
+	latencySumNanos atomic.Int64
 }
 
 func (c *counters) snapshot() Snapshot {
@@ -39,6 +54,44 @@ func (c *counters) snapshot() Snapshot {
 		ResponseBlocked:  c.responseBlocked.Load(),
 		ResponseRedacted: c.responseRedacted.Load(),
 		Failover:         c.failover.Load(),
+		Latency:          c.latencySnapshot(),
+	}
+}
+
+// recordLatency sorts one observed duration into the histogram: the
+// first bucket whose bound is >= the observation (non-cumulative at
+// this point — latencySnapshot cumulates on read), plus the running
+// count/sum every observation contributes to regardless of which
+// bucket it landed in.
+func (c *counters) recordLatency(d time.Duration) {
+	c.latencyCount.Add(1)
+	c.latencySumNanos.Add(int64(d))
+	seconds := d.Seconds()
+	for i, bound := range latencyBucketsSeconds {
+		if seconds <= bound {
+			c.latencyBuckets[i].Add(1)
+			break
+		}
+	}
+}
+
+// latencySnapshot renders the histogram as cumulative "le" buckets, the
+// shape Prometheus's histogram_quantile() expects: each bucket's count
+// includes every observation at or below its bound, and the final
+// "+Inf" bucket always equals Count.
+func (c *counters) latencySnapshot() LatencySnapshot {
+	buckets := make([]LatencyBucket, len(latencyBucketsSeconds)+1)
+	var cumulative int64
+	for i, bound := range latencyBucketsSeconds {
+		cumulative += c.latencyBuckets[i].Load()
+		buckets[i] = LatencyBucket{Le: strconv.FormatFloat(bound, 'g', -1, 64), Count: cumulative}
+	}
+	count := c.latencyCount.Load()
+	buckets[len(latencyBucketsSeconds)] = LatencyBucket{Le: "+Inf", Count: count}
+	return LatencySnapshot{
+		Count:      count,
+		SumSeconds: float64(c.latencySumNanos.Load()) / 1e9,
+		Buckets:    buckets,
 	}
 }
 
@@ -195,6 +248,18 @@ func (s *Stats) RecordFailover(target string) {
 	s.counterFor(target).failover.Add(1)
 }
 
+// RecordLatency records how long one successful upstream RoundTrip took
+// for target — see failoverTransport in the proxy package, the only
+// caller. When a request failed over across candidates before finally
+// succeeding, d includes the time spent on the earlier, unreachable
+// attempts too: that retry time is real added latency the client
+// actually experienced for this request, not something to hide from
+// the histogram.
+func (s *Stats) RecordLatency(target string, d time.Duration) {
+	s.overall.recordLatency(d)
+	s.counterFor(target).recordLatency(d)
+}
+
 // RecordResponseBlock records one upstream response the rule engine
 // withheld from the client because a rule matched something in it —
 // distinct from RecordBlock, which is a request never sent upstream at
@@ -267,6 +332,37 @@ func (s *Stats) CrossedBudget(costPer1KTokens, budget float64) (cost float64, cr
 	return cost, s.budgetAlerted.CompareAndSwap(false, true)
 }
 
+// LatencyBucket is one cumulative "le" (less-than-or-equal) point of a
+// LatencySnapshot's histogram, rendered the way Prometheus's text
+// exposition format expects a bucket's bound: a decimal string for a
+// finite bound, or "+Inf" for the last one.
+type LatencyBucket struct {
+	Le    string `json:"le"`
+	Count int64  `json:"count"`
+}
+
+// LatencySnapshot is a point-in-time copy of one histogram of observed
+// upstream latencies — see Stats.RecordLatency. Buckets is always the
+// full, ordered set of latencyBucketsSeconds plus a final "+Inf" entry,
+// even when Count is 0, for a structurally predictable shape scrape to
+// scrape.
+type LatencySnapshot struct {
+	Count      int64           `json:"count"`
+	SumSeconds float64         `json:"sum_seconds"`
+	Buckets    []LatencyBucket `json:"buckets,omitempty"`
+}
+
+// AvgLatencyMillis returns the mean observed latency in milliseconds,
+// or 0 before any observation has been recorded — a simple derived
+// convenience for display, alongside the full histogram, the same role
+// Snapshot.EstimatedCost plays for TotalTokens.
+func (l LatencySnapshot) AvgLatencyMillis() float64 {
+	if l.Count == 0 {
+		return 0
+	}
+	return l.SumSeconds / float64(l.Count) * 1000
+}
+
 // RuleSnapshot is a point-in-time copy of one named rule's block/redact
 // counters, for both requests and responses, live and dry-run.
 type RuleSnapshot struct {
@@ -326,6 +422,13 @@ type Snapshot struct {
 	// and the dry-run counters, this is broken down per target: a
 	// failover is always about one specific route's own candidate list.
 	Failover int64 `json:"failover"`
+
+	// Latency summarizes observed upstream response times as a
+	// Prometheus-style histogram — see Stats.RecordLatency. Present at
+	// every level (top-level, and inside each PerTarget entry) same as
+	// TotalTokens: a target's own latency profile is exactly the kind of
+	// thing a per-target breakdown exists to surface.
+	Latency LatencySnapshot `json:"latency"`
 
 	PerTarget map[string]Snapshot     `json:"per_target,omitempty"`
 	PerRule   map[string]RuleSnapshot `json:"per_rule,omitempty"`
@@ -401,6 +504,9 @@ func (s Snapshot) String() string {
 	if s.Failover > 0 {
 		out += fmt.Sprintf("\nFailovers:            %d", s.Failover)
 	}
+	if s.Latency.Count > 0 {
+		out += fmt.Sprintf("\nAvg upstream latency: %.1fms (n=%d)", s.Latency.AvgLatencyMillis(), s.Latency.Count)
+	}
 	return out
 }
 
@@ -431,6 +537,9 @@ func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
 		}
 		if t.Failover > 0 {
 			fmt.Fprintf(&b, " failover=%d", t.Failover)
+		}
+		if t.Latency.Count > 0 {
+			fmt.Fprintf(&b, " avg-latency=%.1fms", t.Latency.AvgLatencyMillis())
 		}
 	}
 	return b.String()

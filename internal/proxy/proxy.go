@@ -359,8 +359,14 @@ type failoverTransport struct {
 func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	reqCtx, _ := req.Context().Value(requestContextKey{}).(requestContextInfo)
 	candidates := reqCtx.targets
+	start := time.Now()
+
 	if len(candidates) <= 1 {
-		return t.base.RoundTrip(req)
+		resp, err := t.base.RoundTrip(req)
+		if err == nil {
+			t.server.Stats.RecordLatency(reqCtx.targetLabel, time.Since(start))
+		}
+		return resp, err
 	}
 
 	var lastErr error
@@ -387,6 +393,12 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 		resp, err := t.base.RoundTrip(attempt)
 		if err == nil {
+			// Deliberately timed from the very first attempt, not just
+			// this successful one: retry time spent on an earlier
+			// unreachable candidate is real latency the client
+			// experienced for this request, and hiding it would make a
+			// flaky target's histogram look healthier than it is.
+			t.server.Stats.RecordLatency(reqCtx.targetLabel, time.Since(start))
 			return resp, nil
 		}
 		lastErr = err
@@ -1539,6 +1551,12 @@ type statsSnapshotJSON struct {
 	// unlike Unauthorized/the dry-run fields below.
 	Failover int64 `json:"failover"`
 
+	// Latency summarizes observed upstream response times — see
+	// stats.LatencySnapshot. Broken down per target like Allowed, same
+	// reasoning as Failover: a target's own latency profile is exactly
+	// what a per-target breakdown exists to surface.
+	Latency stats.LatencySnapshot `json:"latency"`
+
 	// DryRunBlocked, DryRunRedacted, ResponseDryRunBlocked, and
 	// ResponseDryRunRedacted are only meaningful at the top level —
 	// dry-run activity is never broken down per target (see
@@ -1583,6 +1601,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		ResponseDryRunRedacted: snap.ResponseDryRunRedacted,
 		Unauthorized:           snap.Unauthorized,
 		Failover:               snap.Failover,
+		Latency:                snap.Latency,
 	}
 	if costPer1KTokens > 0 {
 		cost := snap.EstimatedCost(costPer1KTokens)
@@ -1714,6 +1733,8 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 		}
 	}
 
+	writeLatencyHistogram(w, snap.PerTarget, names)
+
 	if costPer1KTokens > 0 {
 		fmt.Fprintln(w, "# HELP aiproxy_estimated_cost Estimated cost of tokens used so far, at the configured cost_per_1k_tokens rate.")
 		fmt.Fprintln(w, "# TYPE aiproxy_estimated_cost counter")
@@ -1759,6 +1780,27 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 		fmt.Fprintln(w, "# HELP aiproxy_cost_budget Configured cost_budget threshold, in the same units as aiproxy_estimated_cost.")
 		fmt.Fprintln(w, "# TYPE aiproxy_cost_budget gauge")
 		fmt.Fprintf(w, "aiproxy_cost_budget %g\n", costBudget)
+	}
+}
+
+// writeLatencyHistogram emits one aiproxy_upstream_latency_seconds
+// histogram series per target, labeled target="<name>", in the exact
+// shape Prometheus's histogram_quantile() expects: cumulative _bucket
+// lines per "le" bound (ascending, ending in "+Inf"), then _sum and
+// _count — see stats.LatencySnapshot. names is the same sorted target
+// list writePromMetrics already built, for a stable scrape-to-scrape
+// order shared with every other series.
+func writeLatencyHistogram(w io.Writer, perTarget map[string]stats.Snapshot, names []string) {
+	fmt.Fprintln(w, "# HELP aiproxy_upstream_latency_seconds Observed latency of successful upstream responses, per target — use histogram_quantile() for percentiles.")
+	fmt.Fprintln(w, "# TYPE aiproxy_upstream_latency_seconds histogram")
+	for _, name := range names {
+		label := promLabelValue(name)
+		lat := perTarget[name].Latency
+		for _, b := range lat.Buckets {
+			fmt.Fprintf(w, "aiproxy_upstream_latency_seconds_bucket{target=%q,le=%q} %d\n", label, b.Le, b.Count)
+		}
+		fmt.Fprintf(w, "aiproxy_upstream_latency_seconds_sum{target=%q} %g\n", label, lat.SumSeconds)
+		fmt.Fprintf(w, "aiproxy_upstream_latency_seconds_count{target=%q} %d\n", label, lat.Count)
 	}
 }
 
