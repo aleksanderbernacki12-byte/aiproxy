@@ -343,6 +343,39 @@ identical request served later is answered straight from that file and
 never reaches the upstream target. `.aiproxy_cache/` is already listed in
 `.gitignore`.
 
+Set `cache_ttl_seconds` alongside it to expire an entry a fixed time
+after it was written, instead of caching forever:
+
+```json
+{
+  "cache_enabled": true,
+  "cache_ttl_seconds": 300
+}
+```
+
+A request whose matching entry is older than that is treated as a plain
+cache miss and forwarded upstream again — the stale file is removed from
+disk at that point too, not left behind. Re-caching the same key (a
+fresh upstream hit after expiry) resets its age, same as writing a brand
+new entry. Zero or absent (the default) means entries never expire on
+their own, the same behavior as before this field existed.
+`aiproxy validate` rejects `cache_ttl_seconds` set without
+`cache_enabled` — a TTL for a cache that's off has nothing to expire.
+
+Without a TTL — or even with one, for immediate effect instead of
+waiting it out — clear every cached entry right now with:
+
+```
+curl -X POST http://127.0.0.1:8080/_aiproxy/cache/clear
+```
+
+A third reserved, proxy-internal path alongside `/_aiproxy/stats` and
+`/_aiproxy/metrics`, `POST`-only since it actually mutates state rather
+than just reading it. Responds `{"cleared": true}` on success, a 404 if
+`cache_enabled` isn't set (nothing to clear), and honors
+`proxy_api_key` exactly like the read-only endpoints if configured — if
+anything, a mutating endpoint deserves at least as much protection.
+
 `cost_per_1k_tokens` is optional and off by default (no cost line at
 all). aiproxy has no built-in, inevitably-stale pricing table — you tell
 it what rate applies to your own usage (whatever your provider actually

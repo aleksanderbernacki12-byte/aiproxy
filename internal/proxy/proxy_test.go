@@ -786,6 +786,208 @@ func TestServer_CacheHit_SecondIdenticalRequestNeverReachesUpstream(t *testing.T
 	}
 }
 
+// TestServer_CacheTTL_ExpiredEntryForcesFreshUpstreamHit proves
+// Server.Cache.TTL is actually honored end-to-end through the proxy: an
+// identical request repeated after the entry's TTL has elapsed reaches
+// the upstream again, instead of being served from the (now-stale)
+// cache.
+func TestServer_CacheTTL_ExpiredEntryForcesFreshUpstreamHit(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	c.TTL = 30 * time.Millisecond
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func() {
+		resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	post()
+	post() // immediately after: still within TTL, must be a cache hit
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream received %d requests after 2 immediate posts, want 1 (second must be a cache hit)", got)
+	}
+
+	time.Sleep(80 * time.Millisecond) // past the 30ms TTL
+	post()
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("upstream received %d requests after the TTL elapsed, want 2 (expired entry must force a fresh upstream hit)", got)
+	}
+}
+
+// TestServer_CacheClearEndpoint_ForcesFreshUpstreamHit proves POSTing
+// cacheClearPath actually deletes cached entries: a request that would
+// otherwise be served from cache reaches the upstream again afterward.
+func TestServer_CacheClearEndpoint_ForcesFreshUpstreamHit(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func() {
+		resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	post()
+	post()
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream received %d requests before clearing, want 1", got)
+	}
+
+	clearResp, err := http.Post(frontend.URL+"/_aiproxy/cache/clear", "", nil)
+	if err != nil {
+		t.Fatalf("post cache/clear: %v", err)
+	}
+	if clearResp.StatusCode != http.StatusOK {
+		t.Fatalf("cache/clear status = %d, want 200", clearResp.StatusCode)
+	}
+	clearResp.Body.Close()
+
+	post()
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("upstream received %d requests after clearing the cache, want 2 (a cleared entry must force a fresh upstream hit)", got)
+	}
+}
+
+// TestServer_CacheClearEndpoint_RejectsNonPostMethod proves the
+// endpoint only accepts POST, since it mutates state — a GET must not
+// be able to trigger it.
+func TestServer_CacheClearEndpoint_RejectsNonPostMethod(t *testing.T) {
+	t.Chdir(t.TempDir())
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/cache/clear")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestServer_CacheClearEndpoint_404sWhenCacheDisabled proves the
+// endpoint reports there's nothing to clear, rather than quietly
+// succeeding, when Server.Cache is nil.
+func TestServer_CacheClearEndpoint_404sWhenCacheDisabled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/_aiproxy/cache/clear", "", nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// TestServer_CacheClearEndpoint_GatedByProxyAuth proves the endpoint
+// honors ProxyAPIKey exactly like statsPath/metricsPath — a mutating
+// endpoint deserves at least the same protection as the read-only ones,
+// if not more.
+func TestServer_CacheClearEndpoint_GatedByProxyAuth(t *testing.T) {
+	t.Chdir(t.TempDir())
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.ProxyAPIKey = "s3cr3t"
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/_aiproxy/cache/clear", "", nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d (missing Proxy-Authorization)", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+}
+
 // TestServer_StreamingResponse_DeliversChunksProgressively proves the
 // core streaming fix: chunks reach the client as they arrive, instead of
 // only after the full response has been read. If the proxy still

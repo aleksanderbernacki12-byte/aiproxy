@@ -441,6 +441,40 @@ func TestLoad_CacheEnabledDefaultsToFalse(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesCacheTTLSeconds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "cache_ttl_seconds": 300}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CacheTTLSeconds != 300 {
+		t.Fatalf("CacheTTLSeconds = %d, want 300", cfg.CacheTTLSeconds)
+	}
+}
+
+func TestLoad_CacheTTLSecondsDefaultsToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CacheTTLSeconds != 0 {
+		t.Fatalf("CacheTTLSeconds = %d, want 0 (no expiry) when absent", cfg.CacheTTLSeconds)
+	}
+}
+
 func TestLoad_MaxRequestsPerMinuteDefaultsToZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

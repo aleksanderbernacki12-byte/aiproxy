@@ -122,6 +122,18 @@ type Config struct {
 	// disabled.
 	CacheEnabled bool `json:"cache_enabled"`
 
+	// CacheTTLSeconds, if greater than zero, expires a cached response
+	// this many seconds after it was written — a request whose matching
+	// entry is older than this is treated as a cache miss and forwarded
+	// upstream again, same as if nothing had ever been cached for it.
+	// Zero (the default when the field is absent) means cached entries
+	// never expire on their own, same behavior as before this field
+	// existed. Only meaningful alongside CacheEnabled: a TTL for a cache
+	// that's off has nothing to expire, so setting this without
+	// CacheEnabled is a config error, same reasoning as CostBudget
+	// requiring CostPer1KTokens.
+	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
+
 	// CostPer1KTokens prices the shutdown summary's total token count at
 	// this rate per 1,000 tokens, in whatever currency and rate the user
 	// knows applies to their own usage. Zero (the default when the field

@@ -149,7 +149,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "circuit breaker: %d requests/minute\n", cfg.MaxRequestsPerMinute)
 		}
 		if cfg.CacheEnabled {
-			fmt.Fprintf(stdout, "response cache: enabled (%s/)\n", cache.DirName)
+			if cfg.CacheTTLSeconds > 0 {
+				fmt.Fprintf(stdout, "response cache: enabled (%s/, ttl %ds)\n", cache.DirName, cfg.CacheTTLSeconds)
+			} else {
+				fmt.Fprintf(stdout, "response cache: enabled (%s/, no ttl)\n", cache.DirName)
+			}
 		}
 		if cfg.CostPer1KTokens > 0 {
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
@@ -311,6 +315,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cache: %w", err))
 		} else {
+			c.TTL = time.Duration(cfg.CacheTTLSeconds) * time.Second
 			lc.cache = c
 		}
 	}
@@ -606,6 +611,12 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.MaxBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
 	}
+	if cfg.CacheTTLSeconds < 0 {
+		problems = append(problems, fmt.Sprintf("cache_ttl_seconds: %d must not be negative", cfg.CacheTTLSeconds))
+	}
+	if cfg.CacheTTLSeconds > 0 && !cfg.CacheEnabled {
+		problems = append(problems, "cache_ttl_seconds requires cache_enabled to be set (there's nothing to expire otherwise)")
+	}
 	if cfg.WebhookURL != "" {
 		if _, err := parseWebhookURL(cfg.WebhookURL); err != nil {
 			problems = append(problems, fmt.Sprintf("webhook_url: %v", err))
@@ -637,6 +648,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  routes with failover:    %d\n", countFailoverTargets(cfg))
 	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
+	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  cost budget:             %g\n", cfg.CostBudget)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
@@ -658,6 +670,15 @@ func logFileDisplay(path string) string {
 		return "disabled"
 	}
 	return path
+}
+
+// cacheTTLDisplay renders cache_ttl_seconds for the validate summary —
+// not a secret like webhook_url/proxy_api_key, so shown in full.
+func cacheTTLDisplay(seconds int) string {
+	if seconds <= 0 {
+		return "none (entries never expire on their own)"
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 // countFailoverTargets counts every targets entry configured with more

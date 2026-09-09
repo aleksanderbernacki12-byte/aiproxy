@@ -136,6 +136,14 @@ const statsPath = "/_aiproxy/stats"
 // "metrics_path: /_aiproxy/metrics" instead.
 const metricsPath = "/_aiproxy/metrics"
 
+// cacheClearPath is a third reserved, proxy-internal path: a POST here
+// deletes every entry from the response cache right now, without a
+// restart — the manual counterpart to cache_ttl_seconds' automatic
+// expiry, and the only way to evict anything at all when no TTL is
+// configured. POST, not GET like statsPath/metricsPath, since this one
+// actually mutates state rather than just reading it.
+const cacheClearPath = "/_aiproxy/cache/clear"
+
 // headerScanExcludes lists, in lowercase, the header names never handed
 // to the rule engine for scanning — see filterHeadersForScanning. These
 // are exactly the headers a client legitimately uses to authenticate to
@@ -656,6 +664,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == metricsPath {
 		s.serveMetrics(w, r)
+		return
+	}
+	if r.URL.Path == cacheClearPath {
+		s.serveCacheClear(w, r)
 		return
 	}
 
@@ -1710,6 +1722,33 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		s.logError("aiproxy: stats: failed to encode response: %v", err)
 	}
+}
+
+// serveCacheClear answers cacheClearPath by deleting every entry from
+// the response cache right now — see cache.Cache.Clear. Only POST is
+// accepted, since this mutates state rather than reading it. A 404
+// (not a 200 that quietly did nothing) is returned when caching isn't
+// enabled at all: there's nothing to clear, and a caller expecting this
+// to actually do something deserves to know it can't rather than
+// silently succeeding. Like serveStats/serveMetrics, this never touches
+// rules or the rate limiter and is never itself counted in Stats.
+func (s *Server) serveCacheClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cch := s.getCache()
+	if cch == nil {
+		http.Error(w, "cache is not enabled", http.StatusNotFound)
+		return
+	}
+	if err := cch.Clear(); err != nil {
+		s.logError("aiproxy: cache clear: %v", err)
+		http.Error(w, "failed to clear cache", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"cleared": true})
 }
 
 // promCounters lists the counters every metricsPath series is built

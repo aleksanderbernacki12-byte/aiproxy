@@ -1101,6 +1101,94 @@ func TestExecute_Validate_ValidConfig_WithWebhooks_ReturnsZero(t *testing.T) {
 	}
 }
 
+// TestExecute_Validate_CacheTTLSeconds_NegativeReportsProblem proves a
+// negative cache_ttl_seconds is rejected, same as every other numeric
+// field in the config.
+func TestExecute_Validate_CacheTTLSeconds_NegativeReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "cache_ttl_seconds": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cache_ttl_seconds") {
+		t.Errorf("stderr missing cache_ttl_seconds problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_CacheTTLSeconds_WithoutCacheEnabledReportsProblem
+// proves setting a TTL for a cache that's off is caught, same reasoning
+// as cost_budget requiring cost_per_1k_tokens.
+func TestExecute_Validate_CacheTTLSeconds_WithoutCacheEnabledReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_ttl_seconds": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cache_ttl_seconds requires cache_enabled") {
+		t.Errorf("stderr missing the cache_enabled requirement problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithCacheTTL_ReturnsZero proves a
+// well-formed cache_ttl_seconds passes validation and shows up in the
+// summary.
+func TestExecute_Validate_ValidConfig_WithCacheTTL_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "cache_ttl_seconds": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cache ttl:               30s") {
+		t.Fatalf("stdout missing cache ttl summary line: %q", stdout.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_CacheEnabledNoTTL_ReturnsZero proves
+// cache_enabled alone (no TTL, the pre-existing behavior) still passes
+// validation and reports "no expiry" in the summary.
+func TestExecute_Validate_ValidConfig_CacheEnabledNoTTL_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cache ttl:               none") {
+		t.Fatalf("stdout missing the no-expiry cache ttl summary line: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_ReportsEffectiveMaxBodySize proves the summary
 // shows what max_body_size_bytes actually resolves to: the configured
 // value when set, or proxy.DefaultMaxBodyBytes when it's left at its
