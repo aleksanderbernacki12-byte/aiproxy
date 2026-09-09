@@ -6422,8 +6422,13 @@ func TestServer_StatsEndpoint_ReportsLatency(t *testing.T) {
 	if got.Latency.Count != 1 {
 		t.Errorf("overall Latency.Count = %d, want 1", got.Latency.Count)
 	}
-	if got.Latency.SumSeconds <= 0 {
-		t.Errorf("overall Latency.SumSeconds = %g, want > 0", got.Latency.SumSeconds)
+	if got.Latency.SumSeconds < 0 {
+		// Not > 0: a genuinely fast local round trip can legitimately
+		// measure as exactly 0 under a coarser timer (observed on
+		// Windows CI) — that's a real, valid measurement, not a bug.
+		// Count and Buckets above are what actually prove an
+		// observation was recorded at all.
+		t.Errorf("overall Latency.SumSeconds = %g, want >= 0", got.Latency.SumSeconds)
 	}
 	if len(got.Latency.Buckets) == 0 {
 		t.Error("overall Latency.Buckets is empty, want the full fixed bucket set")
