@@ -145,6 +145,69 @@ in this section, and, like `webhook_url`, is never printed to the
 terminal or a log line — only whether it's set (`aiproxy validate`'s
 `proxy authentication:` line, the startup notice).
 
+### Multiple named keys, with per-key stats and rate limits
+
+`proxy_api_key` is one shared secret for everyone. Set `proxy_api_keys`
+instead (or alongside it) to give several agents or teams their own key
+— each shows up under its own name in stats and logs, and can optionally
+get its own dedicated rate limit:
+
+```json
+{
+  "proxy_api_keys": [
+    { "name": "team-a", "key": "team-a-long-random-key" },
+    { "name": "team-b", "key": "team-b-long-random-key", "max_requests_per_minute": 60 }
+  ]
+}
+```
+
+Every entry needs a `name` (unique, and never `"default"` — reserved for
+the anonymous `proxy_api_key`, if that's also set) and a `key` (also
+unique — two entries can't share one, since there'd be no way to tell
+which name a request authenticated with it should attribute to);
+`aiproxy validate` rejects either kind of collision, plus an empty name
+or key. `proxy_api_key`, if set, keeps working completely unchanged — a
+single, anonymous key labeled `"default"` wherever a named key would be
+labeled by its own name — and combines freely with `proxy_api_keys`;
+neither requires the other.
+
+`max_requests_per_minute` on one of these entries gives that key its own
+dedicated rate limit, checked *instead of* whatever
+[route](#multi-target-routing) or the server-wide `max_requests_per_minute`
+would otherwise apply — a caller's own budget is authoritative regardless
+of which route they hit. A key with no override just shares whatever
+route/global limiter would otherwise apply, same as before this field
+existed.
+
+Every request authenticated with a named key is attributed by that name
+— in `GET /_aiproxy/stats`'s `per_client` field, the Prometheus
+endpoint's `aiproxy_client_*_total{client="..."}` series (and
+`aiproxy_client_estimated_cost`, when `cost_per_1k_tokens` is set), and
+the shutdown summary's `=== per-client breakdown ===` section:
+
+```json
+{
+  "per_client": {
+    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "total_tokens": 0 },
+    "team-a": { "allowed": 40, "blocked": 1, "redacted": 0, "rate_limited": 0, "total_tokens": 3100 },
+    "team-b": { "allowed": 8, "blocked": 0, "redacted": 0, "rate_limited": 2, "total_tokens": 0 }
+  }
+}
+```
+
+A deliberately smaller set of fields than `per_target`: no cache-hit,
+failover, or latency breakdown — those are inherently about which
+target/route a request went through, not who called it. `per_client` is
+only ever populated when at least one key is actually configured — no
+bucket for a fully open proxy, since there's no caller identity to
+attribute anything to. Names are never secret and appear freely in
+stats/logs/the startup notice; the keys themselves get the same
+treatment `proxy_api_key` always has — never printed anywhere, not even
+in an error message, which instead identifies a failed webhook delivery
+or similar by position (`webhook_url`, `webhooks[N]`) rather than value.
+Hot-reloadable via [SIGHUP](#reloading-config-without-restarting) like
+everything else in this section.
+
 ## Built-in secret patterns
 
 No config needed — these block by default the moment aiproxy starts:
@@ -264,7 +327,8 @@ Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
 custom rules, path rules, the rate limit, the cache, cost estimation,
 the cost budget, the max request body size, the webhook alert URL,
-additional `webhooks` destinations, the proxy API key, `log_file` (see
+additional `webhooks` destinations, the proxy API key, additional named
+`proxy_api_keys`, `log_file` (see
 [persistent log file](#persistent-log-file)
 for why this one is reopened unconditionally, not just when its path
 changes), and target routes all take effect for the next request,
@@ -780,6 +844,10 @@ can be monitored without waiting for Ctrl+C:
   "per_rule": {
     "aws-access-key": { "blocked": 1, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 0, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 },
     "candidate-rule": { "blocked": 0, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 1, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 }
+  },
+  "per_client": {
+    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "total_tokens": 0 },
+    "team-a": { "allowed": 30, "blocked": 1, "redacted": 0, "rate_limited": 0, "total_tokens": 3100 }
   }
 }
 ```
@@ -815,7 +883,12 @@ route's own candidate list, not something target-agnostic. `latency`
 shape and what it measures) is broken down by target too, for the same
 reason — `count` and `sum_seconds` alone are enough to compute a mean
 latency (`sum_seconds / count * 1000` for milliseconds) without needing
-the full `buckets` list. Any method other than `GET` gets a 405.
+the full `buckets` list. `per_client` (see
+[multiple named keys](#multiple-named-keys-with-per-key-stats-and-rate-limits))
+breaks down by which named `proxy_api_keys` entry (or `"default"` for
+the anonymous `proxy_api_key`) a request was authenticated with, instead
+of target or rule — empty entirely unless at least one proxy key is
+configured. Any method other than `GET` gets a 405.
 Once `proxy_api_key` is set, this endpoint requires it too — a request
 missing or failing that check never reaches this handler at all, and
 gets a 407 instead. Because the path
@@ -867,6 +940,12 @@ aiproxy_upstream_latency_seconds_bucket{target="default",le="10"} 42
 aiproxy_upstream_latency_seconds_bucket{target="default",le="+Inf"} 42
 aiproxy_upstream_latency_seconds_sum{target="default"} 3.31
 aiproxy_upstream_latency_seconds_count{target="default"} 42
+aiproxy_client_allowed_total{client="team-a"} 40
+aiproxy_client_blocked_total{client="team-a"} 1
+aiproxy_client_redacted_total{client="team-a"} 0
+aiproxy_client_rate_limited_total{client="team-a"} 0
+aiproxy_client_tokens_used_total{client="team-a"} 3100
+aiproxy_client_estimated_cost{client="team-a"} 0.093
 aiproxy_cost_budget 10
 ```
 
@@ -912,7 +991,18 @@ scraping. `aiproxy_cost_budget` is a gauge, not
 a counter — the configured `cost_budget` threshold itself, included only
 when it's set — and unlabeled for a different reason than the series
 above: a single whole-proxy-run value, not something with a per-target
-or per-rule breakdown to begin with. Once `proxy_api_key` is set, a
+or per-rule breakdown to begin with.
+
+`aiproxy_client_*` mirrors `per_client` from the JSON endpoint (see
+[multiple named keys](#multiple-named-keys-with-per-key-stats-and-rate-limits)):
+one `client="<name>"` series per key that has ever been used to
+authenticate — `"default"` for the anonymous `proxy_api_key`, a named
+`proxy_api_keys` entry's own name otherwise — present only once at least
+one proxy key is actually configured. `aiproxy_client_estimated_cost` is
+included only when `cost_per_1k_tokens` is also set, same condition as
+the unlabeled `aiproxy_estimated_cost`.
+
+Once `proxy_api_key` is set, a
 scrape has to send it back the same way any other request does (see
 [authenticating requests](#authenticating-requests-to-the-proxy)) — a
 Prometheus `scrape_configs` entry's `authorization: { type: Bearer,
@@ -1111,8 +1201,9 @@ Checks `aiproxy.json` for problems without starting the proxy: every
 well-formed, unique prefix and exactly one of a valid HTTPS `url` or a
 non-empty `urls` list of them, every `webhooks` entry needs a
 well-formed `url` and, if `events` is given, every name in it must be
-one aiproxy actually fires, `log_file` (if set) must actually be
-possible to open, every
+one aiproxy actually fires, every `proxy_api_keys` entry needs a
+non-empty, unique `name` (never `"default"`) and a non-empty, unique
+`key`, `log_file` (if set) must actually be possible to open, every
 `builtin_rule_actions` key must name a real built-in rule with a valid
 action, and the numeric fields can't be negative. It reports every
 problem it finds in one pass rather than stopping at the first, and

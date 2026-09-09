@@ -107,6 +107,14 @@ type requestContextInfo struct {
 	forwardPath string
 	targetLabel string
 
+	// clientLabel is the authenticated proxy key's attribution label —
+	// "default" for the anonymous Server.ProxyAPIKey, a named
+	// Server.ProxyAPIKeys entry's Name, or "" when no key is configured
+	// at all — carried through to modifyResponse so token usage
+	// extracted from the response can be attributed the same way
+	// requests already are; see checkProxyAuth/clientAuth.
+	clientLabel string
+
 	// latency, if non-nil, is written by failoverTransport.RoundTrip the
 	// moment a response actually comes back (successfully, from
 	// whichever candidate) and read back by modifyResponse to log a
@@ -265,6 +273,17 @@ type Server struct {
 	// anything else with it; see checkProxyAuth. Empty (the default)
 	// disables the check entirely.
 	ProxyAPIKey string
+
+	// ProxyAPIKeys lists additional named keys beyond ProxyAPIKey, each
+	// checked the same constant-time way. A request authenticated with
+	// one of these is attributed, in stats and logs, to that key's Name
+	// instead of ProxyAPIKey's anonymous "default" label — see
+	// checkProxyAuth and clientAuth. A key with its own Limiter takes
+	// precedence over whatever route or the server-wide Limiter would
+	// otherwise apply for that request: a caller's own budget is
+	// authoritative regardless of which route they hit. nil/empty (the
+	// default) means ProxyAPIKey alone (if set) is the only key.
+	ProxyAPIKeys []ProxyKey
 
 	// LogFile, if non-nil, is an open, append-mode file every log event
 	// (including the shutdown summary) is also written to as one JSON
@@ -566,10 +585,12 @@ func (s *Server) getWebhooks() []WebhookTarget {
 	return s.Webhooks
 }
 
-func (s *Server) getProxyAPIKey() string {
+// getProxyAPIKeys returns both ProxyAPIKey and ProxyAPIKeys under one
+// lock, for checkProxyAuth.
+func (s *Server) getProxyAPIKeys() (string, []ProxyKey) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.ProxyAPIKey
+	return s.ProxyAPIKey, s.ProxyAPIKeys
 }
 
 func (s *Server) getLogFile() *os.File {
@@ -592,15 +613,16 @@ type Route struct {
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
 // cost-per-1K-tokens rate, cost budget, max request body size, webhook
-// alert URL, additional webhook destinations, proxy API key, log file,
-// and target routes — e.g. after re-reading aiproxy.json on SIGHUP. All
-// of them change together under one lock, so a request in flight never
-// observes a torn mix of old and new configuration; a request takes
-// effect from the moment it's accepted, so anything already being
-// handled keeps running against whatever configuration it started with.
-// Pass nil for limiter/cache/webhookURL/webhooks/logFile to disable
+// alert URL, additional webhook destinations, proxy API key, additional
+// named proxy keys, log file, and target routes — e.g. after re-reading
+// aiproxy.json on SIGHUP. All of them change together under one lock,
+// so a request in flight never observes a torn mix of old and new
+// configuration; a request takes effect from the moment it's accepted,
+// so anything already being handled keeps running against whatever
+// configuration it started with. Pass nil for
+// limiter/cache/webhookURL/webhooks/proxyAPIKeys/logFile to disable
 // them, matching how the corresponding field would be set at startup;
-// pass "" for proxyAPIKey to disable the auth check; pass zero for
+// pass "" for proxyAPIKey to disable the anonymous key; pass zero for
 // costBudget to disable the budget check, or maxBodyBytes to fall back
 // to DefaultMaxBodyBytes, same as leaving Server.MaxBodyBytes unset.
 //
@@ -612,7 +634,7 @@ type Route struct {
 // the next reload's fresh handle creates a new file at that same path.
 // The old handle, if any, is closed after the swap — never left open —
 // so a long-running proxy reloaded repeatedly never leaks descriptors.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, logFile *os.File, routes []Route) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter}
@@ -629,6 +651,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.WebhookURL = webhookURL
 	s.Webhooks = webhooks
 	s.ProxyAPIKey = proxyAPIKey
+	s.ProxyAPIKeys = proxyAPIKeys
 	s.LogFile = logFile
 	s.routes = newRoutes
 	s.mu.Unlock()
@@ -657,22 +680,66 @@ func (s *Server) LogEvent(level, message string) {
 // project's own examples presents a bearer credential.
 const proxyAuthScheme = "Bearer "
 
-// checkProxyAuth reports whether r is allowed to use the proxy at all:
-// true if Server.ProxyAPIKey is unset (the check is disabled), or if r
-// carries a "Proxy-Authorization: Bearer <key>" header whose key exactly
-// matches, compared in constant time so a wrong guess can't be narrowed
-// down by response timing the way a plain == comparison could leak.
-func (s *Server) checkProxyAuth(r *http.Request) bool {
-	want := s.getProxyAPIKey()
-	if want == "" {
-		return true
+// ProxyKey is one resolved additional named entry in Server.ProxyAPIKeys.
+type ProxyKey struct {
+	// Name identifies this key in stats, logs, and webhook payloads —
+	// never the key itself. Never "default", reserved for the anonymous
+	// Server.ProxyAPIKey.
+	Name string
+	Key  string
+
+	// Limiter, if non-nil, is this key's own dedicated rate limit,
+	// checked instead of whatever route or the server-wide Limiter
+	// would otherwise apply for a request authenticated with it.
+	Limiter *limiter.Limiter
+}
+
+// clientAuth is checkProxyAuth's result: which key (if any) matched,
+// for attributing the request in stats/logs, and that key's own rate
+// limit override, if it has one. The zero value means either the check
+// is disabled entirely (no keys configured at all) or — impossible to
+// tell apart from label alone, which is fine, since both cases mean
+// "nothing to attribute" — never actually returned alongside ok=false.
+type clientAuth struct {
+	// label is "default" for the anonymous Server.ProxyAPIKey, a named
+	// ProxyKey's Name, or "" when the auth check is disabled entirely
+	// (nothing to attribute a request to).
+	label   string
+	limiter *limiter.Limiter
+}
+
+// checkProxyAuth reports whether r is allowed to use the proxy at all,
+// and if so, which key (if any) it authenticated with. True with a
+// zero clientAuth if neither Server.ProxyAPIKey nor Server.ProxyAPIKeys
+// is set (the check is disabled). Otherwise r must carry a
+// "Proxy-Authorization: Bearer <key>" header matching Server.ProxyAPIKey
+// or one of Server.ProxyAPIKeys — each compared in constant time so a
+// wrong guess can't be narrowed down by response timing the way a plain
+// == comparison could leak; checking multiple keys in a loop only ever
+// reveals "how many keys are configured" to a caller who doesn't
+// already hold a valid one, never anything about their guess.
+func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
+	proxyAPIKey, proxyAPIKeys := s.getProxyAPIKeys()
+	if proxyAPIKey == "" && len(proxyAPIKeys) == 0 {
+		return clientAuth{}, true
 	}
+
 	got := r.Header.Get("Proxy-Authorization")
 	if !strings.HasPrefix(got, proxyAuthScheme) {
-		return false
+		return clientAuth{}, false
 	}
 	got = strings.TrimPrefix(got, proxyAuthScheme)
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	gotBytes := []byte(got)
+
+	if proxyAPIKey != "" && subtle.ConstantTimeCompare(gotBytes, []byte(proxyAPIKey)) == 1 {
+		return clientAuth{label: "default"}, true
+	}
+	for _, k := range proxyAPIKeys {
+		if subtle.ConstantTimeCompare(gotBytes, []byte(k.Key)) == 1 {
+			return clientAuth{label: k.Name, limiter: k.Limiter}, true
+		}
+	}
+	return clientAuth{}, false
 }
 
 // ServeHTTP implements http.Handler. It reads the full request body into
@@ -682,7 +749,8 @@ func (s *Server) checkProxyAuth(r *http.Request) bool {
 // it intact to the resolved target (Target by default, or a
 // path-prefix route added via AddRoute) over HTTPS.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !s.checkProxyAuth(r) {
+	auth, ok := s.checkProxyAuth(r)
+	if !ok {
 		// Checked before statsPath/metricsPath too — an API key, once
 		// configured, gates the whole proxy, monitoring endpoints
 		// included, not just traffic actually forwarded upstream.
@@ -727,6 +795,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// first (primary) one — a stable identity for the route regardless of
 	// which candidate actually ends up serving any one request.
 	targets, forwardPath, targetLabel, effectiveLimiter := s.resolveRoute(r.URL.Path)
+	if auth.limiter != nil {
+		// The authenticated key's own rate limit is authoritative for
+		// this caller regardless of which route they hit — takes
+		// precedence over both the route's own limiter and the
+		// server-wide one.
+		effectiveLimiter = auth.limiter
+	}
 
 	// The cache is checked before rules and the rate limiter: a cache hit
 	// never touches either, and never reaches the upstream target. The
@@ -764,6 +839,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The matched secret itself must never reach the log, only the
 		// static rule name that identifies which pattern triggered it.
 		s.Stats.RecordBlock(targetLabel, ruleName)
+		s.Stats.RecordClientBlock(auth.label)
 		s.logBlock(r.Method, r.URL.String(), ruleName)
 		s.notifyWebhook("block", r.Method, r.URL.String(), ruleName)
 		http.Error(w, "blocked by aiproxy rules", http.StatusForbidden)
@@ -772,6 +848,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if effectiveLimiter != nil && !effectiveLimiter.Allow() {
 		s.Stats.RecordRateLimited(targetLabel)
+		s.Stats.RecordClientRateLimited(auth.label)
 		s.logRateLimited(r.Method, r.URL.String())
 		s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "")
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
@@ -799,10 +876,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if action == rules.Redact {
 		s.Stats.RecordRedact(targetLabel, ruleName)
+		s.Stats.RecordClientRedact(auth.label)
 		s.logRedact(r.Method, r.URL.String(), ruleName)
 		s.notifyWebhook("redact", r.Method, r.URL.String(), ruleName)
 	} else {
 		s.Stats.RecordAllow(targetLabel)
+		s.Stats.RecordClientAllow(auth.label)
 		s.logAllow(r.Method, r.URL.String())
 	}
 
@@ -818,6 +897,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		targets:     targets,
 		forwardPath: forwardPath,
 		targetLabel: targetLabel,
+		clientLabel: auth.label,
 		latency:     new(time.Duration),
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
@@ -1213,6 +1293,7 @@ func tryUnmarshalUsage(data []byte) (int, bool) {
 func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 	if tokens := extractTotalTokens(body); tokens > 0 {
 		s.Stats.RecordTokensUsed(reqCtx.targetLabel, tokens)
+		s.Stats.RecordClientTokensUsed(reqCtx.clientLabel, tokens)
 		s.logUsage(reqCtx.method, reqCtx.url, tokens)
 		if cost, crossed := s.Stats.CrossedBudget(s.getCostPer1KTokens(), s.getCostBudget()); crossed {
 			s.logBudgetExceeded(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
@@ -1723,6 +1804,13 @@ type statsSnapshotJSON struct {
 	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
 	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
 
+	// PerClient breaks down by named proxy API key instead of target or
+	// rule — see stats.ClientSnapshot. Only meaningful at the top level,
+	// same reasoning as PerRule: which client is independent of which
+	// target the request happened to route to, so toStatsSnapshotJSON
+	// never sets it inside PerTarget.
+	PerClient map[string]stats.ClientSnapshot `json:"per_client,omitempty"`
+
 	// CostBudget is the configured cost_budget threshold, included only
 	// when it's set. Unlike EstimatedCost, it's never repeated inside
 	// PerTarget — a budget is a single whole-proxy-run threshold, not
@@ -1762,6 +1850,9 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 	}
 	if len(snap.PerRule) > 0 {
 		out.PerRule = snap.PerRule
+	}
+	if len(snap.PerClient) > 0 {
+		out.PerClient = snap.PerClient
 	}
 	return out
 }
@@ -1873,6 +1964,25 @@ var promDryRunCounters = []struct {
 	{"aiproxy_dry_run_response_redacted_total", "Total number of upstream responses a dry_run rule would have redacted.", func(s stats.Snapshot) int64 { return s.ResponseDryRunRedacted }},
 }
 
+// promClientCounters mirrors promCounters for the per-client breakdown
+// — which named proxy API key a request was authenticated with,
+// independent of which target it happened to route to. A smaller set
+// than promCounters, matching stats.ClientSnapshot's own smaller field
+// set: no cache-hit/failover/latency/dry-run equivalent, since none of
+// those are meaningfully attributable to a caller rather than a
+// target/route.
+var promClientCounters = []struct {
+	name string
+	help string
+	get  func(stats.ClientSnapshot) int64
+}{
+	{"aiproxy_client_allowed_total", "Total number of requests allowed and forwarded, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.Allowed }},
+	{"aiproxy_client_blocked_total", "Total number of requests blocked by a rule, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.Blocked }},
+	{"aiproxy_client_redacted_total", "Total number of requests redacted, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.Redacted }},
+	{"aiproxy_client_rate_limited_total", "Total number of requests rejected by the rate limiter, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.RateLimited }},
+	{"aiproxy_client_tokens_used_total", "Total number of tokens reported in upstream response usage fields, for requests authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.TotalTokens }},
+}
+
 // promLabelValue escapes a label value per the Prometheus text
 // exposition format: backslash, double quote, and newline are the only
 // characters that need it.
@@ -1936,6 +2046,29 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 		fmt.Fprintf(w, "# HELP %s %s\n", c.name, c.help)
 		fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
 		fmt.Fprintf(w, "%s %d\n", c.name, c.get(snap))
+	}
+
+	clientNames := make([]string, 0, len(snap.PerClient))
+	for name := range snap.PerClient {
+		clientNames = append(clientNames, name)
+	}
+	sort.Strings(clientNames)
+
+	for _, c := range promClientCounters {
+		fmt.Fprintf(w, "# HELP %s %s\n", c.name, c.help)
+		fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
+		for _, name := range clientNames {
+			fmt.Fprintf(w, "%s{client=%q} %d\n", c.name, promLabelValue(name), c.get(snap.PerClient[name]))
+		}
+	}
+
+	if costPer1KTokens > 0 && len(clientNames) > 0 {
+		fmt.Fprintln(w, "# HELP aiproxy_client_estimated_cost Estimated cost of tokens used so far, for requests authenticated with this proxy API key.")
+		fmt.Fprintln(w, "# TYPE aiproxy_client_estimated_cost counter")
+		for _, name := range clientNames {
+			c := snap.PerClient[name]
+			fmt.Fprintf(w, "aiproxy_client_estimated_cost{client=%q} %g\n", promLabelValue(name), c.EstimatedCost(costPer1KTokens))
+		}
 	}
 
 	// Unlabeled, same reasoning as promDryRunCounters: a rejected
@@ -2014,6 +2147,9 @@ func (s *Server) Summary() string {
 		summary += "\n" + breakdown
 	}
 	if breakdown := snap.PerRuleString(); breakdown != "" {
+		summary += "\n" + breakdown
+	}
+	if breakdown := snap.PerClientString(cost); breakdown != "" {
 		summary += "\n" + breakdown
 	}
 	return summary

@@ -2000,25 +2000,35 @@ type ruleJSONResponse struct {
 // statsJSONResponse mirrors the wire shape served at GET /_aiproxy/stats,
 // for tests to decode into.
 type statsJSONResponse struct {
-	Allowed                int64                        `json:"allowed"`
-	Blocked                int64                        `json:"blocked"`
-	Redacted               int64                        `json:"redacted"`
-	RateLimited            int64                        `json:"rate_limited"`
-	CacheHits              int64                        `json:"cache_hits"`
-	TotalTokens            int64                        `json:"total_tokens"`
-	ResponseBlocked        int64                        `json:"response_blocked"`
-	ResponseRedacted       int64                        `json:"response_redacted"`
-	DryRunBlocked          int64                        `json:"dry_run_blocked"`
-	DryRunRedacted         int64                        `json:"dry_run_redacted"`
-	ResponseDryRunBlocked  int64                        `json:"response_dry_run_blocked"`
-	ResponseDryRunRedacted int64                        `json:"response_dry_run_redacted"`
-	Unauthorized           int64                        `json:"unauthorized"`
-	Failover               int64                        `json:"failover"`
-	Latency                latencyJSONResponse          `json:"latency"`
-	EstimatedCost          *float64                     `json:"estimated_cost,omitempty"`
-	CostBudget             *float64                     `json:"cost_budget,omitempty"`
-	PerTarget              map[string]statsJSONResponse `json:"per_target,omitempty"`
-	PerRule                map[string]ruleJSONResponse  `json:"per_rule,omitempty"`
+	Allowed                int64                         `json:"allowed"`
+	Blocked                int64                         `json:"blocked"`
+	Redacted               int64                         `json:"redacted"`
+	RateLimited            int64                         `json:"rate_limited"`
+	CacheHits              int64                         `json:"cache_hits"`
+	TotalTokens            int64                         `json:"total_tokens"`
+	ResponseBlocked        int64                         `json:"response_blocked"`
+	ResponseRedacted       int64                         `json:"response_redacted"`
+	DryRunBlocked          int64                         `json:"dry_run_blocked"`
+	DryRunRedacted         int64                         `json:"dry_run_redacted"`
+	ResponseDryRunBlocked  int64                         `json:"response_dry_run_blocked"`
+	ResponseDryRunRedacted int64                         `json:"response_dry_run_redacted"`
+	Unauthorized           int64                         `json:"unauthorized"`
+	Failover               int64                         `json:"failover"`
+	Latency                latencyJSONResponse           `json:"latency"`
+	EstimatedCost          *float64                      `json:"estimated_cost,omitempty"`
+	CostBudget             *float64                      `json:"cost_budget,omitempty"`
+	PerTarget              map[string]statsJSONResponse  `json:"per_target,omitempty"`
+	PerRule                map[string]ruleJSONResponse   `json:"per_rule,omitempty"`
+	PerClient              map[string]clientJSONResponse `json:"per_client,omitempty"`
+}
+
+// clientJSONResponse mirrors stats.ClientSnapshot's wire shape.
+type clientJSONResponse struct {
+	Allowed     int64 `json:"allowed"`
+	Blocked     int64 `json:"blocked"`
+	Redacted    int64 `json:"redacted"`
+	RateLimited int64 `json:"rate_limited"`
+	TotalTokens int64 `json:"total_tokens"`
 }
 
 // latencyJSONResponse mirrors stats.LatencySnapshot's wire shape.
@@ -3076,7 +3086,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, []proxy.Route{
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
 	})
 
@@ -3140,7 +3150,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil)
 		}
 	}()
 
@@ -4082,7 +4092,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -4985,6 +4995,354 @@ func TestServer_ProxyAuth_AllowsCorrectKey(t *testing.T) {
 	}
 }
 
+// TestServer_ProxyAuth_MultipleNamedKeysAllAuthenticate proves every
+// configured key — the anonymous ProxyAPIKey and every named
+// ProxyAPIKeys entry — independently grants access, not just the first
+// one checked.
+func TestServer_ProxyAuth_MultipleNamedKeysAllAuthenticate(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "anon-key"
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "team-a", Key: "team-a-key"},
+		{Name: "team-b", Key: "team-b-key"},
+	}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for _, key := range []string{"anon-key", "team-a-key", "team-b-key"} {
+		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do (key %q): %v", key, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("key %q: status = %d, want %d", key, resp.StatusCode, http.StatusOK)
+		}
+	}
+}
+
+// TestServer_ProxyAuth_WrongKeyRejectedWithMultipleKeysConfigured proves
+// a request presenting none of the valid keys still gets 407, even when
+// several keys are configured — no accidental "any non-empty header
+// passes" bug from the multi-key loop.
+func TestServer_ProxyAuth_WrongKeyRejectedWithMultipleKeysConfigured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("request with a wrong key must never reach the upstream target")
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "anon-key"
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "team-a", Key: "team-a-key"}}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer totally-wrong-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+}
+
+// TestServer_ProxyAuth_AttributesStatsToMatchedClientName proves a
+// request authenticated with a named key shows up in
+// GET /_aiproxy/stats' per_client under that key's own name, while one
+// authenticated with the anonymous ProxyAPIKey shows up under
+// "default" — including token usage, so per-client cost tracking works
+// end to end.
+func TestServer_ProxyAuth_AttributesStatsToMatchedClientName(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"usage":{"total_tokens":42}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "anon-key"
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "team-a", Key: "team-a-key"}}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	do := func(key string) {
+		req, err := http.NewRequest(http.MethodPost, frontend.URL+"/x", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+	}
+	do("team-a-key")
+	do("anon-key")
+	do("anon-key")
+
+	statsResp, err := (&http.Client{}).Do(func() *http.Request {
+		req, _ := http.NewRequest(http.MethodGet, frontend.URL+"/_aiproxy/stats", nil)
+		req.Header.Set("Proxy-Authorization", "Bearer anon-key")
+		return req
+	}())
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var got statsJSONResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	teamA, ok := got.PerClient["team-a"]
+	if !ok {
+		t.Fatalf("PerClient missing team-a: %+v", got.PerClient)
+	}
+	if teamA.Allowed != 1 || teamA.TotalTokens != 42 {
+		t.Errorf("PerClient[team-a] = %+v, want allowed=1 total_tokens=42", teamA)
+	}
+
+	def, ok := got.PerClient["default"]
+	if !ok {
+		t.Fatalf("PerClient missing default: %+v", got.PerClient)
+	}
+	if def.Allowed != 2 || def.TotalTokens != 84 {
+		t.Errorf("PerClient[default] = %+v, want allowed=2 total_tokens=84", def)
+	}
+}
+
+// TestServer_ProxyAuth_NamedKeyOwnRateLimitTakesPrecedenceOverRoute
+// proves a key's own max_requests_per_minute override actually governs
+// that caller's traffic instead of the route's own (looser) limiter —
+// the confirmed precedence: the caller's own budget is authoritative
+// regardless of which route they hit.
+func TestServer_ProxyAuth_NamedKeyOwnRateLimitTakesPrecedenceOverRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	// The route's own limiter is generous (1000/min) — the key's own
+	// limiter (1/min) must be what actually governs this caller.
+	srv.Limiter = limiter.New(1000, time.Minute)
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "team-a", Key: "team-a-key", Limiter: limiter.New(1, time.Minute)},
+	}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	do := func() int {
+		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer team-a-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := do(); got != http.StatusOK {
+		t.Fatalf("first request status = %d, want %d", got, http.StatusOK)
+	}
+	if got := do(); got != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (the key's own 1/min limit, not the route's 1000/min)", got, http.StatusTooManyRequests)
+	}
+}
+
+// TestServer_ProxyAuth_NamedKeyWithoutOwnLimiterFallsBackToRoute proves
+// a key with no max_requests_per_minute override behaves exactly as
+// before — sharing whatever route/global limiter would otherwise apply
+// — a regression check for the common case (most keys won't set their
+// own override).
+func TestServer_ProxyAuth_NamedKeyWithoutOwnLimiterFallsBackToRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Limiter = limiter.New(1, time.Minute)
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "team-a", Key: "team-a-key"}} // no Limiter
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	do := func() int {
+		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer team-a-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := do(); got != http.StatusOK {
+		t.Fatalf("first request status = %d, want %d", got, http.StatusOK)
+	}
+	if got := do(); got != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (falls back to the server-wide 1/min limiter)", got, http.StatusTooManyRequests)
+	}
+}
+
+// TestServer_MetricsEndpoint_ReportsClientLabeledCounters proves the
+// per-client counters (and estimated cost gauge) reach the Prometheus
+// endpoint, labeled client="...", same as the per-target/per-rule
+// series.
+func TestServer_MetricsEndpoint_ReportsClientLabeledCounters(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"usage":{"total_tokens":100}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "team-a", Key: "team-a-key"}}
+	srv.CostPer1KTokens = 0.03
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/x", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer team-a-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	metricsReq, err := http.NewRequest(http.MethodGet, frontend.URL+"/_aiproxy/metrics", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	metricsReq.Header.Set("Proxy-Authorization", "Bearer team-a-key")
+	metricsResp, err := http.DefaultClient.Do(metricsReq)
+	if err != nil {
+		t.Fatalf("get metrics: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	body, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	out := string(body)
+
+	for _, want := range []string{
+		"# TYPE aiproxy_client_allowed_total counter",
+		`aiproxy_client_allowed_total{client="team-a"} 1`,
+		`aiproxy_client_tokens_used_total{client="team-a"} 100`,
+		`aiproxy_client_estimated_cost{client="team-a"} 0.003`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics output missing %q: %q", want, out)
+		}
+	}
+}
+
+// TestServer_ReloadConfig_SwapsProxyAPIKeysLive proves ReloadConfig
+// actually replaces Server.ProxyAPIKeys, same as every other reloadable
+// field: a key that didn't exist before the reload works afterward, and
+// one that existed before stops working.
+func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "old-team", Key: "old-key"}}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil)
+
+	do := func(key string) int {
+		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := do("old-key"); got != http.StatusProxyAuthRequired {
+		t.Errorf("old-key after reload: status = %d, want %d (must no longer work)", got, http.StatusProxyAuthRequired)
+	}
+	if got := do("new-key"); got != http.StatusOK {
+		t.Errorf("new-key after reload: status = %d, want %d", got, http.StatusOK)
+	}
+}
+
 // TestServer_ProxyAuth_IndependentOfClientsUpstreamCredential proves
 // aiproxy's own Proxy-Authorization check is entirely separate from
 // whatever Authorization/X-Api-Key credential the client is sending
@@ -5293,7 +5651,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -5667,7 +6025,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -6718,7 +7076,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", newFile, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 

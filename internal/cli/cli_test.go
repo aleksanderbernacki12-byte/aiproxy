@@ -1101,6 +1101,174 @@ func TestExecute_Validate_ValidConfig_WithWebhooks_ReturnsZero(t *testing.T) {
 	}
 }
 
+// TestExecute_Validate_ProxyAPIKeys_EmptyNameReportsProblem proves an
+// entry with no name is rejected — it's the stats/log attribution
+// label, so it can't be blank.
+func TestExecute_Validate_ProxyAPIKeys_EmptyNameReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [{"name": "", "key": "some-key"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "name must not be empty") {
+		t.Errorf("stderr missing the empty-name problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ProxyAPIKeys_ReservedDefaultNameReportsProblem
+// proves "default" (reserved for the anonymous top-level
+// proxy_api_key) can't be reused as a named key's name.
+func TestExecute_Validate_ProxyAPIKeys_ReservedDefaultNameReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [{"name": "default", "key": "some-key"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "reserved") {
+		t.Errorf("stderr missing the reserved-name problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ProxyAPIKeys_DuplicateNameReportsProblem proves
+// two entries can't share a name — it would silently merge two
+// different callers' attributed stats together.
+func TestExecute_Validate_ProxyAPIKeys_DuplicateNameReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [
+		{"name": "team-a", "key": "key-1"},
+		{"name": "team-a", "key": "key-2"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "duplicate name") {
+		t.Errorf("stderr missing the duplicate-name problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ProxyAPIKeys_DuplicateKeyReportsProblem proves
+// two entries can't share the same key value — ambiguous which name
+// a request authenticated with it would be attributed to.
+func TestExecute_Validate_ProxyAPIKeys_DuplicateKeyReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [
+		{"name": "team-a", "key": "shared-key"},
+		{"name": "team-b", "key": "shared-key"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "team-b") || !strings.Contains(stderr.String(), "duplicates") {
+		t.Errorf("stderr missing the duplicate-key problem: %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "shared-key") {
+		t.Errorf("stderr leaked the key value itself: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ProxyAPIKeys_EmptyKeyReportsProblem proves an
+// entry with a name but no key is rejected.
+func TestExecute_Validate_ProxyAPIKeys_EmptyKeyReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [{"name": "team-a", "key": ""}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "team-a") || !strings.Contains(stderr.String(), "key must not be empty") {
+		t.Errorf("stderr missing the empty-key problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ProxyAPIKeys_NegativeMaxRequestsPerMinuteReportsProblem
+// proves the per-key rate limit override can't be negative.
+func TestExecute_Validate_ProxyAPIKeys_NegativeMaxRequestsPerMinuteReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [{"name": "team-a", "key": "some-key", "max_requests_per_minute": -5}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "max_requests_per_minute") {
+		t.Errorf("stderr missing the negative-rate-limit problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithProxyAPIKeys_ReturnsZero proves a
+// well-formed proxy_api_keys list passes validation, is reflected in
+// the summary by count only, and never leaks a key value or the names
+// (names aren't secret, but this asserts the count line specifically).
+func TestExecute_Validate_ValidConfig_WithProxyAPIKeys_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [
+		{"name": "team-a", "key": "key-1"},
+		{"name": "team-b", "key": "key-2", "max_requests_per_minute": 60}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "additional proxy keys:   2") {
+		t.Fatalf("stdout missing additional proxy keys count: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "key-1") || strings.Contains(stdout.String(), "key-2") {
+		t.Fatalf("stdout leaked a proxy key value: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_CacheTTLSeconds_NegativeReportsProblem proves a
 // negative cache_ttl_seconds is rejected, same as every other numeric
 // field in the config.

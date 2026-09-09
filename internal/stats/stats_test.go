@@ -663,3 +663,131 @@ func TestSnapshot_PerTargetString_IncludesAvgLatency(t *testing.T) {
 		t.Errorf("PerTargetString() = %q, want target b (no observations) to omit avg-latency", rendered)
 	}
 }
+
+func TestStats_RecordClient_TracksAllowBlockRedactRateLimitedSeparatelyPerClient(t *testing.T) {
+	s := stats.New()
+	s.RecordClientAllow("team-a")
+	s.RecordClientAllow("team-a")
+	s.RecordClientBlock("team-a")
+	s.RecordClientRedact("team-b")
+	s.RecordClientRateLimited("team-b")
+	s.RecordClientRateLimited("team-b")
+
+	snap := s.Snapshot()
+	teamA, ok := snap.PerClient["team-a"]
+	if !ok {
+		t.Fatalf("PerClient missing team-a: %+v", snap.PerClient)
+	}
+	if teamA.Allowed != 2 || teamA.Blocked != 1 || teamA.Redacted != 0 || teamA.RateLimited != 0 {
+		t.Errorf("PerClient[team-a] = %+v, want allowed=2 blocked=1", teamA)
+	}
+
+	teamB, ok := snap.PerClient["team-b"]
+	if !ok {
+		t.Fatalf("PerClient missing team-b: %+v", snap.PerClient)
+	}
+	if teamB.Redacted != 1 || teamB.RateLimited != 2 || teamB.Allowed != 0 || teamB.Blocked != 0 {
+		t.Errorf("PerClient[team-b] = %+v, want redacted=1 rate-limited=2", teamB)
+	}
+}
+
+func TestStats_RecordClientTokensUsed_TracksAndIgnoresZeroAndNegative(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("team-a", 100)
+	s.RecordClientTokensUsed("team-a", 50)
+	s.RecordClientTokensUsed("team-a", 0)
+	s.RecordClientTokensUsed("team-a", -5)
+
+	snap := s.Snapshot()
+	if got := snap.PerClient["team-a"].TotalTokens; got != 150 {
+		t.Errorf("PerClient[team-a].TotalTokens = %d, want 150 (zero/negative ignored)", got)
+	}
+}
+
+// TestStats_RecordClient_IgnoresEmptyClientLabel proves every
+// RecordClient* method is a deliberate no-op for an empty client label
+// — the "no proxy key configured at all" case, where there's nothing
+// meaningful to attribute a request to.
+func TestStats_RecordClient_IgnoresEmptyClientLabel(t *testing.T) {
+	s := stats.New()
+	s.RecordClientAllow("")
+	s.RecordClientBlock("")
+	s.RecordClientRedact("")
+	s.RecordClientRateLimited("")
+	s.RecordClientTokensUsed("", 100)
+
+	snap := s.Snapshot()
+	if len(snap.PerClient) != 0 {
+		t.Errorf("PerClient = %+v, want empty — an empty client label must never create a bucket", snap.PerClient)
+	}
+}
+
+func TestClientSnapshot_EstimatedCost(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("team-a", 1000)
+
+	snap := s.Snapshot()
+	got := snap.PerClient["team-a"].EstimatedCost(0.03)
+	if got != 0.03 {
+		t.Errorf("EstimatedCost = %g, want 0.03", got)
+	}
+}
+
+func TestSnapshot_PerClientString_EmptyWithNoClients(t *testing.T) {
+	empty := stats.Snapshot{}
+	if got := empty.PerClientString(0); got != "" {
+		t.Errorf("PerClientString() with no clients = %q, want \"\"", got)
+	}
+}
+
+// TestSnapshot_PerClientString_RendersSingleClient proves it shows a
+// breakdown even for exactly one client, same reasoning as
+// PerRuleString: the overall totals already conflate every caller
+// together, so one client's own numbers are never redundant.
+func TestSnapshot_PerClientString_RendersSingleClient(t *testing.T) {
+	snap := stats.Snapshot{PerClient: map[string]stats.ClientSnapshot{
+		"default": {Allowed: 3, TotalTokens: 100},
+	}}
+
+	rendered := snap.PerClientString(0)
+	if !strings.HasPrefix(rendered, "=== per-client breakdown ===") {
+		t.Fatalf("PerClientString() = %q, want it to start with the breakdown header", rendered)
+	}
+	if !strings.Contains(rendered, "[default] allowed=3 blocked=0 redacted=0 rate-limited=0 tokens=100") {
+		t.Errorf("PerClientString() missing correct default line: %q", rendered)
+	}
+}
+
+func TestSnapshot_PerClientString_RendersSortedBreakdownWithCost(t *testing.T) {
+	snap := stats.Snapshot{PerClient: map[string]stats.ClientSnapshot{
+		"team-b": {Allowed: 2, TotalTokens: 10},
+		"team-a": {Allowed: 1, Blocked: 1, TotalTokens: 30},
+	}}
+
+	rendered := snap.PerClientString(0.02)
+
+	teamAIdx := strings.Index(rendered, "[team-a]")
+	teamBIdx := strings.Index(rendered, "[team-b]")
+	if teamAIdx == -1 || teamBIdx == -1 {
+		t.Fatalf("PerClientString() = %q, missing one of the client lines", rendered)
+	}
+	if teamBIdx < teamAIdx {
+		t.Errorf("PerClientString() = %q, want team-a before team-b (sorted)", rendered)
+	}
+	if !strings.Contains(rendered, "[team-a] allowed=1 blocked=1 redacted=0 rate-limited=0 tokens=30 cost=0.0006") {
+		t.Errorf("PerClientString() missing correct team-a line: %q", rendered)
+	}
+	if !strings.Contains(rendered, "[team-b] allowed=2 blocked=0 redacted=0 rate-limited=0 tokens=10 cost=0.0002") {
+		t.Errorf("PerClientString() missing correct team-b line: %q", rendered)
+	}
+}
+
+func TestSnapshot_PerClientString_OmitsCostWhenRateIsZero(t *testing.T) {
+	snap := stats.Snapshot{PerClient: map[string]stats.ClientSnapshot{
+		"team-a": {Allowed: 1, TotalTokens: 10},
+	}}
+	rendered := snap.PerClientString(0)
+	if strings.Contains(rendered, "cost=") {
+		t.Errorf("PerClientString(0) = %q, want no cost field when the rate is zero", rendered)
+	}
+}

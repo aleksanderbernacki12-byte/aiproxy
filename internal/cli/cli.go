@@ -124,6 +124,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.WebhookURL = lc.webhookURL
 	server.Webhooks = lc.webhooks
 	server.ProxyAPIKey = lc.proxyAPIKey
+	server.ProxyAPIKeys = lc.proxyAPIKeys
 	server.LogFile = lc.logFile
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.targets, r.limiter)
@@ -181,6 +182,16 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// Deliberately never prints the key itself, same discipline
 			// as the webhook URL above.
 			fmt.Fprintln(stdout, "proxy authentication: required (Proxy-Authorization: Bearer <key>)")
+		}
+		if len(lc.proxyAPIKeys) > 0 {
+			// Names identify a key in stats/logs and aren't secret, but
+			// the keys themselves get the same treatment as the
+			// anonymous one above — counts and names only.
+			names := make([]string, len(lc.proxyAPIKeys))
+			for i, k := range lc.proxyAPIKeys {
+				names[i] = k.Name
+			}
+			fmt.Fprintf(stdout, "additional named proxy keys: %d (%s)\n", len(lc.proxyAPIKeys), strings.Join(names, ", "))
 		}
 		if cfg.LogFile != "" {
 			fmt.Fprintf(stdout, "log file: %s (JSON lines, reopened on SIGHUP)\n", cfg.LogFile)
@@ -264,7 +275,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.logFile, routes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes)
 
 	label := loadedFrom
 	if label == "" {
@@ -286,6 +297,7 @@ type liveConfig struct {
 	webhookURL   *url.URL
 	webhooks     []proxy.WebhookTarget
 	proxyAPIKey  string
+	proxyAPIKeys []proxy.ProxyKey
 	logFile      *os.File
 	routes       []targetRoute
 }
@@ -338,6 +350,10 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	lc.webhooks = webhooks
 
 	lc.proxyAPIKey = cfg.ProxyAPIKey
+
+	proxyAPIKeys, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys)
+	errs = append(errs, proxyKeyErrs...)
+	lc.proxyAPIKeys = proxyAPIKeys
 
 	if cfg.LogFile != "" {
 		logFile, err := openLogFile(cfg.LogFile)
@@ -626,6 +642,10 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	for _, e := range webhookErrs {
 		problems = append(problems, e.Error())
 	}
+	_, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys)
+	for _, e := range proxyKeyErrs {
+		problems = append(problems, e.Error())
+	}
 	if cfg.LogFile != "" {
 		if f, err := openLogFile(cfg.LogFile); err != nil {
 			problems = append(problems, err.Error())
@@ -658,6 +678,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  path rules:              %d\n", len(cfg.PathRules))
 	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
 	fmt.Fprintf(stdout, "  proxy authentication:    %v\n", cfg.ProxyAPIKey != "")
+	fmt.Fprintf(stdout, "  additional proxy keys:   %d\n", len(cfg.ProxyAPIKeys))
 	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
 }
@@ -1007,6 +1028,60 @@ func compileTargetURLs(prefix string, t config.Target) ([]*url.URL, []error) {
 		return nil, errs
 	}
 	return urls, nil
+}
+
+// compileProxyAPIKeys validates and resolves the config file's
+// proxy_api_keys list into proxy.ProxyKey values, ready for
+// Server.ProxyAPIKeys — same shape and rigor as compileTargetRoutes:
+// every entry needs a non-empty, unique name (it's the stats/log
+// attribution label, so a collision would silently merge two different
+// callers' numbers together — "default" is reserved for the anonymous
+// top-level proxy_api_key, so it's rejected here too) and a non-empty,
+// unique key; max_requests_per_minute, if set, must not be negative and
+// compiles into that key's own dedicated limiter, checked instead of
+// whatever route/global limiter would otherwise apply for that caller.
+func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry) ([]proxy.ProxyKey, []error) {
+	compiled := make([]proxy.ProxyKey, 0, len(entries))
+	var errs []error
+	seenNames := make(map[string]bool, len(entries))
+	seenKeys := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.Name == "" {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: name must not be empty"))
+			continue
+		}
+		if e.Name == "default" {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: name %q is reserved for the anonymous top-level proxy_api_key", e.Name))
+			continue
+		}
+		if seenNames[e.Name] {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: duplicate name %q (stats would merge under one label)", e.Name))
+			continue
+		}
+		seenNames[e.Name] = true
+
+		if e.Key == "" {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: key must not be empty", e.Name))
+			continue
+		}
+		if seenKeys[e.Key] {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: key duplicates an earlier entry's (whichever is checked first would silently claim every request)", e.Name))
+			continue
+		}
+		seenKeys[e.Key] = true
+
+		if e.MaxRequestsPerMinute < 0 {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: max_requests_per_minute %d must not be negative", e.Name, e.MaxRequestsPerMinute))
+			continue
+		}
+
+		pk := proxy.ProxyKey{Name: e.Name, Key: e.Key}
+		if e.MaxRequestsPerMinute > 0 {
+			pk.Limiter = limiter.New(e.MaxRequestsPerMinute, time.Minute)
+		}
+		compiled = append(compiled, pk)
+	}
+	return compiled, errs
 }
 
 func printUsage(w io.Writer) {

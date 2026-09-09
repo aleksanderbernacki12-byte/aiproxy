@@ -76,6 +76,26 @@ type WebhookTarget struct {
 	Events []string `json:"events,omitempty"`
 }
 
+// ProxyAPIKeyEntry is one additional named proxy key, alongside the
+// top-level ProxyAPIKey, as it appears in the config file.
+type ProxyAPIKeyEntry struct {
+	// Name identifies this key in stats, logs, and webhook payloads —
+	// never the key itself. Must be non-empty and unique among every
+	// entry (and can't be "default", reserved for the anonymous
+	// top-level ProxyAPIKey) — a collision would silently merge two
+	// different callers' attributed numbers together.
+	Name string `json:"name"`
+	Key  string `json:"key"`
+
+	// MaxRequestsPerMinute, if greater than zero, gives this key its own
+	// dedicated rate limit — checked instead of whatever route or the
+	// server-wide limiter would otherwise apply, since a caller's own
+	// budget is authoritative regardless of which route they hit. Zero
+	// (the default) means this key shares whatever route/global limiter
+	// would otherwise apply, same as before this field existed.
+	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
+}
+
 // Target is one path-prefix-to-upstream mapping for multi-target
 // routing, as it appears in the config file, before URL/URLs has been
 // parsed.
@@ -225,6 +245,22 @@ type Config struct {
 	// entirely — anyone who can reach the proxy's listen address can use
 	// it, same as before this field existed.
 	ProxyAPIKey string `json:"proxy_api_key,omitempty"`
+
+	// ProxyAPIKeys lists additional named proxy keys beyond ProxyAPIKey
+	// — so several agents/teams can share one proxy while each getting
+	// their own attributed stats and token/cost tracking (see
+	// GET /_aiproxy/stats' per_client field) and, if given their own
+	// max_requests_per_minute, their own dedicated rate limit that takes
+	// precedence over whatever route or the server-wide limiter would
+	// otherwise apply for that caller. Every request must present
+	// ProxyAPIKey (if set) or one of these; ProxyAPIKey keeps working
+	// completely unchanged (a single, anonymous key labeled "default" in
+	// stats) and can be freely combined with ProxyAPIKeys, the same
+	// relationship WebhookURL has to Webhooks. An empty slice (the
+	// default when the field is absent) means ProxyAPIKey alone (or no
+	// auth at all, if that's empty too) is unchanged from before this
+	// field existed.
+	ProxyAPIKeys []ProxyAPIKeyEntry `json:"proxy_api_keys,omitempty"`
 
 	// LogFile, if set, is a path every log event — the same ones printed
 	// to stdout/stderr, plus the shutdown summary — is also appended to,

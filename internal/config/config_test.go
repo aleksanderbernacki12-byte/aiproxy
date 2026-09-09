@@ -262,6 +262,48 @@ func TestLoad_ProxyAPIKeyDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesProxyAPIKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [
+		{"name": "team-a", "key": "key-1"},
+		{"name": "team-b", "key": "key-2", "max_requests_per_minute": 60}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.ProxyAPIKeys) != 2 {
+		t.Fatalf("len(ProxyAPIKeys) = %d, want 2", len(cfg.ProxyAPIKeys))
+	}
+	if cfg.ProxyAPIKeys[0].Name != "team-a" || cfg.ProxyAPIKeys[0].Key != "key-1" {
+		t.Errorf("ProxyAPIKeys[0] = %+v, want name=team-a key=key-1", cfg.ProxyAPIKeys[0])
+	}
+	if cfg.ProxyAPIKeys[1].MaxRequestsPerMinute != 60 {
+		t.Errorf("ProxyAPIKeys[1].MaxRequestsPerMinute = %d, want 60", cfg.ProxyAPIKeys[1].MaxRequestsPerMinute)
+	}
+}
+
+func TestLoad_ProxyAPIKeysDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.ProxyAPIKeys) != 0 {
+		t.Fatalf("ProxyAPIKeys = %v, want empty when absent", cfg.ProxyAPIKeys)
+	}
+}
+
 func TestLoad_ParsesCostBudget(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

@@ -125,6 +125,31 @@ func (c *ruleCounters) snapshot() RuleSnapshot {
 	}
 }
 
+// clientCounters tracks the handful of outcomes attributable to one
+// named proxy API key — see Stats.RecordClientAllow and its siblings.
+// Deliberately a smaller set of fields than the per-target counters:
+// cache hits, failover, latency, and dry-run activity are inherently
+// about the target/route a request happened to go through, not about
+// who called it, so there's nothing meaningful to attribute there per
+// client.
+type clientCounters struct {
+	allowed     atomic.Int64
+	blocked     atomic.Int64
+	redacted    atomic.Int64
+	rateLimited atomic.Int64
+	totalTokens atomic.Int64
+}
+
+func (c *clientCounters) snapshot() ClientSnapshot {
+	return ClientSnapshot{
+		Allowed:     c.allowed.Load(),
+		Blocked:     c.blocked.Load(),
+		Redacted:    c.redacted.Load(),
+		RateLimited: c.rateLimited.Load(),
+		TotalTokens: c.totalTokens.Load(),
+	}
+}
+
 // dryRunCounters tracks how often a dry-run rule matched, overall —
 // never per target, for the same reason as ruleCounters: a dry-run
 // rule's whole point is testing that one rule, not measuring which
@@ -147,6 +172,7 @@ type Stats struct {
 	mu        sync.Mutex
 	perTarget map[string]*counters
 	perRule   map[string]*ruleCounters
+	perClient map[string]*clientCounters
 }
 
 // New creates a Stats with every counter at zero.
@@ -154,6 +180,7 @@ func New() *Stats {
 	return &Stats{
 		perTarget: make(map[string]*counters),
 		perRule:   make(map[string]*ruleCounters),
+		perClient: make(map[string]*clientCounters),
 	}
 }
 
@@ -180,6 +207,62 @@ func (s *Stats) ruleCounterFor(ruleName string) *ruleCounters {
 		s.perRule[ruleName] = c
 	}
 	return c
+}
+
+// clientCounterFor returns the clientCounters for client, creating them
+// on first use.
+func (s *Stats) clientCounterFor(client string) *clientCounters {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.perClient[client]
+	if !ok {
+		c = &clientCounters{}
+		s.perClient[client] = c
+	}
+	return c
+}
+
+// RecordClientAllow, RecordClientBlock, RecordClientRedact,
+// RecordClientRateLimited, and RecordClientTokensUsed are RecordAllow/
+// RecordBlock/RecordRedact/RecordRateLimited/RecordTokensUsed's
+// counterparts attributing the same outcome to a named proxy API key
+// instead of a target — see clientCounters. client is "" whenever no
+// proxy_api_key/proxy_api_keys is configured at all (nothing to
+// attribute to), in which case these are all deliberate no-ops rather
+// than accumulating a meaningless "" bucket.
+func (s *Stats) RecordClientAllow(client string) {
+	if client == "" {
+		return
+	}
+	s.clientCounterFor(client).allowed.Add(1)
+}
+
+func (s *Stats) RecordClientBlock(client string) {
+	if client == "" {
+		return
+	}
+	s.clientCounterFor(client).blocked.Add(1)
+}
+
+func (s *Stats) RecordClientRedact(client string) {
+	if client == "" {
+		return
+	}
+	s.clientCounterFor(client).redacted.Add(1)
+}
+
+func (s *Stats) RecordClientRateLimited(client string) {
+	if client == "" {
+		return
+	}
+	s.clientCounterFor(client).rateLimited.Add(1)
+}
+
+func (s *Stats) RecordClientTokensUsed(client string, n int) {
+	if client == "" || n <= 0 {
+		return
+	}
+	s.clientCounterFor(client).totalTokens.Add(int64(n))
 }
 
 // RecordAllow records one request that passed rules and the rate
@@ -380,6 +463,26 @@ type RuleSnapshot struct {
 	ResponseDryRunRedacted int64 `json:"response_dry_run_redacted"`
 }
 
+// ClientSnapshot is a point-in-time copy of one named proxy API key's
+// attributed activity — see Stats.RecordClientAllow. A smaller set of
+// fields than Snapshot: cache hits, failover, latency, and dry-run
+// activity are inherently about the target/route a request happened to
+// go through, not who called it, so there's nothing to attribute there
+// per client.
+type ClientSnapshot struct {
+	Allowed     int64 `json:"allowed"`
+	Blocked     int64 `json:"blocked"`
+	Redacted    int64 `json:"redacted"`
+	RateLimited int64 `json:"rate_limited"`
+	TotalTokens int64 `json:"total_tokens"`
+}
+
+// EstimatedCost prices TotalTokens at costPer1KTokens, the same unit
+// conversion as Snapshot.EstimatedCost.
+func (c ClientSnapshot) EstimatedCost(costPer1KTokens float64) float64 {
+	return float64(c.TotalTokens) / 1000 * costPer1KTokens
+}
+
 // Snapshot is a point-in-time copy of the counters, safe to read and
 // print without further synchronization. PerTarget holds the same
 // breakdown keyed by target name; a Snapshot inside PerTarget never has
@@ -432,10 +535,15 @@ type Snapshot struct {
 
 	PerTarget map[string]Snapshot     `json:"per_target,omitempty"`
 	PerRule   map[string]RuleSnapshot `json:"per_rule,omitempty"`
+
+	// PerClient holds a breakdown keyed by named proxy API key instead of
+	// target or rule — see ClientSnapshot. Empty whenever no
+	// proxy_api_key/proxy_api_keys is configured at all.
+	PerClient map[string]ClientSnapshot `json:"per_client,omitempty"`
 }
 
 // Snapshot returns the current value of every counter, overall, per
-// target, and per rule.
+// target, per rule, and per client.
 func (s *Stats) Snapshot() Snapshot {
 	s.mu.Lock()
 	perTarget := make(map[string]Snapshot, len(s.perTarget))
@@ -445,6 +553,10 @@ func (s *Stats) Snapshot() Snapshot {
 	perRule := make(map[string]RuleSnapshot, len(s.perRule))
 	for name, c := range s.perRule {
 		perRule[name] = c.snapshot()
+	}
+	perClient := make(map[string]ClientSnapshot, len(s.perClient))
+	for name, c := range s.perClient {
+		perClient[name] = c.snapshot()
 	}
 	s.mu.Unlock()
 
@@ -456,6 +568,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.Unauthorized = s.unauthorized.Load()
 	snap.PerTarget = perTarget
 	snap.PerRule = perRule
+	snap.PerClient = perClient
 	return snap
 }
 
@@ -570,6 +683,36 @@ func (s Snapshot) PerRuleString() string {
 		if r.DryRunBlocked > 0 || r.DryRunRedacted > 0 || r.ResponseDryRunBlocked > 0 || r.ResponseDryRunRedacted > 0 {
 			fmt.Fprintf(&b, " dry-run-blocked=%d dry-run-redacted=%d dry-run-response-blocked=%d dry-run-response-redacted=%d",
 				r.DryRunBlocked, r.DryRunRedacted, r.ResponseDryRunBlocked, r.ResponseDryRunRedacted)
+		}
+	}
+	return b.String()
+}
+
+// PerClientString renders a per-client breakdown, sorted by client
+// name, pricing each client's tokens at costPer1KTokens (omitted when
+// zero) — same shape and reasoning as PerRuleString: shown even for a
+// single client, since the overall totals already conflate every caller
+// together. Returns "" when no proxy_api_key/proxy_api_keys traffic has
+// ever been recorded.
+func (s Snapshot) PerClientString(costPer1KTokens float64) string {
+	if len(s.PerClient) == 0 {
+		return ""
+	}
+
+	names := make([]string, 0, len(s.PerClient))
+	for name := range s.PerClient {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString("=== per-client breakdown ===")
+	for _, name := range names {
+		c := s.PerClient[name]
+		fmt.Fprintf(&b, "\n[%s] allowed=%d blocked=%d redacted=%d rate-limited=%d tokens=%d",
+			name, c.Allowed, c.Blocked, c.Redacted, c.RateLimited, c.TotalTokens)
+		if costPer1KTokens > 0 {
+			fmt.Fprintf(&b, " cost=%.4f", c.EstimatedCost(costPer1KTokens))
 		}
 	}
 	return b.String()
