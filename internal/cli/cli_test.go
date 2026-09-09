@@ -1357,6 +1357,191 @@ func TestExecute_Validate_ValidConfig_CacheEnabledNoTTL_ReturnsZero(t *testing.T
 	}
 }
 
+// TestExecute_Validate_ModelRoutes_EmptyNameReportsProblem proves an
+// entry with no name is rejected — it's the stats/log attribution
+// label, so it can't be blank.
+func TestExecute_Validate_ModelRoutes_EmptyNameReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [{"name": "", "models": ["claude-*"], "url": "https://api.anthropic.com"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "name must not be empty") {
+		t.Errorf("stderr missing the empty-name problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ModelRoutes_DuplicateNameReportsProblem proves
+// two entries can't share a name — it would silently merge two
+// different upstreams' attributed stats together.
+func TestExecute_Validate_ModelRoutes_DuplicateNameReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com"},
+		{"name": "anthropic", "models": ["claude-3-*"], "url": "https://backup.anthropic.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "duplicate name") {
+		t.Errorf("stderr missing the duplicate-name problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ModelRoutes_EmptyModelsReportsProblem proves an
+// entry with no models list is rejected — nothing for it to ever match.
+func TestExecute_Validate_ModelRoutes_EmptyModelsReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [{"name": "anthropic", "models": [], "url": "https://api.anthropic.com"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "at least one pattern") {
+		t.Errorf("stderr missing the empty-models problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ModelRoutes_InvalidGlobPatternReportsProblem
+// proves a syntactically malformed glob (an unterminated character
+// class) is caught at validate time rather than silently never matching
+// anything at request time.
+func TestExecute_Validate_ModelRoutes_InvalidGlobPatternReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [{"name": "anthropic", "models": ["claude-["], "url": "https://api.anthropic.com"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "not a valid glob pattern") {
+		t.Errorf("stderr missing the invalid-glob problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ModelRoutes_DuplicatePatternReportsProblem
+// proves the same literal model pattern can't appear in two different
+// routes — the second would be permanently unreachable, since routes
+// are checked in order and the first match wins.
+func TestExecute_Validate_ModelRoutes_DuplicatePatternReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "anthropic", "models": ["claude-3-opus"], "url": "https://api.anthropic.com"},
+		{"name": "anthropic-backup", "models": ["claude-3-opus"], "url": "https://backup.anthropic.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "duplicates an earlier route") {
+		t.Errorf("stderr missing the duplicate-pattern problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ModelRoutes_URLAndURLsMutuallyExclusiveReportsProblem
+// proves a model route can't set both url and urls, same rule as a
+// targets entry.
+func TestExecute_Validate_ModelRoutes_URLAndURLsMutuallyExclusiveReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com", "urls": ["https://backup.anthropic.com"]}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "mutually exclusive") {
+		t.Errorf("stderr missing the mutually-exclusive problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ModelRoutes_NegativeMaxRequestsPerMinuteReportsProblem
+// proves the per-route rate limit override can't be negative.
+func TestExecute_Validate_ModelRoutes_NegativeMaxRequestsPerMinuteReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com", "max_requests_per_minute": -5}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "max_requests_per_minute") {
+		t.Errorf("stderr missing the negative-rate-limit problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithModelRoutes_ReturnsZero proves a
+// well-formed model_routes list passes validation and is reflected in
+// the summary by count.
+func TestExecute_Validate_ValidConfig_WithModelRoutes_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com"},
+		{"name": "openai", "models": ["gpt-*", "o1*"], "urls": ["https://api.openai.com", "https://backup.openai.com"], "max_requests_per_minute": 60}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "model routes:            2") {
+		t.Fatalf("stdout missing model routes count: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_ReportsEffectiveMaxBodySize proves the summary
 // shows what max_body_size_bytes actually resolves to: the configured
 // value when set, or proxy.DefaultMaxBodyBytes when it's left at its

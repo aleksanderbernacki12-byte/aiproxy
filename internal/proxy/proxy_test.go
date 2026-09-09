@@ -3088,7 +3088,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	})
+	}, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -3150,7 +3150,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil)
 		}
 	}()
 
@@ -4092,7 +4092,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -5319,7 +5319,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -5651,7 +5651,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -6025,7 +6025,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7081,7 +7081,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -7163,5 +7163,439 @@ func TestServer_LogFile_WriteFailureNeverAffectsClientResponse(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d (a broken log file must never affect the client response)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_ModelRouting_RoutesByBodyModelFieldAndLeavesPathUnchanged
+// proves AddModelRoute's core contract: a request whose JSON body's
+// "model" field matches a registered glob pattern is forwarded to that
+// route's target, with the client's own path left completely unchanged
+// (unlike path-prefix routing, there is no prefix to strip).
+func TestServer_ModelRouting_RoutesByBodyModelFieldAndLeavesPathUnchanged(t *testing.T) {
+	var anthropicPath, openaiPath, defaultPath string
+
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthropicPath = r.URL.Path
+		w.Write([]byte("anthropic response"))
+	}))
+	defer anthropic.Close()
+
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openaiPath = r.URL.Path
+		w.Write([]byte("openai response"))
+	}))
+	defer openai.Close()
+
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultPath = r.URL.Path
+		w.Write([]byte("default response"))
+	}))
+	defer defaultUpstream.Close()
+
+	anthropicURL, err := url.Parse(anthropic.URL)
+	if err != nil {
+		t.Fatalf("parse anthropic url: %v", err)
+	}
+	openaiURL, err := url.Parse(openai.URL)
+	if err != nil {
+		t.Fatalf("parse openai url: %v", err)
+	}
+	defaultURL, err := url.Parse(defaultUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse default url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", defaultURL, engine)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{anthropicURL}, nil)
+	srv.AddModelRoute("openai", []string{"gpt-*", "o1*"}, []*url.URL{openaiURL}, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(path, model string) string {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(`{"model":"`+model+`","messages":[]}`))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("post %s: read body: %v", path, err)
+		}
+		return string(body)
+	}
+
+	if got := post("/v1/messages", "claude-3-opus-20240229"); got != "anthropic response" {
+		t.Fatalf("model claude-3-opus-20240229 body = %q, want the anthropic upstream's response", got)
+	}
+	if anthropicPath != "/v1/messages" {
+		t.Fatalf("anthropic upstream saw path %q, want /v1/messages unchanged (model routing never strips a prefix)", anthropicPath)
+	}
+
+	if got := post("/v1/chat/completions", "gpt-4o"); got != "openai response" {
+		t.Fatalf("model gpt-4o body = %q, want the openai upstream's response", got)
+	}
+	if openaiPath != "/v1/chat/completions" {
+		t.Fatalf("openai upstream saw path %q, want /v1/chat/completions unchanged", openaiPath)
+	}
+
+	if got := post("/v1/chat/completions", "o1-preview"); got != "openai response" {
+		t.Fatalf("model o1-preview body = %q, want the openai upstream's response (matches the o1* pattern)", got)
+	}
+
+	if got := post("/v1/embeddings", "text-embedding-3-small"); got != "default response" {
+		t.Fatalf("unmatched model body = %q, want the default target's response", got)
+	}
+	if defaultPath != "/v1/embeddings" {
+		t.Fatalf("default upstream saw path %q, want /v1/embeddings unchanged", defaultPath)
+	}
+}
+
+// TestServer_ModelRouting_TakesPriorityOverPathPrefixRouting proves the
+// documented precedence: when both a model route and a path-prefix
+// route could apply to the same request, the model route wins and
+// path-prefix routing is skipped entirely for that request.
+func TestServer_ModelRouting_TakesPriorityOverPathPrefixRouting(t *testing.T) {
+	var modelRouteHit, pathRouteHit bool
+
+	modelUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelRouteHit = true
+		w.Write([]byte("model route response"))
+	}))
+	defer modelUpstream.Close()
+
+	pathUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathRouteHit = true
+		w.Write([]byte("path route response"))
+	}))
+	defer pathUpstream.Close()
+
+	modelURL, err := url.Parse(modelUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse model url: %v", err)
+	}
+	pathURL, err := url.Parse(pathUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse path url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", pathURL, engine)
+	srv.AddRoute("/v1", []*url.URL{pathURL}, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-3-opus"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	if string(body) != "model route response" {
+		t.Fatalf("body = %q, want the model route's response (it must take priority over the matching /v1 path route)", string(body))
+	}
+	if !modelRouteHit || pathRouteHit {
+		t.Fatalf("modelRouteHit=%v pathRouteHit=%v, want only the model route hit", modelRouteHit, pathRouteHit)
+	}
+}
+
+// TestServer_ModelRouting_FirstMatchingRouteWinsInConfiguredOrder
+// proves that when more than one registered route's pattern could match
+// a model name, the first one added wins — same "first match, in
+// order" rule as path-prefix routes and webhook event filters.
+func TestServer_ModelRouting_FirstMatchingRouteWinsInConfiguredOrder(t *testing.T) {
+	var firstHit, secondHit bool
+
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHit = true
+		w.Write([]byte("first"))
+	}))
+	defer first.Close()
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHit = true
+		w.Write([]byte("second"))
+	}))
+	defer second.Close()
+
+	firstURL, err := url.Parse(first.URL)
+	if err != nil {
+		t.Fatalf("parse first url: %v", err)
+	}
+	secondURL, err := url.Parse(second.URL)
+	if err != nil {
+		t.Fatalf("parse second url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", firstURL, engine)
+	srv.AddModelRoute("first", []string{"claude-*"}, []*url.URL{firstURL}, nil)
+	srv.AddModelRoute("second", []string{"claude-3-*"}, []*url.URL{secondURL}, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-3-opus"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if string(body) != "first" || !firstHit || secondHit {
+		t.Fatalf("body = %q firstHit=%v secondHit=%v, want only the first-registered matching route hit", string(body), firstHit, secondHit)
+	}
+}
+
+// TestServer_ModelRouting_PerTargetStatsLabeledByModelRouteName proves a
+// model route's traffic is attributed in Server.Stats.Snapshot().PerTarget
+// under "model:<name>" — distinct from a path prefix's own label, so the
+// two routing mechanisms can never collide in stats even if configured
+// with overlapping-looking names.
+func TestServer_ModelRouting_PerTargetStatsLabeledByModelRouteName(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", upstreamURL, engine)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-3-opus"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	snap := srv.Stats.Snapshot()
+	modelSnap, ok := snap.PerTarget["model:anthropic"]
+	if !ok {
+		keys := make([]string, 0, len(snap.PerTarget))
+		for k := range snap.PerTarget {
+			keys = append(keys, k)
+		}
+		t.Fatalf("PerTarget missing \"model:anthropic\" key; got keys %v", keys)
+	}
+	if modelSnap.Allowed != 1 {
+		t.Fatalf("PerTarget[model:anthropic].Allowed = %d, want 1", modelSnap.Allowed)
+	}
+}
+
+// TestServer_ModelRouting_OwnRateLimitTakesPrecedenceOverServerWide
+// proves a model route's own dedicated Limiter, if set, is what
+// actually gets enforced — not the server-wide one — mirroring the same
+// precedence a path-prefix route's own Limiter already has.
+func TestServer_ModelRouting_OwnRateLimitTakesPrecedenceOverServerWide(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", upstreamURL, engine)
+	// The server-wide limiter is generous; the model route's own is not
+	// — if the route's own limiter isn't what's actually enforced, this
+	// request would never be rate-limited within the test.
+	srv.Limiter = limiter.New(1000, time.Minute)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, limiter.New(1, time.Minute))
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() int {
+		resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-3-opus"}`))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := post(); got != http.StatusOK {
+		t.Fatalf("first request status = %d, want %d", got, http.StatusOK)
+	}
+	if got := post(); got != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (the model route's own 1/minute limit should have tripped)", got, http.StatusTooManyRequests)
+	}
+}
+
+// TestServer_ModelRouting_FailoverAcrossCandidatesWorksLikePathRoutes
+// proves a model route's ordered urls list fails over exactly like a
+// path-prefix route's does: an unreachable first candidate falls
+// through to the second, and the client never sees the failure.
+func TestServer_ModelRouting_FailoverAcrossCandidatesWorksLikePathRoutes(t *testing.T) {
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("working"))
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse working url: %v", err)
+	}
+
+	unreachable, err := url.Parse("https://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse unreachable url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", workingURL, engine)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{unreachable, workingURL}, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-3-opus"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "working" {
+		t.Fatalf("body = %q, want the second (working) candidate's response after the first proved unreachable", string(body))
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.PerTarget["model:anthropic"].Failover != 1 {
+		t.Fatalf("PerTarget[model:anthropic].Failover = %d, want 1", snap.PerTarget["model:anthropic"].Failover)
+	}
+}
+
+// TestServer_ModelRouting_UnparseableOrMissingModelFieldFallsBackToPathRouting
+// proves a request with no "model" field, or a body that isn't even
+// valid JSON, never errors out — it just falls back to whatever
+// path-prefix routing (or the default Target) would otherwise apply,
+// exactly as if no model routes were configured at all.
+func TestServer_ModelRouting_UnparseableOrMissingModelFieldFallsBackToPathRouting(t *testing.T) {
+	var defaultHits int
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultHits++
+		w.Write([]byte("default"))
+	}))
+	defer defaultUpstream.Close()
+	defaultURL, err := url.Parse(defaultUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	modelUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("model"))
+	}))
+	defer modelUpstream.Close()
+	modelURL, err := url.Parse(modelUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse model url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", defaultURL, engine)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(body string) (int, string) {
+		resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		got, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp.StatusCode, string(got)
+	}
+
+	if status, got := post(`{"messages":[]}`); status != http.StatusOK || got != "default" {
+		t.Fatalf("no model field: status=%d body=%q, want 200/default", status, got)
+	}
+	if status, got := post(`not valid json`); status != http.StatusOK || got != "default" {
+		t.Fatalf("invalid JSON body: status=%d body=%q, want 200/default (never an error)", status, got)
+	}
+	if defaultHits != 2 {
+		t.Fatalf("defaultHits = %d, want 2", defaultHits)
+	}
+}
+
+// TestServer_ReloadConfig_SwapsModelRoutesLive proves a SIGHUP-style
+// ReloadConfig can add a model route to a server that started with
+// none — the same "swap under one lock" guarantee already proven for
+// path-prefix routes.
+func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("routed"))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("default"))
+	}))
+	defer defaultUpstream.Close()
+	defaultURL, err := url.Parse(defaultUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse default url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", defaultURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() string {
+		resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-3-opus"}`))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body)
+	}
+
+	if got := post(); got != "default" {
+		t.Fatalf("before reload: body = %q, want default (no model route registered yet)", got)
+	}
+
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
+		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
+	})
+
+	if got := post(); got != "routed" {
+		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
 	}
 }

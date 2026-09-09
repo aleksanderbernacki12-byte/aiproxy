@@ -19,6 +19,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -138,6 +139,17 @@ type route struct {
 	limiter *limiter.Limiter
 }
 
+// modelRoute is one model-name-to-upstream mapping for content-based
+// routing (see resolveModelRoute). targets and limiter behave exactly
+// like route's fields; models is a non-empty list of path.Match glob
+// patterns checked, in order, against the request body's "model" field.
+type modelRoute struct {
+	name    string
+	models  []string
+	targets []*url.URL
+	limiter *limiter.Limiter
+}
+
 // statsPath is a reserved, proxy-internal path: a GET request to it never
 // reaches any upstream target. It is handled directly by ServeHTTP, ahead
 // of caching, rules, and the rate limiter, so it stays reachable for
@@ -235,6 +247,7 @@ type Server struct {
 	Cache           *cache.Cache     // nil disables the response cache
 	CostPer1KTokens float64          // zero omits the shutdown summary's cost line
 	routes          []route
+	modelRoutes     []modelRoute
 
 	// CostBudget, if greater than zero, is a threshold in the same units
 	// as CostPer1KTokens; once the running total cost reaches or passes
@@ -536,6 +549,61 @@ func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath stri
 	return []*url.URL{s.Target}, path, "default", s.Limiter
 }
 
+// AddModelRoute registers a content-based route: any request whose
+// body's top-level "model" field matches one of models (path.Match glob
+// syntax) is forwarded to the first URL in targets instead, with the
+// request's own path left completely unchanged — unlike AddRoute, there
+// is no prefix to strip, since a model route is about *which* upstream
+// gets the traffic, not *which URL space* the client used to ask for
+// it. name identifies this route in stats/logs, prefixed with "model:"
+// to keep it visually and collision-free distinct from a path prefix's
+// own label. See resolveModelRoute for matching order and precedence
+// over path-prefix routes.
+func (s *Server) AddModelRoute(name string, models []string, targets []*url.URL, lim *limiter.Limiter) {
+	s.modelRoutes = append(s.modelRoutes, modelRoute{name: name, models: models, targets: targets, limiter: lim})
+}
+
+// modelField pulls just the top-level "model" string out of a request
+// body for resolveModelRoute — every other field is ignored, and a body
+// that isn't a JSON object (or has no "model" field) simply resolves to
+// an empty string, never an error.
+type modelField struct {
+	Model string `json:"model"`
+}
+
+// resolveModelRoute checks body's "model" field against every
+// registered model route, in the order they were added, and returns the
+// first match's candidate targets, stats/log label ("model:" plus the
+// route's own name), and rate limiter. matched is false — and every
+// other return value is a zero value — when no model route is
+// registered at all, the body has no (or an unparseable) "model" field,
+// or no registered route's patterns match it; the caller falls back to
+// resolveRoute(path) in that case. Checked before path-prefix routing:
+// a model route represents a deliberate, explicit routing decision by
+// the operator, so when one is configured and matches, it takes
+// priority over whatever path the client happened to use.
+func (s *Server) resolveModelRoute(body []byte) (targets []*url.URL, label string, lim *limiter.Limiter, matched bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.modelRoutes) == 0 {
+		return nil, "", nil, false
+	}
+
+	var mf modelField
+	if err := json.Unmarshal(body, &mf); err != nil || mf.Model == "" {
+		return nil, "", nil, false
+	}
+
+	for _, r := range s.modelRoutes {
+		for _, pattern := range r.models {
+			if ok, err := path.Match(pattern, mf.Model); err == nil && ok {
+				return r.targets, "model:" + r.name, r.limiter, true
+			}
+		}
+	}
+	return nil, "", nil, false
+}
+
 // getEngine, getCache, getCostPer1KTokens, and getWebhookURL are small
 // locked accessors for the fields ReloadConfig can change at runtime,
 // used everywhere they're read outside of resolveRoute (which takes the
@@ -611,11 +679,26 @@ type Route struct {
 	Limiter *limiter.Limiter
 }
 
+// ModelRoute describes one model-name-to-upstream mapping for
+// ReloadConfig, mirroring what AddModelRoute registers before the
+// server starts serving. Targets must be non-empty; Models must be
+// non-empty. See resolveModelRoute for matching order and precedence
+// over Route's path-prefix matching.
+type ModelRoute struct {
+	Name    string
+	Models  []string
+	Targets []*url.URL
+	// Limiter, if non-nil, gives this route its own dedicated rate
+	// limit instead of sharing whatever Limiter ReloadConfig sets.
+	Limiter *limiter.Limiter
+}
+
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
 // cost-per-1K-tokens rate, cost budget, max request body size, webhook
 // alert URL, additional webhook destinations, proxy API key, additional
-// named proxy keys, log file, and target routes — e.g. after re-reading
-// aiproxy.json on SIGHUP. All of them change together under one lock,
+// named proxy keys, log file, path-prefix routes, and model routes —
+// e.g. after re-reading aiproxy.json on SIGHUP. All of them change
+// together under one lock,
 // so a request in flight never observes a torn mix of old and new
 // configuration; a request takes effect from the moment it's accepted,
 // so anything already being handled keeps running against whatever
@@ -634,10 +717,14 @@ type Route struct {
 // the next reload's fresh handle creates a new file at that same path.
 // The old handle, if any, is closed after the swap — never left open —
 // so a long-running proxy reloaded repeatedly never leaks descriptors.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter}
+	}
+	newModelRoutes := make([]modelRoute, len(modelRoutes))
+	for i, r := range modelRoutes {
+		newModelRoutes[i] = modelRoute{name: r.Name, models: r.Models, targets: r.Targets, limiter: r.Limiter}
 	}
 
 	s.mu.Lock()
@@ -654,6 +741,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.ProxyAPIKeys = proxyAPIKeys
 	s.LogFile = logFile
 	s.routes = newRoutes
+	s.modelRoutes = newModelRoutes
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -794,7 +882,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// failover route), the cache key is still computed against only the
 	// first (primary) one — a stable identity for the route regardless of
 	// which candidate actually ends up serving any one request.
-	targets, forwardPath, targetLabel, effectiveLimiter := s.resolveRoute(r.URL.Path)
+	//
+	// A model route, if configured and matched, takes priority over
+	// path-prefix routing entirely — see resolveModelRoute — and forwards
+	// with the client's own path unchanged, since there's no prefix to
+	// strip.
+	var targets []*url.URL
+	var forwardPath, targetLabel string
+	var effectiveLimiter *limiter.Limiter
+	if mTargets, mLabel, mLimiter, matched := s.resolveModelRoute(body); matched {
+		targets, forwardPath, targetLabel, effectiveLimiter = mTargets, r.URL.Path, mLabel, mLimiter
+	} else {
+		targets, forwardPath, targetLabel, effectiveLimiter = s.resolveRoute(r.URL.Path)
+	}
 	if auth.limiter != nil {
 		// The authenticated key's own rate limit is authoritative for
 		// this caller regardless of which route they hit — takes

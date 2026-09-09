@@ -128,6 +128,42 @@ type Target struct {
 	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
 }
 
+// ModelRoute is one model-name-to-upstream mapping for content-based
+// routing, as it appears in the config file, before URL/URLs has been
+// parsed. Unlike Target, which routes by URL path prefix, a ModelRoute
+// matches the "model" field inside the request body's own JSON — the
+// way a single endpoint fronting several LLM providers (an
+// OpenAI-compatible client pointed at one aiproxy URL, picking its
+// model per request) can still be routed to the right upstream.
+type ModelRoute struct {
+	// Name identifies this route in stats, logs, and webhook payloads —
+	// must be non-empty and unique among every entry.
+	Name string `json:"name"`
+
+	// Models is a non-empty list of glob patterns (path.Match syntax:
+	// "*", "?", "[...]" — the same shape as a shell glob) matched
+	// against the request body's top-level "model" field. Routes are
+	// checked in the order they appear in the file; the first one with
+	// any matching pattern wins, same "first match, in order" rule as
+	// Targets' path prefixes.
+	Models []string `json:"models"`
+
+	// URL is a single upstream — same meaning as Target.URL. Mutually
+	// exclusive with URLs: a route sets exactly one of the two.
+	URL string `json:"url,omitempty"`
+
+	// URLs, set instead of URL, gives this route an ordered failover
+	// list — same meaning and same never-retry-on-5xx safety boundary
+	// as Target.URLs.
+	URLs []string `json:"urls,omitempty"`
+
+	// MaxRequestsPerMinute, if greater than zero, gives this route its
+	// own dedicated rate limit instead of sharing the top-level
+	// max_requests_per_minute limiter with every other target — same
+	// meaning as Target.MaxRequestsPerMinute.
+	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
+}
+
 // Config is the top-level shape of aiproxy.json.
 type Config struct {
 	CustomRules []CustomRule `json:"custom_rules"`
@@ -167,6 +203,15 @@ type Config struct {
 	// prefix stripped. An empty slice (the default when the field is
 	// absent) means every request just goes to the default --target.
 	Targets []Target `json:"targets"`
+
+	// ModelRoutes routes by the request body's own "model" field instead
+	// of by URL path prefix — see ModelRoute. Checked before Targets: if
+	// a request's model matches an entry here, that route is used and
+	// Targets' path-prefix matching is skipped entirely for that
+	// request. An empty slice (the default when the field is absent)
+	// means no request is ever routed this way, same as before this
+	// field existed.
+	ModelRoutes []ModelRoute `json:"model_routes,omitempty"`
 
 	// BuiltinRuleActions overrides the action of one or more of aiproxy's
 	// built-in secret-blocking rules, keyed by rule name (see the CLI's

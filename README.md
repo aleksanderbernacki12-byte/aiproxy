@@ -675,6 +675,49 @@ as forwarding to a single, entirely-down target has always produced —
 this adds a chance to recover before that happens, not a guarantee
 against it.
 
+### Model-based routing
+
+`targets` routes by URL path prefix; `model_routes` routes by the
+request body's own `"model"` field instead — useful when one
+OpenAI-compatible client (or one aiproxy endpoint) sends requests for
+several different providers' models without using a different path
+convention per provider:
+
+```json
+{
+  "model_routes": [
+    { "name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com" },
+    { "name": "openai", "models": ["gpt-*", "o1*"], "url": "https://api.openai.com" }
+  ]
+}
+```
+
+A request whose body is `{"model": "claude-3-opus-20240229", ...}` goes
+to `https://api.anthropic.com`, with the client's own path forwarded
+completely unchanged — unlike `targets[].prefix`, there's no prefix to
+strip, since a model route is about *which upstream* gets the traffic,
+not *which URL space* the client used to ask for it. `models` is a list
+of glob patterns (`path.Match` syntax: `*`, `?`, `[...]` — the same
+shape as a shell glob); routes are checked in the order they're listed,
+first matching pattern wins, same rule as `targets[].prefix`. Every
+`model_routes` entry needs a unique `name` (used as its
+stats/log/metrics label, `model:<name>`) and at least one pattern; the
+same literal pattern can't appear in two different entries, since the
+second would never be reachable.
+
+**Checked before `targets`**, and takes priority over it: if a request's
+model matches a `model_routes` entry, that route is used and path-prefix
+routing is skipped for that request entirely. A request with no `model`
+field, an unparseable body, or a model that matches no configured
+pattern simply falls through to `targets`/`--target` exactly as if
+`model_routes` didn't exist — this never errors, it's always a
+best-effort match. `url`/`urls` (for failover), and
+`max_requests_per_minute` (for a route's own dedicated rate limit that
+takes precedence over the server-wide one) work exactly like their
+`targets[]` counterparts, including the same never-retry-on-a-5xx
+failover safety boundary. `aiproxy validate` reports a `model routes:`
+count in its summary.
+
 ## Path-based endpoint rules
 
 `targets` picks which upstream a path goes to; `path_rules` decides
@@ -858,7 +901,10 @@ used so far — unlike the printed shutdown summary, which leaves the
 breakdown out entirely for a single-target run, the JSON endpoint stays
 structurally the same shape regardless of how many targets are in play,
 since that predictability matters more for something meant to be parsed
-by a script or dashboard. `per_rule` breaks the same block/redact
+by a script or dashboard. A [model route](#model-based-routing)'s
+traffic appears here too, keyed by `model:<name>` — distinct from any
+path prefix's own key, so the two routing mechanisms can never collide
+even with overlapping-looking names. `per_rule` breaks the same block/redact
 outcomes down by which named rule (built-in, custom, or path) actually
 matched — combining its request-side and response-side hits under the
 one name, since which target the match happened to route through

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"regexp"
 	"strings"
 	"syscall"
@@ -129,6 +130,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.targets, r.limiter)
 	}
+	for _, r := range lc.modelRoutes {
+		server.AddModelRoute(r.name, r.models, r.targets, r.limiter)
+	}
 
 	if cfg != nil {
 		if len(cfg.CustomRules) > 0 {
@@ -204,6 +208,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, dest)
 			}
 		}
+		for _, r := range lc.modelRoutes {
+			dest := formatTargetsForDisplay(r.targets)
+			models := strings.Join(r.models, ", ")
+			if r.maxRequestsPerMinute > 0 {
+				fmt.Fprintf(stdout, "model route: %s (%s) -> %s (rate limit: %d requests/minute)\n", r.name, models, dest, r.maxRequestsPerMinute)
+			} else {
+				fmt.Fprintf(stdout, "model route: %s (%s) -> %s\n", r.name, models, dest)
+			}
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -275,7 +288,11 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes)
+	modelRoutes := make([]proxy.ModelRoute, len(lc.modelRoutes))
+	for i, r := range lc.modelRoutes {
+		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter}
+	}
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes)
 
 	label := loadedFrom
 	if label == "" {
@@ -300,6 +317,7 @@ type liveConfig struct {
 	proxyAPIKeys []proxy.ProxyKey
 	logFile      *os.File
 	routes       []targetRoute
+	modelRoutes  []modelRoute
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -367,6 +385,10 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	routes, routeErrs := compileTargetRoutes(cfg.Targets)
 	errs = append(errs, routeErrs...)
 	lc.routes = routes
+
+	modelRoutes, modelRouteErrs := compileModelRoutes(cfg.ModelRoutes)
+	errs = append(errs, modelRouteErrs...)
+	lc.modelRoutes = modelRoutes
 
 	return lc, errs
 }
@@ -602,6 +624,11 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, e.Error())
 	}
 
+	_, modelRouteErrs := compileModelRoutes(cfg.ModelRoutes)
+	for _, e := range modelRouteErrs {
+		problems = append(problems, e.Error())
+	}
+
 	_, pathRuleErrs := compilePathRules(cfg.PathRules)
 	for _, e := range pathRuleErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
@@ -666,6 +693,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  custom rules:            %d\n", len(cfg.CustomRules))
 	fmt.Fprintf(stdout, "  target routes:           %d\n", len(cfg.Targets))
 	fmt.Fprintf(stdout, "  routes with failover:    %d\n", countFailoverTargets(cfg))
+	fmt.Fprintf(stdout, "  model routes:            %d\n", len(cfg.ModelRoutes))
 	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
@@ -973,7 +1001,7 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 		}
 		seenPrefixes[t.Prefix] = true
 
-		urls, urlErrs := compileTargetURLs(t.Prefix, t)
+		urls, urlErrs := compileURLCandidates(fmt.Sprintf("targets: prefix %q", t.Prefix), t.URL, t.URLs)
 		if len(urlErrs) > 0 {
 			errs = append(errs, urlErrs...)
 			continue
@@ -993,33 +1021,37 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 	return compiled, errs
 }
 
-// compileTargetURLs resolves one targets entry's url/urls fields into an
+// compileURLCandidates resolves an entry's url/urls fields into an
 // ordered, non-empty list of upstream URLs. Exactly one of the two must
 // be set — url for a single upstream (the original, still-supported
 // shape), urls for an ordered failover list — and every URL, from
 // either field, must pass the same https validation as --target.
-func compileTargetURLs(prefix string, t config.Target) ([]*url.URL, []error) {
-	if t.URL != "" && len(t.URLs) > 0 {
-		return nil, []error{fmt.Errorf("targets: prefix %q: url and urls are mutually exclusive — set exactly one", prefix)}
+// label prefixes every error message (e.g. `targets: prefix "/foo"`,
+// `model_routes: "anthropic"`) so the caller's own identity is clear
+// without this helper needing to know which kind of route it's for.
+// Shared by compileTargetRoutes and compileModelRoutes.
+func compileURLCandidates(label, rawURL string, rawURLs []string) ([]*url.URL, []error) {
+	if rawURL != "" && len(rawURLs) > 0 {
+		return nil, []error{fmt.Errorf("%s: url and urls are mutually exclusive — set exactly one", label)}
 	}
-	if t.URL == "" && len(t.URLs) == 0 {
-		return nil, []error{fmt.Errorf("targets: prefix %q: must set one of url or urls", prefix)}
+	if rawURL == "" && len(rawURLs) == 0 {
+		return nil, []error{fmt.Errorf("%s: must set one of url or urls", label)}
 	}
 
-	if t.URL != "" {
-		u, err := parseHTTPSURL(t.URL)
+	if rawURL != "" {
+		u, err := parseHTTPSURL(rawURL)
 		if err != nil {
-			return nil, []error{fmt.Errorf("targets: prefix %q: url %w", prefix, err)}
+			return nil, []error{fmt.Errorf("%s: url %w", label, err)}
 		}
 		return []*url.URL{u}, nil
 	}
 
-	urls := make([]*url.URL, 0, len(t.URLs))
+	urls := make([]*url.URL, 0, len(rawURLs))
 	var errs []error
-	for i, raw := range t.URLs {
+	for i, raw := range rawURLs {
 		u, err := parseHTTPSURL(raw)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("targets: prefix %q: urls[%d] %w", prefix, i, err))
+			errs = append(errs, fmt.Errorf("%s: urls[%d] %w", label, i, err))
 			continue
 		}
 		urls = append(urls, u)
@@ -1028,6 +1060,94 @@ func compileTargetURLs(prefix string, t config.Target) ([]*url.URL, []error) {
 		return nil, errs
 	}
 	return urls, nil
+}
+
+// compileModelRoutes validates and parses each model_routes entry from
+// the config file. name must be non-empty and unique; models must be a
+// non-empty list of syntactically valid path.Match glob patterns, and
+// no single literal pattern string may repeat across two different
+// routes (a duplicate would leave the second entry unreachable for that
+// exact model name, since routes are checked in order and the first
+// match wins) — the same "duplicate makes an entry dead" reasoning as
+// compileTargetRoutes' prefix check, just at the level of one pattern
+// instead of the whole entry. url/urls and max_requests_per_minute are
+// validated exactly like a targets entry. Problems are collected and
+// returned rather than stopping at the first one — the caller decides
+// whether that's fatal (runStart) or just a reported problem
+// (runValidate).
+func compileModelRoutes(routes []config.ModelRoute) ([]modelRoute, []error) {
+	compiled := make([]modelRoute, 0, len(routes))
+	var errs []error
+	seenNames := make(map[string]bool, len(routes))
+	seenPatterns := make(map[string]bool)
+	for _, r := range routes {
+		if r.Name == "" {
+			errs = append(errs, fmt.Errorf("model_routes: name must not be empty"))
+			continue
+		}
+		if seenNames[r.Name] {
+			errs = append(errs, fmt.Errorf("model_routes: duplicate name %q (stats would merge under one label)", r.Name))
+			continue
+		}
+		seenNames[r.Name] = true
+
+		if len(r.Models) == 0 {
+			errs = append(errs, fmt.Errorf("model_routes: %q: models must list at least one pattern", r.Name))
+			continue
+		}
+		validPatterns := true
+		for _, pattern := range r.Models {
+			if pattern == "" {
+				errs = append(errs, fmt.Errorf("model_routes: %q: models entries must not be empty", r.Name))
+				validPatterns = false
+				continue
+			}
+			if _, err := path.Match(pattern, ""); err != nil {
+				errs = append(errs, fmt.Errorf("model_routes: %q: models: %q is not a valid glob pattern: %w", r.Name, pattern, err))
+				validPatterns = false
+				continue
+			}
+			if seenPatterns[pattern] {
+				errs = append(errs, fmt.Errorf("model_routes: %q: models: pattern %q duplicates an earlier route's (it would never be reached, since the earlier route is checked first)", r.Name, pattern))
+				validPatterns = false
+				continue
+			}
+			seenPatterns[pattern] = true
+		}
+		if !validPatterns {
+			continue
+		}
+
+		urls, urlErrs := compileURLCandidates(fmt.Sprintf("model_routes: %q", r.Name), r.URL, r.URLs)
+		if len(urlErrs) > 0 {
+			errs = append(errs, urlErrs...)
+			continue
+		}
+
+		if r.MaxRequestsPerMinute < 0 {
+			errs = append(errs, fmt.Errorf("model_routes: %q: max_requests_per_minute %d must not be negative", r.Name, r.MaxRequestsPerMinute))
+			continue
+		}
+
+		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute}
+		if r.MaxRequestsPerMinute > 0 {
+			mr.limiter = limiter.New(r.MaxRequestsPerMinute, time.Minute)
+		}
+		compiled = append(compiled, mr)
+	}
+	return compiled, errs
+}
+
+// modelRoute is one compiled entry from the config file's model_routes
+// list, ready to be added to a proxy.Server via AddModelRoute — the
+// content-based-routing counterpart to targetRoute. limiter is nil
+// unless the entry set its own max_requests_per_minute override.
+type modelRoute struct {
+	name                 string
+	models               []string
+	targets              []*url.URL
+	maxRequestsPerMinute int
+	limiter              *limiter.Limiter
 }
 
 // compileProxyAPIKeys validates and resolves the config file's

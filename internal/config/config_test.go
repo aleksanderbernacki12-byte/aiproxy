@@ -304,6 +304,54 @@ func TestLoad_ProxyAPIKeysDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesModelRoutes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com"},
+		{"name": "openai", "models": ["gpt-*", "o1*"], "urls": ["https://api.openai.com", "https://backup.openai.com"], "max_requests_per_minute": 60}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.ModelRoutes) != 2 {
+		t.Fatalf("len(ModelRoutes) = %d, want 2", len(cfg.ModelRoutes))
+	}
+	if cfg.ModelRoutes[0].Name != "anthropic" || len(cfg.ModelRoutes[0].Models) != 1 || cfg.ModelRoutes[0].Models[0] != "claude-*" {
+		t.Errorf("ModelRoutes[0] = %+v, want name=anthropic models=[claude-*]", cfg.ModelRoutes[0])
+	}
+	if cfg.ModelRoutes[0].URL != "https://api.anthropic.com" {
+		t.Errorf("ModelRoutes[0].URL = %q, want https://api.anthropic.com", cfg.ModelRoutes[0].URL)
+	}
+	if len(cfg.ModelRoutes[1].URLs) != 2 {
+		t.Errorf("len(ModelRoutes[1].URLs) = %d, want 2", len(cfg.ModelRoutes[1].URLs))
+	}
+	if cfg.ModelRoutes[1].MaxRequestsPerMinute != 60 {
+		t.Errorf("ModelRoutes[1].MaxRequestsPerMinute = %d, want 60", cfg.ModelRoutes[1].MaxRequestsPerMinute)
+	}
+}
+
+func TestLoad_ModelRoutesDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.ModelRoutes) != 0 {
+		t.Fatalf("ModelRoutes = %v, want empty when absent", cfg.ModelRoutes)
+	}
+}
+
 func TestLoad_ParsesCostBudget(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
