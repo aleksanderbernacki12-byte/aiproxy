@@ -2868,7 +2868,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, "", nil, []proxy.Route{
+	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
 	})
 
@@ -2932,7 +2932,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, "", nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil)
 		}
 	}()
 
@@ -3617,6 +3617,275 @@ func TestServer_Webhook_DeliveryFailureNeverAffectsClientResponse(t *testing.T) 
 	logOutput := waitForLogContains(&logBuf, "webhook", 2*time.Second)
 	if !strings.Contains(logOutput, "webhook") {
 		t.Fatalf("log missing a webhook delivery failure notice: %q", logOutput)
+	}
+}
+
+// TestServer_Webhooks_EventFilterOnlyDeliversMatchingEvents proves an
+// additional Server.Webhooks destination with an Events filter only
+// receives events named in that filter, while Server.WebhookURL (no
+// filter, the original behavior) keeps receiving everything — the whole
+// point of the feature: routing e.g. budget_exceeded to one destination
+// and block/redact to another.
+func TestServer_Webhooks_EventFilterOnlyDeliversMatchingEvents(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	newReceiver := func() (*httptest.Server, *url.URL, chan string) {
+		received := make(chan string, 4)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var payload map[string]any
+			json.NewDecoder(r.Body).Decode(&payload)
+			received <- fmt.Sprintf("%v", payload["event"])
+			w.WriteHeader(http.StatusOK)
+		}))
+		u, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatalf("parse url: %v", err)
+		}
+		return srv, u, received
+	}
+
+	catchAll, catchAllURL, catchAllReceived := newReceiver()
+	defer catchAll.Close()
+	filtered, filteredURL, filteredReceived := newReceiver()
+	defer filtered.Close()
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "aws-access-key", Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`), Action: rules.Block})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "openai-api-key", Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`), Action: rules.Redact})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.WebhookURL = catchAllURL
+	srv.Webhooks = []proxy.WebhookTarget{{URL: filteredURL, Events: []string{"redact"}}}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	blockResp, err := http.Post(frontend.URL+"/x", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post (block): %v", err)
+	}
+	blockResp.Body.Close()
+
+	select {
+	case event := <-catchAllReceived:
+		if event != "block" {
+			t.Errorf("catch-all event = %q, want block", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("catch-all webhook was never called for the block event")
+	}
+	select {
+	case event := <-filteredReceived:
+		t.Fatalf("filtered webhook (events: [redact]) unexpectedly received a %q event", event)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: the block event doesn't match this destination's
+		// filter, so nothing should ever arrive here.
+	}
+
+	redactResp, err := http.Post(frontend.URL+"/y", "text/plain", strings.NewReader("token=sk-FAKEKEY1234567890ABCDEFGHIJ"))
+	if err != nil {
+		t.Fatalf("post (redact): %v", err)
+	}
+	redactResp.Body.Close()
+
+	select {
+	case event := <-catchAllReceived:
+		if event != "redact" {
+			t.Errorf("catch-all event = %q, want redact", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("catch-all webhook was never called for the redact event")
+	}
+	select {
+	case event := <-filteredReceived:
+		if event != "redact" {
+			t.Errorf("filtered event = %q, want redact", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("filtered webhook was never called for the matching redact event")
+	}
+}
+
+// TestServer_Webhooks_WorksWithoutWebhookURL proves Server.Webhooks
+// alone — no Server.WebhookURL at all — is a complete, independent
+// delivery path, not merely an add-on that requires the legacy field to
+// also be set.
+func TestServer_Webhooks_WorksWithoutWebhookURL(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "aws-access-key", Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`), Action: rules.Block})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Webhooks = []proxy.WebhookTarget{{URL: webhookURL}} // no Events filter: catch-all, no WebhookURL set at all
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "block" {
+			t.Errorf("event = %v, want block", payload["event"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Webhooks-only destination was never called")
+	}
+}
+
+// TestServer_Webhooks_OneUnreachableDestinationNeverBlocksAnother proves
+// each destination is delivered to independently: WebhookURL pointing
+// at a dead address must not prevent a working Server.Webhooks entry
+// from receiving its payload, and must not affect the client's response
+// either — same isolation guarantee
+// TestServer_Webhook_DeliveryFailureNeverAffectsClientResponse proves
+// for the single-destination case.
+func TestServer_Webhooks_OneUnreachableDestinationNeverBlocksAnother(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	deadListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadAddr := deadListener.Addr().String()
+	deadListener.Close()
+	deadURL, err := url.Parse("http://" + deadAddr)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	working := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer working.Close()
+	workingURL, err := url.Parse(working.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "aws-access-key", Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`), Action: rules.Block})
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.WebhookURL = deadURL
+	srv.Webhooks = []proxy.WebhookTarget{{URL: workingURL}}
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (an undeliverable destination must never change the client's response)", resp.StatusCode, http.StatusForbidden)
+	}
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "block" {
+			t.Errorf("event = %v, want block", payload["event"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("working destination was never called despite the other destination being unreachable")
+	}
+
+	logOutput := waitForLogContains(&logBuf, "webhook_url", 2*time.Second)
+	if !strings.Contains(logOutput, "webhook_url") {
+		t.Fatalf("log missing a webhook_url-labeled delivery failure notice: %q", logOutput)
+	}
+}
+
+// TestServer_Webhooks_ReloadConfigSwapsThemLive proves ReloadConfig
+// actually replaces Server.Webhooks, same as every other reloadable
+// field: a route with no additional destinations picks up one after a
+// reload, live.
+func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "aws-access-key", Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`), Action: rules.Block})
+
+	srv := proxy.New("unused", targetURL, engine)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil)
+
+	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "block" {
+			t.Errorf("event = %v, want block", payload["event"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook added via ReloadConfig was never called")
 	}
 }
 
@@ -4813,7 +5082,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, "new-key-after-reload", nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -5187,7 +5456,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, "", nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -6015,7 +6284,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, "", newFile, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", newFile, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 

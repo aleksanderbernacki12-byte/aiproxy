@@ -180,6 +180,54 @@ func TestLoad_WebhookURLDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesWebhooks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhooks": [
+		{"url": "https://hooks.example.com/budget", "events": ["budget_exceeded"]},
+		{"url": "https://hooks.example.com/everything"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Webhooks) != 2 {
+		t.Fatalf("len(Webhooks) = %d, want 2", len(cfg.Webhooks))
+	}
+	if cfg.Webhooks[0].URL != "https://hooks.example.com/budget" {
+		t.Errorf("Webhooks[0].URL = %q, want the budget endpoint", cfg.Webhooks[0].URL)
+	}
+	if len(cfg.Webhooks[0].Events) != 1 || cfg.Webhooks[0].Events[0] != "budget_exceeded" {
+		t.Errorf("Webhooks[0].Events = %v, want [budget_exceeded]", cfg.Webhooks[0].Events)
+	}
+	if cfg.Webhooks[1].URL != "https://hooks.example.com/everything" {
+		t.Errorf("Webhooks[1].URL = %q, want the catch-all endpoint", cfg.Webhooks[1].URL)
+	}
+	if len(cfg.Webhooks[1].Events) != 0 {
+		t.Errorf("Webhooks[1].Events = %v, want empty (no filter given)", cfg.Webhooks[1].Events)
+	}
+}
+
+func TestLoad_WebhooksDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Webhooks) != 0 {
+		t.Fatalf("Webhooks = %v, want empty when absent", cfg.Webhooks)
+	}
+}
+
 func TestLoad_ParsesProxyAPIKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

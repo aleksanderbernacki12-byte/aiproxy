@@ -63,6 +63,19 @@ type PathRule struct {
 	DryRun bool `json:"dry_run,omitempty"`
 }
 
+// WebhookTarget is one additional webhook destination, alongside the
+// top-level WebhookURL, as it appears in the config file.
+type WebhookTarget struct {
+	URL string `json:"url"`
+
+	// Events, if non-empty, limits this destination to only the named
+	// event types (e.g. ["budget_exceeded", "failover"]). Empty (the
+	// default when the field is absent) means this destination receives
+	// every event, same as WebhookURL's own unfiltered behavior. The
+	// CLI's webhookEventNames has the full valid set.
+	Events []string `json:"events,omitempty"`
+}
+
 // Target is one path-prefix-to-upstream mapping for multi-target
 // routing, as it appears in the config file, before URL/URLs has been
 // parsed.
@@ -151,6 +164,18 @@ type Config struct {
 	// field is absent) disables alerting entirely; nothing is ever
 	// POSTed.
 	WebhookURL string `json:"webhook_url,omitempty"`
+
+	// Webhooks lists additional webhook destinations beyond WebhookURL,
+	// each optionally filtered to a subset of event types via its own
+	// Events field. WebhookURL, if set, is still notified of every
+	// event exactly as before this field existed; entries here are
+	// additional, useful for routing a specific event (e.g.
+	// budget_exceeded) to a different destination than the general
+	// block/redact stream — a budget alert to one Slack channel,
+	// block/redact to another. An empty slice (the default when the
+	// field is absent) means WebhookURL, if set, is the only
+	// destination, same as before this field existed.
+	Webhooks []WebhookTarget `json:"webhooks,omitempty"`
 
 	// PathRules blocks or allows whole endpoints by path prefix,
 	// independent of their content — checked before any body/header

@@ -230,6 +230,16 @@ type Server struct {
 	// notifyWebhook. nil (the default) disables alerting entirely.
 	WebhookURL *url.URL
 
+	// Webhooks lists additional webhook destinations beyond WebhookURL,
+	// each with its own optional filter of which event names it wants —
+	// see deliverWebhookPayload and WebhookTarget.matches. WebhookURL, if
+	// set, is still notified of every event exactly as before this field
+	// existed; entries here are additional, useful for routing a
+	// specific event (e.g. budget_exceeded) to a different destination
+	// than the general block/redact stream. nil/empty (the default)
+	// means WebhookURL alone is the only destination.
+	Webhooks []WebhookTarget
+
 	// ProxyAPIKey, if non-empty, requires every request — including
 	// GET /_aiproxy/stats and /_aiproxy/metrics — to present it as a
 	// "Proxy-Authorization: Bearer <key>" header before ServeHTTP does
@@ -507,6 +517,12 @@ func (s *Server) getWebhookURL() *url.URL {
 	return s.WebhookURL
 }
 
+func (s *Server) getWebhooks() []WebhookTarget {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Webhooks
+}
+
 func (s *Server) getProxyAPIKey() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -533,17 +549,17 @@ type Route struct {
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
 // cost-per-1K-tokens rate, cost budget, max request body size, webhook
-// alert URL, proxy API key, log file, and target routes — e.g. after
-// re-reading aiproxy.json on SIGHUP. All of them change together under
-// one lock, so a request in flight never observes a torn mix of old and
-// new configuration; a request takes effect from the moment it's
-// accepted, so anything already being handled keeps running against
-// whatever configuration it started with. Pass nil for
-// limiter/cache/webhookURL/logFile to disable them, matching how the
-// corresponding field would be set at startup; pass "" for proxyAPIKey
-// to disable the auth check; pass zero for costBudget to disable the
-// budget check, or maxBodyBytes to fall back to DefaultMaxBodyBytes,
-// same as leaving Server.MaxBodyBytes unset.
+// alert URL, additional webhook destinations, proxy API key, log file,
+// and target routes — e.g. after re-reading aiproxy.json on SIGHUP. All
+// of them change together under one lock, so a request in flight never
+// observes a torn mix of old and new configuration; a request takes
+// effect from the moment it's accepted, so anything already being
+// handled keeps running against whatever configuration it started with.
+// Pass nil for limiter/cache/webhookURL/webhooks/logFile to disable
+// them, matching how the corresponding field would be set at startup;
+// pass "" for proxyAPIKey to disable the auth check; pass zero for
+// costBudget to disable the budget check, or maxBodyBytes to fall back
+// to DefaultMaxBodyBytes, same as leaving Server.MaxBodyBytes unset.
 //
 // logFile is always swapped in, even if the caller reopened the exact
 // same path — the caller (the cli package's reloadConfig) is expected
@@ -553,7 +569,7 @@ type Route struct {
 // the next reload's fresh handle creates a new file at that same path.
 // The old handle, if any, is closed after the swap — never left open —
 // so a long-running proxy reloaded repeatedly never leaks descriptors.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, proxyAPIKey string, logFile *os.File, routes []Route) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, logFile *os.File, routes []Route) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter}
@@ -568,6 +584,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.CostBudget = costBudget
 	s.MaxBodyBytes = maxBodyBytes
 	s.WebhookURL = webhookURL
+	s.Webhooks = webhooks
 	s.ProxyAPIKey = proxyAPIKey
 	s.LogFile = logFile
 	s.routes = newRoutes
@@ -1351,18 +1368,50 @@ type webhookAlert struct {
 	NextTarget   string   `json:"next_target,omitempty"`
 }
 
-// deliverWebhookPayload marshals payload and POSTs it to Server.WebhookURL
-// on its own goroutine, if configured — shared by notifyWebhook and
-// notifyBudgetWebhook so the actual delivery mechanics (timeout, error
-// logging, no retry) live in exactly one place. A slow or unreachable
-// webhook endpoint never delays the client's actual request — the
-// request has already been decided and logged by the time this runs. A
-// delivery failure (or a non-2xx response) is logged as an internal
-// error and otherwise ignored: there is no retry, and it never changes
-// the outcome of the request that triggered it.
+// WebhookTarget is one resolved entry in Server.Webhooks: a destination
+// URL plus an optional filter of the event names it should receive.
+type WebhookTarget struct {
+	URL *url.URL
+
+	// Events, if non-empty, restricts this destination to only the
+	// named event names (see webhookAlert.Event for the full set —
+	// "block", "redact", "budget_exceeded", and so on). Empty/nil (the
+	// zero value) matches every event, the same unfiltered behavior
+	// Server.WebhookURL alone has always had.
+	Events []string
+}
+
+// matches reports whether t should receive an event named event — every
+// event, if Events is empty, otherwise only a named match.
+func (t WebhookTarget) matches(event string) bool {
+	if len(t.Events) == 0 {
+		return true
+	}
+	for _, e := range t.Events {
+		if e == event {
+			return true
+		}
+	}
+	return false
+}
+
+// deliverWebhookPayload marshals payload once and POSTs it to every
+// configured destination that wants this event: Server.WebhookURL
+// (unconditionally, if set — the original, still-unfiltered behavior)
+// plus every Server.Webhooks entry whose own Events filter matches —
+// shared by notifyWebhook, notifyBudgetWebhook, and notifyFailoverWebhook
+// so the actual delivery mechanics (timeout, error logging, no retry)
+// live in exactly one place. Each destination is POSTed to on its own
+// goroutine, so a slow or unreachable endpoint never delays the
+// client's actual request (already decided and logged by the time this
+// runs) and never delays or blocks delivery to any other destination
+// either. A delivery failure (or a non-2xx response) is logged as an
+// internal error and otherwise ignored: there is no retry, and it never
+// changes the outcome of the request that triggered it.
 func (s *Server) deliverWebhookPayload(payload webhookAlert) {
 	webhookURL := s.getWebhookURL()
-	if webhookURL == nil {
+	webhooks := s.getWebhooks()
+	if webhookURL == nil && len(webhooks) == 0 {
 		return
 	}
 	data, err := json.Marshal(payload)
@@ -1373,15 +1422,33 @@ func (s *Server) deliverWebhookPayload(payload webhookAlert) {
 		return
 	}
 
+	if webhookURL != nil {
+		s.postWebhook("webhook_url", webhookURL, data)
+	}
+	for i, target := range webhooks {
+		if target.matches(payload.Event) {
+			s.postWebhook(fmt.Sprintf("webhooks[%d]", i), target.URL, data)
+		}
+	}
+}
+
+// postWebhook POSTs data to target on its own goroutine. A delivery
+// error is logged with label identifying which configured destination
+// failed (its position in Webhooks, or "webhook_url" for the top-level
+// one) — deliberately never the URL itself, even in an error message:
+// a webhook URL, a Slack incoming webhook especially, typically embeds
+// a bearer credential directly in its path, so it gets the same
+// treatment as every other secret aiproxy handles.
+func (s *Server) postWebhook(label string, target *url.URL, data []byte) {
 	go func() {
-		resp, err := webhookClient.Post(webhookURL.String(), "application/json", bytes.NewReader(data))
+		resp, err := webhookClient.Post(target.String(), "application/json", bytes.NewReader(data))
 		if err != nil {
-			s.logError("aiproxy: webhook: delivery failed: %v", err)
+			s.logError("aiproxy: webhook (%s): delivery failed: %v", label, err)
 			return
 		}
 		resp.Body.Close()
 		if resp.StatusCode >= 300 {
-			s.logError("aiproxy: webhook: endpoint returned status %d", resp.StatusCode)
+			s.logError("aiproxy: webhook (%s): endpoint returned status %d", label, resp.StatusCode)
 		}
 	}()
 }

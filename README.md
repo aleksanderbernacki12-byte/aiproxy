@@ -246,8 +246,9 @@ kill -HUP <aiproxy-pid>
 Sending `SIGHUP` re-reads the same config file `--config` (or the
 default `aiproxy.json`) pointed at on startup, and applies it live:
 custom rules, path rules, the rate limit, the cache, cost estimation,
-the cost budget, the max request body size, the webhook alert URL, the
-proxy API key, `log_file` (see [persistent log file](#persistent-log-file)
+the cost budget, the max request body size, the webhook alert URL,
+additional `webhooks` destinations, the proxy API key, `log_file` (see
+[persistent log file](#persistent-log-file)
 for why this one is reopened unconditionally, not just when its path
 changes), and target routes all take effect for the next request,
 with no dropped connections and no restart. Every one of these is logged
@@ -1006,6 +1007,49 @@ summary ever print the URL itself — a webhook URL, Slack's especially,
 typically embeds a bearer credential directly in its path, so it gets
 the same treatment as every other secret aiproxy handles.
 
+### Multiple webhook destinations and per-event routing
+
+`webhook_url` is one destination for every event. Set `webhooks` instead
+(or alongside it) to send different events to different places — a
+budget alert to one Slack channel, everything else to another, say:
+
+```json
+{
+  "webhook_url": "https://hooks.slack.com/services/T00/B00/GENERAL",
+  "webhooks": [
+    {
+      "url": "https://hooks.slack.com/services/T00/B00/BUDGET-ALERTS",
+      "events": ["budget_exceeded"]
+    }
+  ]
+}
+```
+
+Each `webhooks` entry has a `url` (validated exactly like `webhook_url`
+— any http or https URL with a host) and an optional `events` list.
+Omit `events` and that destination is a catch-all, notified of
+everything, exactly like `webhook_url` itself; give it a list — any
+combination of `block`, `redact`, `response_block`, `response_redact`,
+`rate_limited`, `unauthorized`, `dry_run_block`, `dry_run_redact`,
+`response_dry_run_block`, `response_dry_run_redact`, `budget_exceeded`,
+or `failover` — and it only fires for those. `aiproxy validate` rejects
+a name outside that set, the same way it rejects an unrecognized
+`builtin_rule_actions` key, so a typo never just silently never matches
+anything. `webhook_url` (if set) keeps its original, unfiltered
+behavior regardless of what's in `webhooks` — the two aren't mutually
+exclusive, and `webhooks` works fine entirely on its own with
+`webhook_url` left unset too, if every destination should be filtered.
+
+Every matching destination is POSTed the same JSON payload,
+independently, on its own goroutine — a slow or unreachable destination
+never delays another, or the client's request. A delivery failure is
+still logged as an internal error, labeled by which destination failed
+(`webhook_url`, or `webhooks[N]`) so multiple destinations stay
+distinguishable in the log — never by the URL itself, same discipline
+as everywhere else. The startup notice and `aiproxy validate`'s summary
+report only a count (`additional webhook destinations: 2`), never the
+destination URLs.
+
 ## Validating a config file
 
 ```
@@ -1015,7 +1059,9 @@ aiproxy validate --config aiproxy.json
 Checks `aiproxy.json` for problems without starting the proxy: every
 `custom_rules` pattern must compile, every `targets` entry needs a
 well-formed, unique prefix and exactly one of a valid HTTPS `url` or a
-non-empty `urls` list of them, `log_file` (if set) must actually be
+non-empty `urls` list of them, every `webhooks` entry needs a
+well-formed `url` and, if `events` is given, every name in it must be
+one aiproxy actually fires, `log_file` (if set) must actually be
 possible to open, every
 `builtin_rule_actions` key must name a real built-in rule with a valid
 action, and the numeric fields can't be negative. It reports every

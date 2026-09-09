@@ -1029,6 +1029,78 @@ func TestExecute_Validate_ValidConfig_WithPlainHTTPWebhookURL_ReturnsZero(t *tes
 	}
 }
 
+// TestExecute_Validate_Webhooks_InvalidURLReportsProblem proves a bad
+// webhooks[].url is caught, the same as a bad top-level webhook_url.
+func TestExecute_Validate_Webhooks_InvalidURLReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhooks": [{"url": "ftp://hooks.example.com/alert"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "webhooks[0].url") {
+		t.Errorf("stderr missing webhooks[0].url problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_Webhooks_UnrecognizedEventNameReportsProblem
+// proves a typo'd event name in webhooks[].events fails validation
+// instead of silently never matching anything — same discipline as
+// builtin_rule_actions rejecting an unrecognized rule name.
+func TestExecute_Validate_Webhooks_UnrecognizedEventNameReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhooks": [{"url": "https://hooks.example.com/alert", "events": ["blocK"]}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "webhooks[0].events") || !strings.Contains(stderr.String(), "blocK") {
+		t.Errorf("stderr missing the unrecognized event name problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithWebhooks_ReturnsZero proves a
+// well-formed webhooks list passes validation and is reflected in the
+// summary by count only, never leaking a destination URL.
+func TestExecute_Validate_ValidConfig_WithWebhooks_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"webhooks": [
+		{"url": "https://hooks.example.com/budget", "events": ["budget_exceeded"]},
+		{"url": "https://hooks.example.com/everything"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "additional webhooks:     2") {
+		t.Fatalf("stdout missing additional webhooks count: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "hooks.example.com") {
+		t.Fatalf("stdout leaked a webhook destination URL: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_ReportsEffectiveMaxBodySize proves the summary
 // shows what max_body_size_bytes actually resolves to: the configured
 // value when set, or proxy.DefaultMaxBodyBytes when it's left at its

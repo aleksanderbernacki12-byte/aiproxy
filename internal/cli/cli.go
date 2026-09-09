@@ -122,6 +122,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.CostBudget = lc.costBudget
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
+	server.Webhooks = lc.webhooks
 	server.ProxyAPIKey = lc.proxyAPIKey
 	server.LogFile = lc.logFile
 	for _, r := range lc.routes {
@@ -166,6 +167,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// same treatment as every other secret aiproxy handles —
 			// never written to a log or the terminal.
 			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/unauthorized/dry-run/budget_exceeded)")
+		}
+		if len(lc.webhooks) > 0 {
+			// Same discipline as the webhook_url notice above: counts
+			// only, never the destination URLs themselves.
+			fmt.Fprintf(stdout, "additional webhook destinations: %d (event-filtered)\n", len(lc.webhooks))
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -254,7 +260,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.routes {
 		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.proxyAPIKey, lc.logFile, routes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.logFile, routes)
 
 	label := loadedFrom
 	if label == "" {
@@ -274,6 +280,7 @@ type liveConfig struct {
 	costBudget   float64
 	maxBodyBytes int64
 	webhookURL   *url.URL
+	webhooks     []proxy.WebhookTarget
 	proxyAPIKey  string
 	logFile      *os.File
 	routes       []targetRoute
@@ -320,6 +327,10 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 			lc.webhookURL = webhookURL
 		}
 	}
+
+	webhooks, webhookErrs := compileWebhookTargets(cfg.Webhooks)
+	errs = append(errs, webhookErrs...)
+	lc.webhooks = webhooks
 
 	lc.proxyAPIKey = cfg.ProxyAPIKey
 
@@ -600,6 +611,10 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 			problems = append(problems, fmt.Sprintf("webhook_url: %v", err))
 		}
 	}
+	_, webhookErrs := compileWebhookTargets(cfg.Webhooks)
+	for _, e := range webhookErrs {
+		problems = append(problems, e.Error())
+	}
 	if cfg.LogFile != "" {
 		if f, err := openLogFile(cfg.LogFile); err != nil {
 			problems = append(problems, err.Error())
@@ -627,6 +642,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
 	fmt.Fprintf(stdout, "  max request body size:   %d bytes\n", effectiveMaxBodyBytes(cfg.MaxBodyBytes))
 	fmt.Fprintf(stdout, "  webhook alerts:          %v\n", cfg.WebhookURL != "")
+	fmt.Fprintf(stdout, "  additional webhooks:     %d\n", len(cfg.Webhooks))
 	fmt.Fprintf(stdout, "  path rules:              %d\n", len(cfg.PathRules))
 	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
 	fmt.Fprintf(stdout, "  proxy authentication:    %v\n", cfg.ProxyAPIKey != "")
@@ -811,6 +827,56 @@ func parseWebhookURL(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("must include a host")
 	}
 	return u, nil
+}
+
+// webhookEventNames is the full set of event names a webhook can ever be
+// notified with — see proxy.notifyWebhook, notifyBudgetWebhook, and
+// notifyFailoverWebhook — used to validate a webhooks[].events entry in
+// the config file. Kept here, next to parseWebhookURL, rather than in
+// the proxy package: this is purely a config-validation concern, and the
+// proxy package never needs to enumerate its own event names back to
+// itself.
+var webhookEventNames = map[string]bool{
+	"block":                   true,
+	"redact":                  true,
+	"rate_limited":            true,
+	"unauthorized":            true,
+	"response_block":          true,
+	"response_redact":         true,
+	"dry_run_block":           true,
+	"dry_run_redact":          true,
+	"response_dry_run_block":  true,
+	"response_dry_run_redact": true,
+	"budget_exceeded":         true,
+	"failover":                true,
+}
+
+// compileWebhookTargets validates and resolves the config file's
+// webhooks list into proxy.WebhookTarget values, ready for
+// Server.Webhooks. Every entry's url is validated the same way
+// webhook_url is (parseWebhookURL); every name in an entry's events, if
+// given, must be a recognized event name — same discipline as
+// builtin_rule_actions rejecting an unrecognized rule name, so a typo'd
+// event name fails validation instead of silently never matching
+// anything. Problems from every entry are collected together, same
+// pattern as every other compile* helper in this file.
+func compileWebhookTargets(targets []config.WebhookTarget) ([]proxy.WebhookTarget, []error) {
+	var errs []error
+	compiled := make([]proxy.WebhookTarget, 0, len(targets))
+	for i, t := range targets {
+		u, err := parseWebhookURL(t.URL)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("webhooks[%d].url: %w", i, err))
+			continue
+		}
+		for _, event := range t.Events {
+			if !webhookEventNames[event] {
+				errs = append(errs, fmt.Errorf("webhooks[%d].events: %q is not a recognized event name", i, event))
+			}
+		}
+		compiled = append(compiled, proxy.WebhookTarget{URL: u, Events: t.Events})
+	}
+	return compiled, errs
 }
 
 // targetRoute is one compiled entry from the config file's targets list,
