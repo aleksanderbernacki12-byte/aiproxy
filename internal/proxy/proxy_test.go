@@ -2870,7 +2870,12 @@ func TestServer_JSONLogging_EmitsOneValidJSONObjectPerEvent(t *testing.T) {
 		events = append(events, ev)
 	}
 
-	wantLevels := []string{"allow", "usage", "block", "rate_limited", "cache_hit"}
+	// The first post gets both a latency line (it reached the upstream)
+	// and a usage line (its response carried a usage field); none of the
+	// remaining three ever reach the upstream — blocked, rate-limited,
+	// and served from cache respectively — so none of them get a
+	// latency line of their own.
+	wantLevels := []string{"allow", "latency", "usage", "block", "rate_limited", "cache_hit"}
 	if len(events) != len(wantLevels) {
 		t.Fatalf("got %d log events, want %d: %+v", len(events), len(wantLevels), events)
 	}
@@ -2879,11 +2884,11 @@ func TestServer_JSONLogging_EmitsOneValidJSONObjectPerEvent(t *testing.T) {
 			t.Errorf("event %d level = %q, want %q (all events: %+v)", i, events[i].Level, want, events)
 		}
 	}
-	if events[1].Tokens != 7 {
-		t.Errorf("usage event tokens = %d, want 7", events[1].Tokens)
+	if events[2].Tokens != 7 {
+		t.Errorf("usage event tokens = %d, want 7", events[2].Tokens)
 	}
-	if events[2].Rule != "test-secret" {
-		t.Errorf("block event rule = %q, want test-secret", events[2].Rule)
+	if events[3].Rule != "test-secret" {
+		t.Errorf("block event rule = %q, want test-secret", events[3].Rule)
 	}
 }
 
@@ -2934,13 +2939,14 @@ func TestServer_JSONLogging_ShutdownSummaryIsOneJSONLine(t *testing.T) {
 	}
 
 	rawLines := strings.Split(strings.TrimRight(logBuf.String(), "\n"), "\n")
-	if len(rawLines) != 2 {
-		t.Fatalf("got %d log lines, want 2 (the allow event, then the summary): %q", len(rawLines), rawLines)
+	if len(rawLines) != 3 {
+		t.Fatalf("got %d log lines, want 3 (the allow event, its latency line, then the summary): %q", len(rawLines), rawLines)
 	}
 
 	var summary statsJSONResponse
-	if err := json.Unmarshal([]byte(rawLines[1]), &summary); err != nil {
-		t.Fatalf("summary line is not valid JSON: %q: %v", rawLines[1], err)
+	lastLine := rawLines[len(rawLines)-1]
+	if err := json.Unmarshal([]byte(lastLine), &summary); err != nil {
+		t.Fatalf("summary line is not valid JSON: %q: %v", lastLine, err)
 	}
 	if summary.Allowed != 1 {
 		t.Fatalf("summary.Allowed = %d, want 1", summary.Allowed)
@@ -3295,9 +3301,12 @@ func TestServer_Redact_JSONLogging_EmitsRedactLevel(t *testing.T) {
 	}
 	resp.Body.Close()
 
+	// The redact event is always the first line; a per-request latency
+	// line for the same request follows it, irrelevant here.
+	firstLine, _, _ := bytes.Cut(bytes.TrimSpace(logBuf.Bytes()), []byte("\n"))
 	var ev jsonLogLine
-	if err := json.Unmarshal(bytes.TrimSpace(logBuf.Bytes()), &ev); err != nil {
-		t.Fatalf("log line is not valid JSON: %q: %v", logBuf.String(), err)
+	if err := json.Unmarshal(firstLine, &ev); err != nil {
+		t.Fatalf("log line is not valid JSON: %q: %v", firstLine, err)
 	}
 	if ev.Level != "redact" {
 		t.Errorf("level = %q, want redact", ev.Level)
@@ -6213,6 +6222,220 @@ func TestServer_Latency_RecordedOnceEvenAfterFailover(t *testing.T) {
 	}
 }
 
+// TestServer_LatencyLog_LogsPerRequestDurationOnAllow proves a
+// forwarded request gets its own [LATENCY] line right after [ALLOW] —
+// the per-request counterpart to the aggregate histogram, visible
+// directly in the log stream without polling stats.
+func TestServer_LatencyLog_LogsPerRequestDurationOnAllow(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	logOutput := waitForLogContains(&logBuf, "[LATENCY]", 2*time.Second)
+	if !strings.Contains(logOutput, "[ALLOW] GET /x") {
+		t.Fatalf("log missing the allow line: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "[LATENCY] GET /x") {
+		t.Fatalf("log missing a latency line for the same request: %q", logOutput)
+	}
+	if strings.Index(logOutput, "[ALLOW]") > strings.Index(logOutput, "[LATENCY]") {
+		t.Fatalf("latency line must come after the allow line, got: %q", logOutput)
+	}
+}
+
+// TestServer_LatencyLog_JSONFormatIncludesDurationMS proves the latency
+// event's JSON shape under --log-format json: level "latency" and a
+// duration_ms field, not folded into the allow event itself (which is
+// logged before the round trip even starts, so it can't carry a
+// duration yet).
+func TestServer_LatencyLog_JSONFormatIncludesDurationMS(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.LogFormat = proxy.LogFormatJSON
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	var latencyEvent map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("line is not valid JSON: %q: %v", line, err)
+		}
+		if ev["level"] == "latency" {
+			latencyEvent = ev
+			break
+		}
+	}
+	if latencyEvent == nil {
+		t.Fatalf("no latency-level event found: %q", logBuf.String())
+	}
+	durationMS, ok := latencyEvent["duration_ms"].(float64)
+	if !ok {
+		t.Fatalf("latency event missing numeric duration_ms: %+v", latencyEvent)
+	}
+	if durationMS < 0 {
+		t.Errorf("duration_ms = %v, want >= 0", durationMS)
+	}
+}
+
+// TestServer_LatencyLog_NotLoggedForRequestBlockedByRules proves a
+// request the rule engine rejects outright — never forwarded upstream —
+// never gets a [LATENCY] line: there's no upstream round trip to time.
+func TestServer_LatencyLog_NotLoggedForRequestBlockedByRules(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "test-secret",
+		Pattern: regexp.MustCompile(`SECRET`),
+		Action:  rules.Block,
+	})
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "text/plain", strings.NewReader("SECRET"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	logOutput := waitForLogContains(&logBuf, "[BLOCK]", 2*time.Second)
+	if strings.Contains(logOutput, "[LATENCY]") {
+		t.Fatalf("log unexpectedly contains a latency line for a request that never reached upstream: %q", logOutput)
+	}
+}
+
+// TestServer_LatencyLog_NotLoggedForCacheHit proves a cache hit — also
+// never forwarded upstream — never gets a [LATENCY] line either.
+func TestServer_LatencyLog_NotLoggedForCacheHit(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"n":1}`
+	post := func() {
+		resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+	post()
+	preSecondPost := waitForLogContains(&logBuf, "[LATENCY]", 2*time.Second) // wait for the first request's own latency line
+	offset := len(preSecondPost)
+
+	post() // identical request: served from cache this time
+	fullLog := waitForLogContains(&logBuf, "[CACHE HIT]", 2*time.Second)
+	sinceSecondPost := fullLog[offset:]
+	if strings.Contains(sinceSecondPost, "[LATENCY]") {
+		t.Fatalf("log unexpectedly contains a latency line for a cache hit: %q", sinceSecondPost)
+	}
+}
+
+// TestServer_LatencyLog_LoggedEvenWhenResponseIsBlocked proves latency
+// is logged regardless of what response scanning then decides to do
+// with the response — it measures how long upstream took to answer,
+// not the outcome of that answer.
+func TestServer_LatencyLog_LoggedEvenWhenResponseIsBlocked(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/x", "application/json", strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	logOutput := waitForLogContains(&logBuf, "[RESPONSE BLOCK]", 2*time.Second)
+	if !strings.Contains(logOutput, "[LATENCY] POST /x") {
+		t.Fatalf("log missing a latency line despite the response itself being blocked: %q", logOutput)
+	}
+}
+
 // TestServer_SingleURLTarget_UnaffectedByFailoverTransport is a
 // regression check: a route with exactly one candidate URL — every
 // route before failover existed, and still the overwhelmingly common
@@ -6325,17 +6548,20 @@ func TestServer_LogFile_WritesJSONLLineForEachEventIndependentOfLogFormat(t *tes
 			blockedResp.Body.Close()
 
 			lines := logFileLines(t, logPath)
-			if len(lines) != 2 {
-				t.Fatalf("log file has %d line(s), want 2: %+v", len(lines), lines)
+			if len(lines) != 3 {
+				t.Fatalf("log file has %d line(s), want 3: %+v", len(lines), lines)
 			}
 			if lines[0]["level"] != "allow" {
 				t.Errorf("lines[0][level] = %v, want %q", lines[0]["level"], "allow")
 			}
-			if lines[1]["level"] != "block" {
-				t.Errorf("lines[1][level] = %v, want %q", lines[1]["level"], "block")
+			if lines[1]["level"] != "latency" {
+				t.Errorf("lines[1][level] = %v, want %q (the allowed request's per-request latency line)", lines[1]["level"], "latency")
 			}
-			if lines[1]["rule"] != "aws-access-key" {
-				t.Errorf("lines[1][rule] = %v, want %q", lines[1]["rule"], "aws-access-key")
+			if lines[2]["level"] != "block" {
+				t.Errorf("lines[2][level] = %v, want %q", lines[2]["level"], "block")
+			}
+			if lines[2]["rule"] != "aws-access-key" {
+				t.Errorf("lines[2][rule] = %v, want %q", lines[2]["rule"], "aws-access-key")
 			}
 		})
 	}
@@ -6378,14 +6604,20 @@ func TestServer_LogFile_SharesExactTimestampWithJSONTerminalOutput(t *testing.T)
 	resp.Body.Close()
 
 	fileLines := logFileLines(t, logPath)
-	if len(fileLines) != 1 {
-		t.Fatalf("log file has %d line(s), want 1", len(fileLines))
+	if len(fileLines) != 2 {
+		t.Fatalf("log file has %d line(s), want 2 (allow, then its per-request latency line)", len(fileLines))
 	}
 
+	// Only the first (the "allow" event) is compared against the file's
+	// own first line — the second line each side writes is the
+	// following latency event, irrelevant to what this test is proving.
+	termLines := strings.Split(strings.TrimSpace(termBuf.String()), "\n")
+	if len(termLines) != 2 {
+		t.Fatalf("terminal output has %d line(s), want 2: %q", len(termLines), termBuf.String())
+	}
 	var termEvent map[string]any
-	termLine := strings.TrimSpace(termBuf.String())
-	if err := json.Unmarshal([]byte(termLine), &termEvent); err != nil {
-		t.Fatalf("terminal line is not valid JSON: %q: %v", termLine, err)
+	if err := json.Unmarshal([]byte(termLines[0]), &termEvent); err != nil {
+		t.Fatalf("terminal line is not valid JSON: %q: %v", termLines[0], err)
 	}
 
 	fileTime, _ := fileLines[0]["time"].(string)
@@ -6447,10 +6679,10 @@ func TestServer_LogFile_IncludesShutdownSummary(t *testing.T) {
 	}
 
 	lines := logFileLines(t, logPath)
-	if len(lines) != 2 {
-		t.Fatalf("log file has %d line(s), want 2 (the request, then the shutdown summary): %+v", len(lines), lines)
+	if len(lines) != 3 {
+		t.Fatalf("log file has %d line(s), want 3 (the request, its latency line, then the shutdown summary): %+v", len(lines), lines)
 	}
-	summary := lines[1]
+	summary := lines[2]
 	if _, ok := summary["allowed"]; !ok {
 		t.Errorf("last line = %+v, want the stats-snapshot shape (an \"allowed\" field)", summary)
 	}

@@ -44,6 +44,7 @@ const (
 	ansiCyan         = "\x1b[36m"
 	ansiGray         = "\x1b[90m"
 	ansiBrightYellow = "\x1b[93m"
+	ansiDim          = "\x1b[2m"
 )
 
 // usageFields is the shape of a "usage" object as different providers
@@ -105,6 +106,16 @@ type requestContextInfo struct {
 	targets     []*url.URL
 	forwardPath string
 	targetLabel string
+
+	// latency, if non-nil, is written by failoverTransport.RoundTrip the
+	// moment a response actually comes back (successfully, from
+	// whichever candidate) and read back by modifyResponse to log a
+	// per-request latency line — a pointer, not a plain field, so the
+	// same allocation set up in ServeHTTP is shared with whatever
+	// modifyResponse later reads through resp.Request's (identical)
+	// context, rather than each holding its own independent copy of the
+	// (still-zero, at ServeHTTP's point) value.
+	latency *time.Duration
 }
 
 // route is one path-prefix-to-upstream mapping for multi-target routing.
@@ -312,7 +323,20 @@ type logEvent struct {
 	// being tried next.
 	FailedTarget string `json:"failed_target,omitempty"`
 	NextTarget   string `json:"next_target,omitempty"`
-	Message      string `json:"message,omitempty"`
+
+	// DurationMS is only set on a latency event: how long, in
+	// milliseconds, the upstream took to respond to this one request —
+	// see logLatency. Distinct from the aggregate histogram at
+	// /_aiproxy/metrics/GET /_aiproxy/stats: this is the same
+	// measurement, but attributable to one specific request in the log
+	// stream, so a single slow call is visible without polling stats. A
+	// pointer, not a plain int64: a genuinely fast local request can
+	// round down to 0ms, and that's a real, meaningful measurement, not
+	// the same thing as the field being absent — omitempty on a bare
+	// int64 would incorrectly drop it in exactly that case.
+	DurationMS *int64 `json:"duration_ms,omitempty"`
+
+	Message string `json:"message,omitempty"`
 }
 
 // New creates a Server that listens on addr, forwards allowed requests to
@@ -382,7 +406,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if len(candidates) <= 1 {
 		resp, err := t.base.RoundTrip(req)
 		if err == nil {
-			t.server.Stats.RecordLatency(reqCtx.targetLabel, time.Since(start))
+			t.recordLatency(reqCtx, time.Since(start))
 		}
 		return resp, err
 	}
@@ -416,7 +440,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			// unreachable candidate is real latency the client
 			// experienced for this request, and hiding it would make a
 			// flaky target's histogram look healthier than it is.
-			t.server.Stats.RecordLatency(reqCtx.targetLabel, time.Since(start))
+			t.recordLatency(reqCtx, time.Since(start))
 			return resp, nil
 		}
 		lastErr = err
@@ -429,6 +453,17 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 	}
 	return nil, lastErr
+}
+
+// recordLatency records d in both places a successful RoundTrip's
+// timing needs to reach: the aggregate Stats histogram, and — via
+// reqCtx.latency, if ServeHTTP set it up — the specific request's own
+// context, for modifyResponse to log as a per-request line afterward.
+func (t *failoverTransport) recordLatency(reqCtx requestContextInfo, d time.Duration) {
+	t.server.Stats.RecordLatency(reqCtx.targetLabel, d)
+	if reqCtx.latency != nil {
+		*reqCtx.latency = d
+	}
 }
 
 // AddRoute registers a path-prefix route: any request whose path starts
@@ -783,6 +818,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		targets:     targets,
 		forwardPath: forwardPath,
 		targetLabel: targetLabel,
+		latency:     new(time.Duration),
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -799,6 +835,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // streaming is never delayed by our own inspection of it.
 func (s *Server) modifyResponse(resp *http.Response) error {
 	reqCtx, _ := resp.Request.Context().Value(requestContextKey{}).(requestContextInfo)
+
+	// Logged here, common to both the streaming and buffered paths below,
+	// and unconditionally — regardless of what the response scanning
+	// further down decides to do with the response (forward, redact,
+	// block): latency measures how long upstream took to answer, not
+	// what aiproxy did with the answer. reqCtx.latency is only nil for a
+	// requestContextInfo built outside ServeHTTP's normal path (e.g. a
+	// zero-valued one from a failed type assertion in a test), never in
+	// real traffic — failoverTransport.RoundTrip always sets it by the
+	// time modifyResponse can even be reached.
+	if reqCtx.latency != nil {
+		s.logLatency(reqCtx.method, reqCtx.url, *reqCtx.latency)
+	}
 
 	if isEventStream(resp) {
 		s.streamResponse(resp, reqCtx)
@@ -1224,6 +1273,25 @@ func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
 		return
 	}
 	s.logf("%s[FAILOVER] %s %s - %s unreachable, trying %s%s", ansiBrightYellow, method, reqURL, failedTarget, nextTarget, ansiReset)
+}
+
+// logLatency logs how long the upstream took to respond to one specific
+// request — the per-request counterpart to Stats.RecordLatency's
+// aggregate histogram, so a single slow call shows up directly in the
+// log stream (terminal or JSONL) instead of only being visible by
+// polling /_aiproxy/stats or /_aiproxy/metrics. Fired for every request
+// that actually reached the upstream and got a response back —
+// regardless of whether that response then goes on to be blocked,
+// redacted, or forwarded as-is; latency measures how long upstream took
+// to answer, independent of what aiproxy decides to do with the answer.
+func (s *Server) logLatency(method, reqURL string, d time.Duration) {
+	ms := d.Milliseconds()
+	ev := s.recordLogEvent(logEvent{Level: "latency", Method: method, URL: reqURL, DurationMS: &ms})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[LATENCY] %s %s - %dms%s", ansiDim, method, reqURL, ms, ansiReset)
 }
 
 func (s *Server) logUsage(method, reqURL string, totalTokens int) {

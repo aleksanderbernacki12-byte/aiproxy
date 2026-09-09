@@ -38,8 +38,21 @@ rejected by the rate limiter in yellow (`[CIRCUIT BREAKER] POST
 /endpoint - Rate limit exceeded`); responses served from the local cache
 in purple (`[CACHE HIT] POST /endpoint`); and, whenever a response
 carries a `usage.total_tokens` field (as LLM APIs typically do), a blue
-usage line (`[USAGE] POST /endpoint - Tokens used: <n>`). The value that
-matched a rule is never written to the log — only the rule's name.
+usage line (`[USAGE] POST /endpoint - Tokens used: <n>`). Every request
+that actually reaches the upstream also gets a dim `[LATENCY] POST
+/endpoint - <n>ms` line right after it, once the response comes back —
+how long that one specific call took, so a single slow request is
+visible directly in the log without polling
+[`/_aiproxy/stats`](#live-stats) or
+[`/_aiproxy/metrics`](#prometheus-metrics). It's logged for every
+outcome that reaches upstream — including a response that then goes on
+to be blocked or redacted — never just for a plain allow; a request
+[blocked](#custom-rules-rate-limiting-caching-and-cost-estimation),
+[rate-limited](#custom-rules-rate-limiting-caching-and-cost-estimation),
+or served from [cache](#custom-rules-rate-limiting-caching-and-cost-estimation)
+never reaches the upstream at all, so none of those get a latency line.
+The value that matched a rule is never written to the log — only the
+rule's name.
 
 Streaming responses (`Content-Type: text/event-stream`, the format LLM
 chat APIs use when `stream: true`) are relayed to the client chunk by
@@ -185,6 +198,7 @@ serves, instead of the multi-line text block):
 
 ```
 {"time":"2026-01-01T12:00:00Z","level":"allow","method":"GET","url":"/get"}
+{"time":"2026-01-01T12:00:00Z","level":"latency","method":"GET","url":"/get","duration_ms":214}
 {"time":"2026-01-01T12:00:01Z","level":"block","method":"POST","url":"/x","rule":"aws-access-key"}
 {"time":"2026-01-01T12:00:02Z","level":"usage","method":"POST","url":"/chat","tokens":42}
 {"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42,"per_target":{"default":{"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42}}}
@@ -193,11 +207,14 @@ serves, instead of the multi-line text block):
 `level` is one of `allow`, `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
 `dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
-`usage`, `budget_exceeded`, `failover`, `cache_hit`, or `error` (an
-internal problem unrelated to any specific request, e.g. a failed cache
-write) — `method`/`url`/`rule`/`tokens` appear only where relevant,
-`cost`/`budget` only on `budget_exceeded`, and `failed_target`/
-`next_target` only on `failover`. This only affects the ongoing per-request log stream on
+`usage`, `latency`, `budget_exceeded`, `failover`, `cache_hit`, or
+`error` (an internal problem unrelated to any specific request, e.g. a
+failed cache write) — `method`/`url`/`rule`/`tokens` appear only where
+relevant, `duration_ms` only on `latency` (present even when it's
+genuinely `0` — a fast local response — since that's a real
+measurement, not the field being absent), `cost`/`budget` only on
+`budget_exceeded`, and `failed_target`/`next_target` only on `failover`.
+This only affects the ongoing per-request log stream on
 stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
 ...`, `aiproxy listening on ...`) still print as plain text on stdout,
 since they're low-volume, human-oriented setup notices rather than part
