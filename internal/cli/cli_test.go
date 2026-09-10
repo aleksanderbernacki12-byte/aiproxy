@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/cli"
 	"aiproxy/internal/proxy"
@@ -290,6 +291,210 @@ func TestRunStart_TLSKeyWithoutCert_ReturnsErrorExitCode(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "-tls-cert and -tls-key must be set together") {
 		t.Fatalf("stderr missing a clear -tls-cert/-tls-key error: %q", stderr.String())
+	}
+}
+
+// TestRunStart_AuditLogKeyFileWithoutLogFile_ReturnsErrorExitCode proves
+// -audit-log-key-file is rejected up front when log_file isn't
+// configured — there'd be nothing to chain — before any config loading
+// that could hit log.Fatal, so this runs directly in-process.
+func TestRunStart_AuditLogKeyFileWithoutLogFile_ReturnsErrorExitCode(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-target", "https://example.com", "-audit-log-key-file", keyPath}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-audit-log-key-file requires log_file") {
+		t.Fatalf("stderr missing a clear -audit-log-key-file/log_file error: %q", stderr.String())
+	}
+}
+
+// TestRunStart_AuditLogKeyFileMissing_ReturnsErrorExitCode proves a
+// nonexistent key file path is reported clearly rather than crashing.
+func TestRunStart_AuditLogKeyFileMissing_ReturnsErrorExitCode(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "aiproxy.json")
+	logPath := filepath.Join(dir, "aiproxy.log")
+	raw := fmt.Sprintf(`{"log_file": %q}`, logPath)
+	if err := os.WriteFile(configPath, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{
+		"start", "-target", "https://example.com",
+		"-config", configPath,
+		"-audit-log-key-file", filepath.Join(dir, "does-not-exist.key"),
+	}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "audit log key file") {
+		t.Fatalf("stderr missing a clear audit log key file error: %q", stderr.String())
+	}
+}
+
+// TestExecute_VerifyLog_IntactChain_ReturnsZeroAndOK and its siblings
+// exercise `aiproxy verify-log` directly: it never blocks or calls
+// log.Fatal, so every case runs in-process.
+func TestExecute_VerifyLog_IntactChain_ReturnsZeroAndOK(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	chain := auditlog.NewChain([]byte("test-key"), "")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("create log file: %v", err)
+	}
+	for _, ev := range []string{`{"level":"allow"}`, `{"level":"block","rule":"x"}`} {
+		wrapped, err := chain.Wrap([]byte(ev))
+		if err != nil {
+			t.Fatalf("Wrap: %v", err)
+		}
+		if _, err := f.Write(append(wrapped, '\n')); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	f.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"verify-log", "-audit-log-key-file", keyPath, logPath}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "OK") || !strings.Contains(stdout.String(), "2 chained line") {
+		t.Fatalf("stdout = %q, want an OK message mentioning 2 chained lines", stdout.String())
+	}
+}
+
+func TestExecute_VerifyLog_TamperedChain_ReturnsOneAndReportsBrokenLine(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	chain := auditlog.NewChain([]byte("test-key"), "")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("create log file: %v", err)
+	}
+	for _, ev := range []string{`{"level":"allow"}`, `{"level":"block"}`} {
+		wrapped, err := chain.Wrap([]byte(ev))
+		if err != nil {
+			t.Fatalf("Wrap: %v", err)
+		}
+		if _, err := f.Write(append(wrapped, '\n')); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	f.Close()
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	tampered := bytes.Replace(data, []byte(`"level":"block"`), []byte(`"level":"allow"`), 1)
+	if err := os.WriteFile(logPath, tampered, 0o644); err != nil {
+		t.Fatalf("write tampered log file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"verify-log", "-audit-log-key-file", keyPath, logPath}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "chain broken at line 2") {
+		t.Fatalf("stderr = %q, want a message about the chain breaking at line 2", stderr.String())
+	}
+}
+
+func TestExecute_VerifyLog_WrongKey_ReturnsOneAndReportsBrokenLine(t *testing.T) {
+	dir := t.TempDir()
+	rightKeyPath := filepath.Join(dir, "right.key")
+	wrongKeyPath := filepath.Join(dir, "wrong.key")
+	if err := os.WriteFile(rightKeyPath, []byte("right-key"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	if err := os.WriteFile(wrongKeyPath, []byte("wrong-key"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	chain := auditlog.NewChain([]byte("right-key"), "")
+	wrapped, err := chain.Wrap([]byte(`{"level":"allow"}`))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(wrapped, '\n'), 0o644); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"verify-log", "-audit-log-key-file", wrongKeyPath, logPath}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "chain broken at line 1") {
+		t.Fatalf("stderr = %q, want a message about the chain breaking at line 1", stderr.String())
+	}
+}
+
+func TestExecute_VerifyLog_MissingKeyFlag_ReturnsUsageErrorExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"verify-log", "somefile.jsonl"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-audit-log-key-file is required") {
+		t.Fatalf("stderr missing a clear required-flag error: %q", stderr.String())
+	}
+}
+
+func TestExecute_VerifyLog_MissingLogFileArg_ReturnsUsageErrorExitCode(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"verify-log", "-audit-log-key-file", keyPath}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+}
+
+func TestExecute_VerifyLog_NonexistentLogFile_ReturnsErrorExitCode(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"verify-log", "-audit-log-key-file", keyPath, filepath.Join(dir, "does-not-exist.jsonl")}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, stderr.String())
 	}
 }
 

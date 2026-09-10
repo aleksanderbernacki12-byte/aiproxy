@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
@@ -7701,6 +7702,273 @@ func TestServer_LogFile_WriteFailureNeverAffectsClientResponse(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d (a broken log file must never affect the client response)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_AuditChain_ChainsRealRequestTrafficIntoAVerifiableLog is a
+// genuine end-to-end proof of the whole audit-signing feature: real
+// requests (allowed, blocked, and rate-limited) against a running
+// Server with AuditChain set produce a log file that auditlog.Verify
+// confirms is fully intact.
+func TestServer_AuditChain_ChainsRealRequestTrafficIntoAVerifiableLog(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	key := []byte("integration-test-key")
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.LogFile = logFile
+	srv.AuditChain = auditlog.NewChain(key, "")
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	allowedResp, err := http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	allowedResp.Body.Close()
+
+	blockedResp, err := http.Post(frontend.URL+"/x", "text/plain", strings.NewReader("AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	blockedResp.Body.Close()
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer f.Close()
+
+	result, err := auditlog.Verify(f, key)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.Broken != 0 {
+		t.Fatalf("chain broken at line %d: %v", result.Broken, result.Err)
+	}
+	if result.Lines < 3 {
+		t.Fatalf("Lines = %d, want at least 3 (allow, latency, block)", result.Lines)
+	}
+
+	// Every stored envelope must still carry the original event's own
+	// fields under "event", not just the chain linkage — the feature
+	// signs the real event stream, it doesn't replace it.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	firstLine := strings.SplitN(string(data), "\n", 2)[0]
+	var env auditlog.Envelope
+	if err := json.Unmarshal([]byte(firstLine), &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(env.Event, &event); err != nil {
+		t.Fatalf("unmarshal event: %v", err)
+	}
+	if event["level"] != "allow" {
+		t.Errorf("event[level] = %v, want %q", event["level"], "allow")
+	}
+	if env.PrevHash != auditlog.Genesis {
+		t.Errorf("first line PrevHash = %q, want Genesis", env.PrevHash)
+	}
+}
+
+// TestServer_AuditChain_TamperingWithLogFileAfterTheFactIsDetected is
+// the feature's actual point: an operator who edits a historical line
+// in the log file after the fact — the exact scenario audit signing
+// exists to catch — gets caught by Verify.
+func TestServer_AuditChain_TamperingWithLogFileAfterTheFactIsDetected(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	key := []byte("tamper-test-key")
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.LogFile = logFile
+	srv.AuditChain = auditlog.NewChain(key, "")
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	blockedResp, err := http.Post(frontend.URL+"/x", "text/plain", strings.NewReader("AKIAABCDEFGHIJKLMNOP"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	blockedResp.Body.Close()
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	// An operator (or attacker) rewrites the blocked event to look like
+	// an allowed one, after the fact, directly on disk. Event is a
+	// json.RawMessage, embedded verbatim (not string-escaped) inside
+	// each line's outer envelope object, so the substring appears
+	// unescaped, the same as it would in the plain, unchained shape.
+	tampered := bytes.Replace(data, []byte(`"level":"block"`), []byte(`"level":"allow"`), 1)
+	if bytes.Equal(data, tampered) {
+		t.Fatal("tamper replacement did not match anything in the file — test setup is wrong")
+	}
+
+	result, err := auditlog.Verify(bytes.NewReader(tampered), key)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.Broken == 0 {
+		t.Fatal("Verify did not detect the tampered line")
+	}
+}
+
+// TestServer_AuditChain_ConcurrentRequestsProduceAValidChain proves the
+// exact race auditlog.Chain's own doc comment warns about — chaining
+// and writing must happen atomically together — is actually prevented
+// under real concurrent request load, not just in auditlog's own
+// package-level tests. Run with -race.
+func TestServer_AuditChain_ConcurrentRequestsProduceAValidChain(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	key := []byte("concurrent-test-key")
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.LogFile = logFile
+	srv.AuditChain = auditlog.NewChain(key, "")
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(frontend.URL + "/ok")
+			if err != nil {
+				t.Errorf("get: %v", err)
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer f.Close()
+
+	result, err := auditlog.Verify(f, key)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.Broken != 0 {
+		t.Fatalf("chain broken at line %d: %v", result.Broken, result.Err)
+	}
+	if result.Lines != n*2 {
+		t.Fatalf("Lines = %d, want %d (allow + latency per request)", result.Lines, n*2)
+	}
+}
+
+// TestServer_AuditChain_NilByDefault_LeavesLogFileUnchained proves
+// audit signing is fully opt-in: a Server with a LogFile but no
+// AuditChain writes the same plain, flat JSON lines it always has,
+// never the chained envelope shape.
+func TestServer_AuditChain_NilByDefault_LeavesLogFileUnchained(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "aiproxy.log")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.LogFile = logFile
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	lines := logFileLines(t, logPath)
+	if len(lines) == 0 {
+		t.Fatal("expected at least one log line")
+	}
+	if _, ok := lines[0]["hash"]; ok {
+		t.Errorf("lines[0] has a \"hash\" field with AuditChain unset: %+v", lines[0])
+	}
+	if lines[0]["level"] != "allow" {
+		t.Errorf("lines[0][level] = %v, want %q (flat, unwrapped shape)", lines[0]["level"], "allow")
 	}
 }
 

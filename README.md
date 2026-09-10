@@ -30,6 +30,9 @@ aiproxy start --target https://api.example.com
 - `--tls-cert`/`--tls-key`: PEM certificate/key file paths — see
   [Serving over TLS](#serving-over-tls). Both or neither; plain HTTP by
   default.
+- `--audit-log-key-file`: path to a secret key file — see
+  [Audit log signing](#audit-log-signing). Requires `log_file` to be
+  configured; off by default.
 
 Point your client at `http://127.0.0.1:8080` instead of the real API.
 Allowed requests are logged in green (`[ALLOW] POST /endpoint`); blocked
@@ -432,6 +435,73 @@ the next reload's fresh handle creates a new file at that same path,
 with the previous handle closed right after the swap so a long-running
 proxy reloaded repeatedly never leaks file descriptors. This is the same
 convention nginx and PostgreSQL use for their own log files.
+
+## Audit log signing
+
+```
+aiproxy start --target https://api.example.com --config aiproxy.json --audit-log-key-file audit.key
+```
+
+`log_file` gives you a durable record, but a plain JSON-lines file on
+disk is trivial to edit after the fact — anyone with write access can
+delete or doctor a `block` line and there'd be no way to tell.
+`-audit-log-key-file` (a CLI flag, not a config field — see below) HMAC
+hash-chains every line appended to `log_file`: each line's `hash`
+covers the line before it's own hash plus its own content, so any
+later edit, deletion, insertion, or reordering breaks the chain from
+that point forward. It requires `log_file` to be set — there's nothing
+to chain otherwise — and rejects startup immediately, before doing
+anything else, if it isn't.
+
+The key itself is a plain secret file, not committed to the repo:
+
+```
+openssl rand -hex 32 > audit.key
+chmod 600 audit.key
+```
+
+Once enabled, each line's shape changes from the flat, plain event to
+a chained envelope wrapping it:
+
+```json
+{"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","hash":"1ebc00a935a9d30583ebf63896f6fc8cbe6fda88fbe872ceffd0f441af9ee94a","event":{"time":"2026-01-01T12:00:00Z","level":"allow","method":"POST","url":"/post"}}
+{"prev_hash":"1ebc00a935a9d30583ebf63896f6fc8cbe6fda88fbe872ceffd0f441af9ee94a","hash":"6e9440d1ceb70ab604fb629c2f9c244cf746fb46d55076bbcf4edfc5ed497bb","event":{"time":"2026-01-01T12:00:01Z","level":"block","method":"POST","url":"/post","rule":"aws-access-key"}}
+```
+
+`event` is the exact same object `--log-format json` prints and a plain
+`log_file` would have stored — audit signing only wraps it, it never
+changes what's actually recorded. The very first line in a chain always
+has `prev_hash` set to 64 zeros; every line after that has the previous
+line's own `hash`.
+
+Check a log file's integrity with the same key:
+
+```
+aiproxy verify-log --audit-log-key-file audit.key /var/log/aiproxy.jsonl
+```
+
+This reports `OK` and how many lines verified, or the first line where
+the chain breaks and why (hash mismatch — that line's content was
+altered, or `prev_hash` mismatch — a line was removed, inserted, or
+reordered) — everything after the break is unverified, since the
+chain's trustworthiness only extends as far as its first broken link.
+
+A restart continues the same chain instead of silently starting a new
+one: on startup, aiproxy reads the last line already in `log_file` and
+resumes from its hash, so a log file that spans several process
+lifetimes (or several `logrotate`-rotated files, in order) still
+verifies as one continuous chain. Turning audit signing on for the
+first time against a `log_file` that already has plain, unchained
+content in it starts the chain fresh at that point — there's no way to
+retroactively chain lines written before signing was ever enabled.
+
+Like [TLS](#serving-over-tls), this is a CLI flag rather than a
+`log_file`-style config field, and it's not hot-reloadable via SIGHUP:
+rotating the signing key is a meaningfully different, riskier operation
+than the atomic in-process field swaps SIGHUP already does for every
+other tunable, so it needs a restart — which, per the paragraph above,
+continues the existing chain under the new key rather than starting
+over.
 
 ## Reloading config without restarting
 

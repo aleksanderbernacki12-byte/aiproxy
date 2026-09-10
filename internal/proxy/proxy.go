@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/rules"
@@ -415,6 +416,21 @@ type Server struct {
 	// the duration of a single append, from any request-handling
 	// goroutine, far more often than a reload ever runs.
 	logFileMu sync.Mutex
+
+	// AuditChain, if non-nil, HMAC-chains every line appended to
+	// LogFile — see auditlog.Chain — so a later edit, deletion, or
+	// reordering of historical lines is detectable with `aiproxy
+	// verify-log` and the same key. Set once at startup from
+	// -audit-log-key-file (see the cli package) and never touched by
+	// ReloadConfig: changing the signing key live is a meaningfully
+	// different, riskier operation than the atomic field swaps
+	// ReloadConfig already does for everything else, the same
+	// reasoning as TLSCertFile/TLSKeyFile above. appendToLogFile calls
+	// Chain.Wrap itself, while holding logFileMu — Chain is not safe
+	// for concurrent use on its own (see its doc comment), so chaining
+	// and the write it produces must happen inside the same critical
+	// section.
+	AuditChain *auditlog.Chain
 
 	reverseProxy *httputil.ReverseProxy
 	httpServer   *http.Server
@@ -2147,13 +2163,31 @@ func (s *Server) logEventJSON(ev logEvent) {
 // write failure is reported to the terminal only, via logf directly —
 // never routed back through logError/recordLogEvent, which would
 // recurse into this exact same failing write on every subsequent event.
+//
+// When AuditChain is set, data is first replaced with its chained
+// envelope (see auditlog.Chain.Wrap) — inside the very same logFileMu
+// critical section as the write, not before it, so the order lines are
+// chained in always matches the order they land in the file. Doing
+// that in two separate locked sections would let two goroutines chain
+// in one order but write in another, corrupting the chain without any
+// real tampering ever happening.
 func (s *Server) appendToLogFile(data []byte) {
 	f := s.getLogFile()
 	if f == nil {
 		return
 	}
-	line := append(append([]byte(nil), data...), '\n')
+
 	s.logFileMu.Lock()
+	if s.AuditChain != nil {
+		wrapped, err := s.AuditChain.Wrap(data)
+		if err != nil {
+			s.logFileMu.Unlock()
+			s.logf("aiproxy: audit_log: failed to chain entry, line dropped: %v", err)
+			return
+		}
+		data = wrapped
+	}
+	line := append(append([]byte(nil), data...), '\n')
 	_, err := f.Write(line)
 	s.logFileMu.Unlock()
 	if err != nil {

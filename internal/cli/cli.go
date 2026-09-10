@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/config"
 	"aiproxy/internal/limiter"
@@ -58,6 +59,8 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 		return runStart(args[1:], stdout, stderr)
 	case "validate":
 		return runValidate(args[1:], stdout, stderr)
+	case "verify-log":
+		return runVerifyLog(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -77,6 +80,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	logFormat := fs.String("log-format", "text", `log output format: "text" (colored, human-readable) or "json" (one JSON object per line, safe to pipe into a log aggregator)`)
 	tlsCert := fs.String("tls-cert", "", "path to a PEM certificate file — combined with -tls-key, makes the proxy terminate TLS itself instead of listening on plain HTTP")
 	tlsKey := fs.String("tls-key", "", "path to a PEM private key file — see -tls-cert")
+	auditLogKeyFile := fs.String("audit-log-key-file", "", "path to a secret key file — when set, every line appended to log_file is HMAC-chained so later tampering is detectable with `aiproxy verify-log`; requires log_file to be configured")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -107,6 +111,30 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
 		return 2
+	}
+
+	logFilePath := ""
+	if cfg != nil {
+		logFilePath = cfg.LogFile
+	}
+	if *auditLogKeyFile != "" && logFilePath == "" {
+		fmt.Fprintln(stderr, "aiproxy: -audit-log-key-file requires log_file to be set in the config (there's nothing to chain otherwise)")
+		return 2
+	}
+
+	var auditChain *auditlog.Chain
+	if *auditLogKeyFile != "" {
+		key, err := auditlog.ReadKeyFile(*auditLogKeyFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+			return 1
+		}
+		prevHash, err := auditlog.RecoverPrevHash(logFilePath)
+		if err != nil {
+			fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+			return 1
+		}
+		auditChain = auditlog.NewChain(key, prevHash)
 	}
 
 	lc, errs := buildLiveConfig(cfg)
@@ -140,6 +168,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.IPDenyList = lc.ipDenyList
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
+	server.AuditChain = auditChain
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.targets, r.limiter, r.tokenLimiter)
 	}
@@ -226,6 +255,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if cfg.LogFile != "" {
 			fmt.Fprintf(stdout, "log file: %s (JSON lines, reopened on SIGHUP)\n", cfg.LogFile)
+		}
+		if auditChain != nil {
+			fmt.Fprintln(stdout, "audit log signing: enabled (HMAC-chained, verify with `aiproxy verify-log`)")
 		}
 		for _, r := range lc.routes {
 			dest := formatTargetsForDisplay(r.targets)
@@ -816,6 +848,56 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// runVerifyLog checks that an audit-signed log file's HMAC chain is
+// intact end to end: every line's hash matches its content and the
+// line before it, exactly what Chain.Wrap computed when aiproxy wrote
+// it with the same key (-audit-log-key-file at `aiproxy start`). It
+// takes no -config: verifying a log file has nothing to do with
+// whichever config produced it, only the key it was signed with.
+func runVerifyLog(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("verify-log", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	keyFile := fs.String("audit-log-key-file", "", "path to the same key file passed to `aiproxy start -audit-log-key-file` when the log was written (required)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "usage: aiproxy verify-log -audit-log-key-file <path> <log-file>")
+		return 2
+	}
+	if *keyFile == "" {
+		fmt.Fprintln(stderr, "aiproxy: -audit-log-key-file is required")
+		return 2
+	}
+
+	key, err := auditlog.ReadKeyFile(*keyFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+		return 1
+	}
+
+	path := fs.Arg(0)
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+		return 1
+	}
+	defer f.Close()
+
+	result, err := auditlog.Verify(f, key)
+	if err != nil {
+		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+		return 1
+	}
+	if result.Broken != 0 {
+		fmt.Fprintf(stderr, "aiproxy: %s: chain broken at line %d: %v\n", path, result.Broken, result.Err)
+		fmt.Fprintf(stderr, "  %d line(s) before it verified OK\n", result.Broken-1)
+		return 1
+	}
+	fmt.Fprintf(stdout, "%s: OK — %d chained line(s) verified\n", path, result.Lines)
+	return 0
+}
+
 // logFileDisplay renders log_file for the validate summary — unlike
 // webhook_url and proxy_api_key, a file path isn't a secret, so it's
 // shown in full rather than masked to a bare true/false.
@@ -1386,7 +1468,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: aiproxy <command> [flags]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "commands:")
-	fmt.Fprintln(w, "  start      start the proxy server")
-	fmt.Fprintln(w, "  validate   check a config file for problems without starting the proxy")
-	fmt.Fprintln(w, "  help       show this help text")
+	fmt.Fprintln(w, "  start        start the proxy server")
+	fmt.Fprintln(w, "  validate     check a config file for problems without starting the proxy")
+	fmt.Fprintln(w, "  verify-log   verify an audit-signed log file's HMAC chain is intact")
+	fmt.Fprintln(w, "  help         show this help text")
 }
