@@ -15,6 +15,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -287,6 +288,19 @@ type Server struct {
 	// means WebhookURL alone is the only destination.
 	Webhooks []WebhookTarget
 
+	// IPAllowList, if non-empty, restricts which client IPs may reach
+	// the proxy at all — checked before ProxyAPIKey or anything else,
+	// as the very first thing ServeHTTP does; see checkIPAccess. A deny
+	// match in IPDenyList always wins over an allow match here. Empty
+	// (the default) means every source IP is allowed, unless
+	// IPDenyList itself denies it.
+	IPAllowList []*net.IPNet
+
+	// IPDenyList unconditionally rejects any request whose remote IP
+	// matches an entry here, regardless of IPAllowList — see
+	// checkIPAccess. Empty (the default) denies nothing.
+	IPDenyList []*net.IPNet
+
 	// ProxyAPIKey, if non-empty, requires every request — including
 	// GET /_aiproxy/stats and /_aiproxy/metrics — to present it as a
 	// "Proxy-Authorization: Bearer <key>" header before ServeHTTP does
@@ -362,6 +376,11 @@ type logEvent struct {
 	// — empty for the server-wide cost_budget's own budget_exceeded
 	// event, which isn't attributable to any one caller.
 	Client string `json:"client,omitempty"`
+
+	// RemoteIP is only set on an ip_denied event: the request's own
+	// r.RemoteAddr, denied by checkIPAccess before anything else about
+	// the request (including proxy auth) was even evaluated.
+	RemoteIP string `json:"remote_ip,omitempty"`
 
 	// FailedTarget and NextTarget are only set on a failover event: the
 	// candidate URL that just turned out to be unreachable, and the one
@@ -674,6 +693,69 @@ func (s *Server) getProxyAPIKeys() (string, []ProxyKey) {
 	return s.ProxyAPIKey, s.ProxyAPIKeys
 }
 
+// getIPLists returns both IPAllowList and IPDenyList under one lock,
+// for checkIPAccess.
+func (s *Server) getIPLists() ([]*net.IPNet, []*net.IPNet) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.IPAllowList, s.IPDenyList
+}
+
+// clientIP extracts and parses the remote TCP peer's IP address from
+// r.RemoteAddr — deliberately never a client-supplied header like
+// X-Forwarded-For, which any caller could set to whatever value they
+// want, defeating an IP allow/deny list entirely. Returns nil if
+// RemoteAddr is empty or doesn't contain a parseable IP address (this
+// package's own tests, and any real net/http server, always set a
+// well-formed "host:port"; the plain-host fallback below only matters
+// for a RemoteAddr set without a port, e.g. in a synthetic *http.Request
+// built by hand).
+func clientIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return net.ParseIP(host)
+}
+
+// checkIPAccess reports whether r's remote IP is allowed to reach the
+// proxy at all — the first check ServeHTTP makes, before proxy
+// authentication or anything else. A match in IPDenyList always wins,
+// even for an IP also covered by IPAllowList (useful for carving an
+// exception out of a broader allow range). If IPAllowList is non-empty,
+// the IP must match one of its entries too. Both lists empty (the
+// default) means every IP is allowed, without even trying to parse
+// RemoteAddr — the same zero-cost-when-unused discipline as every other
+// optional check in this package. An IP that fails to parse is denied
+// whenever either list is configured, since there's no way to evaluate
+// it against either one.
+func (s *Server) checkIPAccess(r *http.Request) bool {
+	allow, deny := s.getIPLists()
+	if len(allow) == 0 && len(deny) == 0 {
+		return true
+	}
+
+	ip := clientIP(r)
+	if ip == nil {
+		return false
+	}
+
+	for _, n := range deny {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+	if len(allow) == 0 {
+		return true
+	}
+	for _, n := range allow {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) getLogFile() *os.File {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -709,9 +791,9 @@ type ModelRoute struct {
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
 // cost-per-1K-tokens rate, cost budget, max request body size, webhook
 // alert URL, additional webhook destinations, proxy API key, additional
-// named proxy keys, log file, path-prefix routes, and model routes —
-// e.g. after re-reading aiproxy.json on SIGHUP. All of them change
-// together under one lock,
+// named proxy keys, log file, path-prefix routes, model routes, and IP
+// allow/deny lists — e.g. after re-reading aiproxy.json on SIGHUP. All
+// of them change together under one lock,
 // so a request in flight never observes a torn mix of old and new
 // configuration; a request takes effect from the moment it's accepted,
 // so anything already being handled keeps running against whatever
@@ -730,7 +812,7 @@ type ModelRoute struct {
 // the next reload's fresh handle creates a new file at that same path.
 // The old handle, if any, is closed after the swap — never left open —
 // so a long-running proxy reloaded repeatedly never leaks descriptors.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter}
@@ -755,6 +837,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.LogFile = logFile
 	s.routes = newRoutes
 	s.modelRoutes = newModelRoutes
+	s.IPAllowList = ipAllowList
+	s.IPDenyList = ipDenyList
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -857,6 +941,18 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 // it intact to the resolved target (Target by default, or a
 // path-prefix route added via AddRoute) over HTTPS.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.checkIPAccess(r) {
+		// Checked before even proxy authentication: a network-level
+		// access decision is more foundational than an application-level
+		// credential check, and should reject a completely unknown
+		// source before it can so much as present a key.
+		s.Stats.RecordIPDenied()
+		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String())
+		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String())
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+
 	auth, ok := s.checkProxyAuth(r)
 	if !ok {
 		// Checked before statsPath/metricsPath too — an API key, once
@@ -1463,6 +1559,15 @@ func (s *Server) logUnauthorized(method, reqURL string) {
 	s.logf("%s[UNAUTHORIZED] %s %s - Missing or invalid Proxy-Authorization%s", ansiBrightRed, method, reqURL, ansiReset)
 }
 
+func (s *Server) logIPDenied(remoteIP, method, reqURL string) {
+	ev := s.recordLogEvent(logEvent{Level: "ip_denied", Method: method, URL: reqURL, RemoteIP: remoteIP})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[IP DENIED] %s %s - %s not in ip_allow_list, or in ip_deny_list%s", ansiBrightRed, method, reqURL, remoteIP, ansiReset)
+}
+
 func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) {
 	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Cost: cost, Budget: budget})
 	if s.LogFormat == LogFormatJSON {
@@ -1670,6 +1775,9 @@ type webhookAlert struct {
 	// Client is only set on a budget_exceeded event fired by a named
 	// proxy key's own cost_budget — see logEvent.Client.
 	Client string `json:"client,omitempty"`
+
+	// RemoteIP is only set on an ip_denied event — see logEvent.RemoteIP.
+	RemoteIP string `json:"remote_ip,omitempty"`
 }
 
 // WebhookTarget is one resolved entry in Server.Webhooks: a destination
@@ -1836,6 +1944,22 @@ func (s *Server) notifyFailoverWebhook(method, reqURL, failedTarget, nextTarget 
 	})
 }
 
+// notifyIPDeniedWebhook builds and delivers a webhookAlert for the
+// ip_denied event — kept separate from notifyWebhook for the same
+// reason as notifyBudgetWebhook/notifyFailoverWebhook: this event
+// carries a remote IP instead of a rule name.
+func (s *Server) notifyIPDeniedWebhook(remoteIP, method, reqURL string) {
+	text := fmt.Sprintf("[IP_DENIED] %s %s - %s not in ip_allow_list, or in ip_deny_list", method, reqURL, remoteIP)
+	s.deliverWebhookPayload(webhookAlert{
+		Text:     text,
+		Event:    "ip_denied",
+		Method:   method,
+		URL:      reqURL,
+		Time:     time.Now().UTC().Format(time.RFC3339),
+		RemoteIP: remoteIP,
+	})
+}
+
 // logEventJSON marshals ev (stamping the current time) and logs it as a
 // single line, for LogFormatJSON.
 func (s *Server) logEventJSON(ev logEvent) {
@@ -1960,6 +2084,11 @@ type statsSnapshotJSON struct {
 	// enough to resolve a target.
 	Unauthorized int64 `json:"unauthorized"`
 
+	// IPDenied is likewise only meaningful at the top level, and always
+	// 0 inside per_target — an IP-denied request never gets far enough
+	// to resolve a target either.
+	IPDenied int64 `json:"ip_denied"`
+
 	EstimatedCost *float64                      `json:"estimated_cost,omitempty"`
 	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
 	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
@@ -1995,6 +2124,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		ResponseDryRunBlocked:  snap.ResponseDryRunBlocked,
 		ResponseDryRunRedacted: snap.ResponseDryRunRedacted,
 		Unauthorized:           snap.Unauthorized,
+		IPDenied:               snap.IPDenied,
 		Failover:               snap.Failover,
 		Latency:                snap.Latency,
 	}
@@ -2237,6 +2367,12 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 	fmt.Fprintln(w, "# HELP aiproxy_unauthorized_total Total number of requests rejected for a missing or invalid Proxy-Authorization header.")
 	fmt.Fprintln(w, "# TYPE aiproxy_unauthorized_total counter")
 	fmt.Fprintf(w, "aiproxy_unauthorized_total %d\n", snap.Unauthorized)
+
+	// Unlabeled, same reasoning as aiproxy_unauthorized_total: an
+	// IP-denied request never gets far enough to resolve a target.
+	fmt.Fprintln(w, "# HELP aiproxy_ip_denied_total Total number of requests rejected by the IP allow/deny list.")
+	fmt.Fprintln(w, "# TYPE aiproxy_ip_denied_total counter")
+	fmt.Fprintf(w, "aiproxy_ip_denied_total %d\n", snap.IPDenied)
 
 	// Unlabeled too, but for a different reason than the series above: a
 	// gauge, not a counter (the configured value doesn't accumulate),

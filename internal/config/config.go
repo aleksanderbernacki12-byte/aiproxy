@@ -324,6 +324,27 @@ type Config struct {
 	// field existed.
 	ProxyAPIKeys []ProxyAPIKeyEntry `json:"proxy_api_keys,omitempty"`
 
+	// IPAllowList, if non-empty, restricts which client IPs may reach
+	// the proxy at all: a request whose remote IP doesn't match any
+	// entry here is rejected with a 403, before proxy_api_key or
+	// anything else downstream is even checked. Each entry is a CIDR
+	// range ("10.0.0.0/8") or a single IP address ("192.168.1.5",
+	// treated as that address's full-width /32 or /128). Checked after
+	// IPDenyList — a deny match always wins, even for an IP that's also
+	// allow-listed, useful for carving an exception out of a broader
+	// allow range. Empty (the default) means every source IP is
+	// allowed, unless IPDenyList itself denies it. Based on the actual
+	// TCP peer address, never a client-supplied header like
+	// X-Forwarded-For, which would let any caller simply claim a
+	// trusted IP.
+	IPAllowList []string `json:"ip_allow_list,omitempty"`
+
+	// IPDenyList unconditionally rejects any request whose remote IP
+	// matches an entry here, regardless of IPAllowList — see
+	// IPAllowList's doc comment for the full precedence and matching
+	// rules. Empty (the default) denies nothing.
+	IPDenyList []string `json:"ip_deny_list,omitempty"`
+
 	// LogFile, if set, is a path every log event — the same ones printed
 	// to stdout/stderr, plus the shutdown summary — is also appended to,
 	// always as one JSON object per line regardless of --log-format,

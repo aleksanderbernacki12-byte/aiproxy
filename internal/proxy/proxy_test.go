@@ -3088,7 +3088,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil)
+	}, nil, nil, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -3150,7 +3150,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil)
 		}
 	}()
 
@@ -4092,7 +4092,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -5319,7 +5319,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -5651,7 +5651,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -6025,7 +6025,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7081,7 +7081,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -7593,7 +7593,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	})
+	}, nil, nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -7909,11 +7909,364 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil, nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
 	if got := callCount.Load(); got != 1 {
 		t.Fatalf("webhook called %d times after reload, want 1 (the newly configured budget should now fire)", got)
+	}
+}
+
+// mustCIDR parses s (CIDR notation) into a *net.IPNet for building
+// Server.IPAllowList/IPDenyList directly in tests, failing the test on
+// a malformed literal rather than silently testing against a nil net.
+func mustCIDR(t *testing.T, s string) *net.IPNet {
+	t.Helper()
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		t.Fatalf("mustCIDR(%q): %v", s, err)
+	}
+	return n
+}
+
+// TestServer_IPAccess_UnconfiguredAllowsEveryIP proves that with both
+// IPAllowList and IPDenyList empty (the default), no IP is ever denied
+// — same zero-cost-when-unused discipline as every other optional
+// check in this package.
+func TestServer_IPAccess_UnconfiguredAllowsEveryIP(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_IPAccess_AllowListLetsMatchingIPThrough proves a request
+// from an IP covered by IPAllowList is forwarded normally.
+func TestServer_IPAccess_AllowListLetsMatchingIPThrough(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	// httptest.NewServer always listens on loopback, so every test
+	// request's remote IP falls inside 127.0.0.0/8.
+	srv.IPAllowList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (127.0.0.1 is covered by the allow list)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_IPAccess_AllowListRejectsNonMatchingIP proves a request
+// from an IP NOT covered by a non-empty IPAllowList is denied with 403
+// and never reaches the upstream target.
+func TestServer_IPAccess_AllowListRejectsNonMatchingIP(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	// A range that can never cover a loopback test connection.
+	srv.IPAllowList = []*net.IPNet{mustCIDR(t, "10.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if upstreamHit.Load() {
+		t.Error("upstream was hit, want the request rejected before ever reaching it")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.IPDenied != 1 {
+		t.Errorf("Stats.IPDenied = %d, want 1", snap.IPDenied)
+	}
+}
+
+// TestServer_IPAccess_DenyListRejectsMatchingIP proves IPDenyList
+// rejects a matching IP even with no IPAllowList configured at all
+// (which would otherwise mean "everyone allowed").
+func TestServer_IPAccess_DenyListRejectsMatchingIP(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestServer_IPAccess_DenyListWinsOverAllowList proves a deny match
+// takes priority even for an IP that's also covered by IPAllowList —
+// the documented "carve an exception out of a broader allow range"
+// behavior.
+func TestServer_IPAccess_DenyListWinsOverAllowList(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.IPAllowList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.1/32")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (a deny match must win even though the broader allow range also matches)", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestServer_IPAccess_CheckedBeforeProxyAuth proves the IP check runs
+// before proxy authentication: a caller presenting a completely valid
+// Proxy-Authorization key still gets rejected by an IP deny list,
+// never even reaching the auth check.
+func TestServer_IPAccess_CheckedBeforeProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-real-key"
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer the-real-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (IP deny must win even with a correct proxy key presented)", resp.StatusCode, http.StatusForbidden)
+	}
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		t.Fatal("got 407, meaning the auth check ran before the IP check — wrong order")
+	}
+}
+
+// TestServer_IPAccess_DeniedRequestNeverCountsAsUnauthorized proves an
+// IP-denied request is counted and logged as ip_denied, not as
+// unauthorized, even when a proxy key is also configured — they're
+// distinct rejection reasons.
+func TestServer_IPAccess_DeniedRequestNeverCountsAsUnauthorized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-real-key"
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	snap := srv.Stats.Snapshot()
+	if snap.IPDenied != 1 {
+		t.Errorf("IPDenied = %d, want 1", snap.IPDenied)
+	}
+	if snap.Unauthorized != 0 {
+		t.Errorf("Unauthorized = %d, want 0 (an IP-denied request never reaches the auth check at all)", snap.Unauthorized)
+	}
+}
+
+// TestServer_Webhook_FiresOnIPDeniedWithExpectedPayload proves the
+// ip_denied webhook event carries the denied remote_ip and an empty
+// rule, and that the log line/JSON event both include it too.
+func TestServer_Webhook_FiresOnIPDeniedWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "ip_denied" {
+			t.Errorf("event = %v, want ip_denied", payload["event"])
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string (an IP denial matches no rule)", payload["rule"])
+		}
+		remoteIP, _ := payload["remote_ip"].(string)
+		if remoteIP == "" {
+			t.Error("remote_ip missing or empty in webhook payload")
+		}
+		if !strings.HasPrefix(remoteIP, "127.0.0.1") {
+			t.Errorf("remote_ip = %q, want it to start with 127.0.0.1", remoteIP)
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "IP_DENIED") {
+			t.Errorf("text = %q, want it to mention IP_DENIED", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesIPLists proves a SIGHUP-style
+// ReloadConfig can add an IP deny list to a server that started with
+// none, live — the same guarantee already proven for every other
+// reloadable field.
+func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func() int {
+		resp, err := http.Get(frontend.URL + "/x")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("before reload: status = %d, want %d (no deny list configured yet)", got, http.StatusOK)
+	}
+
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
+		mustCIDR(t, "127.0.0.0/8"),
+	})
+
+	if got := get(); got != http.StatusForbidden {
+		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
 	}
 }

@@ -96,6 +96,53 @@ when no rule has ever matched at all — even a single rule's own numbers
 are never redundant with the totals above, since those totals already
 conflate every rule together.
 
+## Restricting access by IP
+
+`ip_allow_list` and `ip_deny_list` restrict which client IPs may reach
+the proxy at all — a network-level complement to
+[`proxy_api_key`](#authenticating-requests-to-the-proxy), checked
+*before* it (and before anything else, including `GET /_aiproxy/stats`
+and `/_aiproxy/metrics`):
+
+```json
+{
+  "ip_allow_list": ["10.0.0.0/8", "192.168.1.5"],
+  "ip_deny_list": ["10.0.5.0/24"]
+}
+```
+
+Each entry is CIDR notation (`10.0.0.0/8`) or a single IP address
+(`192.168.1.5`, treated as that address's own full-width `/32` — or
+`/128` for IPv6). A request whose remote IP matches any `ip_deny_list`
+entry is always rejected with a 403, *even if it also matches
+`ip_allow_list`* — useful for carving an exception out of a broader
+allow range (allow the whole office network, deny one compromised
+subnet inside it). If `ip_allow_list` is non-empty, a request must match
+one of its entries to get through at all; if it's empty (the default),
+every IP is allowed unless `ip_deny_list` denies it — the same
+"allow-list absent means allow everyone" default every other list-based
+setting in aiproxy uses.
+
+The match is always against the actual TCP peer address
+(`r.RemoteAddr`) — **never** a client-supplied header like
+`X-Forwarded-For`, which any caller could set to whatever value they
+want, defeating the whole point of an IP-based check. If you run
+aiproxy behind another reverse proxy or load balancer, every request
+will appear to come from *that* proxy's own IP, not the original
+client's — plan your allow/deny ranges around whatever actually
+terminates the TCP connection to aiproxy, or run aiproxy directly on the
+connection path if you need per-client IP filtering to mean anything.
+
+A denied request is counted (`GET /_aiproxy/stats`'s top-level
+`ip_denied` field, never broken down per target — the same reasoning as
+`unauthorized`, since a rejected request never resolves one — and the
+Prometheus endpoint's unlabeled `aiproxy_ip_denied_total`), logged
+(`[IP DENIED]`, bright red — the same color as `[UNAUTHORIZED]`), and,
+if `webhook_url` is set, [alerted](#webhook-alerts) with an `ip_denied`
+event carrying the denied `remote_ip`. Hot-reloadable via
+[SIGHUP](#reloading-config-without-restarting) like everything else in
+this README.
+
 ## Authenticating requests to the proxy
 
 By default, anyone who can reach the proxy's listen address can use it —
@@ -910,6 +957,7 @@ can be monitored without waiting for Ctrl+C:
   "response_dry_run_blocked": 0,
   "response_dry_run_redacted": 0,
   "unauthorized": 0,
+  "ip_denied": 0,
   "failover": 1,
   "latency": { "count": 42, "sum_seconds": 3.31, "buckets": [ { "le": "0.005", "count": 0 }, { "le": "0.01", "count": 12 }, { "le": "+Inf", "count": 42 } ] },
   "estimated_cost": 0.062,
@@ -948,9 +996,10 @@ most real leaks. The four `dry_run_*`/`response_dry_run_*` fields (see
 [dry-run mode](#dry-run-mode-for-rules)) are never broken down by
 target — always `0` inside `per_target`, appearing only in the overall
 totals and inside `per_rule`. `unauthorized` (see
-[authenticating requests](#authenticating-requests-to-the-proxy)) goes
-further still: never broken down by target OR by rule, since a rejected
-request never resolves either. `cost_budget` (see
+[authenticating requests](#authenticating-requests-to-the-proxy)) and
+`ip_denied` (see [restricting access by IP](#restricting-access-by-ip))
+go further still: never broken down by target OR by rule, since a
+rejected request never resolves either. `cost_budget` (see
 [cost budget alerts](#custom-rules-rate-limiting-caching-and-cost-estimation))
 is included only when it's set, and — unlike `estimated_cost` — never
 repeated inside `per_target`: it's a single whole-proxy-run threshold,
@@ -1110,8 +1159,9 @@ Set `webhook_url` to get pushed a real-time alert instead, the moment a
 rule matches — on a request going out, a
 [response](#scanning-responses-too) coming back, the
 [rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
-tripping, a [dry-run](#dry-run-mode-for-rules) rule matching, a
-request failing [proxy authentication](#authenticating-requests-to-the-proxy),
+tripping, a [dry-run](#dry-run-mode-for-rules) rule matching, a request
+denied by [ip_allow_list/ip_deny_list](#restricting-access-by-ip) or
+failing [proxy authentication](#authenticating-requests-to-the-proxy),
 the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-and-cost-estimation),
 or a [failover](#failover-across-multiple-upstreams) to the next candidate target:
 
@@ -1122,9 +1172,10 @@ or a [failover](#failover-across-multiple-upstreams) to the next candidate targe
 ```
 
 Every alertable event — `block`, `redact`, `response_block`,
-`response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
-`dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
-`budget_exceeded`, or `failover` — POSTs this JSON body to that URL:
+`response_redact`, `rate_limited`, `ip_denied`, `unauthorized`,
+`dry_run_block`, `dry_run_redact`, `response_dry_run_block`,
+`response_dry_run_redact`, `budget_exceeded`, or `failover` — POSTs this
+JSON body to that URL:
 
 ```json
 {
@@ -1164,6 +1215,23 @@ likewise carries an empty `rule`, and never echoes the configured
   "method": "POST",
   "url": "/v1/messages",
   "rule": "",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+An `ip_denied` alert — fired by [ip_allow_list/ip_deny_list](#restricting-access-by-ip),
+checked even before `unauthorized` — likewise carries an empty `rule`,
+plus a `remote_ip` field no other event has: the denied request's own
+TCP peer address:
+
+```json
+{
+  "text": "[IP_DENIED] POST /v1/messages - 203.0.113.7 not in ip_allow_list, or in ip_deny_list",
+  "event": "ip_denied",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
+  "remote_ip": "203.0.113.7",
   "time": "2026-01-01T12:00:00Z"
 }
 ```

@@ -374,6 +374,45 @@ func TestLoad_ModelRoutesDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesIPAllowAndDenyLists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"ip_allow_list": ["10.0.0.0/8", "192.168.1.5"],
+		"ip_deny_list": ["10.0.5.0/24"]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.IPAllowList) != 2 || cfg.IPAllowList[0] != "10.0.0.0/8" || cfg.IPAllowList[1] != "192.168.1.5" {
+		t.Errorf("IPAllowList = %v, want [10.0.0.0/8 192.168.1.5]", cfg.IPAllowList)
+	}
+	if len(cfg.IPDenyList) != 1 || cfg.IPDenyList[0] != "10.0.5.0/24" {
+		t.Errorf("IPDenyList = %v, want [10.0.5.0/24]", cfg.IPDenyList)
+	}
+}
+
+func TestLoad_IPListsDefaultToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.IPAllowList) != 0 || len(cfg.IPDenyList) != 0 {
+		t.Fatalf("IPAllowList=%v IPDenyList=%v, want both empty when absent", cfg.IPAllowList, cfg.IPDenyList)
+	}
+}
+
 func TestLoad_ParsesCostBudget(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

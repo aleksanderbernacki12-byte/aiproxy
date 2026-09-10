@@ -1425,6 +1425,77 @@ func TestExecute_Validate_ValidConfig_CacheEnabledNoTTL_ReturnsZero(t *testing.T
 	}
 }
 
+// TestExecute_Validate_IPAllowList_InvalidEntryReportsProblem proves a
+// malformed ip_allow_list entry (neither a valid IP nor a valid CIDR
+// range) is rejected.
+func TestExecute_Validate_IPAllowList_InvalidEntryReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"ip_allow_list": ["not-an-ip"]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "ip_allow_list") || !strings.Contains(stderr.String(), "not a valid IP address or CIDR range") {
+		t.Errorf("stderr missing the invalid-entry problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_IPDenyList_InvalidCIDRReportsProblem proves a
+// malformed ip_deny_list CIDR (bad prefix length) is rejected.
+func TestExecute_Validate_IPDenyList_InvalidCIDRReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"ip_deny_list": ["10.0.0.0/99"]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "ip_deny_list") || !strings.Contains(stderr.String(), "not a valid IP address or CIDR range") {
+		t.Errorf("stderr missing the invalid-CIDR problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithIPLists_ReturnsZero proves a
+// well-formed ip_allow_list/ip_deny_list — mixing CIDR ranges and bare
+// IP addresses — passes validation and is reflected in the summary.
+func TestExecute_Validate_ValidConfig_WithIPLists_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"ip_allow_list": ["10.0.0.0/8", "192.168.1.5"],
+		"ip_deny_list": ["10.0.5.0/24"]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "IP allow list entries:   2") {
+		t.Fatalf("stdout missing IP allow list entry count: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "IP deny list entries:    1") {
+		t.Fatalf("stdout missing IP deny list entry count: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_ModelRoutes_EmptyNameReportsProblem proves an
 // entry with no name is rejected — it's the stats/log attribution
 // label, so it can't be blank.

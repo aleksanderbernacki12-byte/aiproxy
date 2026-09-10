@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -127,6 +128,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.ProxyAPIKey = lc.proxyAPIKey
 	server.ProxyAPIKeys = lc.proxyAPIKeys
 	server.LogFile = lc.logFile
+	server.IPAllowList = lc.ipAllowList
+	server.IPDenyList = lc.ipDenyList
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.targets, r.limiter)
 	}
@@ -181,6 +184,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// Same discipline as the webhook_url notice above: counts
 			// only, never the destination URLs themselves.
 			fmt.Fprintf(stdout, "additional webhook destinations: %d (event-filtered)\n", len(lc.webhooks))
+		}
+		if len(lc.ipAllowList) > 0 {
+			// Not a secret like a webhook URL or a proxy key — printed
+			// in full, same as a route's destination URL.
+			fmt.Fprintf(stdout, "IP allow list: %s\n", strings.Join(formatIPNets(lc.ipAllowList), ", "))
+		}
+		if len(lc.ipDenyList) > 0 {
+			fmt.Fprintf(stdout, "IP deny list: %s\n", strings.Join(formatIPNets(lc.ipDenyList), ", "))
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -292,7 +303,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList)
 
 	label := loadedFrom
 	if label == "" {
@@ -318,6 +329,8 @@ type liveConfig struct {
 	logFile      *os.File
 	routes       []targetRoute
 	modelRoutes  []modelRoute
+	ipAllowList  []*net.IPNet
+	ipDenyList   []*net.IPNet
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -390,7 +403,52 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	errs = append(errs, modelRouteErrs...)
 	lc.modelRoutes = modelRoutes
 
+	ipAllowList, allowErrs := compileIPList("ip_allow_list", cfg.IPAllowList)
+	errs = append(errs, allowErrs...)
+	lc.ipAllowList = ipAllowList
+
+	ipDenyList, denyErrs := compileIPList("ip_deny_list", cfg.IPDenyList)
+	errs = append(errs, denyErrs...)
+	lc.ipDenyList = ipDenyList
+
 	return lc, errs
+}
+
+// compileIPList parses and validates a config file's ip_allow_list or
+// ip_deny_list entries into net.IPNet values for Server.IPAllowList/
+// Server.IPDenyList. Each entry is either CIDR notation ("10.0.0.0/8")
+// or a bare IP address ("192.168.1.5"), normalized to that address's
+// full-width CIDR (/32 for IPv4, /128 for IPv6) — the common,
+// unsurprising shorthand for "just this one address." fieldName names
+// the config field in error messages ("ip_allow_list" or
+// "ip_deny_list"). Problems are collected and returned rather than
+// stopping at the first one, same pattern as every other compile*
+// helper in this file.
+func compileIPList(fieldName string, entries []string) ([]*net.IPNet, []error) {
+	compiled := make([]*net.IPNet, 0, len(entries))
+	var errs []error
+	for i, raw := range entries {
+		cidr := raw
+		if !strings.Contains(raw, "/") {
+			ip := net.ParseIP(raw)
+			if ip == nil {
+				errs = append(errs, fmt.Errorf("%s[%d]: %q is not a valid IP address or CIDR range", fieldName, i, raw))
+				continue
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			cidr = fmt.Sprintf("%s/%d", raw, bits)
+		}
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s[%d]: %q is not a valid IP address or CIDR range", fieldName, i, raw))
+			continue
+		}
+		compiled = append(compiled, ipNet)
+	}
+	return compiled, errs
 }
 
 // openLogFile opens path in append mode, creating it if it doesn't
@@ -629,6 +687,15 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, e.Error())
 	}
 
+	_, ipAllowErrs := compileIPList("ip_allow_list", cfg.IPAllowList)
+	for _, e := range ipAllowErrs {
+		problems = append(problems, e.Error())
+	}
+	_, ipDenyErrs := compileIPList("ip_deny_list", cfg.IPDenyList)
+	for _, e := range ipDenyErrs {
+		problems = append(problems, e.Error())
+	}
+
 	_, pathRuleErrs := compilePathRules(cfg.PathRules)
 	for _, e := range pathRuleErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
@@ -707,6 +774,8 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
 	fmt.Fprintf(stdout, "  proxy authentication:    %v\n", cfg.ProxyAPIKey != "")
 	fmt.Fprintf(stdout, "  additional proxy keys:   %d\n", len(cfg.ProxyAPIKeys))
+	fmt.Fprintf(stdout, "  IP allow list entries:   %d\n", len(cfg.IPAllowList))
+	fmt.Fprintf(stdout, "  IP deny list entries:    %d\n", len(cfg.IPDenyList))
 	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
 }
@@ -919,6 +988,7 @@ var webhookEventNames = map[string]bool{
 	"response_dry_run_redact": true,
 	"budget_exceeded":         true,
 	"failover":                true,
+	"ip_denied":               true,
 }
 
 // compileWebhookTargets validates and resolves the config file's
@@ -976,6 +1046,16 @@ func formatTargetsForDisplay(targets []*url.URL) string {
 		strs[i] = u.String()
 	}
 	return strings.Join(strs, " -> ")
+}
+
+// formatIPNets renders a compiled IP allow/deny list for the startup
+// notice and the validate summary.
+func formatIPNets(nets []*net.IPNet) []string {
+	strs := make([]string, len(nets))
+	for i, n := range nets {
+		strs[i] = n.String()
+	}
+	return strs
 }
 
 // compileTargetRoutes validates and parses each targets entry from the

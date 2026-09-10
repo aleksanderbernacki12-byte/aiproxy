@@ -173,6 +173,7 @@ type Stats struct {
 	overall       counters
 	dryRun        dryRunCounters
 	unauthorized  atomic.Int64
+	ipDenied      atomic.Int64
 	budgetAlerted atomic.Bool
 
 	mu        sync.Mutex
@@ -308,6 +309,15 @@ func (s *Stats) RecordRateLimited(target string) {
 // parameter at all: there is nothing to attribute it to yet.
 func (s *Stats) RecordUnauthorized() {
 	s.unauthorized.Add(1)
+}
+
+// RecordIPDenied records one request rejected by the IP allow/deny
+// list, before any target was even resolved — same reasoning as
+// RecordUnauthorized: no target parameter, since there's nothing to
+// attribute it to yet, and this check runs even before proxy
+// authentication.
+func (s *Stats) RecordIPDenied() {
+	s.ipDenied.Add(1)
 }
 
 // RecordCacheHit records one request served from the on-disk cache
@@ -551,6 +561,11 @@ type Snapshot struct {
 	// broken down per target — see Stats.RecordUnauthorized.
 	Unauthorized int64 `json:"unauthorized"`
 
+	// IPDenied counts requests rejected by the IP allow/deny list,
+	// before proxy authentication or anything else even runs. Never
+	// broken down per target — see Stats.RecordIPDenied.
+	IPDenied int64 `json:"ip_denied"`
+
 	// Failover counts how many times a request moved on to the next
 	// candidate URL in a target's failover list because an earlier one
 	// was unreachable — see Stats.RecordFailover. Unlike Unauthorized
@@ -598,6 +613,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.ResponseDryRunBlocked = s.dryRun.responseBlocked.Load()
 	snap.ResponseDryRunRedacted = s.dryRun.responseRedacted.Load()
 	snap.Unauthorized = s.unauthorized.Load()
+	snap.IPDenied = s.ipDenied.Load()
 	snap.PerTarget = perTarget
 	snap.PerRule = perRule
 	snap.PerClient = perClient
@@ -643,6 +659,12 @@ func (s Snapshot) String() string {
 	// proxy_api_key, so printing it unconditionally would just be noise.
 	if s.Unauthorized > 0 {
 		out += fmt.Sprintf("\nUnauthorized (407):   %d", s.Unauthorized)
+	}
+	// Same reasoning again: 0 for every run that never configured
+	// ip_allow_list/ip_deny_list, or that did but never actually denied
+	// anything.
+	if s.IPDenied > 0 {
+		out += fmt.Sprintf("\nIP denied (403):      %d", s.IPDenied)
 	}
 	// Same reasoning again: 0 for every run that never configured a
 	// multi-URL target, or that did but never needed to actually use it.

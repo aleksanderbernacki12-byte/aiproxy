@@ -498,6 +498,24 @@ func TestStats_RecordUnauthorized_TracksOverallOnly(t *testing.T) {
 	}
 }
 
+func TestStats_RecordIPDenied_TracksOverallOnly(t *testing.T) {
+	s := stats.New()
+	s.RecordIPDenied()
+	s.RecordIPDenied()
+	s.RecordIPDenied()
+	s.RecordAllow("default")
+
+	snap := s.Snapshot()
+	if snap.IPDenied != 3 {
+		t.Errorf("IPDenied = %d, want 3", snap.IPDenied)
+	}
+	for target, t2 := range snap.PerTarget {
+		if t2.IPDenied != 0 {
+			t.Errorf("PerTarget[%q].IPDenied = %d, want 0 (never broken down per target)", target, t2.IPDenied)
+		}
+	}
+}
+
 func TestSnapshot_String_OmitsUnauthorizedLineWhenZero(t *testing.T) {
 	snap := stats.Snapshot{Allowed: 5}
 	if rendered := snap.String(); strings.Contains(rendered, "Unauthorized") {
