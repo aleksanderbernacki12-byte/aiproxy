@@ -116,6 +116,13 @@ type requestContextInfo struct {
 	// requests already are; see checkProxyAuth/clientAuth.
 	clientLabel string
 
+	// clientCostBudget is the authenticated key's own CostBudget (zero
+	// if it has none, or if clientLabel is "" or "default" — the
+	// anonymous top-level ProxyAPIKey has no per-key fields to source
+	// one from) — carried through to logUsageFromBody the same way
+	// clientLabel is, for stats.Stats.CrossedClientBudget.
+	clientCostBudget float64
+
 	// latency, if non-nil, is written by failoverTransport.RoundTrip the
 	// moment a response actually comes back (successfully, from
 	// whichever candidate) and read back by modifyResponse to log a
@@ -349,6 +356,12 @@ type logEvent struct {
 	// cost_budget threshold it crossed.
 	Cost   float64 `json:"cost,omitempty"`
 	Budget float64 `json:"budget,omitempty"`
+
+	// Client is only set on a budget_exceeded event fired by a named
+	// proxy key's own cost_budget (see stats.Stats.CrossedClientBudget)
+	// — empty for the server-wide cost_budget's own budget_exceeded
+	// event, which isn't attributable to any one caller.
+	Client string `json:"client,omitempty"`
 
 	// FailedTarget and NextTarget are only set on a failover event: the
 	// candidate URL that just turned out to be unreachable, and the one
@@ -780,6 +793,12 @@ type ProxyKey struct {
 	// checked instead of whatever route or the server-wide Limiter
 	// would otherwise apply for a request authenticated with it.
 	Limiter *limiter.Limiter
+
+	// CostBudget, if greater than zero, is this key's own cost
+	// threshold — see stats.Stats.CrossedClientBudget. Fires
+	// independently of Server.CostBudget (the server-wide one) and of
+	// every other key's own budget.
+	CostBudget float64
 }
 
 // clientAuth is checkProxyAuth's result: which key (if any) matched,
@@ -792,8 +811,9 @@ type clientAuth struct {
 	// label is "default" for the anonymous Server.ProxyAPIKey, a named
 	// ProxyKey's Name, or "" when the auth check is disabled entirely
 	// (nothing to attribute a request to).
-	label   string
-	limiter *limiter.Limiter
+	label      string
+	limiter    *limiter.Limiter
+	costBudget float64
 }
 
 // checkProxyAuth reports whether r is allowed to use the proxy at all,
@@ -824,7 +844,7 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 	}
 	for _, k := range proxyAPIKeys {
 		if subtle.ConstantTimeCompare(gotBytes, []byte(k.Key)) == 1 {
-			return clientAuth{label: k.Name, limiter: k.Limiter}, true
+			return clientAuth{label: k.Name, limiter: k.Limiter, costBudget: k.CostBudget}, true
 		}
 	}
 	return clientAuth{}, false
@@ -991,14 +1011,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rewritten to the absolute upstream URL, and they need the exact
 	// same target/cache key ServeHTTP already resolved and checked.
 	reqCtx := requestContextInfo{
-		method:      r.Method,
-		url:         r.URL.String(),
-		cacheKey:    cacheKey,
-		targets:     targets,
-		forwardPath: forwardPath,
-		targetLabel: targetLabel,
-		clientLabel: auth.label,
-		latency:     new(time.Duration),
+		method:           r.Method,
+		url:              r.URL.String(),
+		cacheKey:         cacheKey,
+		targets:          targets,
+		forwardPath:      forwardPath,
+		targetLabel:      targetLabel,
+		clientLabel:      auth.label,
+		clientCostBudget: auth.costBudget,
+		latency:          new(time.Duration),
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -1399,6 +1420,10 @@ func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 			s.logBudgetExceeded(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
 			s.notifyBudgetWebhook(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
 		}
+		if cost, crossed := s.Stats.CrossedClientBudget(reqCtx.clientLabel, s.getCostPer1KTokens(), reqCtx.clientCostBudget); crossed {
+			s.logClientBudgetExceeded(reqCtx.method, reqCtx.url, reqCtx.clientLabel, cost, reqCtx.clientCostBudget)
+			s.notifyClientBudgetWebhook(reqCtx.method, reqCtx.url, reqCtx.clientLabel, cost, reqCtx.clientCostBudget)
+		}
 	}
 }
 
@@ -1445,6 +1470,20 @@ func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) 
 		return
 	}
 	s.logf("%s[BUDGET EXCEEDED] %s %s - Estimated cost %.4f exceeds budget %.4f%s", ansiYellow, method, reqURL, cost, budget, ansiReset)
+}
+
+// logClientBudgetExceeded is logBudgetExceeded's per-client counterpart
+// — see stats.Stats.CrossedClientBudget. Kept as its own method, not a
+// client-aware branch inside logBudgetExceeded, since the two fire from
+// independent CrossedBudget/CrossedClientBudget checks and can both
+// fire for the very same request.
+func (s *Server) logClientBudgetExceeded(method, reqURL, client string, cost, budget float64) {
+	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Client: client, Cost: cost, Budget: budget})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[BUDGET EXCEEDED] %s %s - client %s: estimated cost %.4f exceeds budget %.4f%s", ansiYellow, method, reqURL, client, cost, budget, ansiReset)
 }
 
 func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
@@ -1627,6 +1666,10 @@ type webhookAlert struct {
 	Budget       *float64 `json:"budget,omitempty"`
 	FailedTarget string   `json:"failed_target,omitempty"`
 	NextTarget   string   `json:"next_target,omitempty"`
+
+	// Client is only set on a budget_exceeded event fired by a named
+	// proxy key's own cost_budget — see logEvent.Client.
+	Client string `json:"client,omitempty"`
 }
 
 // WebhookTarget is one resolved entry in Server.Webhooks: a destination
@@ -1753,6 +1796,23 @@ func (s *Server) notifyBudgetWebhook(method, reqURL string, cost, budget float64
 		Event:  "budget_exceeded",
 		Method: method,
 		URL:    reqURL,
+		Time:   time.Now().UTC().Format(time.RFC3339),
+		Cost:   &cost,
+		Budget: &budget,
+	})
+}
+
+// notifyClientBudgetWebhook is notifyBudgetWebhook's per-client
+// counterpart — see logClientBudgetExceeded for why this is a separate
+// method rather than a branch inside the existing one.
+func (s *Server) notifyClientBudgetWebhook(method, reqURL, client string, cost, budget float64) {
+	text := fmt.Sprintf("[BUDGET_EXCEEDED] %s %s - client %s: estimated cost %.4f exceeds budget %.4f", method, reqURL, client, cost, budget)
+	s.deliverWebhookPayload(webhookAlert{
+		Text:   text,
+		Event:  "budget_exceeded",
+		Method: method,
+		URL:    reqURL,
+		Client: client,
 		Time:   time.Now().UTC().Format(time.RFC3339),
 		Cost:   &cost,
 		Budget: &budget,

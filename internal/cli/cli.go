@@ -369,7 +369,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 
 	lc.proxyAPIKey = cfg.ProxyAPIKey
 
-	proxyAPIKeys, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys)
+	proxyAPIKeys, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
 	errs = append(errs, proxyKeyErrs...)
 	lc.proxyAPIKeys = proxyAPIKeys
 
@@ -669,7 +669,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	for _, e := range webhookErrs {
 		problems = append(problems, e.Error())
 	}
-	_, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys)
+	_, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
 	for _, e := range proxyKeyErrs {
 		problems = append(problems, e.Error())
 	}
@@ -1160,7 +1160,7 @@ type modelRoute struct {
 // unique key; max_requests_per_minute, if set, must not be negative and
 // compiles into that key's own dedicated limiter, checked instead of
 // whatever route/global limiter would otherwise apply for that caller.
-func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry) ([]proxy.ProxyKey, []error) {
+func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry, costPer1KTokens float64) ([]proxy.ProxyKey, []error) {
 	compiled := make([]proxy.ProxyKey, 0, len(entries))
 	var errs []error
 	seenNames := make(map[string]bool, len(entries))
@@ -1195,7 +1195,16 @@ func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry) ([]proxy.ProxyKey, [
 			continue
 		}
 
-		pk := proxy.ProxyKey{Name: e.Name, Key: e.Key}
+		if e.CostBudget < 0 {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget %g must not be negative", e.Name, e.CostBudget))
+			continue
+		}
+		if e.CostBudget > 0 && costPer1KTokens <= 0 {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget requires the top-level cost_per_1k_tokens to be set (there's no rate to price tokens at otherwise)", e.Name))
+			continue
+		}
+
+		pk := proxy.ProxyKey{Name: e.Name, Key: e.Key, CostBudget: e.CostBudget}
 		if e.MaxRequestsPerMinute > 0 {
 			pk.Limiter = limiter.New(e.MaxRequestsPerMinute, time.Minute)
 		}

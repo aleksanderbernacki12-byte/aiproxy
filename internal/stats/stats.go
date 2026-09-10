@@ -138,6 +138,12 @@ type clientCounters struct {
 	redacted    atomic.Int64
 	rateLimited atomic.Int64
 	totalTokens atomic.Int64
+
+	// budgetAlerted is this client's own one-shot latch for
+	// CrossedClientBudget — separate from Stats.budgetAlerted (the
+	// global one), so a named key's own cost_budget and the
+	// server-wide cost_budget each fire independently, exactly once.
+	budgetAlerted atomic.Bool
 }
 
 func (c *clientCounters) snapshot() ClientSnapshot {
@@ -413,6 +419,32 @@ func (s *Stats) CrossedBudget(costPer1KTokens, budget float64) (cost float64, cr
 		return cost, false
 	}
 	return cost, s.budgetAlerted.CompareAndSwap(false, true)
+}
+
+// CrossedClientBudget is CrossedBudget's per-client counterpart: it
+// reports whether one specific client's own running cost — that
+// client's TotalTokens priced at costPer1KTokens, not the whole
+// proxy's — has just reached or passed its own budget for the first
+// time, via the same one-shot CAS latch pattern, scoped to that
+// client's own clientCounters instead of the shared overall one, so a
+// named key's own budget and the server-wide budget (or another key's
+// own budget) each fire independently. client == "" (no proxy key
+// configured at all — nothing to attribute a budget to, and nothing to
+// look up) never crosses and never creates a clientCounters entry,
+// same no-op-on-empty-label discipline as every RecordClient* method;
+// budget <= 0 (this client has no budget of its own) never crosses
+// either, but cost is still computed and returned either way, same as
+// CrossedBudget.
+func (s *Stats) CrossedClientBudget(client string, costPer1KTokens, budget float64) (cost float64, crossed bool) {
+	if client == "" {
+		return 0, false
+	}
+	c := s.clientCounterFor(client)
+	cost = float64(c.totalTokens.Load()) / 1000 * costPer1KTokens
+	if budget <= 0 || cost < budget {
+		return cost, false
+	}
+	return cost, c.budgetAlerted.CompareAndSwap(false, true)
 }
 
 // LatencyBucket is one cumulative "le" (less-than-or-equal) point of a

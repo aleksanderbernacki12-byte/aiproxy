@@ -94,6 +94,23 @@ type ProxyAPIKeyEntry struct {
 	// (the default) means this key shares whatever route/global limiter
 	// would otherwise apply, same as before this field existed.
 	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
+
+	// CostBudget, if greater than zero, is a threshold in the same
+	// currency/rate as the top-level CostPer1KTokens — once this key's
+	// own running cost (its own attributed TotalTokens priced at
+	// CostPer1KTokens) reaches or passes it, aiproxy logs and
+	// webhook-alerts a budget_exceeded event carrying this key's Name,
+	// independent of the server-wide CostBudget (if any) and of every
+	// other key's own budget — each fires once, on its own. Same
+	// alert-only (never enforcement) semantics as the top-level
+	// CostBudget: this never blocks or otherwise changes how a request
+	// is handled. Only meaningful alongside the top-level
+	// CostPer1KTokens: a budget with no rate to price tokens at has
+	// nothing to compare against, so setting this without
+	// CostPer1KTokens is a config error, same reasoning as the top-level
+	// CostBudget. Zero (the default) means this key has no budget of
+	// its own.
+	CostBudget float64 `json:"cost_budget,omitempty"`
 }
 
 // Target is one path-prefix-to-upstream mapping for multi-target

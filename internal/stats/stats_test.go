@@ -564,6 +564,101 @@ func TestStats_CrossedBudget_ExactlyAtBudgetCounts(t *testing.T) {
 	}
 }
 
+func TestStats_CrossedClientBudget_UnsetBudgetNeverCrosses(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("team-a", 1_000_000)
+
+	if _, crossed := s.CrossedClientBudget("team-a", 1.0, 0); crossed {
+		t.Error("CrossedClientBudget with budget=0 (unset) reported crossed, want never")
+	}
+}
+
+func TestStats_CrossedClientBudget_BelowBudgetNeverCrosses(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("team-a", 1000) // cost = 1000/1000*0.01 = 0.01
+
+	cost, crossed := s.CrossedClientBudget("team-a", 0.01, 10.0)
+	if crossed {
+		t.Error("CrossedClientBudget reported crossed while cost is well under budget")
+	}
+	if cost != 0.01 {
+		t.Errorf("cost = %g, want 0.01", cost)
+	}
+}
+
+func TestStats_CrossedClientBudget_FiresExactlyOnce(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("team-a", 10_000) // cost = 10.0
+
+	cost, crossed := s.CrossedClientBudget("team-a", 1.0, 5.0)
+	if !crossed {
+		t.Fatal("first CrossedClientBudget call over budget reported crossed=false, want true")
+	}
+	if cost != 10.0 {
+		t.Errorf("cost = %g, want 10.0", cost)
+	}
+
+	s.RecordClientTokensUsed("team-a", 10_000)
+	if _, crossed := s.CrossedClientBudget("team-a", 1.0, 5.0); crossed {
+		t.Error("second CrossedClientBudget call reported crossed=true, want the one-shot latch to suppress it")
+	}
+}
+
+func TestStats_CrossedClientBudget_ExactlyAtBudgetCounts(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("team-a", 5_000) // cost = 5.0, exactly at budget
+
+	if _, crossed := s.CrossedClientBudget("team-a", 1.0, 5.0); !crossed {
+		t.Error("CrossedClientBudget at exactly the threshold reported crossed=false, want true (>=, not >)")
+	}
+}
+
+// TestStats_CrossedClientBudget_EmptyClientNeverCrosses proves the
+// no-op-on-empty-label discipline every other RecordClient*/Crossed*
+// method already follows: an empty client label (no proxy key
+// configured at all) never crosses, regardless of cost or budget.
+func TestStats_CrossedClientBudget_EmptyClientNeverCrosses(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("", 10_000)
+
+	if cost, crossed := s.CrossedClientBudget("", 1.0, 5.0); crossed || cost != 0 {
+		t.Errorf("CrossedClientBudget(\"\", ...) = (%g, %v), want (0, false)", cost, crossed)
+	}
+}
+
+// TestStats_CrossedClientBudget_IndependentPerClient proves each
+// client's own budget latch is independent: one client crossing its
+// budget must never suppress or affect another client's own check, and
+// each client's cost is computed from only its own attributed tokens.
+func TestStats_CrossedClientBudget_IndependentPerClient(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokensUsed("team-a", 10_000) // cost = 10.0
+	s.RecordClientTokensUsed("team-b", 1_000)  // cost = 1.0
+
+	if _, crossed := s.CrossedClientBudget("team-a", 1.0, 5.0); !crossed {
+		t.Error("team-a: want crossed=true (cost 10.0 >= budget 5.0)")
+	}
+	if _, crossed := s.CrossedClientBudget("team-b", 1.0, 5.0); crossed {
+		t.Error("team-b: want crossed=false (cost 1.0 < budget 5.0) — must be unaffected by team-a's own crossing")
+	}
+}
+
+// TestStats_CrossedClientBudget_IndependentFromGlobalBudget proves a
+// client's own budget latch is entirely separate from the server-wide
+// CrossedBudget latch — crossing one must never suppress the other.
+func TestStats_CrossedClientBudget_IndependentFromGlobalBudget(t *testing.T) {
+	s := stats.New()
+	s.RecordTokensUsed("default", 10_000)      // feeds the global/overall counter
+	s.RecordClientTokensUsed("team-a", 10_000) // feeds team-a's own counter
+
+	if _, crossed := s.CrossedBudget(1.0, 5.0); !crossed {
+		t.Fatal("global CrossedBudget: want crossed=true")
+	}
+	if _, crossed := s.CrossedClientBudget("team-a", 1.0, 5.0); !crossed {
+		t.Error("team-a CrossedClientBudget: want crossed=true, independent of the global budget having already fired")
+	}
+}
+
 func TestStats_RecordLatency_TracksOverallAndPerTarget(t *testing.T) {
 	s := stats.New()
 	s.RecordLatency("default", 20*time.Millisecond)

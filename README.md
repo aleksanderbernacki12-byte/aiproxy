@@ -208,6 +208,40 @@ or similar by position (`webhook_url`, `webhooks[N]`) rather than value.
 Hot-reloadable via [SIGHUP](#reloading-config-without-restarting) like
 everything else in this section.
 
+#### Per-key cost budgets
+
+`cost_budget` (see [cost budget alerts](#custom-rules-rate-limiting-caching-and-cost-estimation))
+is a single, server-wide threshold. Add `cost_budget` to one of
+`proxy_api_keys`' own entries to give that key its own, independent
+threshold instead:
+
+```json
+{
+  "cost_per_1k_tokens": 0.03,
+  "proxy_api_keys": [
+    { "name": "team-a", "key": "team-a-long-random-key", "cost_budget": 25 },
+    { "name": "team-b", "key": "team-b-long-random-key" }
+  ]
+}
+```
+
+Once `team-a`'s own running cost — its own `per_client` token count,
+priced at the top-level `cost_per_1k_tokens` — reaches or passes 25,
+aiproxy logs and webhook-alerts a `budget_exceeded` event carrying
+`"client": "team-a"`, exactly once, same one-shot-per-process semantics
+as the server-wide budget. `team-b` has no budget of its own here, so
+its usage is only ever reflected in the server-wide budget (if one is
+set) and in its own `per_client` stats — same as before this field
+existed. A key's own budget and the server-wide one are entirely
+independent: either, both, or neither can fire for the same request,
+and each is alert-only — nothing is ever blocked, throttled, or
+otherwise changed by crossing it. Same rule as the top-level
+`cost_budget`: setting this on a key without the top-level
+`cost_per_1k_tokens` also being set is a config error, since there's no
+rate to price that key's tokens at. Hot-reloadable via
+[SIGHUP](#reloading-config-without-restarting), like every other field
+on a `proxy_api_keys` entry.
+
 ## Built-in secret patterns
 
 No config needed — these block by default the moment aiproxy starts:
@@ -1150,6 +1184,25 @@ running process, not on every request past the threshold:
   "time": "2026-01-01T12:00:00Z",
   "cost": 10.4,
   "budget": 10
+}
+```
+
+A named key's own [per-key `cost_budget`](#per-key-cost-budgets) fires
+the same `budget_exceeded` event, independent of the server-wide one,
+distinguished only by an added `client` field naming which key crossed
+it (absent — same as every other event — for the server-wide budget):
+
+```json
+{
+  "text": "[BUDGET_EXCEEDED] POST /v1/messages - client team-a: estimated cost 25.1000 exceeds budget 25.0000",
+  "event": "budget_exceeded",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
+  "client": "team-a",
+  "time": "2026-01-01T12:00:00Z",
+  "cost": 25.1,
+  "budget": 25
 }
 ```
 

@@ -1240,6 +1240,74 @@ func TestExecute_Validate_ProxyAPIKeys_NegativeMaxRequestsPerMinuteReportsProble
 	}
 }
 
+// TestExecute_Validate_ProxyAPIKeys_NegativeCostBudgetReportsProblem
+// proves a named key's own cost_budget can't be negative, same rule as
+// the top-level cost_budget.
+func TestExecute_Validate_ProxyAPIKeys_NegativeCostBudgetReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "proxy_api_keys": [{"name": "team-a", "key": "some-key", "cost_budget": -5}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cost_budget") || !strings.Contains(stderr.String(), "must not be negative") {
+		t.Errorf("stderr missing the negative-cost_budget problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ProxyAPIKeys_CostBudgetWithoutCostPer1KTokensReportsProblem
+// proves a named key's own cost_budget requires the top-level
+// cost_per_1k_tokens to be set — same reasoning as the top-level
+// cost_budget requiring it: a budget with no rate to price tokens at
+// has nothing to compare against.
+func TestExecute_Validate_ProxyAPIKeys_CostBudgetWithoutCostPer1KTokensReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [{"name": "team-a", "key": "some-key", "cost_budget": 5}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "team-a") || !strings.Contains(stderr.String(), "cost_budget requires the top-level cost_per_1k_tokens") {
+		t.Errorf("stderr missing the cost_per_1k_tokens requirement problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithProxyAPIKeyCostBudget_ReturnsZero
+// proves a well-formed per-key cost_budget (alongside the required
+// top-level cost_per_1k_tokens) passes validation.
+func TestExecute_Validate_ValidConfig_WithProxyAPIKeyCostBudget_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "proxy_api_keys": [{"name": "team-a", "key": "key-1", "cost_budget": 10}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "additional proxy keys:   1") {
+		t.Fatalf("stdout missing additional proxy keys count: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_ValidConfig_WithProxyAPIKeys_ReturnsZero proves a
 // well-formed proxy_api_keys list passes validation, is reflected in
 // the summary by count only, and never leaks a key value or the names

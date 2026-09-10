@@ -7599,3 +7599,321 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
 	}
 }
+
+// TestServer_ClientCostBudget_FiresWebhookOnlyForTheKeyThatCrossedIt
+// proves a named proxy key's own cost_budget fires an independent
+// budget_exceeded alert — carrying that key's own Name in the payload's
+// "client" field — while a different key, whose own usage stays under
+// its own budget, never triggers one.
+func TestServer_ClientCostBudget_FiresWebhookOnlyForTheKeyThatCrossedIt(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 4)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // cost = 10.0 per request
+	srv.WebhookURL = webhookURL
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "team-over", Key: "key-over", CostBudget: 5.0},    // crossed by the first request
+		{Name: "team-under", Key: "key-under", CostBudget: 50.0}, // not crossed by one request
+	}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(key string) {
+		req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	post("key-under")
+	post("key-over")
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "budget_exceeded" {
+			t.Fatalf("event = %v, want budget_exceeded", payload["event"])
+		}
+		if payload["client"] != "team-over" {
+			t.Fatalf("client = %v, want team-over", payload["client"])
+		}
+		if cost, ok := payload["cost"].(float64); !ok || cost != 10.0 {
+			t.Errorf("cost = %v, want 10.0", payload["cost"])
+		}
+		if budget, ok := payload["budget"].(float64); !ok || budget != 5.0 {
+			t.Errorf("budget = %v, want 5.0", payload["budget"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called for team-over")
+	}
+
+	select {
+	case payload := <-received:
+		t.Fatalf("a second webhook call arrived, want none (team-under's own budget was never crossed): %+v", payload)
+	case <-time.After(300 * time.Millisecond):
+		// expected: team-under never crosses its own 50.0 budget with one 10.0 request
+	}
+}
+
+// TestServer_ClientCostBudget_IndependentFromServerWideBudget proves a
+// named key's own cost_budget and Server.CostBudget (the server-wide
+// one) are entirely separate checks: a request can cross one, both, or
+// neither, and each still only ever fires its own alert once.
+func TestServer_ClientCostBudget_IndependentFromServerWideBudget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan string, 4)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		client, _ := payload["client"].(string)
+		received <- client
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // cost = 10.0 per request
+	srv.CostBudget = 5.0      // server-wide: crossed by any request, client="" (never attributed)
+	srv.WebhookURL = webhookURL
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "team-a", Key: "key-a", CostBudget: 5.0}, // also crossed by its own first request
+	}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer key-a")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	// Both the server-wide budget (client="") and team-a's own budget
+	// (client="team-a") should have fired from this single request.
+	var events []string
+	for i := 0; i < 2; i++ {
+		select {
+		case client := <-received:
+			events = append(events, client)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("want 2 webhook calls (server-wide + team-a), got %v", events)
+		}
+	}
+
+	sawGlobal, sawClient := false, false
+	for _, c := range events {
+		if c == "" {
+			sawGlobal = true
+		}
+		if c == "team-a" {
+			sawClient = true
+		}
+	}
+	if !sawGlobal || !sawClient {
+		t.Fatalf("events = %v, want one with client=\"\" (server-wide) and one with client=\"team-a\"", events)
+	}
+}
+
+// TestServer_ClientCostBudget_AlertFiresExactlyOnceAcrossManyRequests
+// proves the one-shot latch holds across real HTTP traffic for a named
+// key's own budget too, not just the server-wide one.
+func TestServer_ClientCostBudget_AlertFiresExactlyOnceAcrossManyRequests(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	var callCount atomic.Int32
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0
+	srv.WebhookURL = webhookURL
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "team-a", Key: "key-a", CostBudget: 5.0}}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 5; i++ {
+		req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer key-a")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if got := callCount.Load(); got != 1 {
+		t.Fatalf("webhook called %d times, want exactly 1 (the one-shot latch should suppress every request after the first crossing)", got)
+	}
+}
+
+// TestServer_ClientCostBudget_NeverBlocksOrAffectsTraffic proves a
+// crossed per-key budget is alert-only, exactly like the server-wide
+// one: the request that crosses it (and every one after) is still
+// forwarded and answered completely normally.
+func TestServer_ClientCostBudget_NeverBlocksOrAffectsTraffic(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "team-a", Key: "key-a", CostBudget: 1.0}}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer key-a")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a crossed per-key budget must never block traffic)", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "total_tokens") {
+		t.Errorf("body = %q, want the upstream response delivered unchanged", body)
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget proves a
+// SIGHUP-style ReloadConfig can add a per-key cost_budget to a server
+// that started with none — the field lives on ProxyKey, so it swaps in
+// with ProxyAPIKeys the same way Name/Key/Limiter already do, no
+// ReloadConfig signature change needed.
+func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	var callCount atomic.Int32
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.CostPer1KTokens = 1.0
+	srv.WebhookURL = webhookURL
+	srv.ProxyAPIKeys = []proxy.ProxyKey{{Name: "team-a", Key: "key-a"}} // no budget yet
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() {
+		req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer key-a")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	post()
+	time.Sleep(200 * time.Millisecond)
+	if got := callCount.Load(); got != 0 {
+		t.Fatalf("webhook called %d times before reload, want 0 (no budget configured yet)", got)
+	}
+
+	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
+		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
+	}, nil, nil, nil)
+
+	post()
+	time.Sleep(200 * time.Millisecond)
+	if got := callCount.Load(); got != 1 {
+		t.Fatalf("webhook called %d times after reload, want 1 (the newly configured budget should now fire)", got)
+	}
+}

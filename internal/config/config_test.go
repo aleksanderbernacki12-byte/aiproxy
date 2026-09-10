@@ -288,6 +288,28 @@ func TestLoad_ParsesProxyAPIKeys(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesProxyAPIKeyCostBudget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [
+		{"name": "team-a", "key": "key-1", "cost_budget": 10.5}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.ProxyAPIKeys) != 1 {
+		t.Fatalf("len(ProxyAPIKeys) = %d, want 1", len(cfg.ProxyAPIKeys))
+	}
+	if cfg.ProxyAPIKeys[0].CostBudget != 10.5 {
+		t.Errorf("ProxyAPIKeys[0].CostBudget = %g, want 10.5", cfg.ProxyAPIKeys[0].CostBudget)
+	}
+}
+
 func TestLoad_ProxyAPIKeysDefaultsToEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
