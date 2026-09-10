@@ -320,6 +320,160 @@ func TestServer_RateLimiting_SixthRequestGets429AndResetsAfterWindow(t *testing.
 	}
 }
 
+// TestServer_TokenRateLimit_BlocksOnceWindowUsageReachesBudgetAndResetsAfterWindow
+// proves the token-based breaker's full lifecycle end to end: each
+// response reports 100 tokens used; against a 150-token budget, the
+// first two requests are allowed (window usage 0, then 100, both under
+// budget) but the third is rejected before ever reaching the upstream
+// (window usage now 200, at/over budget) — then, once the window has
+// fully elapsed, capacity frees up again exactly like the plain
+// request-count breaker does.
+func TestServer_TokenRateLimit_BlocksOnceWindowUsageReachesBudgetAndResetsAfterWindow(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Write([]byte(`{"usage":{"total_tokens":100}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(&logBuf, "", 0)
+	const window = 150 * time.Millisecond
+	srv.TokenLimiter = limiter.NewTokenLimiter(150, window)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func() int {
+		resp, err := http.Get(frontend.URL + "/endpoint")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("request 1: status = %d, want %d", got, http.StatusOK)
+	}
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("request 2: status = %d, want %d (window usage 100/150, still under budget)", got, http.StatusOK)
+	}
+	if got := get(); got != http.StatusTooManyRequests {
+		t.Fatalf("request 3: status = %d, want %d (window usage 200/150, over budget)", got, http.StatusTooManyRequests)
+	}
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want exactly 2 (the 3rd must never reach upstream)", upstreamHits.Load())
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "[TOKEN LIMIT] GET /endpoint - Token rate limit exceeded") {
+		t.Fatalf("log missing token limit message: %q", logOutput)
+	}
+
+	time.Sleep(window + 100*time.Millisecond)
+
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("request after window reset: status = %d, want %d", got, http.StatusOK)
+	}
+	if upstreamHits.Load() != 3 {
+		t.Fatalf("upstream hits = %d, want exactly 3 after the window reset", upstreamHits.Load())
+	}
+}
+
+// TestServer_TokenRateLimit_NeverBlocksFirstRequestRegardlessOfItsOwnUsage
+// documents the intentional overshoot tradeoff described in
+// limiter.TokenLimiter's doc comment, exercised through the full
+// ServeHTTP path: a request's own token cost isn't known until its
+// response comes back, so even a tiny configured budget never blocks
+// the very first request against an empty window — it can only ever
+// reject a *later* one, once usage has actually been recorded.
+func TestServer_TokenRateLimit_NeverBlocksFirstRequestRegardlessOfItsOwnUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TokenLimiter = limiter.NewTokenLimiter(1, time.Minute) // budget of just 1 token
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (the window was empty when this request was checked)", resp.StatusCode, http.StatusOK)
+	}
+
+	// The next request, however, must now be rejected — the first
+	// response's 10000 tokens are recorded, hugely over the 1-token
+	// budget.
+	resp2, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("get 2: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (10000 tokens now recorded against a 1-token budget)", resp2.StatusCode, http.StatusTooManyRequests)
+	}
+}
+
+// TestServer_TokenRateLimit_RejectedRequestNeverCountsAsPlainRateLimited
+// proves the two breakers are tracked as fully independent counters —
+// same "distinct counters for distinct rejection reasons" discipline as
+// ip_denied vs. unauthorized — so a token-budget rejection is visible in
+// stats as exactly that, not folded into RateLimited.
+func TestServer_TokenRateLimit_RejectedRequestNeverCountsAsPlainRateLimited(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TokenLimiter = limiter.NewTokenLimiter(0, time.Minute) // 0: nothing ever allowed
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.TokenRateLimited != 1 {
+		t.Errorf("TokenRateLimited = %d, want 1", snap.TokenRateLimited)
+	}
+	if snap.RateLimited != 0 {
+		t.Errorf("RateLimited = %d, want 0 (a token-budget rejection is not a plain rate limit rejection)", snap.RateLimited)
+	}
+}
+
 // TestServer_MaxBodyBytes_OversizedRequestGets413 proves a request body
 // larger than the configured MaxBodyBytes is rejected before it's fully
 // buffered, never reaching the upstream, while a body within the limit
@@ -1669,8 +1823,8 @@ func TestServer_MultiTargetRouting_RoutesByPathPrefixAndStripsPrefix(t *testing.
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -1748,8 +1902,8 @@ func TestServer_MultiTargetRouting_CacheKeysDifferPerTarget(t *testing.T) {
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", openaiURL, engine)
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
 	srv.Cache = c
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -1845,8 +1999,8 @@ func TestServer_MultiTargetRouting_StatsBreakDownPerTarget(t *testing.T) {
 	})
 
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
 	srv.CostPer1KTokens = 0.02
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -2271,7 +2425,7 @@ func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
 	}
 
 	srv.CostPer1KTokens = 0.02
-	srv.AddRoute("/other", []*url.URL{otherURL}, nil)
+	srv.AddRoute("/other", []*url.URL{otherURL}, nil, nil)
 	resp2, err := http.Get(frontend.URL + "/other/y")
 	if err != nil {
 		t.Fatalf("GET /other/y: %v", err)
@@ -2661,7 +2815,7 @@ func TestServer_MetricsEndpoint_IncludesCostOnlyWhenConfiguredAndLabelsEveryTarg
 	}
 
 	srv.CostPer1KTokens = 0.02
-	srv.AddRoute("/other", []*url.URL{otherURL}, nil)
+	srv.AddRoute("/other", []*url.URL{otherURL}, nil, nil)
 	resp2, err := http.Get(frontend.URL + "/other/y")
 	if err != nil {
 		t.Fatalf("GET /other/y: %v", err)
@@ -2709,8 +2863,8 @@ func TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently(t *testing.
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", sharedURL, engine)
 	srv.Limiter = limiter.New(5, time.Minute) // generous shared budget
-	srv.AddRoute("/strict", []*url.URL{strictURL}, limiter.New(1, time.Minute))
-	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil) // no override: shares srv.Limiter
+	srv.AddRoute("/strict", []*url.URL{strictURL}, limiter.New(1, time.Minute), nil)
+	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil, nil) // no override: shares srv.Limiter
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -2751,6 +2905,74 @@ func TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently(t *testing.
 	}
 }
 
+// TestServer_MultiTargetRouting_PerTargetTokenLimiterActsIndependently
+// is TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently's
+// counterpart for the token-based breaker: a route with its own
+// max_tokens_per_minute override never draws from — or is exhausted
+// by — another route's token usage, and a route with no override of its
+// own keeps sharing the server-wide TokenLimiter.
+func TestServer_MultiTargetRouting_PerTargetTokenLimiterActsIndependently(t *testing.T) {
+	var strictHits, sharedHits atomic.Int32
+	strict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		strictHits.Add(1)
+		w.Write([]byte(`{"usage":{"total_tokens":100}}`))
+	}))
+	defer strict.Close()
+	shared := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sharedHits.Add(1)
+		w.Write([]byte(`{"usage":{"total_tokens":100}}`))
+	}))
+	defer shared.Close()
+
+	strictURL, err := url.Parse(strict.URL)
+	if err != nil {
+		t.Fatalf("parse strict url: %v", err)
+	}
+	sharedURL, err := url.Parse(shared.URL)
+	if err != nil {
+		t.Fatalf("parse shared url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", sharedURL, engine)
+	srv.TokenLimiter = limiter.NewTokenLimiter(1000, time.Minute) // generous shared budget
+	srv.AddRoute("/strict", []*url.URL{strictURL}, nil, limiter.NewTokenLimiter(100, time.Minute))
+	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil, nil) // no override: shares srv.TokenLimiter
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func(path string) int {
+		resp, err := http.Get(frontend.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get("/strict/x"); got != http.StatusOK {
+		t.Fatalf("first /strict request status = %d, want %d", got, http.StatusOK)
+	}
+	if got := get("/strict/x"); got != http.StatusTooManyRequests {
+		t.Fatalf("second /strict request status = %d, want %d (its own 100-token budget already used up by the first response)", got, http.StatusTooManyRequests)
+	}
+	if strictHits.Load() != 1 {
+		t.Fatalf("strict upstream hits = %d, want exactly 1", strictHits.Load())
+	}
+
+	// /shared has no override, so it draws from the full server-wide
+	// 1000-token budget, entirely unaffected by /strict's own dedicated
+	// (and already-exhausted) breaker.
+	if got := get("/shared/x"); got != http.StatusOK {
+		t.Fatalf("/shared request status = %d, want %d", got, http.StatusOK)
+	}
+	if sharedHits.Load() != 1 {
+		t.Fatalf("shared upstream hits = %d, want exactly 1", sharedHits.Load())
+	}
+}
+
 // TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget
 // proves a 429 from a per-target limiter is recorded under that target's
 // own stats entry, not lumped into the overall count without a target,
@@ -2768,7 +2990,7 @@ func TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget(
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", targetURL, engine)
-	srv.AddRoute("/limited", []*url.URL{targetURL}, limiter.New(1, time.Minute))
+	srv.AddRoute("/limited", []*url.URL{targetURL}, limiter.New(1, time.Minute), nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -3088,7 +3310,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -3150,7 +3372,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil)
 		}
 	}()
 
@@ -3741,6 +3963,73 @@ func TestServer_Webhook_FiresOnRateLimitWithExpectedPayload(t *testing.T) {
 	}
 }
 
+// TestServer_Webhook_FiresOnTokenRateLimitWithExpectedPayload is
+// TestServer_Webhook_FiresOnRateLimitWithExpectedPayload's counterpart
+// for the token-based breaker.
+func TestServer_Webhook_FiresOnTokenRateLimitWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("token-rate-limited request must never reach the upstream target")
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.TokenLimiter = limiter.NewTokenLimiter(0, time.Minute) // 0: nothing ever allowed
+	srv.WebhookURL = webhookURL
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "token_rate_limited" {
+			t.Errorf("event = %v, want %q", payload["event"], "token_rate_limited")
+		}
+		if payload["method"] != "POST" {
+			t.Errorf("method = %v, want %q", payload["method"], "POST")
+		}
+		if payload["url"] != "/chat" {
+			t.Errorf("url = %v, want %q", payload["url"], "/chat")
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string (a token rate limit trip matches no rule)", payload["rule"])
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "TOKEN_RATE_LIMITED") || !strings.Contains(text, "Token rate limit exceeded") {
+			t.Errorf("text = %q, want it to mention TOKEN_RATE_LIMITED and the token rate limit", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
 // TestServer_Webhook_NeverFiresOnAllow proves a clean, allowed request
 // never triggers a webhook call at all — alerts are for block/redact
 // events only, not every request.
@@ -4092,7 +4381,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -5192,6 +5481,52 @@ func TestServer_ProxyAuth_NamedKeyOwnRateLimitTakesPrecedenceOverRoute(t *testin
 	}
 }
 
+// TestServer_ProxyAuth_NamedKeyOwnTokenRateLimitTakesPrecedenceOverRoute
+// is TestServer_ProxyAuth_NamedKeyOwnRateLimitTakesPrecedenceOverRoute's
+// counterpart for the token-based breaker.
+func TestServer_ProxyAuth_NamedKeyOwnTokenRateLimitTakesPrecedenceOverRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":100}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	// The server-wide token breaker is generous — the key's own (100
+	// tokens) must be what actually governs this caller.
+	srv.TokenLimiter = limiter.NewTokenLimiter(1000000, time.Minute)
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "team-a", Key: "team-a-key", TokenLimiter: limiter.NewTokenLimiter(100, time.Minute)},
+	}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	do := func() int {
+		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer team-a-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := do(); got != http.StatusOK {
+		t.Fatalf("first request status = %d, want %d", got, http.StatusOK)
+	}
+	if got := do(); got != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (the key's own 100-token budget, not the server-wide one)", got, http.StatusTooManyRequests)
+	}
+}
+
 // TestServer_ProxyAuth_NamedKeyWithoutOwnLimiterFallsBackToRoute proves
 // a key with no max_requests_per_minute override behaves exactly as
 // before — sharing whatever route/global limiter would otherwise apply
@@ -5319,7 +5654,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -5651,7 +5986,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -6025,7 +6360,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -6055,7 +6390,7 @@ func TestServer_Failover_FailsOverToNextCandidateWhenFirstUnreachable(t *testing
 	var logBuf syncBuffer
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(&logBuf, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -6117,7 +6452,7 @@ func TestServer_Failover_NeverRetriesOnHTTPLevelErrorResponse(t *testing.T) {
 
 	srv := proxy.New("unused", failingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{failingURL, secondURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{failingURL, secondURL}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -6160,7 +6495,7 @@ func TestServer_Failover_AllCandidatesUnreachable_StillReturnsAnErrorResponse(t 
 
 	srv := proxy.New("unused", firstDead, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{firstDead, secondDead}, nil)
+	srv.AddRoute("/openai", []*url.URL{firstDead, secondDead}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -6200,7 +6535,7 @@ func TestServer_Failover_ReusesBufferedBodyAcrossAttempts(t *testing.T) {
 
 	srv := proxy.New("unused", echoingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, echoingURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, echoingURL}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -6252,7 +6587,7 @@ func TestServer_Webhook_FiresOnFailoverWithExpectedPayload(t *testing.T) {
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.WebhookURL = webhookURL
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -6307,7 +6642,7 @@ func TestServer_StatsEndpoint_ReportsFailoverPerTarget(t *testing.T) {
 
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -6353,7 +6688,7 @@ func TestServer_MetricsEndpoint_ReportsFailoverCounter(t *testing.T) {
 
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -6561,7 +6896,7 @@ func TestServer_Latency_RecordedOnceEvenAfterFailover(t *testing.T) {
 
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -7081,7 +7416,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -7207,8 +7542,8 @@ func TestServer_ModelRouting_RoutesByBodyModelFieldAndLeavesPathUnchanged(t *tes
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{anthropicURL}, nil)
-	srv.AddModelRoute("openai", []string{"gpt-*", "o1*"}, []*url.URL{openaiURL}, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{anthropicURL}, nil, nil)
+	srv.AddModelRoute("openai", []string{"gpt-*", "o1*"}, []*url.URL{openaiURL}, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7283,8 +7618,8 @@ func TestServer_ModelRouting_TakesPriorityOverPathPrefixRouting(t *testing.T) {
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", pathURL, engine)
-	srv.AddRoute("/v1", []*url.URL{pathURL}, nil)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil)
+	srv.AddRoute("/v1", []*url.URL{pathURL}, nil, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7338,8 +7673,8 @@ func TestServer_ModelRouting_FirstMatchingRouteWinsInConfiguredOrder(t *testing.
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", firstURL, engine)
-	srv.AddModelRoute("first", []string{"claude-*"}, []*url.URL{firstURL}, nil)
-	srv.AddModelRoute("second", []string{"claude-3-*"}, []*url.URL{secondURL}, nil)
+	srv.AddModelRoute("first", []string{"claude-*"}, []*url.URL{firstURL}, nil, nil)
+	srv.AddModelRoute("second", []string{"claude-3-*"}, []*url.URL{secondURL}, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7374,7 +7709,7 @@ func TestServer_ModelRouting_PerTargetStatsLabeledByModelRouteName(t *testing.T)
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", upstreamURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7420,7 +7755,7 @@ func TestServer_ModelRouting_OwnRateLimitTakesPrecedenceOverServerWide(t *testin
 	// — if the route's own limiter isn't what's actually enforced, this
 	// request would never be rate-limited within the test.
 	srv.Limiter = limiter.New(1000, time.Minute)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, limiter.New(1, time.Minute))
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, limiter.New(1, time.Minute), nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7440,6 +7775,49 @@ func TestServer_ModelRouting_OwnRateLimitTakesPrecedenceOverServerWide(t *testin
 	}
 	if got := post(); got != http.StatusTooManyRequests {
 		t.Fatalf("second request status = %d, want %d (the model route's own 1/minute limit should have tripped)", got, http.StatusTooManyRequests)
+	}
+}
+
+// TestServer_ModelRouting_OwnTokenRateLimitTakesPrecedenceOverServerWide
+// is TestServer_ModelRouting_OwnRateLimitTakesPrecedenceOverServerWide's
+// counterpart for the token-based breaker.
+func TestServer_ModelRouting_OwnTokenRateLimitTakesPrecedenceOverServerWide(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":100}}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", upstreamURL, engine)
+	// The server-wide token breaker is generous; the model route's own
+	// (100 tokens) is not — if the route's own isn't what's actually
+	// enforced, this request would never be token-rate-limited within
+	// the test.
+	srv.TokenLimiter = limiter.NewTokenLimiter(1000000, time.Minute)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil, limiter.NewTokenLimiter(100, time.Minute))
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() int {
+		resp, err := http.Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-3-opus"}`))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := post(); got != http.StatusOK {
+		t.Fatalf("first request status = %d, want %d", got, http.StatusOK)
+	}
+	if got := post(); got != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (the model route's own 100-token budget should have tripped)", got, http.StatusTooManyRequests)
 	}
 }
 
@@ -7464,7 +7842,7 @@ func TestServer_ModelRouting_FailoverAcrossCandidatesWorksLikePathRoutes(t *test
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", workingURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{unreachable, workingURL}, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{unreachable, workingURL}, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7517,7 +7895,7 @@ func TestServer_ModelRouting_UnparseableOrMissingModelFieldFallsBackToPathRoutin
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7593,7 +7971,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil)
+	}, nil, nil, nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -7909,7 +8287,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -8264,10 +8642,52 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	})
+	}, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesTokenLimiter proves the server-wide
+// TokenLimiter is one of the fields ReloadConfig atomically swaps in —
+// disabled before the reload, live and enforcing immediately after.
+func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":100}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func() int {
+		resp, err := http.Get(frontend.URL + "/x")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
+	}
+
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute))
+
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
+	}
+	if got := get(); got != http.StatusTooManyRequests {
+		t.Fatalf("second request after reload: status = %d, want %d (100 tokens already recorded against the newly configured 50-token budget)", got, http.StatusTooManyRequests)
 	}
 }
 

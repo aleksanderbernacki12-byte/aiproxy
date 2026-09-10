@@ -124,6 +124,14 @@ type requestContextInfo struct {
 	// clientLabel is, for stats.Stats.CrossedClientBudget.
 	clientCostBudget float64
 
+	// tokenLimiter is the effective token-based rate limiter for this
+	// request (the authenticated key's own, else the resolved route's,
+	// else the server-wide one — see ServeHTTP), carried through to
+	// logUsageFromBody so its Add can record this request's actual
+	// usage the moment it's known, from the upstream response. nil
+	// means no token-based breaker applies to this request at all.
+	tokenLimiter *limiter.TokenLimiter
+
 	// latency, if non-nil, is written by failoverTransport.RoundTrip the
 	// moment a response actually comes back (successfully, from
 	// whichever candidate) and read back by modifyResponse to log a
@@ -142,9 +150,10 @@ type requestContextInfo struct {
 // which case it applies instead of the server-wide Limiter for this
 // route's traffic only.
 type route struct {
-	prefix  string
-	targets []*url.URL
-	limiter *limiter.Limiter
+	prefix       string
+	targets      []*url.URL
+	limiter      *limiter.Limiter
+	tokenLimiter *limiter.TokenLimiter
 }
 
 // modelRoute is one model-name-to-upstream mapping for content-based
@@ -152,10 +161,11 @@ type route struct {
 // like route's fields; models is a non-empty list of path.Match glob
 // patterns checked, in order, against the request body's "model" field.
 type modelRoute struct {
-	name    string
-	models  []string
-	targets []*url.URL
-	limiter *limiter.Limiter
+	name         string
+	models       []string
+	targets      []*url.URL
+	limiter      *limiter.Limiter
+	tokenLimiter *limiter.TokenLimiter
 }
 
 // statsPath is a reserved, proxy-internal path: a GET request to it never
@@ -294,11 +304,21 @@ type Server struct {
 	LogFormat LogFormat
 
 	// mu guards every field below it against a concurrent ReloadConfig.
-	mu              sync.RWMutex
-	Engine          *rules.Engine
-	Limiter         *limiter.Limiter // nil disables the circuit breaker
-	Cache           *cache.Cache     // nil disables the response cache
-	CostPer1KTokens float64          // zero omits the shutdown summary's cost line
+	mu      sync.RWMutex
+	Engine  *rules.Engine
+	Limiter *limiter.Limiter // nil disables the circuit breaker
+
+	// TokenLimiter is a second, orthogonal circuit breaker keyed on
+	// upstream response tokens actually used within a rolling minute,
+	// instead of Limiter's plain request count — see
+	// limiter.TokenLimiter. nil disables it entirely. Resolved with the
+	// same precedence as Limiter: a route/model route's own TokenLimiter
+	// (if any) or a ProxyKey's own (if any, taking priority over both)
+	// override this server-wide one for their own traffic.
+	TokenLimiter *limiter.TokenLimiter
+
+	Cache           *cache.Cache // nil disables the response cache
+	CostPer1KTokens float64      // zero omits the shutdown summary's cost line
 	routes          []route
 	modelRoutes     []modelRoute
 
@@ -591,9 +611,9 @@ func (t *failoverTransport) recordLatency(reqCtx requestContextInfo, d time.Dura
 // traffic to one provider then can't throttle the others. Pass nil for a
 // route that should just share whatever Limiter (if any) the server is
 // configured with, same as every route did before per-target limits
-// existed.
-func (s *Server) AddRoute(prefix string, targets []*url.URL, lim *limiter.Limiter) {
-	s.routes = append(s.routes, route{prefix: prefix, targets: targets, limiter: lim})
+// existed. tokenLim behaves the same way for TokenLimiter.
+func (s *Server) AddRoute(prefix string, targets []*url.URL, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
+	s.routes = append(s.routes, route{prefix: prefix, targets: targets, limiter: lim, tokenLimiter: tokenLim})
 }
 
 // resolveRoute matches path against the registered routes and returns
@@ -602,12 +622,12 @@ func (s *Server) AddRoute(prefix string, targets []*url.URL, lim *limiter.Limite
 // the path to forward it as (the matched prefix stripped, if any route
 // matched), a label identifying the target for the per-target stats
 // breakdown (the matched prefix, or "default" for the fallback Target),
-// and the rate limiter that applies to this request: the matched
-// route's own limiter if it has one, otherwise the server-wide Limiter
-// (nil if that is unset too, meaning no limiting at all). It falls back
-// to a single-element list holding the default Target, unmodified path,
-// when nothing matches.
-func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter) {
+// and the rate limiters that apply to this request: the matched route's
+// own limiter/tokenLimiter if it has them, otherwise the server-wide
+// Limiter/TokenLimiter (nil if those are unset too, meaning no limiting
+// at all). It falls back to a single-element list holding the default
+// Target, unmodified path, when nothing matches.
+func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, r := range s.routes {
@@ -620,10 +640,14 @@ func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath stri
 			if effectiveLimiter == nil {
 				effectiveLimiter = s.Limiter
 			}
-			return r.targets, stripped, r.prefix, effectiveLimiter
+			effectiveTokenLimiter := r.tokenLimiter
+			if effectiveTokenLimiter == nil {
+				effectiveTokenLimiter = s.TokenLimiter
+			}
+			return r.targets, stripped, r.prefix, effectiveLimiter, effectiveTokenLimiter
 		}
 	}
-	return []*url.URL{s.Target}, path, "default", s.Limiter
+	return []*url.URL{s.Target}, path, "default", s.Limiter, s.TokenLimiter
 }
 
 // AddModelRoute registers a content-based route: any request whose
@@ -635,9 +659,10 @@ func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath stri
 // it. name identifies this route in stats/logs, prefixed with "model:"
 // to keep it visually and collision-free distinct from a path prefix's
 // own label. See resolveModelRoute for matching order and precedence
-// over path-prefix routes.
-func (s *Server) AddModelRoute(name string, models []string, targets []*url.URL, lim *limiter.Limiter) {
-	s.modelRoutes = append(s.modelRoutes, modelRoute{name: name, models: models, targets: targets, limiter: lim})
+// over path-prefix routes. tokenLim behaves like AddRoute's own
+// parameter of the same name.
+func (s *Server) AddModelRoute(name string, models []string, targets []*url.URL, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
+	s.modelRoutes = append(s.modelRoutes, modelRoute{name: name, models: models, targets: targets, limiter: lim, tokenLimiter: tokenLim})
 }
 
 // modelField pulls just the top-level "model" string out of a request
@@ -659,26 +684,26 @@ type modelField struct {
 // a model route represents a deliberate, explicit routing decision by
 // the operator, so when one is configured and matches, it takes
 // priority over whatever path the client happened to use.
-func (s *Server) resolveModelRoute(body []byte) (targets []*url.URL, label string, lim *limiter.Limiter, matched bool) {
+func (s *Server) resolveModelRoute(body []byte) (targets []*url.URL, label string, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter, matched bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if len(s.modelRoutes) == 0 {
-		return nil, "", nil, false
+		return nil, "", nil, nil, false
 	}
 
 	var mf modelField
 	if err := json.Unmarshal(body, &mf); err != nil || mf.Model == "" {
-		return nil, "", nil, false
+		return nil, "", nil, nil, false
 	}
 
 	for _, r := range s.modelRoutes {
 		for _, pattern := range r.models {
 			if ok, err := path.Match(pattern, mf.Model); err == nil && ok {
-				return r.targets, "model:" + r.name, r.limiter, true
+				return r.targets, "model:" + r.name, r.limiter, r.tokenLimiter, true
 			}
 		}
 	}
-	return nil, "", nil, false
+	return nil, "", nil, nil, false
 }
 
 // getEngine, getCache, getCostPer1KTokens, and getWebhookURL are small
@@ -817,6 +842,10 @@ type Route struct {
 	// Limiter, if non-nil, gives this route its own dedicated rate
 	// limit instead of sharing whatever Limiter ReloadConfig sets.
 	Limiter *limiter.Limiter
+	// TokenLimiter, if non-nil, gives this route its own dedicated
+	// token-based rate limit instead of sharing whatever TokenLimiter
+	// ReloadConfig sets.
+	TokenLimiter *limiter.TokenLimiter
 }
 
 // ModelRoute describes one model-name-to-upstream mapping for
@@ -831,6 +860,10 @@ type ModelRoute struct {
 	// Limiter, if non-nil, gives this route its own dedicated rate
 	// limit instead of sharing whatever Limiter ReloadConfig sets.
 	Limiter *limiter.Limiter
+	// TokenLimiter, if non-nil, gives this route its own dedicated
+	// token-based rate limit instead of sharing whatever TokenLimiter
+	// ReloadConfig sets.
+	TokenLimiter *limiter.TokenLimiter
 }
 
 // ReloadConfig atomically replaces the engine, rate limiter, cache,
@@ -857,20 +890,27 @@ type ModelRoute struct {
 // the next reload's fresh handle creates a new file at that same path.
 // The old handle, if any, is closed after the swap — never left open —
 // so a long-running proxy reloaded repeatedly never leaks descriptors.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet) {
+//
+// tokenLim replaces the server-wide TokenLimiter the same way lim
+// replaces Limiter; pass nil to disable it. Appended as the last
+// parameter, after every field that existed before the token-based
+// breaker did, rather than alongside lim, purely to keep every existing
+// positional call site's argument order intact.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
-		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter}
+		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
 	}
 	newModelRoutes := make([]modelRoute, len(modelRoutes))
 	for i, r := range modelRoutes {
-		newModelRoutes[i] = modelRoute{name: r.Name, models: r.Models, targets: r.Targets, limiter: r.Limiter}
+		newModelRoutes[i] = modelRoute{name: r.Name, models: r.Models, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
 	}
 
 	s.mu.Lock()
 	oldLogFile := s.LogFile
 	s.Engine = engine
 	s.Limiter = lim
+	s.TokenLimiter = tokenLim
 	s.Cache = cch
 	s.CostPer1KTokens = costPer1KTokens
 	s.CostBudget = costBudget
@@ -923,6 +963,12 @@ type ProxyKey struct {
 	// would otherwise apply for a request authenticated with it.
 	Limiter *limiter.Limiter
 
+	// TokenLimiter, if non-nil, is this key's own dedicated token-based
+	// rate limit, checked instead of whatever route or the server-wide
+	// TokenLimiter would otherwise apply for a request authenticated
+	// with it — same precedence Limiter already has.
+	TokenLimiter *limiter.TokenLimiter
+
 	// CostBudget, if greater than zero, is this key's own cost
 	// threshold — see stats.Stats.CrossedClientBudget. Fires
 	// independently of Server.CostBudget (the server-wide one) and of
@@ -940,9 +986,10 @@ type clientAuth struct {
 	// label is "default" for the anonymous Server.ProxyAPIKey, a named
 	// ProxyKey's Name, or "" when the auth check is disabled entirely
 	// (nothing to attribute a request to).
-	label      string
-	limiter    *limiter.Limiter
-	costBudget float64
+	label        string
+	limiter      *limiter.Limiter
+	tokenLimiter *limiter.TokenLimiter
+	costBudget   float64
 }
 
 // checkProxyAuth reports whether r is allowed to use the proxy at all,
@@ -973,7 +1020,7 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 	}
 	for _, k := range proxyAPIKeys {
 		if subtle.ConstantTimeCompare(gotBytes, []byte(k.Key)) == 1 {
-			return clientAuth{label: k.Name, limiter: k.Limiter, costBudget: k.CostBudget}, true
+			return clientAuth{label: k.Name, limiter: k.Limiter, tokenLimiter: k.TokenLimiter, costBudget: k.CostBudget}, true
 		}
 	}
 	return clientAuth{}, false
@@ -1062,10 +1109,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var targets []*url.URL
 	var forwardPath, targetLabel string
 	var effectiveLimiter *limiter.Limiter
-	if mTargets, mLabel, mLimiter, matched := s.resolveModelRoute(body); matched {
-		targets, forwardPath, targetLabel, effectiveLimiter = mTargets, r.URL.Path, mLabel, mLimiter
+	var effectiveTokenLimiter *limiter.TokenLimiter
+	if mTargets, mLabel, mLimiter, mTokenLimiter, matched := s.resolveModelRoute(body); matched {
+		targets, forwardPath, targetLabel, effectiveLimiter, effectiveTokenLimiter = mTargets, r.URL.Path, mLabel, mLimiter, mTokenLimiter
 	} else {
-		targets, forwardPath, targetLabel, effectiveLimiter = s.resolveRoute(r.URL.Path)
+		targets, forwardPath, targetLabel, effectiveLimiter, effectiveTokenLimiter = s.resolveRoute(r.URL.Path)
 	}
 	if auth.limiter != nil {
 		// The authenticated key's own rate limit is authoritative for
@@ -1073,6 +1121,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// precedence over both the route's own limiter and the
 		// server-wide one.
 		effectiveLimiter = auth.limiter
+	}
+	if auth.tokenLimiter != nil {
+		effectiveTokenLimiter = auth.tokenLimiter
 	}
 
 	// The cache is checked before rules and the rate limiter: a cache hit
@@ -1127,6 +1178,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A second, independent breaker: effectiveTokenLimiter.Allow() only
+	// peeks at usage already recorded for this window (see
+	// limiter.TokenLimiter) — the actual token cost of *this* request
+	// isn't known until its response comes back, so it can never be
+	// checked against the budget before forwarding, only after, via
+	// logUsageFromBody's Add call once reqCtx carries this same limiter
+	// through to modifyResponse.
+	if effectiveTokenLimiter != nil && !effectiveTokenLimiter.Allow() {
+		s.Stats.RecordTokenRateLimited(targetLabel)
+		s.Stats.RecordClientTokenRateLimited(auth.label)
+		s.logTokenRateLimited(r.Method, r.URL.String())
+		s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "")
+		http.Error(w, "token rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	// evaluatedBody and evaluatedHeaders are body/r.Header unchanged
 	// unless action is Redact, in which case whichever of the two the
 	// match was actually found in has the matched secret masked out —
@@ -1171,6 +1238,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		targetLabel:      targetLabel,
 		clientLabel:      auth.label,
 		clientCostBudget: auth.costBudget,
+		tokenLimiter:     effectiveTokenLimiter,
 		latency:          new(time.Duration),
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
@@ -1565,6 +1633,13 @@ func tryUnmarshalUsage(data []byte) (int, bool) {
 
 func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 	if tokens := extractTotalTokens(body); tokens > 0 {
+		// Records this request's actual cost against whatever token
+		// breaker applied to it — see effectiveTokenLimiter in ServeHTTP
+		// and limiter.TokenLimiter.Allow's own doc comment for why this
+		// can only happen now, after the fact, never before forwarding.
+		if reqCtx.tokenLimiter != nil {
+			reqCtx.tokenLimiter.Add(tokens)
+		}
 		s.Stats.RecordTokensUsed(reqCtx.targetLabel, tokens)
 		s.Stats.RecordClientTokensUsed(reqCtx.clientLabel, tokens)
 		s.logUsage(reqCtx.method, reqCtx.url, tokens)
@@ -1604,6 +1679,20 @@ func (s *Server) logRateLimited(method, reqURL string) {
 		return
 	}
 	s.logf("%s[CIRCUIT BREAKER] %s %s - Rate limit exceeded%s", ansiYellow, method, reqURL, ansiReset)
+}
+
+// logTokenRateLimited is logRateLimited's counterpart for the
+// token-based breaker — see limiter.TokenLimiter. Kept as its own Level
+// ("token_rate_limited", not "rate_limited") so the two are
+// distinguishable in a JSON log stream or GET /_aiproxy/stats, the same
+// way ip_denied is kept separate from unauthorized.
+func (s *Server) logTokenRateLimited(method, reqURL string) {
+	ev := s.recordLogEvent(logEvent{Level: "token_rate_limited", Method: method, URL: reqURL})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[TOKEN LIMIT] %s %s - Token rate limit exceeded%s", ansiYellow, method, reqURL, ansiReset)
 }
 
 func (s *Server) logUnauthorized(method, reqURL string) {
@@ -1803,16 +1892,17 @@ func (s *Server) handleResponseDryRunHits(hits []rules.DryRunMatch, method, reqU
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
 // webhookAlert is the JSON body POSTed to Server.WebhookURL for every
-// block, redact, rate_limited, unauthorized, budget_exceeded, failover,
-// or dry-run event (dry_run_block, dry_run_redact,
-// response_dry_run_block, response_dry_run_redact). Text alone is
-// enough for a Slack incoming webhook (which reads exactly that field
-// and ignores the rest); the remaining fields serve a generic JSON
+// block, redact, rate_limited, token_rate_limited, unauthorized,
+// ip_denied, budget_exceeded, failover, or dry-run event (dry_run_block,
+// dry_run_redact, response_dry_run_block, response_dry_run_redact). Text
+// alone is enough for a Slack incoming webhook (which reads exactly that
+// field and ignores the rest); the remaining fields serve a generic JSON
 // webhook consumer that wants the event structured instead of parsed
 // back out of a sentence. Like every other log line in this package, it
 // carries the rule name that matched, never the matched secret itself;
-// Rule is empty for a rate_limited, unauthorized, budget_exceeded, or
-// failover event, since none of those is attributable to any one rule.
+// Rule is empty for a rate_limited, token_rate_limited, unauthorized,
+// ip_denied, budget_exceeded, or failover event, since none of those is
+// attributable to any one rule.
 // Cost and Budget are set only for budget_exceeded; FailedTarget and
 // NextTarget only for failover; omitted (via omitempty) for every other
 // event.
@@ -1932,6 +2022,8 @@ func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
 	switch {
 	case event == "rate_limited":
 		text = fmt.Sprintf("[%s] %s %s - Rate limit exceeded", strings.ToUpper(event), method, reqURL)
+	case event == "token_rate_limited":
+		text = fmt.Sprintf("[%s] %s %s - Token rate limit exceeded", strings.ToUpper(event), method, reqURL)
 	case event == "unauthorized":
 		text = fmt.Sprintf("[%s] %s %s - Missing or invalid Proxy-Authorization", strings.ToUpper(event), method, reqURL)
 	case strings.Contains(event, "dry_run"):
@@ -2104,10 +2196,15 @@ func (s *Server) logf(format string, args ...any) {
 // is a proxy-level concern (CostPer1KTokens) that the stats package has
 // no notion of.
 type statsSnapshotJSON struct {
-	Allowed          int64 `json:"allowed"`
-	Blocked          int64 `json:"blocked"`
-	Redacted         int64 `json:"redacted"`
-	RateLimited      int64 `json:"rate_limited"`
+	Allowed     int64 `json:"allowed"`
+	Blocked     int64 `json:"blocked"`
+	Redacted    int64 `json:"redacted"`
+	RateLimited int64 `json:"rate_limited"`
+
+	// TokenRateLimited counts requests rejected by the token-based
+	// circuit breaker — see limiter.TokenLimiter. Distinct from
+	// RateLimited, which is the plain request-count breaker.
+	TokenRateLimited int64 `json:"token_rate_limited"`
 	CacheHits        int64 `json:"cache_hits"`
 	TotalTokens      int64 `json:"total_tokens"`
 	ResponseBlocked  int64 `json:"response_blocked"`
@@ -2171,6 +2268,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		Blocked:                snap.Blocked,
 		Redacted:               snap.Redacted,
 		RateLimited:            snap.RateLimited,
+		TokenRateLimited:       snap.TokenRateLimited,
 		CacheHits:              snap.CacheHits,
 		TotalTokens:            snap.TotalTokens,
 		ResponseBlocked:        snap.ResponseBlocked,
@@ -2281,6 +2379,7 @@ var promCounters = []struct {
 	{"aiproxy_requests_blocked_total", "Total number of requests blocked by a rule.", func(s stats.Snapshot) int64 { return s.Blocked }},
 	{"aiproxy_requests_redacted_total", "Total number of requests forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.Redacted }},
 	{"aiproxy_requests_rate_limited_total", "Total number of requests rejected by the rate limiter.", func(s stats.Snapshot) int64 { return s.RateLimited }},
+	{"aiproxy_requests_token_rate_limited_total", "Total number of requests rejected by the token-based rate limiter.", func(s stats.Snapshot) int64 { return s.TokenRateLimited }},
 	{"aiproxy_cache_hits_total", "Total number of requests served from the local response cache.", func(s stats.Snapshot) int64 { return s.CacheHits }},
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
@@ -2339,6 +2438,7 @@ var promClientCounters = []struct {
 	{"aiproxy_client_blocked_total", "Total number of requests blocked by a rule, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.Blocked }},
 	{"aiproxy_client_redacted_total", "Total number of requests redacted, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.Redacted }},
 	{"aiproxy_client_rate_limited_total", "Total number of requests rejected by the rate limiter, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.RateLimited }},
+	{"aiproxy_client_token_rate_limited_total", "Total number of requests rejected by the token-based rate limiter, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.TokenRateLimited }},
 	{"aiproxy_client_tokens_used_total", "Total number of tokens reported in upstream response usage fields, for requests authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.TotalTokens }},
 }
 

@@ -516,6 +516,62 @@ func TestStats_RecordIPDenied_TracksOverallOnly(t *testing.T) {
 	}
 }
 
+// TestStats_RecordTokenRateLimited_TracksOverallAndPerTarget proves
+// RecordTokenRateLimited behaves like RecordRateLimited — broken down
+// per target, unlike RecordIPDenied/RecordUnauthorized — since which
+// token breaker tripped is always about a specific target/route.
+func TestStats_RecordTokenRateLimited_TracksOverallAndPerTarget(t *testing.T) {
+	s := stats.New()
+	s.RecordTokenRateLimited("openai")
+	s.RecordTokenRateLimited("openai")
+	s.RecordTokenRateLimited("anthropic")
+
+	snap := s.Snapshot()
+	if snap.TokenRateLimited != 3 {
+		t.Errorf("TokenRateLimited = %d, want 3", snap.TokenRateLimited)
+	}
+	if got := snap.PerTarget["openai"].TokenRateLimited; got != 2 {
+		t.Errorf("PerTarget[openai].TokenRateLimited = %d, want 2", got)
+	}
+	if got := snap.PerTarget["anthropic"].TokenRateLimited; got != 1 {
+		t.Errorf("PerTarget[anthropic].TokenRateLimited = %d, want 1", got)
+	}
+}
+
+// TestStats_RecordClientTokenRateLimited_AttributesToNamedKeyOnly
+// proves RecordClientTokenRateLimited is a no-op for an empty client
+// label (no proxy_api_key configured) and otherwise attributes to the
+// named key only — same discipline as every other RecordClient* method.
+func TestStats_RecordClientTokenRateLimited_AttributesToNamedKeyOnly(t *testing.T) {
+	s := stats.New()
+	s.RecordClientTokenRateLimited("")
+	s.RecordClientTokenRateLimited("team-a")
+	s.RecordClientTokenRateLimited("team-a")
+
+	snap := s.Snapshot()
+	if len(snap.PerClient) != 1 {
+		t.Fatalf("len(PerClient) = %d, want 1 (empty label must never create an entry)", len(snap.PerClient))
+	}
+	if got := snap.PerClient["team-a"].TokenRateLimited; got != 2 {
+		t.Errorf("PerClient[team-a].TokenRateLimited = %d, want 2", got)
+	}
+}
+
+func TestSnapshot_String_OmitsTokenRateLimitedLineWhenZero(t *testing.T) {
+	snap := stats.Snapshot{Allowed: 5}
+	if rendered := snap.String(); strings.Contains(rendered, "Token rate-limited") {
+		t.Errorf("String() = %q, want no Token rate-limited line when nothing tripped the breaker", rendered)
+	}
+}
+
+func TestSnapshot_String_IncludesTokenRateLimitedLineWhenNonZero(t *testing.T) {
+	snap := stats.Snapshot{TokenRateLimited: 4}
+	rendered := snap.String()
+	if !strings.Contains(rendered, "Token rate-limited:   4") {
+		t.Errorf("String() = %q, want a Token rate-limited: 4 line", rendered)
+	}
+}
+
 func TestSnapshot_String_OmitsUnauthorizedLineWhenZero(t *testing.T) {
 	snap := stats.Snapshot{Allowed: 5}
 	if rendered := snap.String(); strings.Contains(rendered, "Unauthorized") {

@@ -119,6 +119,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		server.Logger = log.New(os.Stderr, "", 0)
 	}
 	server.Limiter = lc.limiter
+	server.TokenLimiter = lc.tokenLimiter
 	server.Cache = lc.cache
 	server.CostPer1KTokens = lc.cost
 	server.CostBudget = lc.costBudget
@@ -131,10 +132,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.IPAllowList = lc.ipAllowList
 	server.IPDenyList = lc.ipDenyList
 	for _, r := range lc.routes {
-		server.AddRoute(r.prefix, r.targets, r.limiter)
+		server.AddRoute(r.prefix, r.targets, r.limiter, r.tokenLimiter)
 	}
 	for _, r := range lc.modelRoutes {
-		server.AddModelRoute(r.name, r.models, r.targets, r.limiter)
+		server.AddModelRoute(r.name, r.models, r.targets, r.limiter, r.tokenLimiter)
 	}
 
 	if cfg != nil {
@@ -155,6 +156,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if cfg.MaxRequestsPerMinute > 0 {
 			fmt.Fprintf(stdout, "circuit breaker: %d requests/minute\n", cfg.MaxRequestsPerMinute)
+		}
+		if cfg.MaxTokensPerMinute > 0 {
+			fmt.Fprintf(stdout, "token circuit breaker: %d tokens/minute\n", cfg.MaxTokensPerMinute)
 		}
 		if cfg.CacheEnabled {
 			if cfg.CacheTTLSeconds > 0 {
@@ -178,7 +182,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// a bearer credential directly in its path, so it gets the
 			// same treatment as every other secret aiproxy handles —
 			// never written to a log or the terminal.
-			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/unauthorized/dry-run/budget_exceeded)")
+			fmt.Fprintln(stdout, "webhook alerts: enabled (on block/redact/rate_limited/token_rate_limited/unauthorized/dry-run/budget_exceeded)")
 		}
 		if len(lc.webhooks) > 0 {
 			// Same discipline as the webhook_url notice above: counts
@@ -213,8 +217,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		for _, r := range lc.routes {
 			dest := formatTargetsForDisplay(r.targets)
-			if r.maxRequestsPerMinute > 0 {
-				fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %d requests/minute)\n", r.prefix, dest, r.maxRequestsPerMinute)
+			if limits := formatRateLimitsForDisplay(r.maxRequestsPerMinute, r.maxTokensPerMinute); limits != "" {
+				fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %s)\n", r.prefix, dest, limits)
 			} else {
 				fmt.Fprintf(stdout, "route: %s -> %s\n", r.prefix, dest)
 			}
@@ -222,8 +226,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		for _, r := range lc.modelRoutes {
 			dest := formatTargetsForDisplay(r.targets)
 			models := strings.Join(r.models, ", ")
-			if r.maxRequestsPerMinute > 0 {
-				fmt.Fprintf(stdout, "model route: %s (%s) -> %s (rate limit: %d requests/minute)\n", r.name, models, dest, r.maxRequestsPerMinute)
+			if limits := formatRateLimitsForDisplay(r.maxRequestsPerMinute, r.maxTokensPerMinute); limits != "" {
+				fmt.Fprintf(stdout, "model route: %s (%s) -> %s (rate limit: %s)\n", r.name, models, dest, limits)
 			} else {
 				fmt.Fprintf(stdout, "model route: %s (%s) -> %s\n", r.name, models, dest)
 			}
@@ -297,13 +301,13 @@ func reloadConfig(server *proxy.Server, configPath string) {
 
 	routes := make([]proxy.Route, len(lc.routes))
 	for i, r := range lc.routes {
-		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter}
+		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
 	modelRoutes := make([]proxy.ModelRoute, len(lc.modelRoutes))
 	for i, r := range lc.modelRoutes {
-		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter}
+		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter)
 
 	label := loadedFrom
 	if label == "" {
@@ -318,6 +322,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 type liveConfig struct {
 	engine       *rules.Engine
 	limiter      *limiter.Limiter
+	tokenLimiter *limiter.TokenLimiter
 	cache        *cache.Cache
 	cost         float64
 	costBudget   float64
@@ -351,6 +356,9 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 
 	if cfg.MaxRequestsPerMinute > 0 {
 		lc.limiter = limiter.New(cfg.MaxRequestsPerMinute, time.Minute)
+	}
+	if cfg.MaxTokensPerMinute > 0 {
+		lc.tokenLimiter = limiter.NewTokenLimiter(cfg.MaxTokensPerMinute, time.Minute)
 	}
 
 	if cfg.CacheEnabled {
@@ -709,6 +717,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.MaxRequestsPerMinute < 0 {
 		problems = append(problems, fmt.Sprintf("max_requests_per_minute: %d must not be negative", cfg.MaxRequestsPerMinute))
 	}
+	if cfg.MaxTokensPerMinute < 0 {
+		problems = append(problems, fmt.Sprintf("max_tokens_per_minute: %d must not be negative", cfg.MaxTokensPerMinute))
+	}
 	if cfg.CostPer1KTokens < 0 {
 		problems = append(problems, fmt.Sprintf("cost_per_1k_tokens: %g must not be negative", cfg.CostPer1KTokens))
 	}
@@ -762,6 +773,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  routes with failover:    %d\n", countFailoverTargets(cfg))
 	fmt.Fprintf(stdout, "  model routes:            %d\n", len(cfg.ModelRoutes))
 	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
+	fmt.Fprintf(stdout, "  max tokens per minute:   %d\n", cfg.MaxTokensPerMinute)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
@@ -979,6 +991,7 @@ var webhookEventNames = map[string]bool{
 	"block":                   true,
 	"redact":                  true,
 	"rate_limited":            true,
+	"token_rate_limited":      true,
 	"unauthorized":            true,
 	"response_block":          true,
 	"response_redact":         true,
@@ -1030,6 +1043,8 @@ type targetRoute struct {
 	targets              []*url.URL
 	maxRequestsPerMinute int
 	limiter              *limiter.Limiter
+	maxTokensPerMinute   int
+	tokenLimiter         *limiter.TokenLimiter
 }
 
 // formatTargetsForDisplay renders a targetRoute's candidate list for the
@@ -1046,6 +1061,24 @@ func formatTargetsForDisplay(targets []*url.URL) string {
 		strs[i] = u.String()
 	}
 	return strings.Join(strs, " -> ")
+}
+
+// formatRateLimitsForDisplay renders a route/model route's own
+// request-count and token-based rate limit overrides, if any, for the
+// startup notice — "%d requests/minute", "%d tokens/minute", or both
+// joined with ", " when the entry sets both independently. Returns ""
+// when neither is set, so the caller can fall back to printing no
+// "(rate limit: ...)" suffix at all, same as before token-based limits
+// existed.
+func formatRateLimitsForDisplay(maxRequestsPerMinute, maxTokensPerMinute int) string {
+	var parts []string
+	if maxRequestsPerMinute > 0 {
+		parts = append(parts, fmt.Sprintf("%d requests/minute", maxRequestsPerMinute))
+	}
+	if maxTokensPerMinute > 0 {
+		parts = append(parts, fmt.Sprintf("%d tokens/minute", maxTokensPerMinute))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // formatIPNets renders a compiled IP allow/deny list for the startup
@@ -1091,10 +1124,17 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 			errs = append(errs, fmt.Errorf("targets: prefix %q: max_requests_per_minute %d must not be negative", t.Prefix, t.MaxRequestsPerMinute))
 			continue
 		}
+		if t.MaxTokensPerMinute < 0 {
+			errs = append(errs, fmt.Errorf("targets: prefix %q: max_tokens_per_minute %d must not be negative", t.Prefix, t.MaxTokensPerMinute))
+			continue
+		}
 
-		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute}
+		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute}
 		if t.MaxRequestsPerMinute > 0 {
 			tr.limiter = limiter.New(t.MaxRequestsPerMinute, time.Minute)
+		}
+		if t.MaxTokensPerMinute > 0 {
+			tr.tokenLimiter = limiter.NewTokenLimiter(t.MaxTokensPerMinute, time.Minute)
 		}
 		compiled = append(compiled, tr)
 	}
@@ -1208,10 +1248,17 @@ func compileModelRoutes(routes []config.ModelRoute) ([]modelRoute, []error) {
 			errs = append(errs, fmt.Errorf("model_routes: %q: max_requests_per_minute %d must not be negative", r.Name, r.MaxRequestsPerMinute))
 			continue
 		}
+		if r.MaxTokensPerMinute < 0 {
+			errs = append(errs, fmt.Errorf("model_routes: %q: max_tokens_per_minute %d must not be negative", r.Name, r.MaxTokensPerMinute))
+			continue
+		}
 
-		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute}
+		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute}
 		if r.MaxRequestsPerMinute > 0 {
 			mr.limiter = limiter.New(r.MaxRequestsPerMinute, time.Minute)
+		}
+		if r.MaxTokensPerMinute > 0 {
+			mr.tokenLimiter = limiter.NewTokenLimiter(r.MaxTokensPerMinute, time.Minute)
 		}
 		compiled = append(compiled, mr)
 	}
@@ -1228,6 +1275,8 @@ type modelRoute struct {
 	targets              []*url.URL
 	maxRequestsPerMinute int
 	limiter              *limiter.Limiter
+	maxTokensPerMinute   int
+	tokenLimiter         *limiter.TokenLimiter
 }
 
 // compileProxyAPIKeys validates and resolves the config file's
@@ -1274,6 +1323,10 @@ func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry, costPer1KTokens floa
 			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: max_requests_per_minute %d must not be negative", e.Name, e.MaxRequestsPerMinute))
 			continue
 		}
+		if e.MaxTokensPerMinute < 0 {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: max_tokens_per_minute %d must not be negative", e.Name, e.MaxTokensPerMinute))
+			continue
+		}
 
 		if e.CostBudget < 0 {
 			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget %g must not be negative", e.Name, e.CostBudget))
@@ -1287,6 +1340,9 @@ func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry, costPer1KTokens floa
 		pk := proxy.ProxyKey{Name: e.Name, Key: e.Key, CostBudget: e.CostBudget}
 		if e.MaxRequestsPerMinute > 0 {
 			pk.Limiter = limiter.New(e.MaxRequestsPerMinute, time.Minute)
+		}
+		if e.MaxTokensPerMinute > 0 {
+			pk.TokenLimiter = limiter.NewTokenLimiter(e.MaxTokensPerMinute, time.Minute)
 		}
 		compiled = append(compiled, pk)
 	}

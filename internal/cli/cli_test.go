@@ -612,6 +612,28 @@ func TestExecute_Validate_NegativeTargetMaxRequestsPerMinute_ReportsProblem(t *t
 	}
 }
 
+func TestExecute_Validate_NegativeTargetMaxTokensPerMinute_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "max_tokens_per_minute": -10}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "/openai") || !strings.Contains(errOut, "max_tokens_per_minute") {
+		t.Fatalf("stderr missing the negative per-target token rate limit problem: %q", errOut)
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithPerTargetRateLimit_ReturnsZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
@@ -837,6 +859,41 @@ func TestExecute_Validate_NegativeNumericFields_ReportsProblems(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "max_body_size_bytes") {
 		t.Errorf("stderr missing negative max body size problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_NegativeMaxTokensPerMinute_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"max_tokens_per_minute": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "max_tokens_per_minute") {
+		t.Errorf("stderr missing negative token rate limit problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithMaxTokensPerMinute_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"max_tokens_per_minute": 10000}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 	}
 }
 
@@ -1237,6 +1294,28 @@ func TestExecute_Validate_ProxyAPIKeys_NegativeMaxRequestsPerMinuteReportsProble
 	}
 	if !strings.Contains(stderr.String(), "max_requests_per_minute") {
 		t.Errorf("stderr missing the negative-rate-limit problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ProxyAPIKeys_NegativeMaxTokensPerMinuteReportsProblem
+// proves the per-key token rate limit override can't be negative, same
+// rule as max_requests_per_minute.
+func TestExecute_Validate_ProxyAPIKeys_NegativeMaxTokensPerMinuteReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [{"name": "team-a", "key": "some-key", "max_tokens_per_minute": -5}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "max_tokens_per_minute") {
+		t.Errorf("stderr missing the negative-token-rate-limit problem: %q", stderr.String())
 	}
 }
 
@@ -1653,6 +1732,25 @@ func TestExecute_Validate_ModelRoutes_NegativeMaxRequestsPerMinuteReportsProblem
 	}
 	if !strings.Contains(stderr.String(), "max_requests_per_minute") {
 		t.Errorf("stderr missing the negative-rate-limit problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ModelRoutes_NegativeMaxTokensPerMinuteReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com", "max_tokens_per_minute": -5}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "max_tokens_per_minute") {
+		t.Errorf("stderr missing the negative-token-rate-limit problem: %q", stderr.String())
 	}
 }
 

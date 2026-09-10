@@ -95,6 +95,14 @@ type ProxyAPIKeyEntry struct {
 	// would otherwise apply, same as before this field existed.
 	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
 
+	// MaxTokensPerMinute, if greater than zero, gives this key its own
+	// dedicated token-based rate limit — checked instead of whatever
+	// route or the server-wide token breaker would otherwise apply, same
+	// precedence MaxRequestsPerMinute already has. Zero (the default)
+	// means this key shares whatever route/global token breaker would
+	// otherwise apply.
+	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
+
 	// CostBudget, if greater than zero, is a threshold in the same
 	// currency/rate as the top-level CostPer1KTokens — once this key's
 	// own running cost (its own attributed TotalTokens priced at
@@ -143,6 +151,16 @@ type Target struct {
 	// override and simply shares the top-level limiter, same as before
 	// per-target limits existed.
 	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
+
+	// MaxTokensPerMinute, if greater than zero, gives this target its own
+	// dedicated token-based rate limit instead of sharing the top-level
+	// max_tokens_per_minute breaker with every other target — same
+	// meaning and same peek-before/record-after semantics as the
+	// top-level MaxTokensPerMinute (see Config.MaxTokensPerMinute), just
+	// scoped to this target's own traffic. Zero (the default) means this
+	// target has no override and simply shares the top-level breaker,
+	// same as MaxRequestsPerMinute.
+	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
 }
 
 // ModelRoute is one model-name-to-upstream mapping for content-based
@@ -179,6 +197,12 @@ type ModelRoute struct {
 	// max_requests_per_minute limiter with every other target — same
 	// meaning as Target.MaxRequestsPerMinute.
 	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
+
+	// MaxTokensPerMinute, if greater than zero, gives this route its own
+	// dedicated token-based rate limit instead of sharing the top-level
+	// max_tokens_per_minute breaker with every other target — same
+	// meaning as Target.MaxTokensPerMinute.
+	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
 }
 
 // Config is the top-level shape of aiproxy.json.
@@ -189,6 +213,20 @@ type Config struct {
 	// breaker allows per minute. Zero (the default when the field is
 	// absent) means the rate limiter is disabled.
 	MaxRequestsPerMinute int `json:"max_requests_per_minute"`
+
+	// MaxTokensPerMinute, if greater than zero, caps how many upstream
+	// response tokens the proxy allows to have been used within any
+	// rolling minute before rejecting further requests with a 429 — a
+	// second circuit breaker, orthogonal to MaxRequestsPerMinute's plain
+	// request count, for traffic where a handful of huge completions can
+	// matter more than how many calls were made. Unlike
+	// MaxRequestsPerMinute, a request's own cost isn't known until its
+	// response comes back, so this only ever rejects once the window is
+	// already at or over budget from usage recorded so far — a single
+	// very large request can still push the window over by more than
+	// this many tokens before the next one is rejected. Zero (the
+	// default when the field is absent) disables this breaker entirely.
+	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
 
 	// CacheEnabled turns on the proxy's local on-disk response cache.
 	// False (the default when the field is absent) means the cache is

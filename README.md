@@ -224,7 +224,8 @@ dedicated rate limit, checked *instead of* whatever
 would otherwise apply — a caller's own budget is authoritative regardless
 of which route they hit. A key with no override just shares whatever
 route/global limiter would otherwise apply, same as before this field
-existed.
+existed. `max_tokens_per_minute` works exactly the same way for
+[the token-based breaker](#token-based-rate-limiting).
 
 Every request authenticated with a named key is attributed by that name
 — in `GET /_aiproxy/stats`'s `per_client` field, the Prometheus
@@ -235,9 +236,9 @@ the shutdown summary's `=== per-client breakdown ===` section:
 ```json
 {
   "per_client": {
-    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "total_tokens": 0 },
-    "team-a": { "allowed": 40, "blocked": 1, "redacted": 0, "rate_limited": 0, "total_tokens": 3100 },
-    "team-b": { "allowed": 8, "blocked": 0, "redacted": 0, "rate_limited": 2, "total_tokens": 0 }
+    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 0 },
+    "team-a": { "allowed": 40, "blocked": 1, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 3100 },
+    "team-b": { "allowed": 8, "blocked": 0, "redacted": 0, "rate_limited": 2, "token_rate_limited": 0, "total_tokens": 0 }
   }
 }
 ```
@@ -498,6 +499,42 @@ alternative. `max_requests_per_minute` is optional; when it is 0 or
 omitted, the rate limiter is disabled. Once the limit is hit, further
 requests get a 429 until the 1-minute window rolls forward.
 
+### Token-based rate limiting
+
+`max_requests_per_minute` counts requests — a second, independent
+breaker, `max_tokens_per_minute`, instead caps how many *tokens* upstream
+responses have reported using within a rolling minute, for traffic where
+a handful of huge completions matter more than how many calls were made:
+
+```json
+{
+  "max_tokens_per_minute": 100000
+}
+```
+
+Optional and disabled by default, same as `max_requests_per_minute`.
+Unlike a request's cost in the plain circuit breaker, a request's own
+token cost isn't known until *its own response* has come back — so this
+breaker can only ever reject a request based on usage already recorded
+from earlier ones, never its own. In practice that means the very first
+request into an empty window is always let through regardless of size,
+and a single very large response can push the window over budget by more
+than `max_tokens_per_minute` before the *next* request gets rejected —
+the same tradeoff every commercial LLM API's own per-minute token limit
+makes, since there's no way to reserve tokens for a cost nobody knows
+yet. A rejected request gets a 429, logged as `[TOKEN LIMIT]` (yellow;
+`"token_rate_limited"` under `--log-format json`) and counted separately
+from `max_requests_per_minute` rejections in stats, the Prometheus
+endpoint, and [webhook alerts](#webhook-alerts) — the two breakers trip
+for different reasons, so they're never folded into one counter.
+
+Like `max_requests_per_minute`, it can be overridden per target, per
+[model route](#model-based-routing), and per
+[named proxy key](#multiple-named-keys-with-per-key-stats-and-rate-limits)
+with their own `max_tokens_per_minute` — whichever is most specific for a
+given request takes precedence, with the exact same precedence order as
+the request-count breaker.
+
 `cache_enabled` is optional and off by default. When true, every 200 OK
 response is stored under `.aiproxy_cache/` in the working directory,
 keyed by a SHA256 hash of the request method, target URL, and body. An
@@ -713,7 +750,8 @@ keeps sharing the top-level 60-requests-per-minute limiter with the
 default target, exactly as if `targets[].max_requests_per_minute` didn't
 exist. Omit or set it to 0 for a target that should just share the
 top-level limiter (or share "no limit at all", if the top-level field is
-itself unset).
+itself unset). `targets[].max_tokens_per_minute` works exactly the same
+way for [the token-based breaker](#token-based-rate-limiting).
 
 ### Failover across multiple upstreams
 
@@ -793,11 +831,11 @@ field, an unparseable body, or a model that matches no configured
 pattern simply falls through to `targets`/`--target` exactly as if
 `model_routes` didn't exist — this never errors, it's always a
 best-effort match. `url`/`urls` (for failover), and
-`max_requests_per_minute` (for a route's own dedicated rate limit that
-takes precedence over the server-wide one) work exactly like their
-`targets[]` counterparts, including the same never-retry-on-a-5xx
-failover safety boundary. `aiproxy validate` reports a `model routes:`
-count in its summary.
+`max_requests_per_minute`/`max_tokens_per_minute` (for a route's own
+dedicated rate limits that take precedence over the server-wide ones)
+work exactly like their `targets[]` counterparts, including the same
+never-retry-on-a-5xx failover safety boundary. `aiproxy validate`
+reports a `model routes:` count in its summary.
 
 ## Path-based endpoint rules
 
@@ -948,6 +986,7 @@ can be monitored without waiting for Ctrl+C:
   "allowed": 42,
   "blocked": 1,
   "rate_limited": 0,
+  "token_rate_limited": 0,
   "cache_hits": 5,
   "total_tokens": 3100,
   "response_blocked": 0,
@@ -963,16 +1002,16 @@ can be monitored without waiting for Ctrl+C:
   "estimated_cost": 0.062,
   "cost_budget": 10,
   "per_target": {
-    "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062, "failover": 1, "latency": { "count": 30, "sum_seconds": 2.9 } },
-    "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "cache_hits": 0, "total_tokens": 0, "failover": 0, "latency": { "count": 12, "sum_seconds": 0.41 } }
+    "/openai": { "allowed": 30, "blocked": 1, "rate_limited": 0, "token_rate_limited": 0, "cache_hits": 5, "total_tokens": 3100, "estimated_cost": 0.062, "failover": 1, "latency": { "count": 30, "sum_seconds": 2.9 } },
+    "default": { "allowed": 12, "blocked": 0, "rate_limited": 0, "token_rate_limited": 0, "cache_hits": 0, "total_tokens": 0, "failover": 0, "latency": { "count": 12, "sum_seconds": 0.41 } }
   },
   "per_rule": {
     "aws-access-key": { "blocked": 1, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 0, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 },
     "candidate-rule": { "blocked": 0, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 1, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 }
   },
   "per_client": {
-    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "total_tokens": 0 },
-    "team-a": { "allowed": 30, "blocked": 1, "redacted": 0, "rate_limited": 0, "total_tokens": 3100 }
+    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 0 },
+    "team-a": { "allowed": 30, "blocked": 1, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 3100 }
   }
 }
 ```
@@ -999,7 +1038,12 @@ totals and inside `per_rule`. `unauthorized` (see
 [authenticating requests](#authenticating-requests-to-the-proxy)) and
 `ip_denied` (see [restricting access by IP](#restricting-access-by-ip))
 go further still: never broken down by target OR by rule, since a
-rejected request never resolves either. `cost_budget` (see
+rejected request never resolves either. `token_rate_limited` (see
+[token-based rate limiting](#token-based-rate-limiting)) is the opposite
+case again — broken down by target and by named client like `rate_limited`,
+since which breaker tripped is always about a specific
+target/route/key, and tracked as a fully separate counter from it: the
+two breakers reject for different reasons. `cost_budget` (see
 [cost budget alerts](#custom-rules-rate-limiting-caching-and-cost-estimation))
 is included only when it's set, and — unlike `estimated_cost` — never
 repeated inside `per_target`: it's a single whole-proxy-run threshold,
@@ -1121,6 +1165,7 @@ aiproxy_requests_allowed_total{target="default"} 42
 aiproxy_requests_blocked_total{target="default"} 1
 aiproxy_requests_redacted_total{target="default"} 0
 aiproxy_requests_rate_limited_total{target="default"} 0
+aiproxy_requests_token_rate_limited_total{target="default"} 0
 aiproxy_cache_hits_total{target="default"} 5
 aiproxy_tokens_used_total{target="default"} 3100
 aiproxy_responses_blocked_total{target="default"} 0
@@ -1158,6 +1203,7 @@ aiproxy_client_allowed_total{client="team-a"} 40
 aiproxy_client_blocked_total{client="team-a"} 1
 aiproxy_client_redacted_total{client="team-a"} 0
 aiproxy_client_rate_limited_total{client="team-a"} 0
+aiproxy_client_token_rate_limited_total{client="team-a"} 0
 aiproxy_client_tokens_used_total{client="team-a"} 3100
 aiproxy_client_estimated_cost{client="team-a"} 0.093
 aiproxy_cost_budget 10
@@ -1168,7 +1214,12 @@ has them.) Every target seen so far gets its own `target="..."` series,
 always, even in a single-target run — a scrape needs the same shape
 every time, unlike the shutdown summary's noise-avoiding suppression.
 `aiproxy_estimated_cost` is included only when `cost_per_1k_tokens` is
-set, same as the JSON endpoint's `estimated_cost`. The `aiproxy_rule_*`
+set, same as the JSON endpoint's `estimated_cost`.
+`aiproxy_requests_token_rate_limited_total`/`aiproxy_client_token_rate_limited_total`
+(see [token-based rate limiting](#token-based-rate-limiting)) mirror
+their `rate_limited` counterparts exactly — labeled the same way, just
+counting the token-based breaker's rejections instead, as a fully
+separate series. The `aiproxy_rule_*`
 series mirror `per_rule` from the JSON endpoint: one `rule="<name>"`
 series per rule that has ever matched, for every rule seen so far — not
 tied to any target label, since a rule's identity doesn't depend on
@@ -1244,7 +1295,8 @@ Set `webhook_url` to get pushed a real-time alert instead, the moment a
 rule matches — on a request going out, a
 [response](#scanning-responses-too) coming back, the
 [rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
-tripping, a [dry-run](#dry-run-mode-for-rules) rule matching, a request
+or [token-based rate limiter](#token-based-rate-limiting) tripping, a
+[dry-run](#dry-run-mode-for-rules) rule matching, a request
 denied by [ip_allow_list/ip_deny_list](#restricting-access-by-ip) or
 failing [proxy authentication](#authenticating-requests-to-the-proxy),
 the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-and-cost-estimation),
@@ -1257,10 +1309,10 @@ or a [failover](#failover-across-multiple-upstreams) to the next candidate targe
 ```
 
 Every alertable event — `block`, `redact`, `response_block`,
-`response_redact`, `rate_limited`, `ip_denied`, `unauthorized`,
-`dry_run_block`, `dry_run_redact`, `response_dry_run_block`,
-`response_dry_run_redact`, `budget_exceeded`, or `failover` — POSTs this
-JSON body to that URL:
+`response_redact`, `rate_limited`, `token_rate_limited`, `ip_denied`,
+`unauthorized`, `dry_run_block`, `dry_run_redact`,
+`response_dry_run_block`, `response_dry_run_redact`, `budget_exceeded`,
+or `failover` — POSTs this JSON body to that URL:
 
 ```json
 {
@@ -1281,6 +1333,23 @@ retrying — carries an empty `rule`, since no scanning rule was involved:
 {
   "text": "[RATE_LIMITED] POST /v1/messages - Rate limit exceeded",
   "event": "rate_limited",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+A `token_rate_limited` alert — fired the moment
+[the token-based breaker](#token-based-rate-limiting) rejects a request —
+is [`rate_limited`](#custom-rules-rate-limiting-caching-and-cost-estimation)'s
+counterpart, tracked as a fully separate event since the two breakers
+trip for different reasons; likewise carries an empty `rule`:
+
+```json
+{
+  "text": "[TOKEN_RATE_LIMITED] POST /v1/messages - Token rate limit exceeded",
+  "event": "token_rate_limited",
   "method": "POST",
   "url": "/v1/messages",
   "rule": "",

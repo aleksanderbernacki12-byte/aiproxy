@@ -310,6 +310,25 @@ func TestLoad_ParsesProxyAPIKeyCostBudget(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesProxyAPIKeyMaxTokensPerMinute(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"proxy_api_keys": [
+		{"name": "team-a", "key": "key-1", "max_tokens_per_minute": 5000}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ProxyAPIKeys[0].MaxTokensPerMinute != 5000 {
+		t.Errorf("ProxyAPIKeys[0].MaxTokensPerMinute = %d, want 5000", cfg.ProxyAPIKeys[0].MaxTokensPerMinute)
+	}
+}
+
 func TestLoad_ProxyAPIKeysDefaultsToEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
@@ -355,6 +374,25 @@ func TestLoad_ParsesModelRoutes(t *testing.T) {
 	}
 	if cfg.ModelRoutes[1].MaxRequestsPerMinute != 60 {
 		t.Errorf("ModelRoutes[1].MaxRequestsPerMinute = %d, want 60", cfg.ModelRoutes[1].MaxRequestsPerMinute)
+	}
+}
+
+func TestLoad_ParsesModelRouteMaxTokensPerMinute(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com", "max_tokens_per_minute": 20000}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ModelRoutes[0].MaxTokensPerMinute != 20000 {
+		t.Fatalf("ModelRoutes[0].MaxTokensPerMinute = %d, want 20000", cfg.ModelRoutes[0].MaxTokensPerMinute)
 	}
 }
 
@@ -643,6 +681,40 @@ func TestLoad_MaxRequestsPerMinuteDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesMaxTokensPerMinute(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"max_tokens_per_minute": 10000}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.MaxTokensPerMinute != 10000 {
+		t.Fatalf("MaxTokensPerMinute = %d, want 10000", cfg.MaxTokensPerMinute)
+	}
+}
+
+func TestLoad_MaxTokensPerMinuteDefaultsToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": []}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.MaxTokensPerMinute != 0 {
+		t.Fatalf("MaxTokensPerMinute = %d, want 0 (disabled) when absent", cfg.MaxTokensPerMinute)
+	}
+}
+
 func TestLoad_ParsesTargets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
@@ -716,6 +788,29 @@ func TestLoad_ParsesTargetMaxRequestsPerMinute(t *testing.T) {
 	}
 	if cfg.Targets[1].MaxRequestsPerMinute != 0 {
 		t.Fatalf("Targets[1].MaxRequestsPerMinute = %d, want 0 (absent means no override)", cfg.Targets[1].MaxRequestsPerMinute)
+	}
+}
+
+func TestLoad_ParsesTargetMaxTokensPerMinute(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "max_tokens_per_minute": 50000},
+		{"prefix": "/anthropic", "url": "https://api.anthropic.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Targets[0].MaxTokensPerMinute != 50000 {
+		t.Fatalf("Targets[0].MaxTokensPerMinute = %d, want 50000", cfg.Targets[0].MaxTokensPerMinute)
+	}
+	if cfg.Targets[1].MaxTokensPerMinute != 0 {
+		t.Fatalf("Targets[1].MaxTokensPerMinute = %d, want 0 (absent means no override)", cfg.Targets[1].MaxTokensPerMinute)
 	}
 }
 

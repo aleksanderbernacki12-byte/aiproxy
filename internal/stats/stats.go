@@ -32,6 +32,7 @@ type counters struct {
 	blocked          atomic.Int64
 	redacted         atomic.Int64
 	rateLimited      atomic.Int64
+	tokenRateLimited atomic.Int64
 	cacheHits        atomic.Int64
 	totalTokens      atomic.Int64
 	responseBlocked  atomic.Int64
@@ -49,6 +50,7 @@ func (c *counters) snapshot() Snapshot {
 		Blocked:          c.blocked.Load(),
 		Redacted:         c.redacted.Load(),
 		RateLimited:      c.rateLimited.Load(),
+		TokenRateLimited: c.tokenRateLimited.Load(),
 		CacheHits:        c.cacheHits.Load(),
 		TotalTokens:      c.totalTokens.Load(),
 		ResponseBlocked:  c.responseBlocked.Load(),
@@ -133,11 +135,12 @@ func (c *ruleCounters) snapshot() RuleSnapshot {
 // who called it, so there's nothing meaningful to attribute there per
 // client.
 type clientCounters struct {
-	allowed     atomic.Int64
-	blocked     atomic.Int64
-	redacted    atomic.Int64
-	rateLimited atomic.Int64
-	totalTokens atomic.Int64
+	allowed          atomic.Int64
+	blocked          atomic.Int64
+	redacted         atomic.Int64
+	rateLimited      atomic.Int64
+	tokenRateLimited atomic.Int64
+	totalTokens      atomic.Int64
 
 	// budgetAlerted is this client's own one-shot latch for
 	// CrossedClientBudget — separate from Stats.budgetAlerted (the
@@ -148,11 +151,12 @@ type clientCounters struct {
 
 func (c *clientCounters) snapshot() ClientSnapshot {
 	return ClientSnapshot{
-		Allowed:     c.allowed.Load(),
-		Blocked:     c.blocked.Load(),
-		Redacted:    c.redacted.Load(),
-		RateLimited: c.rateLimited.Load(),
-		TotalTokens: c.totalTokens.Load(),
+		Allowed:          c.allowed.Load(),
+		Blocked:          c.blocked.Load(),
+		Redacted:         c.redacted.Load(),
+		RateLimited:      c.rateLimited.Load(),
+		TokenRateLimited: c.tokenRateLimited.Load(),
+		TotalTokens:      c.totalTokens.Load(),
 	}
 }
 
@@ -265,6 +269,18 @@ func (s *Stats) RecordClientRateLimited(client string) {
 	s.clientCounterFor(client).rateLimited.Add(1)
 }
 
+// RecordClientTokenRateLimited is RecordClientRateLimited's counterpart
+// for the token-based breaker — see Stats.RecordTokenRateLimited. client
+// is "" whenever no proxy_api_key/proxy_api_keys is configured at all,
+// same no-op-on-empty-label discipline as every other RecordClient*
+// method.
+func (s *Stats) RecordClientTokenRateLimited(client string) {
+	if client == "" {
+		return
+	}
+	s.clientCounterFor(client).tokenRateLimited.Add(1)
+}
+
 func (s *Stats) RecordClientTokensUsed(client string, n int) {
 	if client == "" || n <= 0 {
 		return
@@ -301,6 +317,16 @@ func (s *Stats) RecordRedact(target, ruleName string) {
 func (s *Stats) RecordRateLimited(target string) {
 	s.overall.rateLimited.Add(1)
 	s.counterFor(target).rateLimited.Add(1)
+}
+
+// RecordTokenRateLimited records one request the token-based circuit
+// breaker rejected — see limiter.TokenLimiter. Distinct from
+// RecordRateLimited: the two breakers trip for different reasons (too
+// many requests vs. too many tokens used), so they're tracked
+// separately rather than folded into one counter.
+func (s *Stats) RecordTokenRateLimited(target string) {
+	s.overall.tokenRateLimited.Add(1)
+	s.counterFor(target).tokenRateLimited.Add(1)
 }
 
 // RecordUnauthorized records one request rejected for a missing or
@@ -516,7 +542,14 @@ type ClientSnapshot struct {
 	Blocked     int64 `json:"blocked"`
 	Redacted    int64 `json:"redacted"`
 	RateLimited int64 `json:"rate_limited"`
-	TotalTokens int64 `json:"total_tokens"`
+
+	// TokenRateLimited counts requests rejected by this key's own
+	// token-based rate limit (or, if it has none of its own, whatever
+	// route/global token breaker applied to it) — see
+	// Stats.RecordClientTokenRateLimited. Distinct from RateLimited: the
+	// two breakers trip for different reasons.
+	TokenRateLimited int64 `json:"token_rate_limited"`
+	TotalTokens      int64 `json:"total_tokens"`
 }
 
 // EstimatedCost prices TotalTokens at costPer1KTokens, the same unit
@@ -537,8 +570,16 @@ type Snapshot struct {
 	Blocked     int64 `json:"blocked"`
 	Redacted    int64 `json:"redacted"`
 	RateLimited int64 `json:"rate_limited"`
-	CacheHits   int64 `json:"cache_hits"`
-	TotalTokens int64 `json:"total_tokens"`
+
+	// TokenRateLimited counts requests rejected by the token-based
+	// circuit breaker (see limiter.TokenLimiter, Stats.RecordTokenRateLimited)
+	// — distinct from RateLimited, which is the plain request-count
+	// breaker. Broken down per target like RateLimited, unlike
+	// Unauthorized/IPDenied: which breaker applies is always about the
+	// specific target/route/key a request resolved to.
+	TokenRateLimited int64 `json:"token_rate_limited"`
+	CacheHits        int64 `json:"cache_hits"`
+	TotalTokens      int64 `json:"total_tokens"`
 
 	// ResponseBlocked and ResponseRedacted count the same two outcomes
 	// as Blocked and Redacted, but for a rule matching the upstream's
@@ -671,6 +712,12 @@ func (s Snapshot) String() string {
 	if s.Failover > 0 {
 		out += fmt.Sprintf("\nFailovers:            %d", s.Failover)
 	}
+	// Same reasoning again: 0 for every run that never configured
+	// max_tokens_per_minute anywhere, or that did but never actually
+	// tripped it.
+	if s.TokenRateLimited > 0 {
+		out += fmt.Sprintf("\nToken rate-limited:   %d", s.TokenRateLimited)
+	}
 	if s.Latency.Count > 0 {
 		out += fmt.Sprintf("\nAvg upstream latency: %.1fms (n=%d)", s.Latency.AvgLatencyMillis(), s.Latency.Count)
 	}
@@ -704,6 +751,9 @@ func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
 		}
 		if t.Failover > 0 {
 			fmt.Fprintf(&b, " failover=%d", t.Failover)
+		}
+		if t.TokenRateLimited > 0 {
+			fmt.Fprintf(&b, " token-rate-limited=%d", t.TokenRateLimited)
 		}
 		if t.Latency.Count > 0 {
 			fmt.Fprintf(&b, " avg-latency=%.1fms", t.Latency.AvgLatencyMillis())
@@ -765,6 +815,9 @@ func (s Snapshot) PerClientString(costPer1KTokens float64) string {
 		c := s.PerClient[name]
 		fmt.Fprintf(&b, "\n[%s] allowed=%d blocked=%d redacted=%d rate-limited=%d tokens=%d",
 			name, c.Allowed, c.Blocked, c.Redacted, c.RateLimited, c.TotalTokens)
+		if c.TokenRateLimited > 0 {
+			fmt.Fprintf(&b, " token-rate-limited=%d", c.TokenRateLimited)
+		}
 		if costPer1KTokens > 0 {
 			fmt.Fprintf(&b, " cost=%.4f", c.EstimatedCost(costPer1KTokens))
 		}

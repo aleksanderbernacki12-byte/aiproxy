@@ -95,7 +95,7 @@ const dashboardHTML = `<!doctype html>
 <div class="section" id="section-target">
   <h2>Per target</h2>
   <table><thead><tr>
-    <th>Target</th><th>Allowed</th><th>Blocked</th><th>Redacted</th><th>Rate limited</th>
+    <th>Target</th><th>Allowed</th><th>Blocked</th><th>Redacted</th><th>Rate limited</th><th>Token limited</th>
     <th>Cache hits</th><th>Tokens</th><th>Est. cost</th><th>Failover</th><th>Avg latency</th>
   </tr></thead><tbody id="target-body"></tbody></table>
 </div>
@@ -111,7 +111,7 @@ const dashboardHTML = `<!doctype html>
 <div class="section" id="section-client">
   <h2>Per client</h2>
   <table><thead><tr>
-    <th>Client</th><th>Allowed</th><th>Blocked</th><th>Redacted</th><th>Rate limited</th>
+    <th>Client</th><th>Allowed</th><th>Blocked</th><th>Redacted</th><th>Rate limited</th><th>Token limited</th>
     <th>Tokens</th>
   </tr></thead><tbody id="client-body"></tbody></table>
 </div>
@@ -152,6 +152,7 @@ const dashboardHTML = `<!doctype html>
     cards.appendChild(card("Blocked", fmtNum(s.blocked), s.blocked > 0 ? "bad" : ""));
     cards.appendChild(card("Redacted", fmtNum(s.redacted)));
     cards.appendChild(card("Rate limited", fmtNum(s.rate_limited)));
+    if (s.token_rate_limited) cards.appendChild(card("Token rate limited", fmtNum(s.token_rate_limited), "bad"));
     cards.appendChild(card("Cache hits", fmtNum(s.cache_hits)));
     cards.appendChild(card("Total tokens", fmtNum(s.total_tokens)));
     if (s.response_blocked) cards.appendChild(card("Resp. blocked", fmtNum(s.response_blocked), "bad"));
@@ -188,6 +189,7 @@ const dashboardHTML = `<!doctype html>
       function (t) { return fmtNum(t.blocked); },
       function (t) { return fmtNum(t.redacted); },
       function (t) { return fmtNum(t.rate_limited); },
+      function (t) { return fmtNum(t.token_rate_limited); },
       function (t) { return fmtNum(t.cache_hits); },
       function (t) { return fmtNum(t.total_tokens); },
       function (t) { return typeof t.estimated_cost === "number" ? fmtCost(t.estimated_cost) : "—"; },
@@ -213,6 +215,7 @@ const dashboardHTML = `<!doctype html>
       function (c) { return fmtNum(c.blocked); },
       function (c) { return fmtNum(c.redacted); },
       function (c) { return fmtNum(c.rate_limited); },
+      function (c) { return fmtNum(c.token_rate_limited); },
       function (c) { return fmtNum(c.total_tokens); }
     ]);
   }
