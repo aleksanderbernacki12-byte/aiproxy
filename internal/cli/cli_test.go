@@ -263,6 +263,36 @@ func TestRunStart_InvalidLogFormat_ReturnsErrorExitCode(t *testing.T) {
 	}
 }
 
+// TestRunStart_TLSCertWithoutKey_ReturnsErrorExitCode and
+// TestRunStart_TLSKeyWithoutCert_ReturnsErrorExitCode prove -tls-cert
+// and -tls-key are validated up front, before -target or any config
+// loading, same as -log-format: setting exactly one without the other
+// is rejected immediately with a clear message and exit code 2, never
+// silently falling back to plain HTTP.
+func TestRunStart_TLSCertWithoutKey_ReturnsErrorExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-tls-cert", "cert.pem"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-tls-cert and -tls-key must be set together") {
+		t.Fatalf("stderr missing a clear -tls-cert/-tls-key error: %q", stderr.String())
+	}
+}
+
+func TestRunStart_TLSKeyWithoutCert_ReturnsErrorExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-tls-key", "key.pem"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-tls-cert and -tls-key must be set together") {
+		t.Fatalf("stderr missing a clear -tls-cert/-tls-key error: %q", stderr.String())
+	}
+}
+
 // runValidate never calls log.Fatal/os.Exit — reporting problems via a
 // normal return code is the whole point — so unlike the start tests
 // above, these run directly in-process with no subprocess needed.

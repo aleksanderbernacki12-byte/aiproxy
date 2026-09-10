@@ -75,6 +75,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	target := fs.String("target", "", "HTTPS URL to forward requests to (required)")
 	configPath := fs.String("config", "", "path to a JSON config file (custom rules, rate limit, cache, cost estimation, extra target routes; default: aiproxy.json in the working directory, if present)")
 	logFormat := fs.String("log-format", "text", `log output format: "text" (colored, human-readable) or "json" (one JSON object per line, safe to pipe into a log aggregator)`)
+	tlsCert := fs.String("tls-cert", "", "path to a PEM certificate file — combined with -tls-key, makes the proxy terminate TLS itself instead of listening on plain HTTP")
+	tlsKey := fs.String("tls-key", "", "path to a PEM private key file — see -tls-cert")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -87,6 +89,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		proxyLogFormat = proxy.LogFormatJSON
 	default:
 		fmt.Fprintf(stderr, "aiproxy: -log-format must be \"text\" or \"json\", got %q\n", *logFormat)
+		return 2
+	}
+
+	if (*tlsCert == "") != (*tlsKey == "") {
+		fmt.Fprintln(stderr, "aiproxy: -tls-cert and -tls-key must be set together, or not at all")
 		return 2
 	}
 
@@ -131,6 +138,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.LogFile = lc.logFile
 	server.IPAllowList = lc.ipAllowList
 	server.IPDenyList = lc.ipDenyList
+	server.TLSCertFile = *tlsCert
+	server.TLSKeyFile = *tlsKey
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.targets, r.limiter, r.tokenLimiter)
 	}
@@ -242,7 +251,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	startReloadOnSIGHUP(ctx, server, *configPath)
 
-	fmt.Fprintf(stdout, "aiproxy listening on %s, forwarding to %s\n", *addr, targetURL)
+	scheme := "http"
+	if *tlsCert != "" {
+		scheme = "https"
+	}
+	fmt.Fprintf(stdout, "aiproxy listening on %s://%s, forwarding to %s\n", scheme, *addr, targetURL)
 	if err := server.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
 		return 1

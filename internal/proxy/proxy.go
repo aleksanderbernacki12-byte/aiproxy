@@ -384,6 +384,23 @@ type Server struct {
 	// default) means ProxyAPIKey alone (if set) is the only key.
 	ProxyAPIKeys []ProxyKey
 
+	// TLSCertFile and TLSKeyFile, if both set, make ListenAndServe
+	// terminate TLS itself — a PEM certificate and private key file,
+	// loaded once at startup — instead of listening on plain HTTP.
+	// Relevant when aiproxy needs to be reachable directly over a
+	// network rather than only from localhost or a same-host sidecar,
+	// where plain HTTP is normally fine. Both empty (the default) means
+	// plain HTTP, unchanged from before this feature existed; the cli
+	// package's flag parsing rejects setting exactly one without the
+	// other before either ever reaches here. Not hot-reloadable via
+	// SIGHUP — unlike every other tunable in this struct, rebinding a
+	// listener's TLS configuration live is a meaningfully different (and
+	// riskier) operation than swapping the fields ReloadConfig already
+	// covers, and a renewed certificate on disk needs a process restart
+	// to take effect, the same limitation a plain `http.Server` has.
+	TLSCertFile string
+	TLSKeyFile  string
+
 	// LogFile, if non-nil, is an open, append-mode file every log event
 	// (including the shutdown summary) is also written to as one JSON
 	// line, independent of LogFormat — see recordLogEvent. Opening,
@@ -2644,17 +2661,45 @@ func (s *Server) logSummary() {
 	s.logf("%s", s.Summary())
 }
 
+// errorLogWriter adapts http.Server.ErrorLog's *log.Logger-based output
+// into this package's own LogEvent-based event stream. Without this,
+// Go's internal server errors — most commonly a TLS handshake failure,
+// the ordinary result of a stray plain-HTTP health check or port scan
+// hitting a TLS-enabled listener — would instead go straight to
+// log.Default()'s own destination (the process's real stderr),
+// bypassing LogFormat/LogFile entirely and, under LogFormatJSON,
+// breaking the documented "every line in the stream is valid JSON"
+// guarantee the very first time TLS is enabled and something other
+// than a real client connects.
+type errorLogWriter struct {
+	server *Server
+}
+
+func (w errorLogWriter) Write(p []byte) (int, error) {
+	w.server.LogEvent("server_error", strings.TrimSpace(string(p)))
+	return len(p), nil
+}
+
 // ListenAndServe starts the proxy and blocks until ctx is cancelled or a
-// fatal server error occurs.
+// fatal server error occurs. Serves plain HTTP unless both TLSCertFile
+// and TLSKeyFile are set, in which case it terminates TLS itself via
+// http.Server.ListenAndServeTLS instead.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	s.httpServer = &http.Server{
-		Addr:    s.Addr,
-		Handler: s,
+		Addr:     s.Addr,
+		Handler:  s,
+		ErrorLog: log.New(errorLogWriter{server: s}, "", 0),
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if s.TLSCertFile != "" && s.TLSKeyFile != "" {
+			err = s.httpServer.ListenAndServeTLS(s.TLSCertFile, s.TLSKeyFile)
+		} else {
+			err = s.httpServer.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()

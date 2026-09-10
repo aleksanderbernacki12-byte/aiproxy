@@ -4,10 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1831,6 +1838,123 @@ func TestServer_ListenAndServe_PrintsStatsSummaryOnShutdown(t *testing.T) {
 	}
 	if strings.Contains(logOutput, "Estimated cost") {
 		t.Fatalf("summary must omit the cost line when CostPer1KTokens is unset: %q", logOutput)
+	}
+}
+
+// generateSelfSignedCert creates a throwaway self-signed certificate and
+// private key, valid for 127.0.0.1, and writes them to two PEM files
+// under a fresh t.TempDir() — everything TLSCertFile/TLSKeyFile need for
+// a real (if untrusted) TLS handshake in a test, with no external
+// dependency beyond the standard library.
+func generateSelfSignedCert(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+
+	certOut, err := os.Create(certFile)
+	if err != nil {
+		t.Fatalf("create cert file: %v", err)
+	}
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		t.Fatalf("encode cert: %v", err)
+	}
+	certOut.Close()
+
+	keyOut, err := os.Create(keyFile)
+	if err != nil {
+		t.Fatalf("create key file: %v", err)
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+		t.Fatalf("encode key: %v", err)
+	}
+	keyOut.Close()
+
+	return certFile, keyFile
+}
+
+// TestServer_ListenAndServe_TLS_ServesHTTPSWhenCertAndKeySet proves
+// TLSCertFile/TLSKeyFile are honored end to end through the real entry
+// point a running aiproxy process uses: a genuine TLS handshake and
+// HTTPS request succeeds, while a plain HTTP request to the exact same
+// address fails — this is a real TLS listener, not a plain one that
+// happens to also still accept cleartext.
+func TestServer_ListenAndServe_TLS_ServesHTTPSWhenCertAndKeySet(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	certFile, keyFile := generateSelfSignedCert(t)
+	addr := freeLoopbackAddr(t)
+
+	srv := proxy.New(addr, targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TLSCertFile = certFile
+	srv.TLSKeyFile = keyFile
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+
+	waitForServerUp(t, addr, time.Second)
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	resp, err := client.Get("https://" + addr + "/endpoint")
+	if err != nil {
+		t.Fatalf("https request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// Go's http.Server specifically detects a plain-text request arriving
+	// on a TLS listener and answers with a readable 400 rather than just
+	// dropping the connection — so this never reaches the proxy's own
+	// handler (and never reaches upstream) either way, whether the
+	// client sees a transport error or a plain 400.
+	if resp, err := http.Get("http://" + addr + "/endpoint"); err == nil {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("plain HTTP request to a TLS listener: status = %d, want %d (Go's own client-sent-plain-HTTP-to-TLS-server response)", resp.StatusCode, http.StatusBadRequest)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ListenAndServe returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not shut down in time")
 	}
 }
 

@@ -27,6 +27,9 @@ aiproxy start --target https://api.example.com
   in the working directory, if present).
 - `--log-format`: `text` (default) or `json` — see
   [Structured JSON logging](#structured-json-logging).
+- `--tls-cert`/`--tls-key`: PEM certificate/key file paths — see
+  [Serving over TLS](#serving-over-tls). Both or neither; plain HTTP by
+  default.
 
 Point your client at `http://127.0.0.1:8080` instead of the real API.
 Allowed requests are logged in green (`[ALLOW] POST /endpoint`); blocked
@@ -95,6 +98,31 @@ different label. The per-rule section, unlike that one, is left out only
 when no rule has ever matched at all — even a single rule's own numbers
 are never redundant with the totals above, since those totals already
 conflate every rule together.
+
+## Serving over TLS
+
+aiproxy listens on plain HTTP by default — the right choice for the
+common case of running as a localhost process or a same-host sidecar,
+where nothing ever leaves the machine. Set `--tls-cert`/`--tls-key` to
+have it terminate TLS itself instead, for reaching it directly over a
+network:
+
+```
+aiproxy start --target https://api.example.com --addr 0.0.0.0:8443 --tls-cert cert.pem --tls-key key.pem
+```
+
+Both flags point at PEM files (a certificate and its matching private
+key) and must be set together — passing just one is rejected immediately
+at startup with exit code 2, before `--target` or any config file is
+even loaded, the same way an invalid `--log-format` is. Neither is
+hot-reloadable via [SIGHUP](#reloading-config-without-restarting): unlike
+every `aiproxy.json` field, rebinding a listener's TLS setup live is a
+meaningfully different operation than the atomic in-process swap SIGHUP
+already does for everything else, so a renewed certificate on disk (e.g.
+from `certbot renew`) needs a restart to take effect — the same
+limitation a plain `net/http` server has. If you need automatic
+certificate rotation with no downtime, put a real reverse proxy or load
+balancer in front of aiproxy instead and let it handle TLS.
 
 ## Restricting access by IP
 
@@ -352,7 +380,13 @@ serves, instead of the multi-line text block):
 `level` is one of `allow`, `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
 `dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
-`usage`, `latency`, `budget_exceeded`, `failover`, `cache_hit`, or
+`usage`, `latency`, `budget_exceeded`, `failover`, `cache_hit`,
+`server_error` (a low-level connection problem from Go's own HTTP
+server, most commonly a TLS handshake failure from something other than
+a real client — a stray plain-HTTP health check or port scan — hitting
+a [TLS-enabled](#serving-over-tls) listener; routed through this same
+event stream instead of the process's raw stderr specifically so it
+can't break the "every line is valid JSON" guarantee), or
 `error` (an internal problem unrelated to any specific request, e.g. a
 failed cache write) — `method`/`url`/`rule`/`tokens` appear only where
 relevant, `duration_ms` only on `latency` (present even when it's
