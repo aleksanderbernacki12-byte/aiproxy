@@ -664,6 +664,40 @@ func TestLoad_CacheTTLSecondsDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesCacheMaxSizeBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "cache_max_size_bytes": 104857600}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CacheMaxSizeBytes != 104857600 {
+		t.Fatalf("CacheMaxSizeBytes = %d, want 104857600", cfg.CacheMaxSizeBytes)
+	}
+}
+
+func TestLoad_CacheMaxSizeBytesDefaultsToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.CacheMaxSizeBytes != 0 {
+		t.Fatalf("CacheMaxSizeBytes = %d, want 0 (unbounded) when absent", cfg.CacheMaxSizeBytes)
+	}
+}
+
 func TestLoad_MaxRequestsPerMinuteDefaultsToZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

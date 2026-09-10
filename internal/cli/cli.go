@@ -166,6 +166,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			} else {
 				fmt.Fprintf(stdout, "response cache: enabled (%s/, no ttl)\n", cache.DirName)
 			}
+			if cfg.CacheMaxSizeBytes > 0 {
+				fmt.Fprintf(stdout, "response cache: size-capped at %d bytes (LRU eviction)\n", cfg.CacheMaxSizeBytes)
+			}
 		}
 		if cfg.CostPer1KTokens > 0 {
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
@@ -367,6 +370,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 			errs = append(errs, fmt.Errorf("cache: %w", err))
 		} else {
 			c.TTL = time.Duration(cfg.CacheTTLSeconds) * time.Second
+			c.MaxSizeBytes = cfg.CacheMaxSizeBytes
 			lc.cache = c
 		}
 	}
@@ -738,6 +742,12 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.CacheTTLSeconds > 0 && !cfg.CacheEnabled {
 		problems = append(problems, "cache_ttl_seconds requires cache_enabled to be set (there's nothing to expire otherwise)")
 	}
+	if cfg.CacheMaxSizeBytes < 0 {
+		problems = append(problems, fmt.Sprintf("cache_max_size_bytes: %d must not be negative", cfg.CacheMaxSizeBytes))
+	}
+	if cfg.CacheMaxSizeBytes > 0 && !cfg.CacheEnabled {
+		problems = append(problems, "cache_max_size_bytes requires cache_enabled to be set (there's nothing to cap otherwise)")
+	}
 	if cfg.WebhookURL != "" {
 		if _, err := parseWebhookURL(cfg.WebhookURL); err != nil {
 			problems = append(problems, fmt.Sprintf("webhook_url: %v", err))
@@ -776,6 +786,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  max tokens per minute:   %d\n", cfg.MaxTokensPerMinute)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
+	fmt.Fprintf(stdout, "  cache max size:          %s\n", cacheMaxSizeDisplay(cfg.CacheMaxSizeBytes))
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  cost budget:             %g\n", cfg.CostBudget)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
@@ -809,6 +820,15 @@ func cacheTTLDisplay(seconds int) string {
 		return "none (entries never expire on their own)"
 	}
 	return fmt.Sprintf("%ds", seconds)
+}
+
+// cacheMaxSizeDisplay renders cache_max_size_bytes for the validate
+// summary, same reasoning as cacheTTLDisplay.
+func cacheMaxSizeDisplay(bytes int64) string {
+	if bytes <= 0 {
+		return "unbounded"
+	}
+	return fmt.Sprintf("%d bytes", bytes)
 }
 
 // countFailoverTargets counts every targets entry configured with more

@@ -994,6 +994,85 @@ func TestServer_CacheTTL_ExpiredEntryForcesFreshUpstreamHit(t *testing.T) {
 	}
 }
 
+// TestServer_CacheMaxSizeBytes_EvictsLeastRecentlyUsedEndToEnd proves
+// Server.Cache.MaxSizeBytes is honored end-to-end through the proxy:
+// once enough distinct cached responses push the total over budget, the
+// least-recently-used one is evicted — a repeat of that exact request
+// reaches the upstream again instead of being served from the
+// (now-evicted) cache, while a more recently used entry stays cached.
+func TestServer_CacheMaxSizeBytes_EvictsLeastRecentlyUsedEndToEnd(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(strings.Repeat("x", 100)))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(body string) {
+		resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	post(`{"id":1}`)
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream hits after the 1st distinct request = %d, want 1", got)
+	}
+
+	entries, err := os.ReadDir(cache.DirName)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("read cache dir: err=%v entries=%d, want exactly 1", err, len(entries))
+	}
+	info, err := entries[0].Info()
+	if err != nil {
+		t.Fatalf("stat cache entry: %v", err)
+	}
+	srv.Cache.MaxSizeBytes = info.Size()*2 + info.Size()/2 // room for 2 entries, not 3
+
+	post(`{"id":2}`)
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("upstream hits after the 2nd distinct request = %d, want 2", got)
+	}
+	post(`{"id":3}`)
+	if got := upstreamHits.Load(); got != 3 {
+		t.Fatalf("upstream hits after the 3rd distinct request = %d, want 3", got)
+	}
+
+	// Request 1's entry was never touched again, so it's now the
+	// least-recently-used — pushing a 3rd entry in should have evicted
+	// it. Repeating it must reach the upstream again.
+	post(`{"id":1}`)
+	if got := upstreamHits.Load(); got != 4 {
+		t.Fatalf("upstream hits after repeating the evicted 1st request = %d, want 4 (a cache hit would still be 3)", got)
+	}
+
+	// Request 3's entry, written most recently, must still be cached.
+	post(`{"id":3}`)
+	if got := upstreamHits.Load(); got != 4 {
+		t.Fatalf("upstream hits after repeating the still-cached 3rd request = %d, want still 4 (must be a cache hit)", got)
+	}
+}
+
 // TestServer_CacheClearEndpoint_ForcesFreshUpstreamHit proves POSTing
 // cacheClearPath actually deletes cached entries: a request that would
 // otherwise be served from cache reaches the upstream again afterward.

@@ -1504,6 +1504,94 @@ func TestExecute_Validate_ValidConfig_CacheEnabledNoTTL_ReturnsZero(t *testing.T
 	}
 }
 
+// TestExecute_Validate_CacheMaxSizeBytes_NegativeReportsProblem proves a
+// negative cache_max_size_bytes is rejected, same as every other
+// numeric field in the config.
+func TestExecute_Validate_CacheMaxSizeBytes_NegativeReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "cache_max_size_bytes": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cache_max_size_bytes") {
+		t.Errorf("stderr missing cache_max_size_bytes problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_CacheMaxSizeBytes_WithoutCacheEnabledReportsProblem
+// proves setting a size cap for a cache that's off is caught, same
+// reasoning as cache_ttl_seconds requiring cache_enabled.
+func TestExecute_Validate_CacheMaxSizeBytes_WithoutCacheEnabledReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_max_size_bytes": 1000}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cache_max_size_bytes requires cache_enabled") {
+		t.Errorf("stderr missing the cache_enabled requirement problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithCacheMaxSize_ReturnsZero proves a
+// well-formed cache_max_size_bytes passes validation and shows up in
+// the summary.
+func TestExecute_Validate_ValidConfig_WithCacheMaxSize_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "cache_max_size_bytes": 1000}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cache max size:          1000 bytes") {
+		t.Fatalf("stdout missing cache max size summary line: %q", stdout.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_CacheEnabledNoMaxSize_ReturnsZero
+// proves cache_enabled alone (no size cap, the pre-existing behavior)
+// still passes validation and reports "unbounded" in the summary.
+func TestExecute_Validate_ValidConfig_CacheEnabledNoMaxSize_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cache max size:          unbounded") {
+		t.Fatalf("stdout missing the unbounded cache max size summary line: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_IPAllowList_InvalidEntryReportsProblem proves a
 // malformed ip_allow_list entry (neither a valid IP nor a valid CIDR
 // range) is rejected.

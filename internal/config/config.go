@@ -245,6 +245,20 @@ type Config struct {
 	// requiring CostPer1KTokens.
 	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
 
+	// CacheMaxSizeBytes, if greater than zero, caps the total on-disk
+	// size of every cached entry combined — once writing a new entry
+	// would push the total over this limit, the least-recently-used
+	// entries (an in-memory index, evicted oldest-used-first, tracked
+	// separately from CacheTTLSeconds' own write-time-based expiry) are
+	// deleted until there's room again. A single entry larger than this
+	// limit on its own is never deleted just for existing — there's
+	// nothing meaningful to evict it in favor of. Zero (the default when
+	// the field is absent) means the cache is never size-capped,
+	// unbounded, same behavior as before this field existed. Only
+	// meaningful alongside CacheEnabled, same reasoning as
+	// CacheTTLSeconds.
+	CacheMaxSizeBytes int64 `json:"cache_max_size_bytes,omitempty"`
+
 	// CostPer1KTokens prices the shutdown summary's total token count at
 	// this rate per 1,000 tokens, in whatever currency and rate the user
 	// knows applies to their own usage. Zero (the default when the field

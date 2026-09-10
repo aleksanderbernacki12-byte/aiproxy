@@ -561,7 +561,40 @@ their own, the same behavior as before this field existed.
 `aiproxy validate` rejects `cache_ttl_seconds` set without
 `cache_enabled` — a TTL for a cache that's off has nothing to expire.
 
-Without a TTL — or even with one, for immediate effect instead of
+### Capping the cache's disk usage
+
+`.aiproxy_cache/` has no size limit by default — left running long enough
+against varied traffic, it can grow without bound. Set `cache_max_size_bytes`
+to cap the total size of every entry combined:
+
+```json
+{
+  "cache_enabled": true,
+  "cache_max_size_bytes": 104857600
+}
+```
+
+Once writing a new entry would push the total over this limit, the
+least-recently-*used* entries are deleted — oldest-used first — until
+there's room again. "Used" means actually read back with a cache hit
+(via `GET`ing it, i.e. a repeat request), not just written — an entry
+Set long ago but hit constantly survives in favor of one written
+recently but never read again. This tracking lives in memory, separate
+from `cache_ttl_seconds`'s own on-disk timestamp: a cache hit never
+resets an entry's TTL clock, so the two features don't interact. A
+single entry larger than `cache_max_size_bytes` on its own is never
+deleted immediately after being cached — there's nothing else left to
+evict it in favor of, and caching a response can never itself fail
+purely because of the size policy. `aiproxy validate` rejects
+`cache_max_size_bytes` set without `cache_enabled`, same reasoning as
+`cache_ttl_seconds`; zero or absent (the default) means the cache stays
+unbounded, same behavior as before this field existed. A restart
+correctly picks up whatever was already on disk — the very first write
+after starting still evicts against the *real* existing total, not an
+empty in-memory count that would otherwise let the directory keep
+growing past the configured limit indefinitely.
+
+Without a size cap — or even with one, for immediate effect instead of
 waiting it out — clear every cached entry right now with:
 
 ```
