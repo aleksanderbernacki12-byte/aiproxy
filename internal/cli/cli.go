@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"aiproxy/internal/anomaly"
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/config"
@@ -170,6 +171,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.GeoIPTable = lc.geoIPTable
 	server.CountryAllowList = lc.countryAllowList
 	server.CountryDenyList = lc.countryDenyList
+	server.AnomalyDetector = lc.anomalyDetector
+	server.AnomalyDryRun = lc.anomalyDryRun
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
@@ -250,6 +253,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if len(lc.countryDenyList) > 0 {
 			fmt.Fprintf(stdout, "country deny list: %s\n", strings.Join(lc.countryDenyList, ", "))
+		}
+		if lc.anomalyDetector != nil {
+			if lc.anomalyDryRun {
+				fmt.Fprintf(stdout, "anomaly detection: %gx baseline (dry-run — logged, never enforced)\n", cfg.AnomalyMultiplier)
+			} else {
+				fmt.Fprintf(stdout, "anomaly detection: %gx baseline\n", cfg.AnomalyMultiplier)
+			}
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -368,7 +378,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun)
 
 	label := loadedFrom
 	if label == "" {
@@ -400,6 +410,8 @@ type liveConfig struct {
 	geoIPTable       *geoip.Table
 	countryAllowList []string
 	countryDenyList  []string
+	anomalyDetector  *anomaly.Registry
+	anomalyDryRun    bool
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -503,6 +515,16 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	countryDenyList, countryDenyErrs := compileCountryList("country_deny_list", cfg.CountryDenyList)
 	errs = append(errs, countryDenyErrs...)
 	lc.countryDenyList = countryDenyList
+
+	if cfg.AnomalyMultiplier < 0 {
+		errs = append(errs, fmt.Errorf("anomaly_multiplier: %g must not be negative", cfg.AnomalyMultiplier))
+	} else if cfg.AnomalyMultiplier > 0 {
+		lc.anomalyDetector = anomaly.NewRegistry(cfg.AnomalyMultiplier, anomaly.DefaultWindow)
+	}
+	if cfg.AnomalyDryRun && cfg.AnomalyMultiplier <= 0 {
+		errs = append(errs, fmt.Errorf("anomaly_dry_run requires anomaly_multiplier to be set (there's nothing to dry-run otherwise)"))
+	}
+	lc.anomalyDryRun = cfg.AnomalyDryRun
 
 	return lc, errs
 }
@@ -824,6 +846,13 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, e.Error())
 	}
 
+	if cfg.AnomalyMultiplier < 0 {
+		problems = append(problems, fmt.Sprintf("anomaly_multiplier: %g must not be negative", cfg.AnomalyMultiplier))
+	}
+	if cfg.AnomalyDryRun && cfg.AnomalyMultiplier <= 0 {
+		problems = append(problems, "anomaly_dry_run requires anomaly_multiplier to be set (there's nothing to dry-run otherwise)")
+	}
+
 	_, pathRuleErrs := compilePathRules(cfg.PathRules)
 	for _, e := range pathRuleErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
@@ -918,6 +947,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  GeoIP ranges file:       %s\n", geoIPRangesFileDisplay(cfg.GeoIPRangesFile))
 	fmt.Fprintf(stdout, "  country allow list:      %d\n", len(cfg.CountryAllowList))
 	fmt.Fprintf(stdout, "  country deny list:       %d\n", len(cfg.CountryDenyList))
+	fmt.Fprintf(stdout, "  anomaly detection:       %s\n", anomalyDisplay(cfg.AnomalyMultiplier, cfg.AnomalyDryRun))
 	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
 }
@@ -930,6 +960,18 @@ func geoIPRangesFileDisplay(path string) string {
 		return "disabled"
 	}
 	return path
+}
+
+// anomalyDisplay renders anomaly_multiplier/anomaly_dry_run for the
+// validate summary.
+func anomalyDisplay(multiplier float64, dryRun bool) string {
+	if multiplier <= 0 {
+		return "disabled"
+	}
+	if dryRun {
+		return fmt.Sprintf("%gx baseline (dry-run)", multiplier)
+	}
+	return fmt.Sprintf("%gx baseline", multiplier)
 }
 
 // runVerifyLog checks that an audit-signed log file's HMAC chain is
@@ -1202,6 +1244,7 @@ var webhookEventNames = map[string]bool{
 	"failover":                true,
 	"ip_denied":               true,
 	"country_denied":          true,
+	"anomaly_detected":        true,
 }
 
 // compileWebhookTargets validates and resolves the config file's

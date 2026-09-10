@@ -329,7 +329,11 @@ would otherwise apply — a caller's own budget is authoritative regardless
 of which route they hit. A key with no override just shares whatever
 route/global limiter would otherwise apply, same as before this field
 existed. `max_tokens_per_minute` works exactly the same way for
-[the token-based breaker](#token-based-rate-limiting).
+[the token-based breaker](#token-based-rate-limiting). Unlike those two,
+[`anomaly_multiplier`](#anomaly-based-rate-limiting) has no per-key
+override to set here — it's a single server-wide setting — but each
+named key still gets its own independent baseline to be measured
+against, purely from its own observed traffic.
 
 Every request authenticated with a named key is attributed by that name
 — in `GET /_aiproxy/stats`'s `per_client` field, the Prometheus
@@ -340,9 +344,9 @@ the shutdown summary's `=== per-client breakdown ===` section:
 ```json
 {
   "per_client": {
-    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 0 },
-    "team-a": { "allowed": 40, "blocked": 1, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 3100 },
-    "team-b": { "allowed": 8, "blocked": 0, "redacted": 0, "rate_limited": 2, "token_rate_limited": 0, "total_tokens": 0 }
+    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "anomaly_detected": 0, "total_tokens": 0 },
+    "team-a": { "allowed": 40, "blocked": 1, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "anomaly_detected": 0, "total_tokens": 3100 },
+    "team-b": { "allowed": 8, "blocked": 0, "redacted": 0, "rate_limited": 2, "token_rate_limited": 0, "anomaly_detected": 1, "total_tokens": 0 }
   }
 }
 ```
@@ -455,7 +459,7 @@ serves, instead of the multi-line text block):
 
 `level` is one of `allow`, `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `unauthorized`, `ip_denied`,
-`country_denied`, `dry_run_block`, `dry_run_redact`,
+`country_denied`, `anomaly_detected`, `dry_run_block`, `dry_run_redact`,
 `response_dry_run_block`, `response_dry_run_redact`,
 `usage`, `latency`, `budget_exceeded`, `failover`, `cache_hit`,
 `server_error` (a low-level connection problem from Go's own HTTP
@@ -712,6 +716,64 @@ Like `max_requests_per_minute`, it can be overridden per target, per
 with their own `max_tokens_per_minute` — whichever is most specific for a
 given request takes precedence, with the exact same precedence order as
 the request-count breaker.
+
+### Anomaly-based rate limiting
+
+`max_requests_per_minute`/`max_tokens_per_minute` are both fixed,
+absolute thresholds — a caller well under either can still be a runaway
+agent loop, just one that hasn't yet reached the configured ceiling.
+`anomaly_multiplier` instead flags a
+[named proxy client](#multiple-named-keys-with-per-key-stats-and-rate-limits)
+whose current minute's request count spikes to a multiple of *that
+client's own* recent baseline — a relative complement to the two fixed
+breakers above, catching a client that's suddenly far faster than it
+itself normally is, regardless of where that falls against any absolute
+cap:
+
+```json
+{
+  "anomaly_multiplier": 50
+}
+```
+
+The baseline is an exponential moving average of a client's own past
+per-minute request counts, established from real traffic — there's no
+warm-up config, it just starts learning from the first request onward.
+A brand new client (or the very first minute of a fresh process) has no
+baseline yet, so nothing is ever flagged during that initial window,
+regardless of how much traffic arrives; only once at least one full
+minute has completed does a spike become detectable. A small built-in
+floor (a handful of requests) also means a client whose baseline is
+naturally near zero never gets flagged over an essentially meaningless
+ratio (2 requests against a 0.1/minute baseline, say). Optional and
+disabled by default (zero/absent).
+
+Only meaningful for an identified caller: [`proxy_api_key`/`proxy_api_keys`](#authenticating-requests-to-the-proxy)
+configured, since there's no notion of "this caller's own baseline"
+without one — a fully anonymous, unauthenticated proxy is completely
+unaffected by `anomaly_multiplier`, the same way it's unaffected by any
+other per-client setting. Each named key (including the anonymous
+`"default"` one, if `proxy_api_key` alone is set) gets its own
+independent baseline; one client spiking never affects another's.
+
+A flagged request gets a 429, logged as `[ANOMALY]` (yellow;
+`"anomaly_detected"` under `--log-format json`, carrying the client's
+current-window `rate` and the `baseline` it was compared against),
+counted separately from `rate_limited`/`token_rate_limited` in stats
+(`GET /_aiproxy/stats`'s `anomaly_detected` field, top-level and per
+client — never per target, since this is fundamentally about which
+*caller*, not which target), the Prometheus endpoint's unlabeled
+`aiproxy_anomaly_detected_total`, and
+[webhook alerts](#webhook-alerts). Set `anomaly_dry_run: true` to only
+log/count/alert what *would* have been rejected, without actually
+blocking anything — the same escape hatch a
+[custom rule's own `dry_run`](#dry-run-mode-for-rules) gives a new,
+untrusted rule: a statistical threshold is inherently more prone to a
+false positive than an exact pattern match, so tuning
+`anomaly_multiplier` against real traffic before trusting it to enforce
+anything is the recommended way to turn this on. `aiproxy validate`
+rejects `anomaly_dry_run` set without `anomaly_multiplier` — there's
+nothing to dry-run otherwise.
 
 `cache_enabled` is optional and off by default. When true, every 200 OK
 response is stored under `.aiproxy_cache/` in the working directory,
@@ -1209,6 +1271,7 @@ can be monitored without waiting for Ctrl+C:
   "unauthorized": 0,
   "ip_denied": 0,
   "country_denied": 0,
+  "anomaly_detected": 1,
   "failover": 1,
   "latency": { "count": 42, "sum_seconds": 3.31, "buckets": [ { "le": "0.005", "count": 0 }, { "le": "0.01", "count": 12 }, { "le": "+Inf", "count": 42 } ] },
   "estimated_cost": 0.062,
@@ -1222,8 +1285,8 @@ can be monitored without waiting for Ctrl+C:
     "candidate-rule": { "blocked": 0, "redacted": 0, "response_blocked": 0, "response_redacted": 0, "dry_run_blocked": 1, "dry_run_redacted": 0, "response_dry_run_blocked": 0, "response_dry_run_redacted": 0 }
   },
   "per_client": {
-    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 0 },
-    "team-a": { "allowed": 30, "blocked": 1, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "total_tokens": 3100 }
+    "default": { "allowed": 12, "blocked": 0, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "anomaly_detected": 0, "total_tokens": 0 },
+    "team-a": { "allowed": 30, "blocked": 1, "redacted": 0, "rate_limited": 0, "token_rate_limited": 0, "anomaly_detected": 1, "total_tokens": 3100 }
   }
 }
 ```
@@ -1257,7 +1320,11 @@ resolves either. `token_rate_limited` (see
 case again — broken down by target and by named client like `rate_limited`,
 since which breaker tripped is always about a specific
 target/route/key, and tracked as a fully separate counter from it: the
-two breakers reject for different reasons. `cost_budget` (see
+two breakers reject for different reasons. `anomaly_detected` (see
+[anomaly-based rate limiting](#anomaly-based-rate-limiting)) is
+broken down by client like `token_rate_limited`, but never by
+target — which client spiked is independent of which target it
+happened to be calling. `cost_budget` (see
 [cost budget alerts](#custom-rules-rate-limiting-caching-and-cost-estimation))
 is included only when it's set, and — unlike `estimated_cost` — never
 repeated inside `per_target`: it's a single whole-proxy-run threshold,
@@ -1403,6 +1470,7 @@ aiproxy_dry_run_response_redacted_total 0
 aiproxy_unauthorized_total 0
 aiproxy_ip_denied_total 0
 aiproxy_country_denied_total 0
+aiproxy_anomaly_detected_total 1
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.005"} 0
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.01"} 12
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.025"} 30
@@ -1422,6 +1490,7 @@ aiproxy_client_blocked_total{client="team-a"} 1
 aiproxy_client_redacted_total{client="team-a"} 0
 aiproxy_client_rate_limited_total{client="team-a"} 0
 aiproxy_client_token_rate_limited_total{client="team-a"} 0
+aiproxy_client_anomaly_detected_total{client="team-a"} 0
 aiproxy_client_tokens_used_total{client="team-a"} 3100
 aiproxy_client_estimated_cost{client="team-a"} 0.093
 aiproxy_cost_budget 10
@@ -1451,7 +1520,14 @@ target or a rule to label it with. `aiproxy_ip_denied_total`/
 `aiproxy_country_denied_total` (see
 [restricting access by IP](#restricting-access-by-ip) and
 [GeoIP-based blocking](#geoip-based-blocking)) are unlabeled the same
-way, for the same reason. `aiproxy_failover_total` is the other
+way, for the same reason. `aiproxy_anomaly_detected_total` (see
+[anomaly-based rate limiting](#anomaly-based-rate-limiting)) is
+unlabeled too, but unlike those two it *does* have a client-labeled
+counterpart, `aiproxy_client_anomaly_detected_total{client="..."}`
+(alongside the other `aiproxy_client_*` series above) — which caller
+spiked is meaningful in a way which IP/country was denied isn't, since
+neither of those checks has resolved a caller identity yet.
+`aiproxy_failover_total` is the other
 way around — labeled `target="..."` like the very first series above,
 not unlabeled — since a failover is always about one specific route's
 own candidate list; every target seen so far gets a series here too,
@@ -1523,7 +1599,9 @@ denied by [ip_allow_list/ip_deny_list](#restricting-access-by-ip) or
 [country_allow_list/country_deny_list](#geoip-based-blocking), or
 failing [proxy authentication](#authenticating-requests-to-the-proxy),
 the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-and-cost-estimation),
-or a [failover](#failover-across-multiple-upstreams) to the next candidate target:
+a [named client](#anomaly-based-rate-limiting) spiking well past its own
+recent baseline, or a [failover](#failover-across-multiple-upstreams) to
+the next candidate target:
 
 ```json
 {
@@ -1533,9 +1611,9 @@ or a [failover](#failover-across-multiple-upstreams) to the next candidate targe
 
 Every alertable event — `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `token_rate_limited`, `ip_denied`,
-`country_denied`, `unauthorized`, `dry_run_block`, `dry_run_redact`,
-`response_dry_run_block`, `response_dry_run_redact`, `budget_exceeded`,
-or `failover` — POSTs this JSON body to that URL:
+`country_denied`, `anomaly_detected`, `unauthorized`, `dry_run_block`,
+`dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
+`budget_exceeded`, or `failover` — POSTs this JSON body to that URL:
 
 ```json
 {
@@ -1576,6 +1654,28 @@ trip for different reasons; likewise carries an empty `rule`:
   "method": "POST",
   "url": "/v1/messages",
   "rule": "",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+An `anomaly_detected` alert — fired by
+[anomaly_multiplier](#anomaly-based-rate-limiting) (including when
+`anomaly_dry_run` is set — an alert still fires for what *would* have
+been rejected) — likewise carries an empty `rule`, plus a `client`
+field (the flagged named proxy key) and `rate`/`baseline` fields no
+other event has: the client's current-window request count, and the
+established baseline it was compared against:
+
+```json
+{
+  "text": "[ANOMALY_DETECTED] POST /v1/messages - client team-a: 500 requests this minute vs. baseline 8.2",
+  "event": "anomaly_detected",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
+  "client": "team-a",
+  "rate": 500,
+  "baseline": 8.2,
   "time": "2026-01-01T12:00:00Z"
 }
 ```

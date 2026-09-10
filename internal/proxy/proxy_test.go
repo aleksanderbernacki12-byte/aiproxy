@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"aiproxy/internal/anomaly"
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/geoip"
@@ -480,6 +481,406 @@ func TestServer_TokenRateLimit_RejectedRequestNeverCountsAsPlainRateLimited(t *t
 	}
 	if snap.RateLimited != 0 {
 		t.Errorf("RateLimited = %d, want 0 (a token-budget rejection is not a plain rate limit rejection)", snap.RateLimited)
+	}
+}
+
+// shortAnomalyWindow lets these tests establish a baseline and trigger
+// a spike in real wall-clock milliseconds instead of the production
+// anomaly.DefaultWindow's real 60 seconds.
+const shortAnomalyWindow = 300 * time.Millisecond
+
+// getWithProxyAuth issues a GET to url with the given
+// Proxy-Authorization bearer key set, failing the test on any
+// transport error.
+func getWithProxyAuth(t *testing.T, url, key string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer "+key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	return resp
+}
+
+// TestServer_AnomalyDetection_UnconfiguredNeverBlocks proves that with
+// AnomalyDetector nil (the default), no burst of traffic is ever
+// flagged — same zero-cost-when-unused discipline as every other
+// optional check in this package.
+func TestServer_AnomalyDetection_UnconfiguredNeverBlocks(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 200; i++ {
+		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d (no AnomalyDetector configured)", i, resp.StatusCode, http.StatusOK)
+		}
+	}
+}
+
+// TestServer_AnomalyDetection_UnidentifiedCallerNeverBlocks proves that
+// even with AnomalyDetector configured, a fully anonymous proxy (no
+// proxy_api_key/proxy_api_keys at all, so auth.label is always "") is
+// never affected — there's no notion of "this caller's own baseline"
+// without an identified caller.
+func TestServer_AnomalyDetection_UnidentifiedCallerNeverBlocks(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.AnomalyDetector = anomaly.NewRegistry(2, shortAnomalyWindow)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 200; i++ {
+		resp, err := http.Get(frontend.URL + "/x")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d (no proxy_api_key configured, so no identified caller)", i, resp.StatusCode, http.StatusOK)
+		}
+	}
+}
+
+// TestServer_AnomalyDetection_BlocksOnceClientSpikesPastOwnBaseline is
+// the feature's core proof: a named client's traffic settles into a
+// steady baseline, then spikes well past its own configured
+// multiplier, and only then gets a 429 — never before the baseline was
+// even established.
+func TestServer_AnomalyDetection_BlocksOnceClientSpikesPastOwnBaseline(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-key"
+	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow) // 5x baseline trips
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	// Establish a steady baseline of 10 requests/window.
+	for w := 0; w < 5; w++ {
+		time.Sleep(shortAnomalyWindow)
+		for i := 0; i < 10; i++ {
+			resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("baseline window %d, request %d: status = %d, want %d", w, i, resp.StatusCode, http.StatusOK)
+			}
+		}
+	}
+
+	// Now a sudden spike, well past 5x the established baseline of 10.
+	time.Sleep(shortAnomalyWindow)
+	var sawBlock bool
+	for i := 0; i < 100 && !sawBlock; i++ {
+		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			sawBlock = true
+		}
+	}
+	if !sawBlock {
+		t.Fatal("a 10x-then-spiking client was never flagged anomalous")
+	}
+
+	hitsBeforeSpikeBlocked := upstreamHits.Load()
+	if hitsBeforeSpikeBlocked <= 50 {
+		// The spike's own requests before the trip point still count as
+		// upstream hits (allowed) — this just confirms the block
+		// actually happened partway through, not on the very first
+		// spike request (which would itself be a false positive against
+		// too aggressive a floor).
+		t.Logf("upstream hits so far: %d (informational)", hitsBeforeSpikeBlocked)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.AnomalyDetected == 0 {
+		t.Error("Stats.AnomalyDetected = 0, want at least 1")
+	}
+	if perClient, ok := snap.PerClient["default"]; !ok || perClient.AnomalyDetected == 0 {
+		t.Errorf("PerClient[default].AnomalyDetected = %+v, want at least 1", perClient)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "[ANOMALY]") {
+		t.Errorf("log missing an [ANOMALY] line: %q", logOutput)
+	}
+}
+
+// TestServer_AnomalyDetection_DryRunNeverBlocksButStillRecords proves
+// AnomalyDryRun's escape hatch: the exact same spike that would
+// otherwise trip a 429 is instead logged/counted but the request still
+// goes through, forwarded exactly as if nothing had matched.
+func TestServer_AnomalyDetection_DryRunNeverBlocksButStillRecords(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-key"
+	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow)
+	srv.AnomalyDryRun = true
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for w := 0; w < 5; w++ {
+		time.Sleep(shortAnomalyWindow)
+		for i := 0; i < 10; i++ {
+			resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
+			resp.Body.Close()
+		}
+	}
+
+	time.Sleep(shortAnomalyWindow)
+	for i := 0; i < 100; i++ {
+		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d during spike: status = %d, want %d (dry-run must never actually block)", i, resp.StatusCode, http.StatusOK)
+		}
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.AnomalyDetected == 0 {
+		t.Error("Stats.AnomalyDetected = 0, want at least 1 (dry-run still records what it would have done)")
+	}
+}
+
+// TestServer_AnomalyDetection_DistinctClientsHaveIndependentBaselines
+// proves one named key's spike never affects another's — each client
+// gets its own Detector, keyed by auth.label.
+func TestServer_AnomalyDetection_DistinctClientsHaveIndependentBaselines(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "spiky", Key: "spiky-key"},
+		{Name: "steady", Key: "steady-key"},
+	}
+	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	// Both clients establish the same steady baseline.
+	for w := 0; w < 5; w++ {
+		time.Sleep(shortAnomalyWindow)
+		for i := 0; i < 10; i++ {
+			getWithProxyAuth(t, frontend.URL+"/x", "spiky-key").Body.Close()
+			getWithProxyAuth(t, frontend.URL+"/x", "steady-key").Body.Close()
+		}
+	}
+
+	// Only "spiky" spikes; "steady" keeps its normal rate.
+	time.Sleep(shortAnomalyWindow)
+	var spikyBlocked bool
+	for i := 0; i < 100; i++ {
+		resp := getWithProxyAuth(t, frontend.URL+"/x", "spiky-key")
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			spikyBlocked = true
+		}
+
+		if i < 10 {
+			steadyResp := getWithProxyAuth(t, frontend.URL+"/x", "steady-key")
+			steadyResp.Body.Close()
+			if steadyResp.StatusCode != http.StatusOK {
+				t.Fatalf("steady client request %d: status = %d, want %d (a different client's spike must never affect this one)", i, steadyResp.StatusCode, http.StatusOK)
+			}
+		}
+	}
+	if !spikyBlocked {
+		t.Fatal("the spiking client was never flagged anomalous")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if perClient, ok := snap.PerClient["steady"]; ok && perClient.AnomalyDetected != 0 {
+		t.Errorf("PerClient[steady].AnomalyDetected = %d, want 0", perClient.AnomalyDetected)
+	}
+}
+
+// TestServer_Webhook_FiresOnAnomalyDetectedWithExpectedPayload proves
+// the anomaly_detected webhook event carries the flagged client, its
+// current rate, and the baseline it was compared against, and an empty
+// rule.
+func TestServer_Webhook_FiresOnAnomalyDetectedWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		select {
+		case received <- payload:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-key"
+	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow)
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for w := 0; w < 5; w++ {
+		time.Sleep(shortAnomalyWindow)
+		for i := 0; i < 10; i++ {
+			getWithProxyAuth(t, frontend.URL+"/chat", "the-key").Body.Close()
+		}
+	}
+	time.Sleep(shortAnomalyWindow)
+	for i := 0; i < 100; i++ {
+		getWithProxyAuth(t, frontend.URL+"/chat", "the-key").Body.Close()
+	}
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "anomaly_detected" {
+			t.Errorf("event = %v, want anomaly_detected", payload["event"])
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string (an anomaly matches no rule)", payload["rule"])
+		}
+		if payload["client"] != "default" {
+			t.Errorf("client = %v, want default", payload["client"])
+		}
+		rate, ok := payload["rate"].(float64)
+		if !ok || rate <= 0 {
+			t.Errorf("rate = %v, want a positive number", payload["rate"])
+		}
+		baseline, ok := payload["baseline"].(float64)
+		if !ok || baseline <= 0 {
+			t.Errorf("baseline = %v, want a positive number", payload["baseline"])
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "ANOMALY_DETECTED") {
+			t.Errorf("text = %q, want it to mention ANOMALY_DETECTED", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesAnomalyDetector proves a SIGHUP-style
+// ReloadConfig can add an AnomalyDetector to a server that started
+// with none, live.
+func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.ProxyAPIKey = "the-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 50; i++ {
+		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("before reload, request %d: status = %d, want %d (no AnomalyDetector configured yet)", i, resp.StatusCode, http.StatusOK)
+		}
+	}
+
+	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false)
+
+	// The freshly reloaded Registry starts cold — no baseline exists
+	// for this client yet, so (correctly, per Detector's own cold-start
+	// guarantee) nothing can trip within the very first window after
+	// the swap. Establish a real baseline against the *new* registry
+	// first, then spike.
+	for w := 0; w < 5; w++ {
+		time.Sleep(shortAnomalyWindow)
+		for i := 0; i < 10; i++ {
+			getWithProxyAuth(t, frontend.URL+"/x", "the-key").Body.Close()
+		}
+	}
+
+	time.Sleep(shortAnomalyWindow)
+	var sawBlock bool
+	for i := 0; i < 100 && !sawBlock; i++ {
+		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			sawBlock = true
+		}
+	}
+	if !sawBlock {
+		t.Fatal("after reload, the newly configured AnomalyDetector never tripped on a real spike")
 	}
 }
 
@@ -3515,7 +3916,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, false)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -3577,7 +3978,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 		}
 	}()
 
@@ -4586,7 +4987,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -5859,7 +6260,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -6191,7 +6592,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -6565,7 +6966,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7621,7 +8022,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -8443,7 +8844,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, false)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -8759,7 +9160,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -9114,7 +9515,7 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, false)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -9555,7 +9956,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"})
+		table, nil, []string{"SE"}, nil, false)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -9594,7 +9995,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)

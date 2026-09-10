@@ -1132,6 +1132,63 @@ func TestExecute_Validate_ValidConfig_WithMaxTokensPerMinute_ReturnsZero(t *test
 	}
 }
 
+func TestExecute_Validate_NegativeAnomalyMultiplier_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"anomaly_multiplier": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "anomaly_multiplier") {
+		t.Errorf("stderr missing negative anomaly_multiplier problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_AnomalyDryRunWithoutMultiplier_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"anomaly_dry_run": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "anomaly_dry_run requires anomaly_multiplier") {
+		t.Errorf("stderr missing anomaly_dry_run-requires-anomaly_multiplier problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithAnomalyDetection_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"anomaly_multiplier": 50, "anomaly_dry_run": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "anomaly detection:       50x baseline (dry-run)") {
+		t.Fatalf("stdout missing anomaly detection summary: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_NegativeCostBudget_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

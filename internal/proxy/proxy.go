@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"aiproxy/internal/anomaly"
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/geoip"
@@ -319,6 +320,24 @@ type Server struct {
 	// override this server-wide one for their own traffic.
 	TokenLimiter *limiter.TokenLimiter
 
+	// AnomalyDetector, if non-nil, flags a named client (see
+	// clientAuth.label) whose current minute's request count has
+	// reached its own configured multiple of that client's own recent
+	// baseline — a relative complement to Limiter/TokenLimiter's fixed,
+	// absolute thresholds. nil (the default, whenever
+	// anomaly_multiplier isn't configured) skips this check entirely.
+	// Server-wide only, unlike Limiter/TokenLimiter: a caller's own
+	// traffic pattern isn't a function of which route it happened to
+	// hit, so there's no per-route/per-key override to resolve here.
+	AnomalyDetector *anomaly.Registry
+
+	// AnomalyDryRun, if true, makes AnomalyDetector only report what it
+	// would have done (log, webhook, stats) without actually rejecting
+	// anything — the same escape hatch a custom rule's own DryRun
+	// gives, since a statistical threshold is inherently more prone to
+	// a false positive than an exact pattern match.
+	AnomalyDryRun bool
+
 	Cache           *cache.Cache // nil disables the response cache
 	CostPer1KTokens float64      // zero omits the shutdown summary's cost line
 	routes          []route
@@ -484,11 +503,25 @@ type logEvent struct {
 	Cost   float64 `json:"cost,omitempty"`
 	Budget float64 `json:"budget,omitempty"`
 
-	// Client is only set on a budget_exceeded event fired by a named
-	// proxy key's own cost_budget (see stats.Stats.CrossedClientBudget)
-	// — empty for the server-wide cost_budget's own budget_exceeded
-	// event, which isn't attributable to any one caller.
+	// Client is set on a budget_exceeded event fired by a named proxy
+	// key's own cost_budget (see stats.Stats.CrossedClientBudget) —
+	// empty for the server-wide cost_budget's own budget_exceeded
+	// event, which isn't attributable to any one caller — and always
+	// set on an anomaly_detected event, which is never attributable to
+	// anything else.
 	Client string `json:"client,omitempty"`
+
+	// Rate and Baseline are only set on an anomaly_detected event: the
+	// flagged client's own current window's request count, and the
+	// established baseline (an exponential moving average of its own
+	// past per-minute counts) it was compared against — see the
+	// anomaly package. Baseline is a pointer, not a plain float64: a
+	// client whose very first window was genuinely idle (0 requests)
+	// can have a real, meaningful baseline of exactly 0 — the same
+	// "don't let omitempty eat a real zero" reasoning as
+	// DurationMS on the latency event.
+	Rate     int      `json:"rate,omitempty"`
+	Baseline *float64 `json:"baseline,omitempty"`
 
 	// RemoteIP is only set on an ip_denied or country_denied event: the
 	// request's own r.RemoteAddr, denied by checkIPAccess/
@@ -888,6 +921,14 @@ func (s *Server) getGeoIPConfig() (*geoip.Table, []string, []string) {
 	return s.GeoIPTable, s.CountryAllowList, s.CountryDenyList
 }
 
+// getAnomalyConfig returns AnomalyDetector and AnomalyDryRun under one
+// lock, for ServeHTTP's anomaly check.
+func (s *Server) getAnomalyConfig() (*anomaly.Registry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.AnomalyDetector, s.AnomalyDryRun
+}
+
 // checkCountryAccess reports whether r's remote IP's resolved country
 // is allowed to reach the proxy, and that resolved country (empty when
 // it couldn't be resolved at all) for the caller to log — checked
@@ -1011,7 +1052,15 @@ type ModelRoute struct {
 // replace IPAllowList/IPDenyList; pass nil for geoIPTable and
 // nil/empty for the two lists to disable country-based access control
 // entirely. Also appended at the very end, same reasoning as tokenLim.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string) {
+//
+// anomalyDetector/anomalyDryRun replace AnomalyDetector/AnomalyDryRun
+// wholesale — like lim/tokenLim, a reload always swaps in a brand new
+// *anomaly.Registry (see cli.buildLiveConfig) rather than trying to
+// preserve any client's already-accumulated baseline, the same
+// cold-state-on-reload behavior Limiter/TokenLimiter already have.
+// Pass nil for anomalyDetector to disable the breaker entirely. Also
+// appended at the very end, same reasoning as tokenLim/geoIPTable.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1042,6 +1091,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.GeoIPTable = geoIPTable
 	s.CountryAllowList = countryAllowList
 	s.CountryDenyList = countryDenyList
+	s.AnomalyDetector = anomalyDetector
+	s.AnomalyDryRun = anomalyDryRun
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -1322,6 +1373,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "")
 		http.Error(w, "token rate limit exceeded", http.StatusTooManyRequests)
 		return
+	}
+
+	// A third, independent breaker, unlike Limiter/TokenLimiter keyed
+	// on this one client's own recent baseline rather than a fixed
+	// threshold — see anomaly.Registry. No-ops entirely for an
+	// unidentified caller (auth.label == "" whenever no
+	// proxy_api_key/proxy_api_keys is configured at all), since
+	// there's no notion of "this caller's own baseline" without one.
+	if anomalyDetector, anomalyDryRun := s.getAnomalyConfig(); anomalyDetector != nil {
+		if anomalous, currentCount, baseline := anomalyDetector.Check(auth.label); anomalous {
+			s.Stats.RecordAnomalyDetected()
+			s.Stats.RecordClientAnomalyDetected(auth.label)
+			s.logAnomalyDetected(auth.label, r.Method, r.URL.String(), currentCount, baseline)
+			s.notifyAnomalyWebhook(auth.label, r.Method, r.URL.String(), currentCount, baseline)
+			if !anomalyDryRun {
+				http.Error(w, "anomalous traffic pattern detected", http.StatusTooManyRequests)
+				return
+			}
+		}
 	}
 
 	// evaluatedBody and evaluatedHeaders are body/r.Header unchanged
@@ -1879,6 +1949,19 @@ func (s *Server) logClientBudgetExceeded(method, reqURL, client string, cost, bu
 	s.logf("%s[BUDGET EXCEEDED] %s %s - client %s: estimated cost %.4f exceeds budget %.4f%s", ansiYellow, method, reqURL, client, cost, budget, ansiReset)
 }
 
+// logAnomalyDetected logs a client's request rate spiking past its own
+// baseline — see anomaly.Registry. currentCount/baseline are always
+// real, meaningful numbers here (Check only ever reports anomalous
+// alongside them), never zero-valued placeholders.
+func (s *Server) logAnomalyDetected(client, method, reqURL string, currentCount int, baseline float64) {
+	ev := s.recordLogEvent(logEvent{Level: "anomaly_detected", Method: method, URL: reqURL, Client: client, Rate: currentCount, Baseline: &baseline})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[ANOMALY] %s %s - client %s: %d requests this minute vs. baseline %.1f%s", ansiYellow, method, reqURL, client, currentCount, baseline, ansiReset)
+}
+
 func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
 	ev := s.recordLogEvent(logEvent{Level: "failover", Method: method, URL: reqURL, FailedTarget: failedTarget, NextTarget: nextTarget})
 	if s.LogFormat == LogFormatJSON {
@@ -2061,8 +2144,9 @@ type webhookAlert struct {
 	FailedTarget string   `json:"failed_target,omitempty"`
 	NextTarget   string   `json:"next_target,omitempty"`
 
-	// Client is only set on a budget_exceeded event fired by a named
-	// proxy key's own cost_budget — see logEvent.Client.
+	// Client is set on a budget_exceeded event fired by a named proxy
+	// key's own cost_budget, and always set on an anomaly_detected
+	// event — see logEvent.Client.
 	Client string `json:"client,omitempty"`
 
 	// RemoteIP is only set on an ip_denied or country_denied event —
@@ -2072,6 +2156,11 @@ type webhookAlert struct {
 	// Country is only set on a country_denied event — see
 	// logEvent.Country.
 	Country string `json:"country,omitempty"`
+
+	// Rate and Baseline are only set on an anomaly_detected event —
+	// see logEvent.Rate/logEvent.Baseline.
+	Rate     int      `json:"rate,omitempty"`
+	Baseline *float64 `json:"baseline,omitempty"`
 }
 
 // WebhookTarget is one resolved entry in Server.Webhooks: a destination
@@ -2220,6 +2309,24 @@ func (s *Server) notifyClientBudgetWebhook(method, reqURL, client string, cost, 
 		Time:   time.Now().UTC().Format(time.RFC3339),
 		Cost:   &cost,
 		Budget: &budget,
+	})
+}
+
+// notifyAnomalyWebhook builds and delivers a webhookAlert for the
+// anomaly_detected event — kept separate from notifyWebhook for the
+// same reason as notifyBudgetWebhook: this event carries a client, a
+// rate, and a baseline instead of a rule name.
+func (s *Server) notifyAnomalyWebhook(client, method, reqURL string, currentCount int, baseline float64) {
+	text := fmt.Sprintf("[ANOMALY_DETECTED] %s %s - client %s: %d requests this minute vs. baseline %.1f", method, reqURL, client, currentCount, baseline)
+	s.deliverWebhookPayload(webhookAlert{
+		Text:     text,
+		Event:    "anomaly_detected",
+		Method:   method,
+		URL:      reqURL,
+		Client:   client,
+		Time:     time.Now().UTC().Format(time.RFC3339),
+		Rate:     currentCount,
+		Baseline: &baseline,
 	})
 }
 
@@ -2433,6 +2540,11 @@ type statsSnapshotJSON struct {
 	// always 0 inside per_target — same reasoning as IPDenied.
 	CountryDenied int64 `json:"country_denied"`
 
+	// AnomalyDetected is likewise only meaningful at the top level, and
+	// always 0 inside per_target — broken down per client instead (see
+	// PerClient), not per target.
+	AnomalyDetected int64 `json:"anomaly_detected"`
+
 	EstimatedCost *float64                      `json:"estimated_cost,omitempty"`
 	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
 	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
@@ -2471,6 +2583,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		Unauthorized:           snap.Unauthorized,
 		IPDenied:               snap.IPDenied,
 		CountryDenied:          snap.CountryDenied,
+		AnomalyDetected:        snap.AnomalyDetected,
 		Failover:               snap.Failover,
 		Latency:                snap.Latency,
 	}
@@ -2631,6 +2744,7 @@ var promClientCounters = []struct {
 	{"aiproxy_client_redacted_total", "Total number of requests redacted, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.Redacted }},
 	{"aiproxy_client_rate_limited_total", "Total number of requests rejected by the rate limiter, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.RateLimited }},
 	{"aiproxy_client_token_rate_limited_total", "Total number of requests rejected by the token-based rate limiter, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.TokenRateLimited }},
+	{"aiproxy_client_anomaly_detected_total", "Total number of requests rejected for spiking past this client's own recent baseline request rate.", func(c stats.ClientSnapshot) int64 { return c.AnomalyDetected }},
 	{"aiproxy_client_tokens_used_total", "Total number of tokens reported in upstream response usage fields, for requests authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.TotalTokens }},
 }
 
@@ -2740,6 +2854,12 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 	fmt.Fprintln(w, "# HELP aiproxy_country_denied_total Total number of requests rejected by the GeoIP country allow/deny list.")
 	fmt.Fprintln(w, "# TYPE aiproxy_country_denied_total counter")
 	fmt.Fprintf(w, "aiproxy_country_denied_total %d\n", snap.CountryDenied)
+
+	// Unlabeled: broken down per client via aiproxy_client_anomaly_detected_total
+	// above instead, not per target.
+	fmt.Fprintln(w, "# HELP aiproxy_anomaly_detected_total Total number of requests rejected for spiking past their client's own recent baseline request rate.")
+	fmt.Fprintln(w, "# TYPE aiproxy_anomaly_detected_total counter")
+	fmt.Fprintf(w, "aiproxy_anomaly_detected_total %d\n", snap.AnomalyDetected)
 
 	// Unlabeled too, but for a different reason than the series above: a
 	// gauge, not a counter (the configured value doesn't accumulate),

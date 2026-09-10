@@ -140,6 +140,7 @@ type clientCounters struct {
 	redacted         atomic.Int64
 	rateLimited      atomic.Int64
 	tokenRateLimited atomic.Int64
+	anomalyDetected  atomic.Int64
 	totalTokens      atomic.Int64
 
 	// budgetAlerted is this client's own one-shot latch for
@@ -156,6 +157,7 @@ func (c *clientCounters) snapshot() ClientSnapshot {
 		Redacted:         c.redacted.Load(),
 		RateLimited:      c.rateLimited.Load(),
 		TokenRateLimited: c.tokenRateLimited.Load(),
+		AnomalyDetected:  c.anomalyDetected.Load(),
 		TotalTokens:      c.totalTokens.Load(),
 	}
 }
@@ -174,12 +176,13 @@ type dryRunCounters struct {
 // Stats holds a running proxy's counters. The zero value is not usable;
 // construct one with New.
 type Stats struct {
-	overall       counters
-	dryRun        dryRunCounters
-	unauthorized  atomic.Int64
-	ipDenied      atomic.Int64
-	countryDenied atomic.Int64
-	budgetAlerted atomic.Bool
+	overall         counters
+	dryRun          dryRunCounters
+	unauthorized    atomic.Int64
+	ipDenied        atomic.Int64
+	countryDenied   atomic.Int64
+	anomalyDetected atomic.Int64
+	budgetAlerted   atomic.Bool
 
 	mu        sync.Mutex
 	perTarget map[string]*counters
@@ -282,6 +285,19 @@ func (s *Stats) RecordClientTokenRateLimited(client string) {
 	s.clientCounterFor(client).tokenRateLimited.Add(1)
 }
 
+// RecordClientAnomalyDetected is RecordClientRateLimited's counterpart
+// for the anomaly-based breaker — see Stats.RecordAnomalyDetected.
+// client is "" whenever no proxy_api_key/proxy_api_keys is configured
+// at all (the same case the anomaly package's own Registry.Check
+// already no-ops for), same no-op-on-empty-label discipline as every
+// other RecordClient* method.
+func (s *Stats) RecordClientAnomalyDetected(client string) {
+	if client == "" {
+		return
+	}
+	s.clientCounterFor(client).anomalyDetected.Add(1)
+}
+
 func (s *Stats) RecordClientTokensUsed(client string, n int) {
 	if client == "" || n <= 0 {
 		return
@@ -354,6 +370,15 @@ func (s *Stats) RecordIPDenied() {
 // network-level checks).
 func (s *Stats) RecordCountryDenied() {
 	s.countryDenied.Add(1)
+}
+
+// RecordAnomalyDetected records one request rejected because the
+// calling client's own request rate spiked well past its own recent
+// baseline — see the anomaly package. No target parameter, same
+// reasoning as RecordIPDenied/RecordCountryDenied: attribution here is
+// by client (RecordClientAnomalyDetected), not by target.
+func (s *Stats) RecordAnomalyDetected() {
+	s.anomalyDetected.Add(1)
 }
 
 // RecordCacheHit records one request served from the on-disk cache
@@ -559,7 +584,15 @@ type ClientSnapshot struct {
 	// Stats.RecordClientTokenRateLimited. Distinct from RateLimited: the
 	// two breakers trip for different reasons.
 	TokenRateLimited int64 `json:"token_rate_limited"`
-	TotalTokens      int64 `json:"total_tokens"`
+
+	// AnomalyDetected counts requests rejected because this client's
+	// own request rate spiked well past its own recent baseline — see
+	// Stats.RecordClientAnomalyDetected. Distinct from RateLimited and
+	// TokenRateLimited: those trip on a fixed, absolute threshold,
+	// this one on a relative shift from the client's own normal
+	// traffic.
+	AnomalyDetected int64 `json:"anomaly_detected"`
+	TotalTokens     int64 `json:"total_tokens"`
 }
 
 // EstimatedCost prices TotalTokens at costPer1KTokens, the same unit
@@ -623,6 +656,15 @@ type Snapshot struct {
 	// target, same reasoning as IPDenied.
 	CountryDenied int64 `json:"country_denied"`
 
+	// AnomalyDetected counts requests rejected because the calling
+	// client's own request rate spiked well past its own recent
+	// baseline — see Stats.RecordAnomalyDetected. Never broken down
+	// per target, same reasoning as IPDenied/CountryDenied; broken
+	// down per client instead (see ClientSnapshot.AnomalyDetected),
+	// since attribution here is fundamentally about which caller, not
+	// which target.
+	AnomalyDetected int64 `json:"anomaly_detected"`
+
 	// Failover counts how many times a request moved on to the next
 	// candidate URL in a target's failover list because an earlier one
 	// was unreachable — see Stats.RecordFailover. Unlike Unauthorized
@@ -672,6 +714,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.Unauthorized = s.unauthorized.Load()
 	snap.IPDenied = s.ipDenied.Load()
 	snap.CountryDenied = s.countryDenied.Load()
+	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.PerTarget = perTarget
 	snap.PerRule = perRule
 	snap.PerClient = perClient
@@ -729,6 +772,12 @@ func (s Snapshot) String() string {
 	// actually denied anything.
 	if s.CountryDenied > 0 {
 		out += fmt.Sprintf("\nCountry denied (403): %d", s.CountryDenied)
+	}
+	// Same reasoning again: 0 for every run that never configured
+	// anomaly_multiplier, or that did but never actually flagged
+	// anything.
+	if s.AnomalyDetected > 0 {
+		out += fmt.Sprintf("\nAnomaly detected (429): %d", s.AnomalyDetected)
 	}
 	// Same reasoning again: 0 for every run that never configured a
 	// multi-URL target, or that did but never needed to actually use it.
@@ -840,6 +889,9 @@ func (s Snapshot) PerClientString(costPer1KTokens float64) string {
 			name, c.Allowed, c.Blocked, c.Redacted, c.RateLimited, c.TotalTokens)
 		if c.TokenRateLimited > 0 {
 			fmt.Fprintf(&b, " token-rate-limited=%d", c.TokenRateLimited)
+		}
+		if c.AnomalyDetected > 0 {
+			fmt.Fprintf(&b, " anomaly-detected=%d", c.AnomalyDetected)
 		}
 		if costPer1KTokens > 0 {
 			fmt.Fprintf(&b, " cost=%.4f", c.EstimatedCost(costPer1KTokens))

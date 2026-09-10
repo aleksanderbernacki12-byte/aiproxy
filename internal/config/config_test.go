@@ -792,6 +792,45 @@ func TestLoad_MaxTokensPerMinuteDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesAnomalyFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"anomaly_multiplier": 50, "anomaly_dry_run": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.AnomalyMultiplier != 50 {
+		t.Errorf("AnomalyMultiplier = %g, want 50", cfg.AnomalyMultiplier)
+	}
+	if !cfg.AnomalyDryRun {
+		t.Error("AnomalyDryRun = false, want true")
+	}
+}
+
+func TestLoad_AnomalyFieldsDefaultToZeroAndFalse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.AnomalyMultiplier != 0 {
+		t.Fatalf("AnomalyMultiplier = %g, want 0 (disabled) when absent", cfg.AnomalyMultiplier)
+	}
+	if cfg.AnomalyDryRun {
+		t.Fatal("AnomalyDryRun = true, want false when absent")
+	}
+}
+
 func TestLoad_ParsesTargets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

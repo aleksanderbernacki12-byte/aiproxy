@@ -228,6 +228,36 @@ type Config struct {
 	// default when the field is absent) disables this breaker entirely.
 	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
 
+	// AnomalyMultiplier, if greater than zero, flags — and, unless
+	// AnomalyDryRun is set, rejects with a 429 — a request from a
+	// named proxy client (see ProxyAPIKeys) whose current minute's
+	// request count has reached this many times its own established
+	// recent baseline (an exponential moving average of its own past
+	// per-minute counts — see the anomaly package). A complement to
+	// MaxRequestsPerMinute's fixed cap: that only ever catches a
+	// caller that's too fast in absolute terms, never one that's
+	// merely far faster than it itself normally is — a caller well
+	// under any configured fixed limit can still be a runaway agent
+	// loop relative to its own quiet-normal traffic. Only meaningful
+	// for an identified caller (ProxyAPIKey/ProxyAPIKeys configured);
+	// a fully anonymous proxy has no notion of "one caller's own
+	// baseline" to compare against, so this has no effect without one.
+	// Zero (the default when the field is absent) disables this
+	// breaker entirely.
+	AnomalyMultiplier float64 `json:"anomaly_multiplier,omitempty"`
+
+	// AnomalyDryRun, if true, makes AnomalyMultiplier only report what
+	// it would have done — via logs, the webhook, and stats — without
+	// actually rejecting anything, the same escape hatch CustomRule's
+	// own DryRun gives a new content rule. Meant for tuning
+	// AnomalyMultiplier against real traffic before trusting it to
+	// actually enforce anything — a statistical threshold is
+	// inherently more prone to a false positive than an exact secret
+	// pattern match. False (the default) means the breaker is fully
+	// live whenever AnomalyMultiplier is set. Meaningless (and
+	// rejected by aiproxy validate) without AnomalyMultiplier also set.
+	AnomalyDryRun bool `json:"anomaly_dry_run,omitempty"`
+
 	// CacheEnabled turns on the proxy's local on-disk response cache.
 	// False (the default when the field is absent) means the cache is
 	// disabled.
