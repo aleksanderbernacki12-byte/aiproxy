@@ -22,6 +22,7 @@ import (
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/config"
+	"aiproxy/internal/geoip"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
@@ -166,6 +167,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.LogFile = lc.logFile
 	server.IPAllowList = lc.ipAllowList
 	server.IPDenyList = lc.ipDenyList
+	server.GeoIPTable = lc.geoIPTable
+	server.CountryAllowList = lc.countryAllowList
+	server.CountryDenyList = lc.countryDenyList
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
@@ -237,6 +241,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if len(lc.ipDenyList) > 0 {
 			fmt.Fprintf(stdout, "IP deny list: %s\n", strings.Join(formatIPNets(lc.ipDenyList), ", "))
+		}
+		if lc.geoIPTable != nil {
+			fmt.Fprintf(stdout, "GeoIP ranges loaded: %d\n", lc.geoIPTable.Len())
+		}
+		if len(lc.countryAllowList) > 0 {
+			fmt.Fprintf(stdout, "country allow list: %s\n", strings.Join(lc.countryAllowList, ", "))
+		}
+		if len(lc.countryDenyList) > 0 {
+			fmt.Fprintf(stdout, "country deny list: %s\n", strings.Join(lc.countryDenyList, ", "))
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -355,7 +368,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList)
 
 	label := loadedFrom
 	if label == "" {
@@ -368,22 +381,25 @@ func reloadConfig(server *proxy.Server, configPath string) {
 // rebuilt from an aiproxy.json: everything runStart wires in at startup,
 // and everything a SIGHUP reload replaces via Server.ReloadConfig.
 type liveConfig struct {
-	engine       *rules.Engine
-	limiter      *limiter.Limiter
-	tokenLimiter *limiter.TokenLimiter
-	cache        *cache.Cache
-	cost         float64
-	costBudget   float64
-	maxBodyBytes int64
-	webhookURL   *url.URL
-	webhooks     []proxy.WebhookTarget
-	proxyAPIKey  string
-	proxyAPIKeys []proxy.ProxyKey
-	logFile      *os.File
-	routes       []targetRoute
-	modelRoutes  []modelRoute
-	ipAllowList  []*net.IPNet
-	ipDenyList   []*net.IPNet
+	engine           *rules.Engine
+	limiter          *limiter.Limiter
+	tokenLimiter     *limiter.TokenLimiter
+	cache            *cache.Cache
+	cost             float64
+	costBudget       float64
+	maxBodyBytes     int64
+	webhookURL       *url.URL
+	webhooks         []proxy.WebhookTarget
+	proxyAPIKey      string
+	proxyAPIKeys     []proxy.ProxyKey
+	logFile          *os.File
+	routes           []targetRoute
+	modelRoutes      []modelRoute
+	ipAllowList      []*net.IPNet
+	ipDenyList       []*net.IPNet
+	geoIPTable       *geoip.Table
+	countryAllowList []string
+	countryDenyList  []string
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -468,7 +484,45 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	errs = append(errs, denyErrs...)
 	lc.ipDenyList = ipDenyList
 
+	if (len(cfg.CountryAllowList) > 0 || len(cfg.CountryDenyList) > 0) && cfg.GeoIPRangesFile == "" {
+		errs = append(errs, fmt.Errorf("country_allow_list/country_deny_list requires geoip_ranges_file to be set (there's nothing to resolve a request's country from otherwise)"))
+	}
+	if cfg.GeoIPRangesFile != "" {
+		table, err := geoip.Load(cfg.GeoIPRangesFile)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			lc.geoIPTable = table
+		}
+	}
+
+	countryAllowList, countryAllowErrs := compileCountryList("country_allow_list", cfg.CountryAllowList)
+	errs = append(errs, countryAllowErrs...)
+	lc.countryAllowList = countryAllowList
+
+	countryDenyList, countryDenyErrs := compileCountryList("country_deny_list", cfg.CountryDenyList)
+	errs = append(errs, countryDenyErrs...)
+	lc.countryDenyList = countryDenyList
+
 	return lc, errs
+}
+
+// compileCountryList validates and normalizes a config file's
+// country_allow_list or country_deny_list entries: each must be a
+// 2-letter ISO 3166-1 alpha-2 code (case-insensitive, normalized to
+// uppercase) — same per-entry indexed error style as compileIPList.
+func compileCountryList(fieldName string, entries []string) ([]string, []error) {
+	compiled := make([]string, 0, len(entries))
+	var errs []error
+	for i, raw := range entries {
+		code := strings.ToUpper(strings.TrimSpace(raw))
+		if !geoip.ValidCountryCode(code) {
+			errs = append(errs, fmt.Errorf("%s[%d]: %q is not a 2-letter country code", fieldName, i, raw))
+			continue
+		}
+		compiled = append(compiled, code)
+	}
+	return compiled, errs
 }
 
 // compileIPList parses and validates a config file's ip_allow_list or
@@ -753,6 +807,23 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, e.Error())
 	}
 
+	if (len(cfg.CountryAllowList) > 0 || len(cfg.CountryDenyList) > 0) && cfg.GeoIPRangesFile == "" {
+		problems = append(problems, "country_allow_list/country_deny_list requires geoip_ranges_file to be set (there's nothing to resolve a request's country from otherwise)")
+	}
+	if cfg.GeoIPRangesFile != "" {
+		if _, err := geoip.Load(cfg.GeoIPRangesFile); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	_, countryAllowErrs := compileCountryList("country_allow_list", cfg.CountryAllowList)
+	for _, e := range countryAllowErrs {
+		problems = append(problems, e.Error())
+	}
+	_, countryDenyErrs := compileCountryList("country_deny_list", cfg.CountryDenyList)
+	for _, e := range countryDenyErrs {
+		problems = append(problems, e.Error())
+	}
+
 	_, pathRuleErrs := compilePathRules(cfg.PathRules)
 	for _, e := range pathRuleErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
@@ -844,8 +915,21 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  additional proxy keys:   %d\n", len(cfg.ProxyAPIKeys))
 	fmt.Fprintf(stdout, "  IP allow list entries:   %d\n", len(cfg.IPAllowList))
 	fmt.Fprintf(stdout, "  IP deny list entries:    %d\n", len(cfg.IPDenyList))
+	fmt.Fprintf(stdout, "  GeoIP ranges file:       %s\n", geoIPRangesFileDisplay(cfg.GeoIPRangesFile))
+	fmt.Fprintf(stdout, "  country allow list:      %d\n", len(cfg.CountryAllowList))
+	fmt.Fprintf(stdout, "  country deny list:       %d\n", len(cfg.CountryDenyList))
 	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
+}
+
+// geoIPRangesFileDisplay renders geoip_ranges_file for the validate
+// summary — a file path isn't a secret, same reasoning as
+// logFileDisplay, so it's shown in full rather than masked.
+func geoIPRangesFileDisplay(path string) string {
+	if path == "" {
+		return "disabled"
+	}
+	return path
 }
 
 // runVerifyLog checks that an audit-signed log file's HMAC chain is
@@ -1117,6 +1201,7 @@ var webhookEventNames = map[string]bool{
 	"budget_exceeded":         true,
 	"failover":                true,
 	"ip_denied":               true,
+	"country_denied":          true,
 }
 
 // compileWebhookTargets validates and resolves the config file's

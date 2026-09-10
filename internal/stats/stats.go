@@ -178,6 +178,7 @@ type Stats struct {
 	dryRun        dryRunCounters
 	unauthorized  atomic.Int64
 	ipDenied      atomic.Int64
+	countryDenied atomic.Int64
 	budgetAlerted atomic.Bool
 
 	mu        sync.Mutex
@@ -344,6 +345,15 @@ func (s *Stats) RecordUnauthorized() {
 // authentication.
 func (s *Stats) RecordIPDenied() {
 	s.ipDenied.Add(1)
+}
+
+// RecordCountryDenied records one request rejected by the GeoIP
+// country allow/deny list — same reasoning as RecordIPDenied: no
+// target parameter, checked before proxy authentication (and after
+// the IP allow/deny list, which is the more foundational of the two
+// network-level checks).
+func (s *Stats) RecordCountryDenied() {
+	s.countryDenied.Add(1)
 }
 
 // RecordCacheHit records one request served from the on-disk cache
@@ -607,6 +617,12 @@ type Snapshot struct {
 	// broken down per target — see Stats.RecordIPDenied.
 	IPDenied int64 `json:"ip_denied"`
 
+	// CountryDenied counts requests rejected by the GeoIP country
+	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
+	// IPDenied (a different rejection reason), never broken down per
+	// target, same reasoning as IPDenied.
+	CountryDenied int64 `json:"country_denied"`
+
 	// Failover counts how many times a request moved on to the next
 	// candidate URL in a target's failover list because an earlier one
 	// was unreachable — see Stats.RecordFailover. Unlike Unauthorized
@@ -655,6 +671,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.ResponseDryRunRedacted = s.dryRun.responseRedacted.Load()
 	snap.Unauthorized = s.unauthorized.Load()
 	snap.IPDenied = s.ipDenied.Load()
+	snap.CountryDenied = s.countryDenied.Load()
 	snap.PerTarget = perTarget
 	snap.PerRule = perRule
 	snap.PerClient = perClient
@@ -706,6 +723,12 @@ func (s Snapshot) String() string {
 	// anything.
 	if s.IPDenied > 0 {
 		out += fmt.Sprintf("\nIP denied (403):      %d", s.IPDenied)
+	}
+	// Same reasoning again: 0 for every run that never configured
+	// country_allow_list/country_deny_list, or that did but never
+	// actually denied anything.
+	if s.CountryDenied > 0 {
+		out += fmt.Sprintf("\nCountry denied (403): %d", s.CountryDenied)
 	}
 	// Same reasoning again: 0 for every run that never configured a
 	// multi-URL target, or that did but never needed to actually use it.

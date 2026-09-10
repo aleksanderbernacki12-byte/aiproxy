@@ -451,6 +451,49 @@ func TestLoad_IPListsDefaultToEmpty(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesGeoIPFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"geoip_ranges_file": "/etc/aiproxy/geoip.csv",
+		"country_allow_list": ["SE", "NO"],
+		"country_deny_list": ["KP"]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.GeoIPRangesFile != "/etc/aiproxy/geoip.csv" {
+		t.Errorf("GeoIPRangesFile = %q, want /etc/aiproxy/geoip.csv", cfg.GeoIPRangesFile)
+	}
+	if len(cfg.CountryAllowList) != 2 || cfg.CountryAllowList[0] != "SE" || cfg.CountryAllowList[1] != "NO" {
+		t.Errorf("CountryAllowList = %v, want [SE NO]", cfg.CountryAllowList)
+	}
+	if len(cfg.CountryDenyList) != 1 || cfg.CountryDenyList[0] != "KP" {
+		t.Errorf("CountryDenyList = %v, want [KP]", cfg.CountryDenyList)
+	}
+}
+
+func TestLoad_GeoIPFieldsDefaultToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.GeoIPRangesFile != "" || len(cfg.CountryAllowList) != 0 || len(cfg.CountryDenyList) != 0 {
+		t.Fatalf("GeoIPRangesFile=%q CountryAllowList=%v CountryDenyList=%v, want all empty when absent", cfg.GeoIPRangesFile, cfg.CountryAllowList, cfg.CountryDenyList)
+	}
+}
+
 func TestLoad_ParsesCostBudget(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

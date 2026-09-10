@@ -29,6 +29,7 @@ import (
 
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
+	"aiproxy/internal/geoip"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/rules"
 	"aiproxy/internal/stats"
@@ -367,6 +368,20 @@ type Server struct {
 	// checkIPAccess. Empty (the default) denies nothing.
 	IPDenyList []*net.IPNet
 
+	// GeoIPTable resolves a client IP to its country code, for
+	// CountryAllowList/CountryDenyList — nil (the default, whenever
+	// geoip_ranges_file isn't configured) skips the country check
+	// entirely, same zero-cost-when-unused discipline as IPAllowList/
+	// IPDenyList both being empty.
+	GeoIPTable *geoip.Table
+
+	// CountryAllowList/CountryDenyList restrict which client countries
+	// may reach the proxy, resolved via GeoIPTable — checked right
+	// after IPAllowList/IPDenyList, independently of it: a request
+	// must pass both checks; see checkCountryAccess.
+	CountryAllowList []string
+	CountryDenyList  []string
+
 	// ProxyAPIKey, if non-empty, requires every request — including
 	// GET /_aiproxy/stats and /_aiproxy/metrics — to present it as a
 	// "Proxy-Authorization: Bearer <key>" header before ServeHTTP does
@@ -475,10 +490,16 @@ type logEvent struct {
 	// event, which isn't attributable to any one caller.
 	Client string `json:"client,omitempty"`
 
-	// RemoteIP is only set on an ip_denied event: the request's own
-	// r.RemoteAddr, denied by checkIPAccess before anything else about
-	// the request (including proxy auth) was even evaluated.
+	// RemoteIP is only set on an ip_denied or country_denied event: the
+	// request's own r.RemoteAddr, denied by checkIPAccess/
+	// checkCountryAccess before anything else about the request
+	// (including proxy auth) was even evaluated.
 	RemoteIP string `json:"remote_ip,omitempty"`
+
+	// Country is only set on a country_denied event: the resolved
+	// country code RemoteIP was denied for, or empty when it couldn't
+	// be resolved at all (still a deny — see checkCountryAccess).
+	Country string `json:"country,omitempty"`
 
 	// FailedTarget and NextTarget are only set on a failover event: the
 	// candidate URL that just turned out to be unreachable, and the one
@@ -859,6 +880,61 @@ func (s *Server) checkIPAccess(r *http.Request) bool {
 	return false
 }
 
+// getGeoIPConfig returns GeoIPTable, CountryAllowList, and
+// CountryDenyList under one lock, for checkCountryAccess.
+func (s *Server) getGeoIPConfig() (*geoip.Table, []string, []string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.GeoIPTable, s.CountryAllowList, s.CountryDenyList
+}
+
+// checkCountryAccess reports whether r's remote IP's resolved country
+// is allowed to reach the proxy, and that resolved country (empty when
+// it couldn't be resolved at all) for the caller to log — checked
+// right after checkIPAccess, independently of it (see
+// CountryAllowList's doc comment: a request must pass both checks,
+// neither is an exemption from the other). Both lists empty (the
+// default) means every country is allowed, without even resolving
+// RemoteAddr's country — same zero-cost-when-unused discipline as
+// checkIPAccess. A country deny match always wins, even for a country
+// also covered by CountryAllowList, the same precedence checkIPAccess
+// already uses between IPDenyList and IPAllowList. An IP whose country
+// can't be resolved at all (nil GeoIPTable, an unparseable remote IP,
+// or simply not covered by any range in the table) is denied whenever
+// either list is configured, since there's no way to evaluate it
+// against either one.
+func (s *Server) checkCountryAccess(r *http.Request) (bool, string) {
+	table, allow, deny := s.getGeoIPConfig()
+	if len(allow) == 0 && len(deny) == 0 {
+		return true, ""
+	}
+
+	var country string
+	if table != nil {
+		if ip := clientIP(r); ip != nil {
+			country, _ = table.Country(ip)
+		}
+	}
+	if country == "" {
+		return false, ""
+	}
+
+	for _, c := range deny {
+		if c == country {
+			return false, country
+		}
+	}
+	if len(allow) == 0 {
+		return true, country
+	}
+	for _, c := range allow {
+		if c == country {
+			return true, country
+		}
+	}
+	return false, country
+}
+
 func (s *Server) getLogFile() *os.File {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -929,7 +1005,13 @@ type ModelRoute struct {
 // parameter, after every field that existed before the token-based
 // breaker did, rather than alongside lim, purely to keep every existing
 // positional call site's argument order intact.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter) {
+//
+// geoIPTable/countryAllowList/countryDenyList replace GeoIPTable/
+// CountryAllowList/CountryDenyList the same way ipAllowList/ipDenyList
+// replace IPAllowList/IPDenyList; pass nil for geoIPTable and
+// nil/empty for the two lists to disable country-based access control
+// entirely. Also appended at the very end, same reasoning as tokenLim.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -957,6 +1039,9 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.modelRoutes = newModelRoutes
 	s.IPAllowList = ipAllowList
 	s.IPDenyList = ipDenyList
+	s.GeoIPTable = geoIPTable
+	s.CountryAllowList = countryAllowList
+	s.CountryDenyList = countryDenyList
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -1081,6 +1166,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.Stats.RecordIPDenied()
 		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String())
 		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String())
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if allowed, country := s.checkCountryAccess(r); !allowed {
+		// Checked right after checkIPAccess, for the same reason — a
+		// network-level access decision before any application-level
+		// credential check — but as a fully independent gate: neither
+		// this nor checkIPAccess is an exemption from the other, see
+		// CountryAllowList's doc comment.
+		s.Stats.RecordCountryDenied()
+		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String())
+		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String())
 		http.Error(w, "access denied", http.StatusForbidden)
 		return
 	}
@@ -1746,6 +1843,19 @@ func (s *Server) logIPDenied(remoteIP, method, reqURL string) {
 	s.logf("%s[IP DENIED] %s %s - %s not in ip_allow_list, or in ip_deny_list%s", ansiBrightRed, method, reqURL, remoteIP, ansiReset)
 }
 
+func (s *Server) logCountryDenied(remoteIP, country, method, reqURL string) {
+	ev := s.recordLogEvent(logEvent{Level: "country_denied", Method: method, URL: reqURL, RemoteIP: remoteIP, Country: country})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	label := country
+	if label == "" {
+		label = "unresolved"
+	}
+	s.logf("%s[COUNTRY DENIED] %s %s - %s (%s) not in country_allow_list, or in country_deny_list%s", ansiBrightRed, method, reqURL, remoteIP, label, ansiReset)
+}
+
 func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) {
 	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Cost: cost, Budget: budget})
 	if s.LogFormat == LogFormatJSON {
@@ -1955,8 +2065,13 @@ type webhookAlert struct {
 	// proxy key's own cost_budget — see logEvent.Client.
 	Client string `json:"client,omitempty"`
 
-	// RemoteIP is only set on an ip_denied event — see logEvent.RemoteIP.
+	// RemoteIP is only set on an ip_denied or country_denied event —
+	// see logEvent.RemoteIP.
 	RemoteIP string `json:"remote_ip,omitempty"`
+
+	// Country is only set on a country_denied event — see
+	// logEvent.Country.
+	Country string `json:"country,omitempty"`
 }
 
 // WebhookTarget is one resolved entry in Server.Webhooks: a destination
@@ -2141,6 +2256,27 @@ func (s *Server) notifyIPDeniedWebhook(remoteIP, method, reqURL string) {
 	})
 }
 
+// notifyCountryDeniedWebhook builds and delivers a webhookAlert for the
+// country_denied event — kept separate from notifyWebhook for the same
+// reason as notifyIPDeniedWebhook: this event carries a remote IP (and
+// its resolved country) instead of a rule name.
+func (s *Server) notifyCountryDeniedWebhook(remoteIP, country, method, reqURL string) {
+	label := country
+	if label == "" {
+		label = "unresolved"
+	}
+	text := fmt.Sprintf("[COUNTRY_DENIED] %s %s - %s (%s) not in country_allow_list, or in country_deny_list", method, reqURL, remoteIP, label)
+	s.deliverWebhookPayload(webhookAlert{
+		Text:     text,
+		Event:    "country_denied",
+		Method:   method,
+		URL:      reqURL,
+		Time:     time.Now().UTC().Format(time.RFC3339),
+		RemoteIP: remoteIP,
+		Country:  country,
+	})
+}
+
 // logEventJSON marshals ev (stamping the current time) and logs it as a
 // single line, for LogFormatJSON.
 func (s *Server) logEventJSON(ev logEvent) {
@@ -2293,6 +2429,10 @@ type statsSnapshotJSON struct {
 	// to resolve a target either.
 	IPDenied int64 `json:"ip_denied"`
 
+	// CountryDenied is likewise only meaningful at the top level, and
+	// always 0 inside per_target — same reasoning as IPDenied.
+	CountryDenied int64 `json:"country_denied"`
+
 	EstimatedCost *float64                      `json:"estimated_cost,omitempty"`
 	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
 	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
@@ -2330,6 +2470,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		ResponseDryRunRedacted: snap.ResponseDryRunRedacted,
 		Unauthorized:           snap.Unauthorized,
 		IPDenied:               snap.IPDenied,
+		CountryDenied:          snap.CountryDenied,
 		Failover:               snap.Failover,
 		Latency:                snap.Latency,
 	}
@@ -2593,6 +2734,12 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 	fmt.Fprintln(w, "# HELP aiproxy_ip_denied_total Total number of requests rejected by the IP allow/deny list.")
 	fmt.Fprintln(w, "# TYPE aiproxy_ip_denied_total counter")
 	fmt.Fprintf(w, "aiproxy_ip_denied_total %d\n", snap.IPDenied)
+
+	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
+	// country-denied request never gets far enough to resolve a target.
+	fmt.Fprintln(w, "# HELP aiproxy_country_denied_total Total number of requests rejected by the GeoIP country allow/deny list.")
+	fmt.Fprintln(w, "# TYPE aiproxy_country_denied_total counter")
+	fmt.Fprintf(w, "aiproxy_country_denied_total %d\n", snap.CountryDenied)
 
 	// Unlabeled too, but for a different reason than the series above: a
 	// gauge, not a counter (the configured value doesn't accumulate),

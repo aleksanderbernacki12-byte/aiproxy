@@ -397,6 +397,31 @@ type Config struct {
 	// rules. Empty (the default) denies nothing.
 	IPDenyList []string `json:"ip_deny_list,omitempty"`
 
+	// GeoIPRangesFile is the path to a CSV file mapping IP ranges to
+	// 2-letter country codes ("1.2.3.0/24,US" per line, "#" comments
+	// and blank lines ignored) — see the geoip package. Required
+	// whenever CountryAllowList or CountryDenyList is set; there's
+	// nothing to resolve a request's country from otherwise.
+	GeoIPRangesFile string `json:"geoip_ranges_file,omitempty"`
+
+	// CountryAllowList/CountryDenyList restrict which client
+	// countries may reach the proxy at all, resolved from
+	// GeoIPRangesFile — checked independently of IPAllowList/
+	// IPDenyList: a request must pass both checks, and an explicit IP
+	// allow-list entry is never an exemption from a country-level
+	// deny (or vice versa) — deliberately, to keep the two dimensions
+	// simple to reason about rather than adding cross-list precedence
+	// rules. Within this pair, CountryDenyList always wins, even over
+	// a country also present in CountryAllowList, the same precedence
+	// IPAllowList/IPDenyList already use. An IP whose country can't be
+	// resolved at all (not covered by any GeoIPRangesFile range) is
+	// denied whenever either list is non-empty — the same "can't
+	// evaluate it, so deny" rule checkIPAccess already applies to an
+	// unparseable remote IP. Each entry is a 2-letter ISO 3166-1
+	// alpha-2 code, case-insensitive.
+	CountryAllowList []string `json:"country_allow_list,omitempty"`
+	CountryDenyList  []string `json:"country_deny_list,omitempty"`
+
 	// LogFile, if set, is a path every log event — the same ones printed
 	// to stdout/stderr, plus the shutdown summary — is also appended to,
 	// always as one JSON object per line regardless of --log-format,

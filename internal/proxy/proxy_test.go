@@ -31,6 +31,7 @@ import (
 
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/cache"
+	"aiproxy/internal/geoip"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
@@ -3514,7 +3515,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -3576,7 +3577,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 		}
 	}()
 
@@ -4585,7 +4586,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -5858,7 +5859,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -6190,7 +6191,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -6564,7 +6565,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7620,7 +7621,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -8442,7 +8443,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -8758,7 +8759,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -9113,10 +9114,451 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil)
+	}, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
+	}
+}
+
+// mustGeoIPTable writes csv to a temp file and loads it via geoip.Load,
+// failing the test on any error — the real loading path production
+// code uses, not a hand-built Table (its fields are all unexported).
+func mustGeoIPTable(t *testing.T, csv string) *geoip.Table {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "geoip.csv")
+	if err := os.WriteFile(path, []byte(csv), 0o644); err != nil {
+		t.Fatalf("write geoip csv: %v", err)
+	}
+	table, err := geoip.Load(path)
+	if err != nil {
+		t.Fatalf("geoip.Load: %v", err)
+	}
+	return table
+}
+
+// TestServer_CountryAccess_UnconfiguredAllowsEveryCountry proves that
+// with both CountryAllowList and CountryDenyList empty (the default),
+// no request is ever country-denied — same zero-cost-when-unused
+// discipline as checkIPAccess, even with a GeoIPTable set.
+func TestServer_CountryAccess_UnconfiguredAllowsEveryCountry(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,ZZ\n")
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_CountryAccess_AllowListLetsMatchingCountryThrough proves a
+// request whose resolved country is covered by CountryAllowList is
+// forwarded normally.
+func TestServer_CountryAccess_AllowListLetsMatchingCountryThrough(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	// httptest.NewServer always listens on loopback, so every test
+	// request's remote IP falls inside this range.
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryAllowList = []string{"SE"}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (the resolved country SE is covered by the allow list)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_CountryAccess_AllowListRejectsNonMatchingCountry proves a
+// request whose resolved country is NOT covered by a non-empty
+// CountryAllowList is denied with 403 and never reaches upstream.
+func TestServer_CountryAccess_AllowListRejectsNonMatchingCountry(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryAllowList = []string{"NO"}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if upstreamHit.Load() {
+		t.Error("upstream was hit, want the request rejected before ever reaching it")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.CountryDenied != 1 {
+		t.Errorf("Stats.CountryDenied = %d, want 1", snap.CountryDenied)
+	}
+}
+
+// TestServer_CountryAccess_DenyListRejectsMatchingCountry proves
+// CountryDenyList rejects a matching country even with no
+// CountryAllowList configured at all.
+func TestServer_CountryAccess_DenyListRejectsMatchingCountry(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryDenyList = []string{"SE"}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestServer_CountryAccess_DenyListWinsOverAllowList proves a country
+// deny match takes priority even for a country also covered by
+// CountryAllowList — the same precedence checkIPAccess already uses.
+func TestServer_CountryAccess_DenyListWinsOverAllowList(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryAllowList = []string{"SE"}
+	srv.CountryDenyList = []string{"SE"}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (a deny match must win even though the same country is also allow-listed)", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestServer_CountryAccess_UnresolvableIPDeniedWhenEitherListConfigured
+// proves an IP whose country can't be resolved (no GeoIPTable, or an
+// IP the table just doesn't cover) is denied whenever either country
+// list is configured — the same "can't evaluate it, so deny" rule
+// checkIPAccess already applies to an unparseable remote IP.
+func TestServer_CountryAccess_UnresolvableIPDeniedWhenEitherListConfigured(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		table *geoip.Table
+	}{
+		{"NilTable", nil},
+		{"IPNotCoveredByAnyRange", mustGeoIPTable(t, "10.0.0.0/8,SE\n")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+			targetURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatalf("parse url: %v", err)
+			}
+
+			srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+			srv.GeoIPTable = tc.table
+			srv.CountryAllowList = []string{"SE"}
+			srv.Logger = log.New(io.Discard, "", 0)
+			frontend := httptest.NewServer(srv)
+			defer frontend.Close()
+
+			resp, err := http.Get(frontend.URL + "/x")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d (an unresolvable country must fail closed)", resp.StatusCode, http.StatusForbidden)
+			}
+		})
+	}
+}
+
+// TestServer_CountryAccess_IndependentOfIPAllowList proves the
+// confirmed design: an IP explicitly covered by IPAllowList is NOT an
+// exemption from a country-level deny — the two checks are a fully
+// independent AND gate, neither is a bypass of the other.
+func TestServer_CountryAccess_IndependentOfIPAllowList(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	// The IP itself is explicitly allow-listed...
+	srv.IPAllowList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	// ...but its resolved country is denied, independently.
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryDenyList = []string{"SE"}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (an IP allow-list entry must not exempt a request from a country-level deny)", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestServer_CountryAccess_CheckedAfterIPAccessButBeforeProxyAuth
+// proves the ordering: an IP-level deny still wins even when the
+// country would otherwise be allowed, and a country deny still wins
+// over a completely valid Proxy-Authorization key.
+func TestServer_CountryAccess_CheckedAfterIPAccessButBeforeProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-real-key"
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryDenyList = []string{"SE"}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer the-real-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (country deny must win even with a correct proxy key presented)", resp.StatusCode, http.StatusForbidden)
+	}
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		t.Fatal("got 407, meaning the auth check ran before the country check — wrong order")
+	}
+}
+
+// TestServer_CountryAccess_DeniedRequestNeverCountsAsIPDeniedOrUnauthorized
+// proves a country-denied request is counted and logged as
+// country_denied only — distinct rejection reasons, never conflated.
+func TestServer_CountryAccess_DeniedRequestNeverCountsAsIPDeniedOrUnauthorized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "the-real-key"
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryDenyList = []string{"SE"}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	snap := srv.Stats.Snapshot()
+	if snap.CountryDenied != 1 {
+		t.Errorf("CountryDenied = %d, want 1", snap.CountryDenied)
+	}
+	if snap.IPDenied != 0 {
+		t.Errorf("IPDenied = %d, want 0 (a country denial is a distinct reason from an IP denial)", snap.IPDenied)
+	}
+	if snap.Unauthorized != 0 {
+		t.Errorf("Unauthorized = %d, want 0 (a country-denied request never reaches the auth check at all)", snap.Unauthorized)
+	}
+}
+
+// TestServer_Webhook_FiresOnCountryDeniedWithExpectedPayload proves the
+// country_denied webhook event carries the denied remote_ip and its
+// resolved country, and an empty rule.
+func TestServer_Webhook_FiresOnCountryDeniedWithExpectedPayload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.GeoIPTable = mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.CountryDenyList = []string{"SE"}
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "country_denied" {
+			t.Errorf("event = %v, want country_denied", payload["event"])
+		}
+		if rule, ok := payload["rule"]; !ok || rule != "" {
+			t.Errorf("rule = %v, want empty string (a country denial matches no rule)", payload["rule"])
+		}
+		if payload["country"] != "SE" {
+			t.Errorf("country = %v, want SE", payload["country"])
+		}
+		remoteIP, _ := payload["remote_ip"].(string)
+		if !strings.HasPrefix(remoteIP, "127.0.0.1") {
+			t.Errorf("remote_ip = %q, want it to start with 127.0.0.1", remoteIP)
+		}
+		text, _ := payload["text"].(string)
+		if !strings.Contains(text, "COUNTRY_DENIED") {
+			t.Errorf("text = %q, want it to mention COUNTRY_DENIED", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was never called")
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesCountryLists proves a SIGHUP-style
+// ReloadConfig can add GeoIPTable/CountryDenyList to a server that
+// started with none, live.
+func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func() int {
+		resp, err := http.Get(frontend.URL + "/x")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("before reload: status = %d, want %d (no country deny list configured yet)", got, http.StatusOK)
+	}
+
+	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
+		table, nil, []string{"SE"})
+
+	if got := get(); got != http.StatusForbidden {
+		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
 	}
 }
 
@@ -9152,7 +9594,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute))
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)

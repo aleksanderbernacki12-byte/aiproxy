@@ -1898,6 +1898,112 @@ func TestExecute_Validate_ValidConfig_WithIPLists_ReturnsZero(t *testing.T) {
 	}
 }
 
+// TestExecute_Validate_CountryListWithoutGeoIPRangesFile_ReportsProblem
+// proves country_allow_list/country_deny_list is rejected when
+// geoip_ranges_file isn't set — there's nothing to resolve a request's
+// country from otherwise.
+func TestExecute_Validate_CountryListWithoutGeoIPRangesFile_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"country_deny_list": ["KP"]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "requires geoip_ranges_file") {
+		t.Errorf("stderr missing the requires-geoip_ranges_file problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_GeoIPRangesFile_MissingFileReportsProblem proves
+// a geoip_ranges_file pointing at a nonexistent path is rejected
+// clearly rather than deferred to a runtime failure.
+func TestExecute_Validate_GeoIPRangesFile_MissingFileReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := fmt.Sprintf(`{"geoip_ranges_file": %q}`, filepath.Join(dir, "does-not-exist.csv"))
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "geoip_ranges_file") {
+		t.Errorf("stderr missing the geoip_ranges_file problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_CountryList_InvalidCodeReportsProblem proves a
+// malformed country code (not 2 letters) is rejected.
+func TestExecute_Validate_CountryList_InvalidCodeReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	csvPath := filepath.Join(dir, "geoip.csv")
+	if err := os.WriteFile(csvPath, []byte("1.2.3.0/24,US\n"), 0o644); err != nil {
+		t.Fatalf("write geoip csv: %v", err)
+	}
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := fmt.Sprintf(`{"geoip_ranges_file": %q, "country_allow_list": ["USA"]}`, csvPath)
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "country_allow_list") || !strings.Contains(stderr.String(), "not a 2-letter country code") {
+		t.Errorf("stderr missing the invalid-country-code problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_ValidConfig_WithGeoIP_ReturnsZero proves a
+// well-formed geoip_ranges_file + country lists passes validation and
+// is reflected in the summary.
+func TestExecute_Validate_ValidConfig_WithGeoIP_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	csvPath := filepath.Join(dir, "geoip.csv")
+	if err := os.WriteFile(csvPath, []byte("1.2.3.0/24,US\n5.6.7.0/24,SE\n"), 0o644); err != nil {
+		t.Fatalf("write geoip csv: %v", err)
+	}
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := fmt.Sprintf(`{
+		"geoip_ranges_file": %q,
+		"country_allow_list": ["se", "no"],
+		"country_deny_list": ["kp"]
+	}`, csvPath)
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "GeoIP ranges file:       "+csvPath) {
+		t.Fatalf("stdout missing GeoIP ranges file path: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "country allow list:      2") {
+		t.Fatalf("stdout missing country allow list entry count: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "country deny list:       1") {
+		t.Fatalf("stdout missing country deny list entry count: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_ModelRoutes_EmptyNameReportsProblem proves an
 // entry with no name is rejected — it's the stats/log attribution
 // label, so it can't be blank.

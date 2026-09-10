@@ -174,6 +174,79 @@ event carrying the denied `remote_ip`. Hot-reloadable via
 [SIGHUP](#reloading-config-without-restarting) like everything else in
 this README.
 
+## GeoIP-based blocking
+
+`country_allow_list` and `country_deny_list` restrict which client
+*countries* may reach the proxy — checked right after
+[`ip_allow_list`/`ip_deny_list`](#restricting-access-by-ip), as a fully
+independent gate: a request must pass *both* checks, and an IP that's
+explicitly `ip_allow_list`-ed is **not** an exemption from a
+country-level deny, or vice versa — the two dimensions never interact,
+by design, to keep precedence simple to reason about.
+
+```json
+{
+  "geoip_ranges_file": "geoip.csv",
+  "country_allow_list": ["SE", "NO", "DK", "FI"],
+  "country_deny_list": ["KP"]
+}
+```
+
+`geoip_ranges_file` points at a plain CSV file mapping IP ranges to
+2-letter country codes, one `cidr_or_ip,country_code` pair per line —
+`#` comments and blank lines are ignored:
+
+```
+# example geoip.csv
+1.2.3.0/24,US
+5.6.7.0/24,SE
+8.8.8.8,US
+```
+
+aiproxy defines this simple format itself rather than parsing
+MaxMind's proprietary `.mmdb` binary database or its own multi-file CSV
+export (which requires joining a *Blocks* file against a *Locations*
+file by `geoname_id`) — keeping this feature usable with any
+IP-to-country data source and keeping the project's stdlib-only, zero
+Go-module-dependency discipline intact. If you already have a MaxMind
+GeoLite2 account, a one-time join of `GeoLite2-Country-Blocks-IPv4.csv`
+against `GeoLite2-Country-Locations-en.csv` (on `geoname_id`, keeping
+just the network and `country_iso_code` columns) produces a file in
+exactly this shape; any other IP-geolocation data source, or a small
+hand-maintained list for a narrow blocklist use case, works just as
+well.
+
+`country_allow_list`/`country_deny_list` each hold 2-letter ISO
+3166-1 alpha-2 codes (case-insensitive, normalized to uppercase). A
+request whose resolved country matches any `country_deny_list` entry
+is always rejected with a 403, *even if it also matches
+`country_allow_list`* — the same "deny always wins" precedence
+`ip_deny_list` already uses. If `country_allow_list` is non-empty, a
+request's resolved country must match one of its entries; if it's
+empty (the default), every country is allowed unless
+`country_deny_list` denies it. `geoip_ranges_file` is required whenever
+either list is set — `aiproxy validate` rejects the combination
+otherwise, since there'd be nothing to resolve a country from.
+
+An IP that can't be resolved to any country at all — not covered by
+any range in `geoip_ranges_file` — is denied whenever either list is
+configured, the same "can't evaluate it, so deny" rule already applied
+to an unparseable remote IP by the IP allow/deny check. The same
+caveat about the match being against the real TCP peer address, never
+`X-Forwarded-For`, applies here too — see
+[Restricting access by IP](#restricting-access-by-ip).
+
+A denied request is counted (`GET /_aiproxy/stats`'s top-level
+`country_denied` field, never broken down per target, and the
+Prometheus endpoint's unlabeled `aiproxy_country_denied_total`), logged
+(`[COUNTRY DENIED]`, bright red), and, if `webhook_url` is set,
+[alerted](#webhook-alerts) with a `country_denied` event carrying the
+denied `remote_ip` and its resolved `country`. Hot-reloadable via
+[SIGHUP](#reloading-config-without-restarting) like `ip_allow_list`/
+`ip_deny_list` — unlike [TLS](#serving-over-tls) or
+[audit log signing](#audit-log-signing), this is ordinary config data,
+not process-level listener/key setup.
+
 ## Authenticating requests to the proxy
 
 By default, anyone who can reach the proxy's listen address can use it —
@@ -381,8 +454,9 @@ serves, instead of the multi-line text block):
 ```
 
 `level` is one of `allow`, `block`, `redact`, `response_block`,
-`response_redact`, `rate_limited`, `unauthorized`, `dry_run_block`,
-`dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
+`response_redact`, `rate_limited`, `unauthorized`, `ip_denied`,
+`country_denied`, `dry_run_block`, `dry_run_redact`,
+`response_dry_run_block`, `response_dry_run_redact`,
 `usage`, `latency`, `budget_exceeded`, `failover`, `cache_hit`,
 `server_error` (a low-level connection problem from Go's own HTTP
 server, most commonly a TLS handshake failure from something other than
@@ -1134,6 +1208,7 @@ can be monitored without waiting for Ctrl+C:
   "response_dry_run_redacted": 0,
   "unauthorized": 0,
   "ip_denied": 0,
+  "country_denied": 0,
   "failover": 1,
   "latency": { "count": 42, "sum_seconds": 3.31, "buckets": [ { "le": "0.005", "count": 0 }, { "le": "0.01", "count": 12 }, { "le": "+Inf", "count": 42 } ] },
   "estimated_cost": 0.062,
@@ -1172,10 +1247,12 @@ most real leaks. The four `dry_run_*`/`response_dry_run_*` fields (see
 [dry-run mode](#dry-run-mode-for-rules)) are never broken down by
 target — always `0` inside `per_target`, appearing only in the overall
 totals and inside `per_rule`. `unauthorized` (see
-[authenticating requests](#authenticating-requests-to-the-proxy)) and
-`ip_denied` (see [restricting access by IP](#restricting-access-by-ip))
-go further still: never broken down by target OR by rule, since a
-rejected request never resolves either. `token_rate_limited` (see
+[authenticating requests](#authenticating-requests-to-the-proxy)),
+`ip_denied` (see [restricting access by IP](#restricting-access-by-ip)),
+and `country_denied` (see
+[GeoIP-based blocking](#geoip-based-blocking)) go further still: never
+broken down by target OR by rule, since a rejected request never
+resolves either. `token_rate_limited` (see
 [token-based rate limiting](#token-based-rate-limiting)) is the opposite
 case again — broken down by target and by named client like `rate_limited`,
 since which breaker tripped is always about a specific
@@ -1221,8 +1298,9 @@ tables, each shown only when the current snapshot actually has data for
 it. Nothing here needs its own config flag; it's always reachable, the
 same way `/_aiproxy/stats`/`/_aiproxy/metrics` always are.
 
-It's gated by `ip_allow_list`/`ip_deny_list` and `proxy_api_key`
-exactly like every other reserved path — **with no exception**: the
+It's gated by `ip_allow_list`/`ip_deny_list`,
+`country_allow_list`/`country_deny_list`, and `proxy_api_key` exactly
+like every other reserved path — **with no exception**: the
 page's own background fetch of `/_aiproxy/stats` goes through the exact
 same check a `curl` request would. In practice this means the dashboard
 just works, with zero setup, for the common case of no `proxy_api_key`
@@ -1244,8 +1322,9 @@ curl http://127.0.0.1:8080/_aiproxy/healthz
 
 `GET /_aiproxy/healthz` is a fifth reserved, proxy-internal path, and
 the one deliberate exception to how every other reserved path
-behaves: it is **never** gated by `ip_allow_list`/`ip_deny_list` or
-`proxy_api_key`, checked before even those. Every other reserved path
+behaves: it is **never** gated by `ip_allow_list`/`ip_deny_list`,
+`country_allow_list`/`country_deny_list`, or `proxy_api_key`, checked
+before even those. Every other reserved path
 is fully gated because it exposes real operational data (token counts,
 rule/client names, cache contents); `/_aiproxy/healthz` exposes nothing
 beyond "this process accepted the connection and its HTTP server is
@@ -1322,6 +1401,8 @@ aiproxy_dry_run_redacted_total 0
 aiproxy_dry_run_response_blocked_total 0
 aiproxy_dry_run_response_redacted_total 0
 aiproxy_unauthorized_total 0
+aiproxy_ip_denied_total 0
+aiproxy_country_denied_total 0
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.005"} 0
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.01"} 12
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.025"} 30
@@ -1366,7 +1447,11 @@ rule-labeled `aiproxy_rule_dry_run_*_total{rule="..."}` counterparts,
 but are themselves unlabeled — dry-run activity is never broken down by
 target. `aiproxy_unauthorized_total` is unlabeled too, and has no
 rule-labeled counterpart at all — a rejected request never resolves a
-target or a rule to label it with. `aiproxy_failover_total` is the other
+target or a rule to label it with. `aiproxy_ip_denied_total`/
+`aiproxy_country_denied_total` (see
+[restricting access by IP](#restricting-access-by-ip) and
+[GeoIP-based blocking](#geoip-based-blocking)) are unlabeled the same
+way, for the same reason. `aiproxy_failover_total` is the other
 way around — labeled `target="..."` like the very first series above,
 not unlabeled — since a failover is always about one specific route's
 own candidate list; every target seen so far gets a series here too,
@@ -1435,6 +1520,7 @@ rule matches — on a request going out, a
 or [token-based rate limiter](#token-based-rate-limiting) tripping, a
 [dry-run](#dry-run-mode-for-rules) rule matching, a request
 denied by [ip_allow_list/ip_deny_list](#restricting-access-by-ip) or
+[country_allow_list/country_deny_list](#geoip-based-blocking), or
 failing [proxy authentication](#authenticating-requests-to-the-proxy),
 the running cost crossing [cost_budget](#custom-rules-rate-limiting-caching-and-cost-estimation),
 or a [failover](#failover-across-multiple-upstreams) to the next candidate target:
@@ -1447,7 +1533,7 @@ or a [failover](#failover-across-multiple-upstreams) to the next candidate targe
 
 Every alertable event — `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `token_rate_limited`, `ip_denied`,
-`unauthorized`, `dry_run_block`, `dry_run_redact`,
+`country_denied`, `unauthorized`, `dry_run_block`, `dry_run_redact`,
 `response_dry_run_block`, `response_dry_run_redact`, `budget_exceeded`,
 or `failover` — POSTs this JSON body to that URL:
 
@@ -1523,6 +1609,26 @@ TCP peer address:
   "url": "/v1/messages",
   "rule": "",
   "remote_ip": "203.0.113.7",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+A `country_denied` alert — fired by
+[country_allow_list/country_deny_list](#geoip-based-blocking), checked
+right after `ip_denied` — likewise carries an empty `rule` and a
+`remote_ip`, plus a `country` field no other event has: the resolved
+country code the request was denied for (empty if it couldn't be
+resolved at all — still a denial):
+
+```json
+{
+  "text": "[COUNTRY_DENIED] POST /v1/messages - 203.0.113.7 (KP) not in country_allow_list, or in country_deny_list",
+  "event": "country_denied",
+  "method": "POST",
+  "url": "/v1/messages",
+  "rule": "",
+  "remote_ip": "203.0.113.7",
+  "country": "KP",
   "time": "2026-01-01T12:00:00Z"
 }
 ```
