@@ -8270,3 +8270,169 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
 	}
 }
+
+// TestServer_Dashboard_ServesHTMLPage proves GET /_aiproxy/dashboard
+// returns a self-contained HTML page that fetches statsPath itself,
+// never anything forwarded from or shaped by the upstream target.
+func TestServer_Dashboard_ServesHTMLPage(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/dashboard")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/dashboard: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html prefix", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "<title>aiproxy dashboard</title>") {
+		t.Error("body missing the expected <title>")
+	}
+	if !strings.Contains(string(body), "/_aiproxy/stats") {
+		t.Error("body missing a reference to /_aiproxy/stats — the dashboard is supposed to poll it client-side")
+	}
+}
+
+// TestServer_Dashboard_RejectsNonGetMethod mirrors
+// TestServer_StatsEndpoint_RejectsNonGetMethod: the dashboard has no
+// meaningful semantics for anything but GET.
+func TestServer_Dashboard_RejectsNonGetMethod(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/_aiproxy/dashboard", "text/plain", nil)
+	if err != nil {
+		t.Fatalf("POST /_aiproxy/dashboard: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestServer_Dashboard_NeverForwardedUpstreamOrCountedInStats mirrors
+// TestServer_StatsEndpoint_NeverForwardedUpstreamOrCountedInStats: like
+// every other reserved proxy-internal path, a dashboard request must
+// never reach the upstream target or be counted as allowed traffic.
+func TestServer_Dashboard_NeverForwardedUpstreamOrCountedInStats(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/dashboard")
+		if err != nil {
+			t.Fatalf("GET /_aiproxy/dashboard: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	if upstreamHit.Load() {
+		t.Fatal("a request for dashboardPath must never reach the upstream target")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Allowed != 0 {
+		t.Fatalf("Allowed = %d, want 0 (dashboard requests must not themselves be counted)", snap.Allowed)
+	}
+}
+
+// TestServer_Dashboard_GatedByProxyAuth proves the deliberate,
+// confirmed design choice: the dashboard page itself is gated by
+// proxy_api_key exactly like statsPath/metricsPath, with no exception
+// — see dashboardPath's doc comment.
+func TestServer_Dashboard_GatedByProxyAuth(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/dashboard")
+	if err != nil {
+		t.Fatalf("GET without key: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Errorf("without key: status = %d, want %d", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/_aiproxy/dashboard", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer s3cr3t-shared-key")
+	authedResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	authedResp.Body.Close()
+	if authedResp.StatusCode != http.StatusOK {
+		t.Errorf("with correct key: status = %d, want %d", authedResp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_Dashboard_GatedByIPAccess proves the dashboard is also
+// subject to ip_allow_list/ip_deny_list, same as every other request —
+// no exception there either.
+func TestServer_Dashboard_GatedByIPAccess(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/dashboard")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/dashboard: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}

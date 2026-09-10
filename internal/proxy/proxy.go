@@ -183,6 +183,26 @@ const metricsPath = "/_aiproxy/metrics"
 // actually mutates state rather than just reading it.
 const cacheClearPath = "/_aiproxy/cache/clear"
 
+// dashboardPath is a fourth reserved, proxy-internal path: a GET here
+// returns a small, self-contained HTML page that polls statsPath in
+// the browser and renders it as a live-updating table, for a
+// zero-setup visual glance at a running proxy without building any
+// separate tooling. Gated by IP allow/deny lists and proxy
+// authentication exactly like statsPath/metricsPath — no exception:
+// this page's own background fetch to statsPath from the browser is
+// subject to the exact same check, so in a proxy_api_key-gated setup a
+// browser (which can't attach a custom header to a plain navigation)
+// simply can't load usable data here — curl or the Prometheus endpoint
+// remain the answer for that case. Confirmed via a real browser
+// (Chromium): a 407 response is actually worse than "can't attach the
+// header" — the browser intercepts it at the network stack itself,
+// since that status is conventionally reserved for the browser's own
+// configured forward proxy rather than an origin server's own
+// response, so fetch() never even delivers a Response object for it,
+// just a generic network failure. The dashboard's own error handling
+// accounts for this. See serveDashboard, dashboard.go.
+const dashboardPath = "/_aiproxy/dashboard"
+
 // headerScanExcludes lists, in lowercase, the header names never handed
 // to the rule engine for scanning — see filterHeadersForScanning. These
 // are exactly the headers a client legitimately uses to authenticate to
@@ -971,6 +991,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == metricsPath {
 		s.serveMetrics(w, r)
+		return
+	}
+	if r.URL.Path == dashboardPath {
+		s.serveDashboard(w, r)
 		return
 	}
 	if r.URL.Path == cacheClearPath {

@@ -1025,6 +1025,36 @@ is reserved, an upstream that genuinely needs to be reached at
 `/_aiproxy/stats` itself cannot be — route it through a different
 prefix if that ever comes up.
 
+## Dashboard
+
+```
+open http://127.0.0.1:8080/_aiproxy/dashboard
+```
+
+`GET /_aiproxy/dashboard` is a fourth reserved, proxy-internal path: a
+single, self-contained HTML page — no external stylesheets, scripts, or
+fonts, same no-external-framework discipline as the rest of aiproxy —
+that polls `GET /_aiproxy/stats` from the browser every 3 seconds and
+renders it as a set of summary cards plus per-target/per-rule/per-client
+tables, each shown only when the current snapshot actually has data for
+it. Nothing here needs its own config flag; it's always reachable, the
+same way `/_aiproxy/stats`/`/_aiproxy/metrics` always are.
+
+It's gated by `ip_allow_list`/`ip_deny_list` and `proxy_api_key`
+exactly like every other reserved path — **with no exception**: the
+page's own background fetch of `/_aiproxy/stats` goes through the exact
+same check a `curl` request would. In practice this means the dashboard
+just works, with zero setup, for the common case of no `proxy_api_key`
+configured; once one is set, a plain browser navigation can't attach a
+`Proxy-Authorization` header, so the dashboard can't load usable data —
+curl or the [Prometheus endpoint](#prometheus-metrics) (whose scrape
+config can carry a bearer token natively) remain the answer for that
+case. Confirmed against a real browser: an HTTP 407 in particular is
+actually intercepted at the network stack itself before it ever reaches
+the page's own JavaScript, since browsers reserve that status for their
+own configured forward proxy rather than an ordinary origin response —
+the dashboard's error banner accounts for this and says so.
+
 ## Prometheus metrics
 
 The same counters are also available at `GET /_aiproxy/metrics` in
