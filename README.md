@@ -1055,6 +1055,61 @@ the page's own JavaScript, since browsers reserve that status for their
 own configured forward proxy rather than an ordinary origin response —
 the dashboard's error banner accounts for this and says so.
 
+## Health check
+
+```
+curl http://127.0.0.1:8080/_aiproxy/healthz
+```
+
+`GET /_aiproxy/healthz` is a fifth reserved, proxy-internal path, and
+the one deliberate exception to how every other reserved path
+behaves: it is **never** gated by `ip_allow_list`/`ip_deny_list` or
+`proxy_api_key`, checked before even those. Every other reserved path
+is fully gated because it exposes real operational data (token counts,
+rule/client names, cache contents); `/_aiproxy/healthz` exposes nothing
+beyond "this process accepted the connection and its HTTP server is
+responsive" — the same thing a caller already learns the instant the
+TCP connection itself succeeds or fails, auth or no auth. That's also
+exactly the plain liveness/readiness signal a container orchestrator
+needs, and orchestrators generally can't attach a `Proxy-Authorization`
+header or get themselves IP-allow-listed without real friction — gating
+this path would make health checks either impossible or require
+punching an orchestrator-shaped hole in `ip_allow_list`, which is
+strictly worse.
+
+Always responds `200 OK` with `{"status":"ok"}` — it never depends on
+`--target`, a `model_routes` upstream, or any other configured
+dependency being reachable; that's what [failover](#failover-across-multiple-upstreams)
+and the [rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation)
+exist to handle gracefully, not something aiproxy's own liveness should
+flap on. GET-only (405 otherwise), never forwarded upstream, and never
+counted in stats or logged — health probes fire far more often than
+anyone would want in a log stream.
+
+A Kubernetes probe needs no changes to the container image at all,
+since the kubelet makes the HTTP call itself from outside the
+container:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /_aiproxy/healthz
+    port: 8080
+readinessProbe:
+  httpGet:
+    path: /_aiproxy/healthz
+    port: 8080
+```
+
+A Docker Compose/Swarm `HEALTHCHECK`, by contrast, runs *inside* the
+container — and the [published image](#installing) is built on
+`distroless/static-debian12:nonroot`, deliberately with no shell and no
+`curl`/`wget`, for the smallest attack surface a proxy that handles
+secrets can have. `HEALTHCHECK` isn't set in the image for that reason;
+if you need a container-internal check, either run an external monitor
+against the published port, or build your own image on a base with an
+HTTP client available.
+
 ## Prometheus metrics
 
 The same counters are also available at `GET /_aiproxy/metrics` in

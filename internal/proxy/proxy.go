@@ -203,6 +203,31 @@ const cacheClearPath = "/_aiproxy/cache/clear"
 // accounts for this. See serveDashboard, dashboard.go.
 const dashboardPath = "/_aiproxy/dashboard"
 
+// healthzPath is a fifth reserved, proxy-internal path — and the one
+// deliberate exception to every other reserved path's rule: it is
+// NEVER gated by ip_allow_list/ip_deny_list or proxy_api_key, checked
+// before even those. Every other reserved path (statsPath, metricsPath,
+// dashboardPath, cacheClearPath) is fully gated because it exposes real
+// operational data (token counts, rule/client names, cache contents);
+// healthzPath exposes nothing at all beyond "this process accepted the
+// TCP connection and its HTTP server is responsive" — information a
+// caller already has the instant the connection itself succeeds or
+// fails, auth or no auth. That's also exactly the plain liveness/
+// readiness signal a Docker HEALTHCHECK or Kubernetes httpGet probe
+// needs, and neither can generally attach a Proxy-Authorization header
+// or be restricted to an allow-listed IP without real orchestration
+// friction — gating this path would make container health checks
+// either impossible or require punching a hole in ip_allow_list
+// specifically for the orchestrator, which is strictly worse. Always
+// reports healthy: it never depends on --target/a model route's
+// upstream being reachable (that's what failover/the circuit breaker
+// exist to handle gracefully, not something aiproxy's own liveness
+// should flap on) or on any other configured dependency. Never counted
+// in Stats or logged, same as every other reserved path — but unlike
+// them, deliberately silent even in that sense, since health probes
+// fire far more often than a human would ever want in a log stream.
+const healthzPath = "/_aiproxy/healthz"
+
 // headerScanExcludes lists, in lowercase, the header names never handed
 // to the rule engine for scanning — see filterHeadersForScanning. These
 // are exactly the headers a client legitimately uses to authenticate to
@@ -961,6 +986,13 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 // it intact to the resolved target (Target by default, or a
 // path-prefix route added via AddRoute) over HTTPS.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == healthzPath {
+		// See healthzPath's doc comment: deliberately checked before
+		// even the IP allow/deny list, since it's the one reserved path
+		// with no exception's worth of information to protect.
+		s.serveHealthz(w, r)
+		return
+	}
 	if !s.checkIPAccess(r) {
 		// Checked before even proxy authentication: a network-level
 		// access decision is more foundational than an application-level
@@ -2179,6 +2211,19 @@ func withCostBudget(out statsSnapshotJSON, budget float64) statsSnapshotJSON {
 		out.CostBudget = &budget
 	}
 	return out
+}
+
+// serveHealthz answers healthzPath with a minimal, always-healthy JSON
+// body — see healthzPath's doc comment for why this is the one
+// reserved path with no auth/IP gating and no dependency checks of its
+// own. GET-only, same as every other reserved path.
+func (s *Server) serveHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"ok"}`))
 }
 
 // serveStats answers statsPath with the current Stats snapshot as JSON,

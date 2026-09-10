@@ -8436,3 +8436,147 @@ func TestServer_Dashboard_GatedByIPAccess(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
 	}
 }
+
+// TestServer_Healthz_ReturnsOK proves the basic contract: a GET to
+// /_aiproxy/healthz always succeeds with a minimal JSON body.
+func TestServer_Healthz_ReturnsOK(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/healthz")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != `{"status":"ok"}` {
+		t.Errorf("body = %q, want {\"status\":\"ok\"}", body)
+	}
+}
+
+// TestServer_Healthz_RejectsNonGetMethod mirrors every other reserved
+// path's method restriction.
+func TestServer_Healthz_RejectsNonGetMethod(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/_aiproxy/healthz", "text/plain", nil)
+	if err != nil {
+		t.Fatalf("POST /_aiproxy/healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestServer_Healthz_NeverForwardedUpstreamOrCountedInStats mirrors the
+// same guarantee every other reserved path makes.
+func TestServer_Healthz_NeverForwardedUpstreamOrCountedInStats(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/healthz")
+		if err != nil {
+			t.Fatalf("GET /_aiproxy/healthz: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	if upstreamHit.Load() {
+		t.Fatal("a request for healthzPath must never reach the upstream target")
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.Allowed != 0 {
+		t.Fatalf("Allowed = %d, want 0 (healthz requests must not themselves be counted)", snap.Allowed)
+	}
+}
+
+// TestServer_Healthz_NeverGatedByProxyAuth proves the deliberate
+// exception documented on healthzPath: unlike every other reserved
+// path, healthz stays reachable even with proxy_api_key configured and
+// no credential presented at all.
+func TestServer_Healthz_NeverGatedByProxyAuth(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t-shared-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/healthz")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/healthz (no credential): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (healthz must never require proxy_api_key)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_Healthz_NeverGatedByIPAccess proves the same exception
+// for ip_allow_list/ip_deny_list: healthz stays reachable even from an
+// IP that would otherwise be denied.
+func TestServer_Healthz_NeverGatedByIPAccess(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/healthz")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (healthz must never be IP-gated)", resp.StatusCode, http.StatusOK)
+	}
+}
