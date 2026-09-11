@@ -278,6 +278,29 @@ type Config struct {
 	// means no limit.
 	UpstreamTotalTimeoutSeconds int `json:"upstream_total_timeout_seconds,omitempty"`
 
+	// TargetEjectionThreshold, if greater than zero, temporarily
+	// deprioritizes a candidate upstream URL once it has failed this
+	// many times in a row with a transport-level error (dial/TLS/timeout
+	// — never an HTTP-level error response, the same "only a genuinely
+	// unreachable candidate counts" rule failover itself already
+	// applies) — see the breaker package. Deprioritized only ever means
+	// a route with more than one candidate tries a healthier one first;
+	// a single-target route (or a route whose every candidate is
+	// currently deprioritized) always still makes a genuine attempt,
+	// since there is nothing better to try instead. Requires
+	// TargetEjectionCooldownSeconds to also be set. Zero (the default
+	// when the field is absent) disables this entirely.
+	TargetEjectionThreshold int `json:"target_ejection_threshold,omitempty"`
+
+	// TargetEjectionCooldownSeconds is how long a candidate stays
+	// deprioritized after crossing TargetEjectionThreshold, before being
+	// preferred again. Only meaningful alongside
+	// TargetEjectionThreshold: a cooldown for a breaker that never trips
+	// has nothing to time, so setting this without
+	// TargetEjectionThreshold is a config error, same reasoning as
+	// AnomalyDryRun requiring AnomalyMultiplier.
+	TargetEjectionCooldownSeconds int `json:"target_ejection_cooldown_seconds,omitempty"`
+
 	// AnomalyMultiplier, if greater than zero, flags — and, unless
 	// AnomalyDryRun is set, rejects with a 429 — a request from a
 	// named proxy client (see ProxyAPIKeys) whose current minute's

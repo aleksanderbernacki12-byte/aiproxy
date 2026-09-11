@@ -214,6 +214,45 @@ func TestLoad_UpstreamTimeoutsDefaultToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesTargetEjectionSettings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": 5, "target_ejection_cooldown_seconds": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.TargetEjectionThreshold != 5 {
+		t.Fatalf("TargetEjectionThreshold = %d, want 5", cfg.TargetEjectionThreshold)
+	}
+	if cfg.TargetEjectionCooldownSeconds != 30 {
+		t.Fatalf("TargetEjectionCooldownSeconds = %d, want 30", cfg.TargetEjectionCooldownSeconds)
+	}
+}
+
+func TestLoad_TargetEjectionSettingsDefaultToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.TargetEjectionThreshold != 0 {
+		t.Fatalf("TargetEjectionThreshold = %d, want 0 when absent", cfg.TargetEjectionThreshold)
+	}
+	if cfg.TargetEjectionCooldownSeconds != 0 {
+		t.Fatalf("TargetEjectionCooldownSeconds = %d, want 0 when absent", cfg.TargetEjectionCooldownSeconds)
+	}
+}
+
 func TestLoad_ParsesWebhookURL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

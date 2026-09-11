@@ -31,6 +31,7 @@ import (
 
 	"aiproxy/internal/anomaly"
 	"aiproxy/internal/auditlog"
+	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/geoip"
 	"aiproxy/internal/limiter"
@@ -856,7 +857,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	}
 
 	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	// The freshly reloaded Registry starts cold — no baseline exists
 	// for this client yet, so (correctly, per Detector's own cold-start
@@ -3916,7 +3917,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -3978,7 +3979,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 		}
 	}()
 
@@ -4987,7 +4988,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -6260,7 +6261,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -6592,7 +6593,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -6966,7 +6967,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7154,6 +7155,293 @@ func TestServer_Failover_ReusesBufferedBodyAcrossAttempts(t *testing.T) {
 
 	if string(receivedBody) != payload {
 		t.Fatalf("second candidate received body = %q, want %q", receivedBody, payload)
+	}
+}
+
+// hijackAndClose is an http.HandlerFunc that hijacks and abruptly
+// closes the raw connection without writing anything — the standard
+// way to make a test server produce a genuine transport-level failure
+// (as opposed to an HTTP-level error response), the same class of
+// failure failover/the breaker only ever react to.
+func hijackAndClose(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("ResponseWriter does not support hijacking")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		conn.Close()
+	}
+}
+
+// TestServer_TargetBreaker_PrefersHealthyCandidateAfterEjection proves
+// the core claim: once a candidate crosses its failure threshold, a
+// route with a healthier alternative stops trying the ejected one
+// first — observed indirectly but unambiguously via the Failover
+// counter, which only increments when a request actually has to move
+// on from one candidate to the next. With threshold=3, the first 3
+// requests each still try the broken candidate first (and so each log
+// a failover); the 4th and 5th, made after ejection, go straight to the
+// healthy candidate and never generate a failover event at all.
+func TestServer_TargetBreaker_PrefersHealthyCandidateAfterEjection(t *testing.T) {
+	broken := httptest.NewServer(hijackAndClose(t))
+	defer broken.Close()
+	brokenURL, err := url.Parse(broken.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer healthy.Close()
+	healthyURL, err := url.Parse(healthy.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", healthyURL, rules.NewEngine(rules.Allow))
+	srv.TargetBreaker = breaker.NewRegistry(3, time.Hour)
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/openai", []*url.URL{brokenURL, healthyURL}, nil, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 5; i++ {
+		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		resp.Body.Close()
+	}
+
+	if got := srv.Stats.Snapshot().Failover; got != 3 {
+		t.Fatalf("Failover = %d, want 3 (only the first 3 requests, before ejection, should have needed to fail over)", got)
+	}
+	if got := srv.Stats.Snapshot().TargetsEjected; got != 1 {
+		t.Fatalf("TargetsEjected = %d, want 1", got)
+	}
+}
+
+// TestServer_TargetBreaker_AlwaysAttemptsWhenNoHealthyCandidateExists
+// proves the confirmed design choice: with no failover candidate to
+// skip ahead to, an ejected target still gets a genuine attempt on
+// every single request — ejection never synthetically fails a request
+// on its own.
+func TestServer_TargetBreaker_AlwaysAttemptsWhenNoHealthyCandidateExists(t *testing.T) {
+	var hitCount atomic.Int32
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitCount.Add(1)
+		hijackAndClose(t)(w, r)
+	}))
+	defer flaky.Close()
+	flakyURL, err := url.Parse(flaky.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", flakyURL, rules.NewEngine(rules.Allow))
+	srv.TargetBreaker = breaker.NewRegistry(1, time.Hour) // ejects after just 1 failure
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(frontend.URL + "/v1/chat")
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		resp.Body.Close()
+	}
+
+	if got := hitCount.Load(); got != 3 {
+		t.Fatalf("hitCount = %d, want 3 (every request must genuinely attempt the only candidate, ejected or not)", got)
+	}
+}
+
+// TestServer_TargetBreaker_LogsEjectionAndRecoveryTransitions proves
+// the ejection and recovery transitions are each logged and counted
+// exactly once, using a single target that starts broken and is then
+// flipped to healthy mid-test.
+func TestServer_TargetBreaker_LogsEjectionAndRecoveryTransitions(t *testing.T) {
+	var up atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !up.Load() {
+			hijackAndClose(t)(w, r)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.TargetBreaker = breaker.NewRegistry(2, time.Hour)
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func() {
+		resp, err := http.Get(frontend.URL + "/v1/chat")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	get() // failure 1 (below threshold)
+	get() // failure 2 -> crosses threshold, ejects
+
+	if !strings.Contains(logBuf.String(), "[TARGET EJECTED]") {
+		t.Fatalf("log missing [TARGET EJECTED]: %q", logBuf.String())
+	}
+	if got := srv.Stats.Snapshot().TargetsEjected; got != 1 {
+		t.Errorf("TargetsEjected = %d, want 1", got)
+	}
+	if got := srv.Stats.Snapshot().TargetsRecovered; got != 0 {
+		t.Errorf("TargetsRecovered = %d, want 0 (not recovered yet)", got)
+	}
+
+	up.Store(true)
+	get() // now succeeds -> recovers
+
+	if !strings.Contains(logBuf.String(), "[TARGET RECOVERED]") {
+		t.Fatalf("log missing [TARGET RECOVERED]: %q", logBuf.String())
+	}
+	if got := srv.Stats.Snapshot().TargetsRecovered; got != 1 {
+		t.Errorf("TargetsRecovered = %d, want 1", got)
+	}
+}
+
+// TestServer_Webhook_FiresOnTargetEjectedAndRecovered proves both
+// events carry the expected event name and target field.
+func TestServer_Webhook_FiresOnTargetEjectedAndRecovered(t *testing.T) {
+	var up atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !up.Load() {
+			hijackAndClose(t)(w, r)
+			return
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	received := make(chan map[string]any, 2)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.TargetBreaker = breaker.NewRegistry(1, time.Hour)
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func() {
+		resp, err := http.Get(frontend.URL + "/v1/chat")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	get() // ejects immediately (threshold=1)
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "target_ejected" {
+			t.Errorf("event = %v, want target_ejected", payload["event"])
+		}
+		if payload["target"] != targetURL.String() {
+			t.Errorf("target = %v, want %s", payload["target"], targetURL.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never received the target_ejected event")
+	}
+
+	up.Store(true)
+	get() // recovers
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "target_recovered" {
+			t.Errorf("event = %v, want target_recovered", payload["event"])
+		}
+		if payload["target"] != targetURL.String() {
+			t.Errorf("target = %v, want %s", payload["target"], targetURL.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never received the target_recovered event")
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesTargetBreaker proves TargetBreaker is
+// actually swapped in by a live SIGHUP-style reload, not just settable
+// at construction.
+func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
+	broken := httptest.NewServer(hijackAndClose(t))
+	defer broken.Close()
+	brokenURL, err := url.Parse(broken.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer healthy.Close()
+	healthyURL, err := url.Parse(healthy.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	srv := proxy.New("unused", healthyURL, engine)
+	srv.AddRoute("/openai", []*url.URL{brokenURL, healthyURL}, nil, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	tb := breaker.NewRegistry(1, time.Hour)
+	reloadedRoutes := []proxy.Route{{Prefix: "/openai", Targets: []*url.URL{brokenURL, healthyURL}}}
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb)
+
+	get := func() {
+		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	get() // ejects the broken candidate (threshold=1)
+	get() // should now skip straight to the healthy one
+
+	if got := srv.Stats.Snapshot().PerTarget["/openai"].Failover; got != 1 {
+		t.Fatalf("Failover = %d, want 1 (only the first request, before ejection, should have needed to fail over)", got)
 	}
 }
 
@@ -8022,7 +8310,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -8844,7 +9132,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -9160,7 +9448,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -9515,7 +9803,7 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -9956,7 +10244,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0)
+		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -9995,7 +10283,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
@@ -10914,7 +11202,7 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil)
 
 	start := time.Now()
 	resp, err := http.Get(frontend.URL + "/v1/chat")

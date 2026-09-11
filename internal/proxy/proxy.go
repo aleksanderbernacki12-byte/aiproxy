@@ -29,6 +29,7 @@ import (
 
 	"aiproxy/internal/anomaly"
 	"aiproxy/internal/auditlog"
+	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/geoip"
 	"aiproxy/internal/limiter"
@@ -361,6 +362,20 @@ type Server struct {
 	// limit.
 	UpstreamTotalTimeout time.Duration
 
+	// TargetBreaker, if non-nil, tracks each candidate upstream URL's own
+	// consecutive transport-level failures and, once one crosses its
+	// configured threshold, temporarily deprioritizes it in favor of a
+	// healthier candidate — see the breaker package and
+	// failoverTransport.RoundTrip. It never refuses to genuinely attempt
+	// an ejected target when there's no healthier candidate to try
+	// instead (a single-target route, or every candidate currently
+	// ejected) — ejection only ever helps skip ahead to a better option
+	// when one exists. nil (the default, whenever
+	// target_ejection_threshold isn't configured) disables this
+	// entirely, the exact behavior aiproxy had before this feature
+	// existed.
+	TargetBreaker *breaker.Registry
+
 	Cache           *cache.Cache // nil disables the response cache
 	CostPer1KTokens float64      // zero omits the shutdown summary's cost line
 	routes          []route
@@ -587,6 +602,14 @@ type logEvent struct {
 	FailedTarget string `json:"failed_target,omitempty"`
 	NextTarget   string `json:"next_target,omitempty"`
 
+	// Target is only set on a target_ejected or target_recovered event:
+	// the one candidate upstream URL that just crossed its
+	// consecutive-failure threshold, or recovered afterward — see the
+	// breaker package. A separate field from FailedTarget/NextTarget
+	// (rather than reusing FailedTarget) since "failed" would be a
+	// misleading label on a target_recovered event.
+	Target string `json:"target,omitempty"`
+
 	// DurationMS is only set on a latency event: how long, in
 	// milliseconds, the upstream took to respond to this one request —
 	// see logLatency. Distinct from the aggregate histogram at
@@ -702,22 +725,40 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return resp
 	}
 
+	tb := t.server.getTargetBreaker()
+
 	if len(candidates) <= 1 {
 		resp, err := base.RoundTrip(req)
 		if err != nil {
 			if cancel != nil {
 				cancel()
 			}
+			if tb != nil && len(candidates) == 1 {
+				t.recordBreakerFailure(tb, candidates[0].String())
+			}
 			return nil, err
+		}
+		if tb != nil && len(candidates) == 1 {
+			t.recordBreakerSuccess(tb, candidates[0].String())
 		}
 		t.recordLatency(reqCtx, time.Since(start))
 		return wrapBody(resp), nil
 	}
 
+	orderedCandidates := candidates
+	if tb != nil {
+		orderedCandidates = healthOrdered(candidates, tb)
+	}
+
 	var lastErr error
-	for i, candidate := range candidates {
+	for i, candidate := range orderedCandidates {
 		attempt := req
-		if i > 0 {
+		if i > 0 || candidate != candidates[0] {
+			// Either a later attempt (already needed a rebuilt URL/body
+			// before failover existed at all), or breaker reordering
+			// promoted a different candidate ahead of the one Rewrite
+			// already pointed req at — either way, req's current URL no
+			// longer matches the candidate this attempt is actually for.
 			attempt = req.Clone(req.Context())
 			attempt.URL = &url.URL{
 				Scheme:   candidate.Scheme,
@@ -741,6 +782,9 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 		resp, err := base.RoundTrip(attempt)
 		if err == nil {
+			if tb != nil {
+				t.recordBreakerSuccess(tb, candidate.String())
+			}
 			// Deliberately timed from the very first attempt, not just
 			// this successful one: retry time spent on an earlier
 			// unreachable candidate is real latency the client
@@ -749,10 +793,13 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			t.recordLatency(reqCtx, time.Since(start))
 			return wrapBody(resp), nil
 		}
+		if tb != nil {
+			t.recordBreakerFailure(tb, candidate.String())
+		}
 		lastErr = err
 
-		if i+1 < len(candidates) {
-			next := candidates[i+1]
+		if i+1 < len(orderedCandidates) {
+			next := orderedCandidates[i+1]
 			t.server.Stats.RecordFailover(reqCtx.targetLabel)
 			t.server.logFailover(reqCtx.method, reqCtx.url, candidate.String(), next.String())
 			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, candidate.String(), next.String())
@@ -762,6 +809,54 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		cancel()
 	}
 	return nil, lastErr
+}
+
+// healthOrdered returns candidates reordered so every currently
+// non-ejected one comes first (preserving their original relative
+// order), followed by every currently ejected one (also in original
+// relative order) — never dropping a candidate, just deprioritizing a
+// known-bad one in favor of trying a healthier one first. When every
+// candidate is currently healthy, or every candidate is currently
+// ejected, the original slice is returned unchanged: ejection only ever
+// helps skip ahead to a better candidate, never stops a request from
+// being genuinely attempted when there's no better option.
+func healthOrdered(candidates []*url.URL, tb *breaker.Registry) []*url.URL {
+	healthy := make([]*url.URL, 0, len(candidates))
+	ejected := make([]*url.URL, 0, len(candidates))
+	for _, c := range candidates {
+		if tb.IsEjected(c.String()) {
+			ejected = append(ejected, c)
+		} else {
+			healthy = append(healthy, c)
+		}
+	}
+	if len(healthy) == 0 || len(ejected) == 0 {
+		return candidates
+	}
+	return append(healthy, ejected...)
+}
+
+// recordBreakerFailure records a transport-level failure against
+// target in tb and, exactly on the transition into ejected, reports it
+// — a log line, a stats counter, and a webhook alert — the same
+// single-fire-on-transition treatment every other breaker-like event in
+// this package gets (see e.g. logAnomalyDetected).
+func (t *failoverTransport) recordBreakerFailure(tb *breaker.Registry, target string) {
+	if tb.RecordFailure(target) {
+		t.server.Stats.RecordTargetEjected()
+		t.server.logTargetEjected(target)
+		t.server.notifyTargetEjectedWebhook(target)
+	}
+}
+
+// recordBreakerSuccess records a success against target in tb and,
+// exactly on the transition out of ejected, reports its recovery.
+func (t *failoverTransport) recordBreakerSuccess(tb *breaker.Registry, target string) {
+	if tb.RecordSuccess(target) {
+		t.server.Stats.RecordTargetRecovered()
+		t.server.logTargetRecovered(target)
+		t.server.notifyTargetRecoveredWebhook(target)
+	}
 }
 
 // recordLatency records d in both places a successful RoundTrip's
@@ -1030,6 +1125,14 @@ func (s *Server) getUpstreamConfig() (*http.Transport, time.Duration) {
 	return s.UpstreamTransport, s.UpstreamTotalTimeout
 }
 
+// getTargetBreaker returns TargetBreaker under lock, for
+// failoverTransport.RoundTrip.
+func (s *Server) getTargetBreaker() *breaker.Registry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.TargetBreaker
+}
+
 // NewUpstreamTransport builds the *http.Transport used for every
 // forwarded request: a clone of http.DefaultTransport — preserving its
 // connection pooling, dialer, and TLS defaults — with
@@ -1178,7 +1281,14 @@ type ModelRoute struct {
 // (see NewUpstreamTransport; cli.buildLiveConfig always builds one, even
 // when upstream_response_timeout_seconds is absent). Also appended at
 // the very end, same reasoning as tokenLim/geoIPTable/anomalyDetector.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration) {
+//
+// targetBreaker replaces TargetBreaker wholesale — like anomalyDetector,
+// a reload always swaps in a brand new *breaker.Registry (see
+// cli.buildLiveConfig) rather than trying to preserve any target's
+// already-accumulated failure/ejection state. Pass nil to disable
+// target ejection entirely. Also appended at the very end, same
+// reasoning as every other field above.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1213,6 +1323,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.AnomalyDryRun = anomalyDryRun
 	s.UpstreamTransport = upstreamTransport
 	s.UpstreamTotalTimeout = upstreamTotalTimeout
+	s.TargetBreaker = targetBreaker
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2170,6 +2281,33 @@ func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
 	s.logf("%s[FAILOVER] %s %s - %s unreachable, trying %s%s", ansiBrightYellow, method, reqURL, failedTarget, nextTarget, ansiReset)
 }
 
+// logTargetEjected logs one candidate upstream URL crossing its
+// consecutive-failure threshold — see breaker.Registry.RecordFailure.
+// Fires exactly once per ejection, not on every subsequent failure
+// while still in cooldown — see failoverTransport.recordBreakerFailure.
+// No method/URL: unlike failover, this isn't tied to any one client
+// request — a target can be ejected by any request that happened to hit
+// it, and the target itself is the whole story.
+func (s *Server) logTargetEjected(target string) {
+	ev := s.recordLogEvent(logEvent{Level: "target_ejected", Target: target})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[TARGET EJECTED] %s temporarily deprioritized after repeated failures%s", ansiBrightRed, target, ansiReset)
+}
+
+// logTargetRecovered logs one candidate upstream URL succeeding again
+// after having been ejected — see breaker.Registry.RecordSuccess.
+func (s *Server) logTargetRecovered(target string) {
+	ev := s.recordLogEvent(logEvent{Level: "target_recovered", Target: target})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[TARGET RECOVERED] %s%s", ansiGreen, target, ansiReset)
+}
+
 // logLatency logs how long the upstream took to respond to one specific
 // request — the per-request counterpart to Stats.RecordLatency's
 // aggregate histogram, so a single slow call shows up directly in the
@@ -2360,6 +2498,10 @@ type webhookAlert struct {
 	// see logEvent.Rate/logEvent.Baseline.
 	Rate     int      `json:"rate,omitempty"`
 	Baseline *float64 `json:"baseline,omitempty"`
+
+	// Target is only set on a target_ejected or target_recovered event
+	// — see logEvent.Target.
+	Target string `json:"target,omitempty"`
 }
 
 // WebhookTarget is one resolved entry in Server.Webhooks: a destination
@@ -2543,6 +2685,30 @@ func (s *Server) notifyFailoverWebhook(method, reqURL, failedTarget, nextTarget 
 		Time:         time.Now().UTC().Format(time.RFC3339),
 		FailedTarget: failedTarget,
 		NextTarget:   nextTarget,
+	})
+}
+
+// notifyTargetEjectedWebhook builds and delivers a webhookAlert for the
+// target_ejected event — no method/URL, same reasoning as
+// logTargetEjected: the target itself is the whole story, independent
+// of which client request happened to trigger the transition.
+func (s *Server) notifyTargetEjectedWebhook(target string) {
+	s.deliverWebhookPayload(webhookAlert{
+		Text:   fmt.Sprintf("[TARGET EJECTED] %s temporarily deprioritized after repeated failures", target),
+		Event:  "target_ejected",
+		Time:   time.Now().UTC().Format(time.RFC3339),
+		Target: target,
+	})
+}
+
+// notifyTargetRecoveredWebhook builds and delivers a webhookAlert for
+// the target_recovered event.
+func (s *Server) notifyTargetRecoveredWebhook(target string) {
+	s.deliverWebhookPayload(webhookAlert{
+		Text:   fmt.Sprintf("[TARGET RECOVERED] %s", target),
+		Event:  "target_recovered",
+		Time:   time.Now().UTC().Format(time.RFC3339),
+		Target: target,
 	})
 }
 
@@ -2744,6 +2910,12 @@ type statsSnapshotJSON struct {
 	// PerClient), not per target.
 	AnomalyDetected int64 `json:"anomaly_detected"`
 
+	// TargetsEjected/TargetsRecovered are likewise only meaningful at
+	// the top level, and always 0 inside per_target — see
+	// stats.Snapshot.TargetsEjected/TargetsRecovered.
+	TargetsEjected   int64 `json:"targets_ejected"`
+	TargetsRecovered int64 `json:"targets_recovered"`
+
 	EstimatedCost *float64                      `json:"estimated_cost,omitempty"`
 	PerTarget     map[string]statsSnapshotJSON  `json:"per_target,omitempty"`
 	PerRule       map[string]stats.RuleSnapshot `json:"per_rule,omitempty"`
@@ -2783,6 +2955,8 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		IPDenied:               snap.IPDenied,
 		CountryDenied:          snap.CountryDenied,
 		AnomalyDetected:        snap.AnomalyDetected,
+		TargetsEjected:         snap.TargetsEjected,
+		TargetsRecovered:       snap.TargetsRecovered,
 		Failover:               snap.Failover,
 		Latency:                snap.Latency,
 	}
@@ -3059,6 +3233,16 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 	fmt.Fprintln(w, "# HELP aiproxy_anomaly_detected_total Total number of requests rejected for spiking past their client's own recent baseline request rate.")
 	fmt.Fprintln(w, "# TYPE aiproxy_anomaly_detected_total counter")
 	fmt.Fprintf(w, "aiproxy_anomaly_detected_total %d\n", snap.AnomalyDetected)
+
+	// Unlabeled: the transition is about one specific candidate URL, not
+	// a route label, so there's no target dimension to break this down
+	// by — see stats.Snapshot.TargetsEjected/TargetsRecovered.
+	fmt.Fprintln(w, "# HELP aiproxy_targets_ejected_total Total number of times a candidate upstream URL crossed its consecutive-failure threshold and was temporarily deprioritized.")
+	fmt.Fprintln(w, "# TYPE aiproxy_targets_ejected_total counter")
+	fmt.Fprintf(w, "aiproxy_targets_ejected_total %d\n", snap.TargetsEjected)
+	fmt.Fprintln(w, "# HELP aiproxy_targets_recovered_total Total number of times a previously-ejected candidate upstream URL succeeded again.")
+	fmt.Fprintln(w, "# TYPE aiproxy_targets_recovered_total counter")
+	fmt.Fprintf(w, "aiproxy_targets_recovered_total %d\n", snap.TargetsRecovered)
 
 	// Unlabeled too, but for a different reason than the series above: a
 	// gauge, not a counter (the configured value doesn't accumulate),

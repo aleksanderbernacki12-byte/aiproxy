@@ -161,6 +161,8 @@ const dashboardHTML = `<!doctype html>
     if (s.ip_denied) cards.appendChild(card("IP denied", fmtNum(s.ip_denied), "bad"));
     if (s.country_denied) cards.appendChild(card("Country denied", fmtNum(s.country_denied), "bad"));
     if (s.anomaly_detected) cards.appendChild(card("Anomaly detected", fmtNum(s.anomaly_detected), "bad"));
+    if (s.targets_ejected) cards.appendChild(card("Targets ejected", fmtNum(s.targets_ejected), "bad"));
+    if (s.targets_recovered) cards.appendChild(card("Targets recovered", fmtNum(s.targets_recovered), "good"));
     if (s.failover) cards.appendChild(card("Failover", fmtNum(s.failover)));
     if (typeof s.estimated_cost === "number") cards.appendChild(card("Estimated cost", fmtCost(s.estimated_cost)));
     if (typeof s.cost_budget === "number") {

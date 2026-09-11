@@ -176,13 +176,15 @@ type dryRunCounters struct {
 // Stats holds a running proxy's counters. The zero value is not usable;
 // construct one with New.
 type Stats struct {
-	overall         counters
-	dryRun          dryRunCounters
-	unauthorized    atomic.Int64
-	ipDenied        atomic.Int64
-	countryDenied   atomic.Int64
-	anomalyDetected atomic.Int64
-	budgetAlerted   atomic.Bool
+	overall          counters
+	dryRun           dryRunCounters
+	unauthorized     atomic.Int64
+	ipDenied         atomic.Int64
+	countryDenied    atomic.Int64
+	anomalyDetected  atomic.Int64
+	targetsEjected   atomic.Int64
+	targetsRecovered atomic.Int64
+	budgetAlerted    atomic.Bool
 
 	mu        sync.Mutex
 	perTarget map[string]*counters
@@ -379,6 +381,24 @@ func (s *Stats) RecordCountryDenied() {
 // by client (RecordClientAnomalyDetected), not by target.
 func (s *Stats) RecordAnomalyDetected() {
 	s.anomalyDetected.Add(1)
+}
+
+// RecordTargetEjected records one candidate upstream URL crossing its
+// consecutive-failure threshold and transitioning into ejected — see
+// the breaker package. No target parameter: the transition is about one
+// specific candidate URL (identified in the accompanying log line and
+// webhook alert instead), not the matched route's own label, and this
+// is a global count of how often that's happened at all, not something
+// broken down further.
+func (s *Stats) RecordTargetEjected() {
+	s.targetsEjected.Add(1)
+}
+
+// RecordTargetRecovered records one candidate upstream URL succeeding
+// again after having been ejected — see the breaker package. Same
+// global-only reasoning as RecordTargetEjected.
+func (s *Stats) RecordTargetRecovered() {
+	s.targetsRecovered.Add(1)
 }
 
 // RecordCacheHit records one request served from the on-disk cache
@@ -665,6 +685,17 @@ type Snapshot struct {
 	// which target.
 	AnomalyDetected int64 `json:"anomaly_detected"`
 
+	// TargetsEjected/TargetsRecovered count how many times a candidate
+	// upstream URL crossed its consecutive-failure threshold and was
+	// temporarily deprioritized, and how many times one recovered
+	// afterward — see Stats.RecordTargetEjected/RecordTargetRecovered
+	// and the breaker package. Never broken down per target: the
+	// transition is about one specific candidate URL (named in the
+	// accompanying log line and webhook alert instead), which for a
+	// failover-configured route can differ from the route's own label.
+	TargetsEjected   int64 `json:"targets_ejected"`
+	TargetsRecovered int64 `json:"targets_recovered"`
+
 	// Failover counts how many times a request moved on to the next
 	// candidate URL in a target's failover list because an earlier one
 	// was unreachable — see Stats.RecordFailover. Unlike Unauthorized
@@ -715,6 +746,8 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.IPDenied = s.ipDenied.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
+	snap.TargetsEjected = s.targetsEjected.Load()
+	snap.TargetsRecovered = s.targetsRecovered.Load()
 	snap.PerTarget = perTarget
 	snap.PerRule = perRule
 	snap.PerClient = perClient
@@ -778,6 +811,15 @@ func (s Snapshot) String() string {
 	// anything.
 	if s.AnomalyDetected > 0 {
 		out += fmt.Sprintf("\nAnomaly detected (429): %d", s.AnomalyDetected)
+	}
+	// Same reasoning again: 0 for every run that never configured
+	// target_ejection_threshold, or that did but every target stayed
+	// healthy the whole run.
+	if s.TargetsEjected > 0 {
+		out += fmt.Sprintf("\nTargets ejected:      %d", s.TargetsEjected)
+	}
+	if s.TargetsRecovered > 0 {
+		out += fmt.Sprintf("\nTargets recovered:    %d", s.TargetsRecovered)
 	}
 	// Same reasoning again: 0 for every run that never configured a
 	// multi-URL target, or that did but never needed to actually use it.

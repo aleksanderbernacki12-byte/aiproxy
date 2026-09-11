@@ -1303,6 +1303,134 @@ func TestExecute_Validate_ValidConfig_WithUpstreamTimeouts_ReturnsZero(t *testin
 	}
 }
 
+func TestExecute_Validate_NegativeTargetEjectionThreshold_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": -5, "target_ejection_cooldown_seconds": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "target_ejection_threshold") {
+		t.Errorf("stderr missing negative target_ejection_threshold problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_NegativeTargetEjectionCooldown_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": 5, "target_ejection_cooldown_seconds": -30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "target_ejection_cooldown_seconds") {
+		t.Errorf("stderr missing negative target_ejection_cooldown_seconds problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_TargetEjectionThresholdWithoutCooldown_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": 5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "target_ejection_threshold requires target_ejection_cooldown_seconds") {
+		t.Errorf("stderr missing threshold-requires-cooldown problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_TargetEjectionCooldownWithoutThreshold_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_cooldown_seconds": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "target_ejection_cooldown_seconds requires target_ejection_threshold") {
+		t.Errorf("stderr missing cooldown-requires-threshold problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithTargetEjection_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": 5, "target_ejection_cooldown_seconds": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "target ejection:         after 5 consecutive failures, 30s cooldown") {
+		t.Fatalf("stdout missing target ejection summary: %q", stdout.String())
+	}
+}
+
+// TestRunStart_TargetEjectionThresholdWithoutCooldown_FatalsWithClearMessage
+// proves a cold start rejects the same pairing problem runValidate
+// reports, not just at `aiproxy validate` time.
+func TestRunStart_TargetEjectionThresholdWithoutCooldown_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"target_ejection_threshold": 5}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_TargetEjectionThresholdWithoutCooldown_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+	if !strings.Contains(stderr.String(), "target_ejection_threshold requires target_ejection_cooldown_seconds") {
+		t.Fatalf("stderr missing expected fatal message: %q", stderr.String())
+	}
+}
+
 func TestExecute_Validate_NegativeCostBudget_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

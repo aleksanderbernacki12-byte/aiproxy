@@ -465,7 +465,8 @@ serves, instead of the multi-line text block):
 `response_redact`, `rate_limited`, `unauthorized`, `ip_denied`,
 `country_denied`, `anomaly_detected`, `dry_run_block`, `dry_run_redact`,
 `response_dry_run_block`, `response_dry_run_redact`,
-`usage`, `latency`, `budget_exceeded`, `failover`, `cache_hit`,
+`usage`, `latency`, `budget_exceeded`, `failover`, `target_ejected`,
+`target_recovered`, `cache_hit`,
 `server_error` (a low-level connection problem from Go's own HTTP
 server, most commonly a TLS handshake failure from something other than
 a real client — a stray plain-HTTP health check or port scan — hitting
@@ -1120,6 +1121,56 @@ as forwarding to a single, entirely-down target has always produced —
 this adds a chance to recover before that happens, not a guarantee
 against it.
 
+### Automatically deprioritizing a failing candidate
+
+Failover already moves a request on to the next candidate URL when one
+turns out to be unreachable — but on the *next* request, it still tries
+the same known-bad candidate first, all over again, paying the same
+connection cost (or [timeout](#configurable-upstream-timeouts)) before
+falling back to the one that actually works. `target_ejection_threshold`
+and `target_ejection_cooldown_seconds` add a small circuit breaker on
+top of failover to stop that:
+
+```json
+{
+  "target_ejection_threshold": 5,
+  "target_ejection_cooldown_seconds": 30
+}
+```
+
+Once a candidate URL has failed `target_ejection_threshold` times in a
+row with a transport-level error (dial, TLS, or timeout — never an
+HTTP-level error response; the exact same "only a genuinely unreachable
+candidate counts" rule failover itself already applies), it's
+temporarily deprioritized for `target_ejection_cooldown_seconds`: a
+route with more than one candidate tries a healthier one first instead,
+only falling back to the deprioritized one if every healthier candidate
+also turns out to be genuinely unreachable. **Deprioritized never means
+refused.** A single-target route (no `urls` failover list configured at
+all), or a route whose every candidate is currently deprioritized,
+always still makes a real attempt against it — ejection only ever helps
+skip ahead to a better option *when one actually exists*; it never
+manufactures a synthetic failure on its own. Both settings are optional
+and independent of every other target's own ejection state (each
+candidate URL is tracked separately); both must be set together, and
+both default to disabled.
+
+A candidate's very first failure right after `target_ejection_cooldown_seconds`
+elapses starts counting fresh toward the threshold again — a target
+that's still genuinely down keeps getting correctly re-deprioritized
+after each cooldown, not silently forgotten about after the first time.
+Crossing the threshold logs `[TARGET EJECTED]` (bright red) and, if
+`webhook_url` is set, [alerts](#webhook-alerts) with the affected URL; a
+later success against a deprioritized candidate logs `[TARGET
+RECOVERED]` (green) and alerts the same way. Both are counted
+global-only (not broken down per target, the same way `unauthorized` and
+the anomaly counters are) via `GET /_aiproxy/stats`'s
+`targets_ejected`/`targets_recovered` fields and the Prometheus
+endpoint's `aiproxy_targets_ejected_total`/`aiproxy_targets_recovered_total`
+— the affected URL itself is only ever in the log line and webhook
+payload, since which specific candidate tripped isn't a route-label-shaped
+dimension the way most other counters are.
+
 ### Configurable upstream timeouts
 
 By default, forwarding a request to an upstream uses Go's own
@@ -1366,6 +1417,8 @@ can be monitored without waiting for Ctrl+C:
   "ip_denied": 0,
   "country_denied": 0,
   "anomaly_detected": 1,
+  "targets_ejected": 1,
+  "targets_recovered": 0,
   "failover": 1,
   "latency": { "count": 42, "sum_seconds": 3.31, "buckets": [ { "le": "0.005", "count": 0 }, { "le": "0.01", "count": 12 }, { "le": "+Inf", "count": 42 } ] },
   "estimated_cost": 0.062,
@@ -1565,6 +1618,8 @@ aiproxy_unauthorized_total 0
 aiproxy_ip_denied_total 0
 aiproxy_country_denied_total 0
 aiproxy_anomaly_detected_total 1
+aiproxy_targets_ejected_total 1
+aiproxy_targets_recovered_total 0
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.005"} 0
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.01"} 12
 aiproxy_upstream_latency_seconds_bucket{target="default",le="0.025"} 30
@@ -1758,7 +1813,8 @@ Every alertable event — `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `token_rate_limited`, `ip_denied`,
 `country_denied`, `anomaly_detected`, `unauthorized`, `dry_run_block`,
 `dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
-`budget_exceeded`, or `failover` — POSTs this JSON body to that URL:
+`budget_exceeded`, `failover`, `target_ejected`, or `target_recovered`
+— POSTs this JSON body to that URL:
 
 ```json
 {
@@ -1821,6 +1877,25 @@ established baseline it was compared against:
   "client": "team-a",
   "rate": 500,
   "baseline": 8.2,
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+A `target_ejected` alert — fired by
+[target_ejection_threshold](#automatically-deprioritizing-a-failing-candidate)
+— has no `method`/`url`/`rule` at all: the transition isn't tied to any
+one client request, just a `target` field naming the affected candidate
+URL. `target_recovered` looks identical but for the event name and
+text:
+
+```json
+{
+  "text": "[TARGET EJECTED] https://backup.example.com temporarily deprioritized after repeated failures",
+  "event": "target_ejected",
+  "method": "",
+  "url": "",
+  "rule": "",
+  "target": "https://backup.example.com",
   "time": "2026-01-01T12:00:00Z"
 }
 ```

@@ -22,6 +22,7 @@ import (
 
 	"aiproxy/internal/anomaly"
 	"aiproxy/internal/auditlog"
+	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/config"
 	"aiproxy/internal/geoip"
@@ -182,6 +183,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.AnomalyDryRun = lc.anomalyDryRun
 	server.UpstreamTransport = lc.upstreamTransport
 	server.UpstreamTotalTimeout = lc.upstreamTotalTimeout
+	server.TargetBreaker = lc.targetBreaker
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
@@ -279,6 +281,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if cfg.UpstreamTotalTimeoutSeconds > 0 {
 			fmt.Fprintf(stdout, "upstream total timeout: %s\n", timeoutDisplay(cfg.UpstreamTotalTimeoutSeconds))
+		}
+		if lc.targetBreaker != nil {
+			fmt.Fprintf(stdout, "target ejection: after %d consecutive failures, %ds cooldown\n", cfg.TargetEjectionThreshold, cfg.TargetEjectionCooldownSeconds)
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -400,7 +405,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker)
 
 	label := loadedFrom
 	if label == "" {
@@ -437,6 +442,8 @@ type liveConfig struct {
 
 	upstreamTransport    *http.Transport
 	upstreamTotalTimeout time.Duration
+
+	targetBreaker *breaker.Registry
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -560,6 +567,22 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 		errs = append(errs, fmt.Errorf("upstream_total_timeout_seconds: %d must not be negative", cfg.UpstreamTotalTimeoutSeconds))
 	}
 	lc.upstreamTotalTimeout = time.Duration(cfg.UpstreamTotalTimeoutSeconds) * time.Second
+
+	if cfg.TargetEjectionThreshold < 0 {
+		errs = append(errs, fmt.Errorf("target_ejection_threshold: %d must not be negative", cfg.TargetEjectionThreshold))
+	}
+	if cfg.TargetEjectionCooldownSeconds < 0 {
+		errs = append(errs, fmt.Errorf("target_ejection_cooldown_seconds: %d must not be negative", cfg.TargetEjectionCooldownSeconds))
+	}
+	if cfg.TargetEjectionThreshold > 0 && cfg.TargetEjectionCooldownSeconds <= 0 {
+		errs = append(errs, fmt.Errorf("target_ejection_threshold requires target_ejection_cooldown_seconds to be set (there's nothing to time the cooldown with otherwise)"))
+	}
+	if cfg.TargetEjectionCooldownSeconds > 0 && cfg.TargetEjectionThreshold <= 0 {
+		errs = append(errs, fmt.Errorf("target_ejection_cooldown_seconds requires target_ejection_threshold to be set (there's no breaker for it to time)"))
+	}
+	if cfg.TargetEjectionThreshold > 0 && cfg.TargetEjectionCooldownSeconds > 0 {
+		lc.targetBreaker = breaker.NewRegistry(cfg.TargetEjectionThreshold, time.Duration(cfg.TargetEjectionCooldownSeconds)*time.Second)
+	}
 
 	return lc, errs
 }
@@ -895,6 +918,19 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, fmt.Sprintf("upstream_total_timeout_seconds: %d must not be negative", cfg.UpstreamTotalTimeoutSeconds))
 	}
 
+	if cfg.TargetEjectionThreshold < 0 {
+		problems = append(problems, fmt.Sprintf("target_ejection_threshold: %d must not be negative", cfg.TargetEjectionThreshold))
+	}
+	if cfg.TargetEjectionCooldownSeconds < 0 {
+		problems = append(problems, fmt.Sprintf("target_ejection_cooldown_seconds: %d must not be negative", cfg.TargetEjectionCooldownSeconds))
+	}
+	if cfg.TargetEjectionThreshold > 0 && cfg.TargetEjectionCooldownSeconds <= 0 {
+		problems = append(problems, "target_ejection_threshold requires target_ejection_cooldown_seconds to be set (there's nothing to time the cooldown with otherwise)")
+	}
+	if cfg.TargetEjectionCooldownSeconds > 0 && cfg.TargetEjectionThreshold <= 0 {
+		problems = append(problems, "target_ejection_cooldown_seconds requires target_ejection_threshold to be set (there's no breaker for it to time)")
+	}
+
 	_, pathRuleErrs := compilePathRules(cfg.PathRules)
 	for _, e := range pathRuleErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
@@ -992,8 +1028,18 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  anomaly detection:       %s\n", anomalyDisplay(cfg.AnomalyMultiplier, cfg.AnomalyDryRun))
 	fmt.Fprintf(stdout, "  upstream response timeout: %s\n", timeoutDisplay(cfg.UpstreamResponseTimeoutSeconds))
 	fmt.Fprintf(stdout, "  upstream total timeout:    %s\n", timeoutDisplay(cfg.UpstreamTotalTimeoutSeconds))
+	fmt.Fprintf(stdout, "  target ejection:         %s\n", targetEjectionDisplay(cfg.TargetEjectionThreshold, cfg.TargetEjectionCooldownSeconds))
 	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
+}
+
+// targetEjectionDisplay renders target_ejection_threshold/
+// target_ejection_cooldown_seconds for the validate summary.
+func targetEjectionDisplay(threshold, cooldownSeconds int) string {
+	if threshold <= 0 {
+		return "disabled"
+	}
+	return fmt.Sprintf("after %d consecutive failures, %ds cooldown", threshold, cooldownSeconds)
 }
 
 // timeoutDisplay renders an upstream_response_timeout_seconds/
@@ -1366,6 +1412,8 @@ var webhookEventNames = map[string]bool{
 	"ip_denied":               true,
 	"country_denied":          true,
 	"anomaly_detected":        true,
+	"target_ejected":          true,
+	"target_recovered":        true,
 }
 
 // compileWebhookTargets validates and resolves the config file's
