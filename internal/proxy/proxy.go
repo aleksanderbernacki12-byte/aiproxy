@@ -1426,6 +1426,106 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 	return clientAuth{}, false
 }
 
+// errorResponse is the JSON body writeError sends when the client's
+// Accept header explicitly asks for it — see acceptsJSON. Error is a
+// stable, machine-readable identifier using the exact same vocabulary
+// as every event name already used in log lines, webhook payloads, and
+// stats (e.g. "block", "rate_limited", "unauthorized") rather than
+// something invented specifically for this JSON shape. Message is the
+// same human-readable text the plain-text body has always carried.
+// Rule is set only on a "block" rejection — the matched rule's name,
+// never the secret it matched.
+type errorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+	Rule    string `json:"rule,omitempty"`
+}
+
+// acceptsJSON reports whether r's Accept header explicitly lists
+// application/json with a non-zero quality value — not simply because a
+// wildcard like "*/*" (curl's own default, sent even with no -H at all)
+// or "application/*" would technically also match it. A plain curl
+// request keeps getting the same plain-text error body it always has;
+// a client that explicitly asks for JSON — virtually every JSON REST
+// client, including every LLM provider SDK this proxy fronts — gets the
+// new structured body instead. This is deliberately narrower than full
+// RFC 7231 content negotiation (no wildcard matching, no comparing
+// specificity against other offered types): the only question that
+// matters here is "did this caller affirmatively ask for JSON," not
+// "would JSON technically satisfy what it said it'd accept."
+func acceptsJSON(r *http.Request) bool {
+	accept := r.Header.Get("Accept")
+	if accept == "" {
+		return false
+	}
+	for _, entry := range strings.Split(accept, ",") {
+		mediaType, params, _ := strings.Cut(strings.TrimSpace(entry), ";")
+		if !strings.EqualFold(strings.TrimSpace(mediaType), "application/json") {
+			continue
+		}
+		q := 1.0
+		for _, param := range strings.Split(params, ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if ok && strings.EqualFold(strings.TrimSpace(name), "q") {
+				if parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+					q = parsed
+				}
+			}
+		}
+		if q > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// writeError writes message as the body of an HTTP error response with
+// statusCode, in whichever format r's Accept header actually asked for
+// — see acceptsJSON. code and rule become errorResponse's Error/Rule
+// fields under JSON negotiation; under plain text, only message is ever
+// sent, exactly as http.Error has always behaved.
+func writeError(w http.ResponseWriter, r *http.Request, statusCode int, code, message, rule string) {
+	if acceptsJSON(r) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(statusCode)
+		json.NewEncoder(w).Encode(errorResponse{Error: code, Message: message, Rule: rule})
+		return
+	}
+	http.Error(w, message, statusCode)
+}
+
+// writeResponseBlockedBody rewrites resp in place into a synthetic 403
+// error body for a response-side rule match, with the same content
+// negotiation as writeError (see acceptsJSON) — using resp.Request
+// (Rewrite only ever changes the URL/Host, never the client's own
+// headers, so this is still the original Accept header) since a
+// ModifyResponse callback has no direct handle on the client-facing
+// *http.Request the way ServeHTTP's own writeError calls do. Also fixes
+// a latent pre-existing gap while it's here: the prior plain-text-only
+// version never reset Content-Type at all, silently leaving whatever
+// the real (now-replaced) upstream response body's Content-Type had
+// been.
+func writeResponseBlockedBody(resp *http.Response, message string) {
+	var body []byte
+	contentType := "text/plain; charset=utf-8"
+	if resp.Request != nil && acceptsJSON(resp.Request) {
+		encoded, err := json.Marshal(errorResponse{Error: "response_block", Message: message})
+		if err == nil {
+			body = encoded
+			contentType = "application/json; charset=utf-8"
+		}
+	}
+	if body == nil {
+		body = []byte(message)
+	}
+	resp.StatusCode = http.StatusForbidden
+	resp.Status = http.StatusText(http.StatusForbidden)
+	resp.Header.Set("Content-Type", contentType)
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	resp.ContentLength = int64(len(body))
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+}
+
 // ServeHTTP implements http.Handler. It reads the full request body into
 // memory (rejecting it with a 413 past MaxBodyBytes, before any of it is
 // buffered) so the rule engine can inspect it in cleartext, evaluates
@@ -1464,7 +1564,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.Stats.RecordIPDenied()
 		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String())
 		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String())
-		http.Error(w, "access denied", http.StatusForbidden)
+		writeError(w, r, http.StatusForbidden, "ip_denied", "access denied", "")
 		return clientAuth{}, false
 	}
 	if allowed, country := s.checkCountryAccess(r); !allowed {
@@ -1476,7 +1576,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.Stats.RecordCountryDenied()
 		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String())
 		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String())
-		http.Error(w, "access denied", http.StatusForbidden)
+		writeError(w, r, http.StatusForbidden, "country_denied", "access denied", "")
 		return clientAuth{}, false
 	}
 
@@ -1489,7 +1589,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.logUnauthorized(r.Method, r.URL.String())
 		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "")
 		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
-		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+		writeError(w, r, http.StatusProxyAuthRequired, "unauthorized", "proxy authentication required", "")
 		return clientAuth{}, false
 	}
 	return auth, true
@@ -1524,7 +1624,7 @@ func (h adminMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case cacheClearPath:
 		s.serveCacheClear(w, r)
 	default:
-		http.NotFound(w, r)
+		writeError(w, r, http.StatusNotFound, "not_found", "404 page not found", "")
 	}
 }
 
@@ -1541,7 +1641,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// AdminAddr's doc comment) — Addr must never forward one of
 		// these paths upstream as if it were an ordinary route, since
 		// "reserved" always meant exactly that.
-		http.NotFound(w, r)
+		writeError(w, r, http.StatusNotFound, "not_found", "404 page not found", "")
 		return
 	}
 
@@ -1572,10 +1672,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			writeError(w, r, http.StatusRequestEntityTooLarge, "body_too_large", "request body too large", "")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "bad_request", err.Error(), "")
 		return
 	}
 
@@ -1641,7 +1741,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Key:     auth.label,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, r, http.StatusBadRequest, "bad_request", err.Error(), "")
 		return
 	}
 	s.handleRequestDryRunHits(dryRunHits, r.Method, r.URL.String())
@@ -1652,7 +1752,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.Stats.RecordClientBlock(auth.label)
 		s.logBlock(r.Method, r.URL.String(), ruleName)
 		s.notifyWebhook("block", r.Method, r.URL.String(), ruleName)
-		http.Error(w, "blocked by aiproxy rules", http.StatusForbidden)
+		writeError(w, r, http.StatusForbidden, "block", "blocked by aiproxy rules", ruleName)
 		return
 	}
 
@@ -1661,7 +1761,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.Stats.RecordClientRateLimited(auth.label)
 		s.logRateLimited(r.Method, r.URL.String())
 		s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "")
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		writeError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded", "")
 		return
 	}
 
@@ -1677,7 +1777,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.Stats.RecordClientTokenRateLimited(auth.label)
 		s.logTokenRateLimited(r.Method, r.URL.String())
 		s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "")
-		http.Error(w, "token rate limit exceeded", http.StatusTooManyRequests)
+		writeError(w, r, http.StatusTooManyRequests, "token_rate_limited", "token rate limit exceeded", "")
 		return
 	}
 
@@ -1694,7 +1794,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.logAnomalyDetected(auth.label, r.Method, r.URL.String(), currentCount, baseline)
 			s.notifyAnomalyWebhook(auth.label, r.Method, r.URL.String(), currentCount, baseline)
 			if !anomalyDryRun {
-				http.Error(w, "anomalous traffic pattern detected", http.StatusTooManyRequests)
+				writeError(w, r, http.StatusTooManyRequests, "anomaly_detected", "anomalous traffic pattern detected", "")
 				return
 			}
 		}
@@ -1812,12 +1912,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
 		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
 		s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
-		msg := []byte("response blocked by aiproxy rules")
-		resp.StatusCode = http.StatusForbidden
-		resp.Status = http.StatusText(http.StatusForbidden)
-		resp.Header.Set("Content-Length", strconv.Itoa(len(msg)))
-		resp.ContentLength = int64(len(msg))
-		resp.Body = io.NopCloser(bytes.NewReader(msg))
+		writeResponseBlockedBody(resp, "response blocked by aiproxy rules")
 		return nil
 	}
 	if action == rules.Redact {
@@ -2995,7 +3090,7 @@ func withCostBudget(out statsSnapshotJSON, budget float64) statsSnapshotJSON {
 // own. GET-only, same as every other reserved path.
 func (s *Server) serveHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -3008,7 +3103,7 @@ func (s *Server) serveHealthz(w http.ResponseWriter, r *http.Request) {
 // itself counted in Stats — it isn't a proxied request.
 func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
 		return
 	}
 	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens()), s.getCostBudget())
@@ -3028,17 +3123,17 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 // rules or the rate limiter and is never itself counted in Stats.
 func (s *Server) serveCacheClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
 		return
 	}
 	cch := s.getCache()
 	if cch == nil {
-		http.Error(w, "cache is not enabled", http.StatusNotFound)
+		writeError(w, r, http.StatusNotFound, "cache_disabled", "cache is not enabled", "")
 		return
 	}
 	if err := cch.Clear(); err != nil {
 		s.logError("aiproxy: cache clear: %v", err)
-		http.Error(w, "failed to clear cache", http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "cache_clear_failed", "failed to clear cache", "")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -3283,7 +3378,7 @@ func writeLatencyHistogram(w io.Writer, perTarget map[string]stats.Snapshot, nam
 // itself counted in Stats.
 func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

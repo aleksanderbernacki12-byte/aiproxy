@@ -487,6 +487,59 @@ of the structured stream a script would actually parse — the two are
 already on separate streams, so piping just stderr gives you a clean,
 pure-JSON feed.
 
+## Structured error responses
+
+Every rejection aiproxy itself produces — a block, a rate limit, an
+unauthorized request, and so on — has always sent a plain-text body, the
+same way `net/http`'s own `http.Error` always has. A client that sends
+`Accept: application/json` — the way virtually every JSON REST client
+does, including every LLM provider SDK this proxy fronts — gets a
+structured body instead, automatically, with no config needed:
+
+```
+curl -H "Accept: application/json" http://127.0.0.1:8080/v1/chat
+```
+
+```json
+{
+  "error": "block",
+  "message": "blocked by aiproxy rules",
+  "rule": "aws-access-key"
+}
+```
+
+`error` is a stable, machine-readable identifier — the exact same
+vocabulary already used everywhere else in aiproxy (log `level`, webhook
+`event`, and stats field names): `ip_denied`, `country_denied`,
+`unauthorized`, `body_too_large`, `bad_request`, `block`,
+`rate_limited`, `token_rate_limited`, `anomaly_detected`,
+`method_not_allowed`, `cache_disabled`, `cache_clear_failed`,
+`response_block`, or `not_found`. `rule` is only ever present on a
+`block` (or `response_block`) rejection — the matched rule's name, never
+the secret it matched, same discipline every log line and webhook alert
+already follows.
+
+A plain `curl` with no `Accept` header (or any other client that never
+explicitly names `application/json`) gets exactly the same plain-text
+body aiproxy has always produced — this is deliberately **not** "always
+JSON now": a bare wildcard like `Accept: */*` (curl's own actual
+default) doesn't count as asking for JSON, only an Accept header that
+actually lists `application/json` (with a non-zero quality value) does.
+Nothing about existing integrations changes unless they start asking for
+it.
+
+This applies uniformly to every rejection reason above, to the 404
+`GET`/`POST` produces for an unknown path, and to a
+[response-side rule match](#scanning-responses-too) — the synthetic body
+substituted for a blocked upstream response gets the same treatment,
+negotiated against the original client's own Accept header. It does
+*not* apply mid-stream: a block that trips partway through an
+already-started SSE response has no clean body to rewrite either way
+(the 200 status and headers are already sent) — see
+[Scanning responses too](#scanning-responses-too) for why that's an
+inherent limitation of streaming, not something content negotiation
+could fix.
+
 ## Persistent log file
 
 `--log-format` only controls what the terminal shows for as long as

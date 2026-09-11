@@ -11219,3 +11219,252 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 		t.Fatalf("status = %d, want a 5xx", resp.StatusCode)
 	}
 }
+
+// getWithAccept issues a GET to url carrying the given Accept header
+// (empty means no header at all, matching a plain http.Get).
+func getWithAccept(t *testing.T, url, accept string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	return resp
+}
+
+// proxyErrorBody is the JSON shape writeError sends — a local copy
+// (proxy_test is an external test package, with no access to the
+// unexported errorResponse type) so these tests decode against the
+// exact same wire shape a real client would.
+type proxyErrorBody struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+	Rule    string `json:"rule,omitempty"`
+}
+
+// TestServer_Block_PlainTextByDefault proves a real end-to-end blocked
+// request, through the actual ServeHTTP path, still gets exactly the
+// same plain-text body as ever when the client never asks for JSON.
+func TestServer_Block_PlainTextByDefault(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/upload", "application/json", strings.NewReader(`{"key":"AKIAABCDEFGHIJKLMNOP"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if strings.TrimSpace(string(body)) != "blocked by aiproxy rules" {
+		t.Fatalf("body = %q, want the plain message", body)
+	}
+}
+
+// TestServer_Block_JSONErrorWhenAccepted proves the same real blocked
+// request instead gets a structured JSON body — with the matched rule
+// name populated — when the client's Accept header explicitly asks for
+// application/json.
+func TestServer_Block_JSONErrorWhenAccepted(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/upload", strings.NewReader(`{"key":"AKIAABCDEFGHIJKLMNOP"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	var got proxyErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	want := proxyErrorBody{Error: "block", Message: "blocked by aiproxy rules", Rule: "aws-access-key"}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestServer_RateLimited_JSONErrorWhenAccepted proves content
+// negotiation applies uniformly across rejection reasons, not just
+// block — the JSON body correctly reports "rate_limited" with no rule
+// (rate limiting isn't attributable to any one rule).
+func TestServer_RateLimited_JSONErrorWhenAccepted(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Limiter = limiter.New(0, time.Minute) // 0 allowed per window: the very first request already trips it
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp := getWithAccept(t, frontend.URL+"/v1/chat", "application/json")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+	var got proxyErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	want := proxyErrorBody{Error: "rate_limited", Message: "rate limit exceeded"}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestServer_IPDenied_JSONErrorWhenAccepted proves a network-level
+// rejection (checked before proxy auth, before anything else) is also
+// covered by content negotiation.
+func TestServer_IPDenied_JSONErrorWhenAccepted(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.IPDenyList = []*net.IPNet{mustCIDR(t, "127.0.0.0/8")}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp := getWithAccept(t, frontend.URL+"/v1/chat", "application/json")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	var got proxyErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	want := proxyErrorBody{Error: "ip_denied", Message: "access denied"}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestServer_ResponseBlock_JSONErrorWhenAccepted proves the
+// response-side synthetic error body (rewritten from inside
+// ModifyResponse, not a direct ServeHTTP write) also honors content
+// negotiation end to end through a real forwarded request.
+func TestServer_ResponseBlock_JSONErrorWhenAccepted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+	})
+	srv := proxy.New("unused", targetURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp := getWithAccept(t, frontend.URL+"/v1/chat", "application/json")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	var got proxyErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if got.Error != "response_block" {
+		t.Fatalf("Error = %q, want response_block", got.Error)
+	}
+}
+
+// TestServer_AdminPathMovedOff_JSONNotFoundWhenAccepted proves the
+// generic 404 for an admin path moved off the main listener (see
+// AdminAddr) also honors content negotiation.
+func TestServer_AdminPathMovedOff_JSONNotFoundWhenAccepted(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.AdminAddr = "127.0.0.1:0" // never actually started; only its non-empty-ness matters to ServeHTTP's own check
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp := getWithAccept(t, frontend.URL+"/_aiproxy/stats", "application/json")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	var got proxyErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if got.Error != "not_found" {
+		t.Fatalf("Error = %q, want not_found", got.Error)
+	}
+}
