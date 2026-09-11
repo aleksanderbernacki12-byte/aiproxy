@@ -681,6 +681,55 @@ alternative. `max_requests_per_minute` is optional; when it is 0 or
 omitted, the rate limiter is disabled. Once the limit is hit, further
 requests get a 429 until the 1-minute window rolls forward.
 
+### Scoping a custom rule to a target or key
+
+By default a custom rule applies to every request, regardless of which
+[target](#multi-target-routing) it's routed to or which
+[named proxy key](#multiple-named-keys-with-per-key-stats-and-rate-limits)
+made it. `targets` and/or `keys` narrow a rule down to only the traffic
+you actually want it checked against — useful when a pattern is only
+ever meaningful for one upstream (an internal API token that should
+never reach one provider but is a completely normal value to send to
+another) or only relevant for one caller (a team-specific secret format
+that would otherwise be a constant false positive for everyone else):
+
+```json
+{
+  "custom_rules": [
+    {
+      "name": "internal-token",
+      "pattern": "ITKN_[0-9]+",
+      "targets": ["/openai", "model:fast"],
+      "keys": ["mobile-app"]
+    }
+  ],
+  "targets": [{ "prefix": "/openai", "url": "https://api.openai.com" }],
+  "model_routes": [{ "name": "fast", "models": ["gpt-4*"], "url": "https://api.openai.com" }],
+  "proxy_api_keys": [{ "name": "mobile-app", "key": "..." }]
+}
+```
+
+Both are optional lists of labels — the same ones already used
+everywhere else in stats, logs, and the Prometheus endpoint: `"default"`
+for the fallback `--target` or the anonymous top-level `proxy_api_key`,
+a `targets[].prefix` entry, `"model:<name>"` for a `model_routes[]`
+entry, or a `proxy_api_keys[].name`. Leaving either out (the default)
+means the rule applies regardless of that dimension, unchanged from
+before these fields existed; setting both means a request must match
+*both* to trigger the rule, not either one alone. A request that misses
+the scope is treated exactly as if the rule didn't exist at all — it
+falls through to whatever other rule or the default action would
+otherwise apply, not merely "not logged." The scope applies identically
+to response scanning (see
+[Scanning responses too](#scanning-responses-too)): a rule scoped to one
+target only ever inspects that target's own responses.
+
+Referencing a target, model route, or key that isn't actually configured
+is a config error, caught by both a cold start and
+`aiproxy validate` — the same typo protection `builtin_rule_actions`
+already gets — rather than silently compiling a rule that can never
+match anything.
+
 ### Token-based rate limiting
 
 `max_requests_per_minute` counts requests — a second, independent

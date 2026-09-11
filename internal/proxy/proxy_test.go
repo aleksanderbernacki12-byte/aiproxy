@@ -10314,3 +10314,146 @@ func TestServer_Healthz_NeverGatedByIPAccess(t *testing.T) {
 		t.Fatalf("status = %d, want %d (healthz must never be IP-gated)", resp.StatusCode, http.StatusOK)
 	}
 }
+
+// postWithProxyAuth POSTs body to url carrying a Proxy-Authorization
+// header for key, the same helper shape as getWithProxyAuth but for a
+// request custom rules can actually scan.
+func postWithProxyAuth(t *testing.T, url, key, contentType, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Proxy-Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", contentType)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	return resp
+}
+
+// TestServer_CustomRuleTargetScoping_OnlyBlocksConfiguredTarget proves a
+// custom rule whose Targets names only one route blocks a matching
+// secret sent to that target but lets the identical secret through
+// completely unblocked when sent to a different target — the rule is
+// treated as if it didn't exist at all outside its configured scope,
+// not merely "not logged" or "dry-run".
+func TestServer_CustomRuleTargetScoping_OnlyBlocksConfiguredTarget(t *testing.T) {
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("openai response"))
+	}))
+	defer openai.Close()
+
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("anthropic response"))
+	}))
+	defer anthropic.Close()
+
+	openaiURL, err := url.Parse(openai.URL)
+	if err != nil {
+		t.Fatalf("parse openai url: %v", err)
+	}
+	anthropicURL, err := url.Parse(anthropic.URL)
+	if err != nil {
+		t.Fatalf("parse anthropic url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "custom-secret",
+		Pattern: regexp.MustCompile(`SECRET_[0-9]+`),
+		Action:  rules.Block,
+		Targets: []string{"/openai"},
+	})
+
+	srv := proxy.New("unused", anthropicURL, engine)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	secretBody := `{"note":"SECRET_12345"}`
+
+	resp, err := http.Post(frontend.URL+"/openai/v1/chat", "application/json", strings.NewReader(secretBody))
+	if err != nil {
+		t.Fatalf("post to scoped target: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status for /openai = %d, want %d (rule is scoped to this target)", resp.StatusCode, http.StatusForbidden)
+	}
+
+	resp, err = http.Post(frontend.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(secretBody))
+	if err != nil {
+		t.Fatalf("post to non-scoped target: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status for /anthropic = %d, want %d (rule must not apply outside its Targets)", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "anthropic response" {
+		t.Fatalf("body = %q, want the anthropic upstream's response", body)
+	}
+}
+
+// TestServer_CustomRuleKeyScoping_OnlyBlocksConfiguredKey proves the
+// same falls-through-as-if-absent behavior for Keys: the same secret is
+// blocked for one named proxy key but passes through untouched for
+// another, both hitting the exact same route.
+func TestServer_CustomRuleKeyScoping_OnlyBlocksConfiguredKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("upstream response"))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "custom-secret",
+		Pattern: regexp.MustCompile(`SECRET_[0-9]+`),
+		Action:  rules.Block,
+		Keys:    []string{"mobile-app"},
+	})
+
+	srv := proxy.New("unused", targetURL, engine)
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "mobile-app", Key: "mobile-key"},
+		{Name: "backend-service", Key: "backend-key"},
+	}
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	secretBody := `{"note":"SECRET_12345"}`
+
+	resp := postWithProxyAuth(t, frontend.URL+"/v1/chat", "mobile-key", "application/json", secretBody)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status for mobile-app key = %d, want %d (rule is scoped to this key)", resp.StatusCode, http.StatusForbidden)
+	}
+
+	resp = postWithProxyAuth(t, frontend.URL+"/v1/chat", "backend-key", "application/json", secretBody)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status for backend-service key = %d, want %d (rule must not apply outside its Keys)", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "upstream response" {
+		t.Fatalf("body = %q, want the upstream's response", body)
+	}
+}

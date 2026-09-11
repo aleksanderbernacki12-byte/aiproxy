@@ -191,6 +191,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			if cr.DryRun {
 				fmt.Fprintf(stdout, "custom rule: %s (dry-run — logged, never enforced)\n", cr.Name)
 			}
+			if len(cr.Targets) > 0 || len(cr.Keys) > 0 {
+				fmt.Fprintf(stdout, "custom rule: %s scoped to targets=%v keys=%v\n", cr.Name, cr.Targets, cr.Keys)
+			}
 		}
 		for _, r := range cfg.PathRules {
 			if r.DryRun {
@@ -710,7 +713,7 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	}
 	errs = append(errs, pErrs...)
 
-	customRules, cErrs := compileCustomRules(cfg.CustomRules)
+	customRules, cErrs := compileCustomRules(cfg.CustomRules, validTargetLabels(cfg), validKeyLabels(cfg))
 	for _, r := range customRules {
 		engine.AddBodyRegexRule(r)
 	}
@@ -801,7 +804,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 
 	var problems []string
 
-	_, ruleErrs := compileCustomRules(cfg.CustomRules)
+	_, ruleErrs := compileCustomRules(cfg.CustomRules, validTargetLabels(cfg), validKeyLabels(cfg))
 	for _, e := range ruleErrs {
 		// compileCustomRules' errors are pre-formatted for runStart's
 		// log.Fatal, which validate never calls; drop that "Fatal
@@ -1125,8 +1128,14 @@ func resolveConfig(configPath string) (*config.Config, string, error) {
 // (compiled with regexp.MustCompile), a custom pattern comes from a file
 // a user can mistype, so compilation failures are collected and returned
 // rather than panicking — it's up to the caller whether that's fatal
-// (runStart) or just a reported problem (runValidate).
-func compileCustomRules(customRules []config.CustomRule) ([]rules.BodyRegexRule, []error) {
+// (runStart) or just a reported problem (runValidate). validTargets and
+// validKeys (see validTargetLabels/validKeyLabels) are the complete set
+// of target/key labels this config actually resolves requests to —
+// every entry in a rule's own Targets/Keys must be one of them, the same
+// "reject an unrecognized name rather than silently compiling a rule
+// that never matches" rigor resolveBuiltinRuleActions already applies to
+// builtin_rule_actions.
+func compileCustomRules(customRules []config.CustomRule, validTargets, validKeys map[string]bool) ([]rules.BodyRegexRule, []error) {
 	compiled := make([]rules.BodyRegexRule, 0, len(customRules))
 	var errs []error
 	for _, cr := range customRules {
@@ -1142,14 +1151,74 @@ func compileCustomRules(customRules []config.CustomRule) ([]rules.BodyRegexRule,
 			continue
 		}
 
+		invalid := false
+		for _, t := range cr.Targets {
+			if !validTargets[t] {
+				errs = append(errs, fmt.Errorf("Fatal error: custom rule %s: targets: %q is not a known target (valid: \"default\", a configured targets[].prefix, or \"model:<name>\" for a configured model_routes[] entry)", cr.Name, t))
+				invalid = true
+			}
+		}
+		for _, k := range cr.Keys {
+			if !validKeys[k] {
+				errs = append(errs, fmt.Errorf("Fatal error: custom rule %s: keys: %q is not a known proxy key (valid: \"default\" when proxy_api_key is set, or a configured proxy_api_keys[].name)", cr.Name, k))
+				invalid = true
+			}
+		}
+		if invalid {
+			continue
+		}
+
 		compiled = append(compiled, rules.BodyRegexRule{
 			Name:    cr.Name,
 			Pattern: pattern,
 			Action:  action,
 			DryRun:  cr.DryRun,
+			Targets: cr.Targets,
+			Keys:    cr.Keys,
 		})
 	}
 	return compiled, errs
+}
+
+// validTargetLabels returns every target label a custom_rules entry's
+// Targets field may reference — the exact labels resolveRoute and
+// resolveModelRoute attach to a request for stats/logs/Prometheus (see
+// proxy.Server.resolveRoute): "default" for the fallback --target
+// (always valid, since a default target always exists), each configured
+// targets[] entry's own Prefix, and "model:<name>" for each configured
+// model_routes[] entry.
+func validTargetLabels(cfg *config.Config) map[string]bool {
+	labels := map[string]bool{"default": true}
+	if cfg == nil {
+		return labels
+	}
+	for _, t := range cfg.Targets {
+		labels[t.Prefix] = true
+	}
+	for _, r := range cfg.ModelRoutes {
+		labels["model:"+r.Name] = true
+	}
+	return labels
+}
+
+// validKeyLabels returns every key label a custom_rules entry's Keys
+// field may reference — the exact labels checkProxyAuth attaches to a
+// request (see proxy.clientAuth.label): "default" for the anonymous
+// top-level proxy_api_key (only when it's actually set — there's no
+// "default" caller to scope to otherwise) and each configured
+// proxy_api_keys[] entry's own Name.
+func validKeyLabels(cfg *config.Config) map[string]bool {
+	labels := make(map[string]bool)
+	if cfg == nil {
+		return labels
+	}
+	if cfg.ProxyAPIKey != "" {
+		labels["default"] = true
+	}
+	for _, k := range cfg.ProxyAPIKeys {
+		labels[k.Name] = true
+	}
+	return labels
 }
 
 // parseRuleAction parses a custom_rules entry's action field: "" (absent)

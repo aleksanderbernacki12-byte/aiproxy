@@ -278,7 +278,7 @@ func TestEngine_EvaluateResponse_BlocksMatchedSecret(t *testing.T) {
 		Action:  rules.Block,
 	})
 
-	action, ruleName, _, _ := engine.EvaluateResponse([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`))
+	action, ruleName, _, _ := engine.EvaluateResponse([]byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`), "", "")
 	if action != rules.Block {
 		t.Fatalf("action = %v, want %v", action, rules.Block)
 	}
@@ -298,7 +298,7 @@ func TestEngine_EvaluateResponse_RedactsMatchedSecret(t *testing.T) {
 		Action:  rules.Redact,
 	})
 
-	action, ruleName, body, _ := engine.EvaluateResponse([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`))
+	action, ruleName, body, _ := engine.EvaluateResponse([]byte(`{"echo":"sk-FAKEKEY1234567890ABCDEFGHIJ"}`), "", "")
 	if action != rules.Redact {
 		t.Fatalf("action = %v, want %v", action, rules.Redact)
 	}
@@ -322,7 +322,7 @@ func TestEngine_EvaluateResponse_AllowsCleanBody(t *testing.T) {
 	})
 
 	body := []byte(`{"echo":"hello"}`)
-	action, ruleName, gotBody, _ := engine.EvaluateResponse(body)
+	action, ruleName, gotBody, _ := engine.EvaluateResponse(body, "", "")
 	if action != rules.Allow {
 		t.Fatalf("action = %v, want %v", action, rules.Allow)
 	}
@@ -702,7 +702,7 @@ func TestEngine_EvaluateResponse_DryRunNeverEnforcedButReported(t *testing.T) {
 	})
 
 	body := []byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`)
-	action, ruleName, gotBody, dryRunHits := engine.EvaluateResponse(body)
+	action, ruleName, gotBody, dryRunHits := engine.EvaluateResponse(body, "", "")
 	if action != rules.Allow {
 		t.Fatalf("action = %v, want %v (a dry_run rule must never actually block a response)", action, rules.Allow)
 	}
@@ -714,5 +714,182 @@ func TestEngine_EvaluateResponse_DryRunNeverEnforcedButReported(t *testing.T) {
 	}
 	if len(dryRunHits) != 1 || dryRunHits[0].RuleName != "aws-access-key" || dryRunHits[0].Action != rules.Block {
 		t.Fatalf("dryRunHits = %+v, want exactly one {aws-access-key, Block}", dryRunHits)
+	}
+}
+
+// TestEngine_BodyRule_TargetScoping_OnlyMatchesConfiguredTarget proves a
+// BodyRegexRule with a non-empty Targets only fires for a request whose
+// Request.Target is in that list, falling through to Default (Allow
+// here) for every other target — the request is treated exactly as if
+// the rule didn't exist at all.
+func TestEngine_BodyRule_TargetScoping_OnlyMatchesConfiguredTarget(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		Targets: []string{"/openai"},
+	})
+
+	body := []byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`)
+
+	action, _, _, _, _, err := engine.Evaluate(rules.Request{
+		Method: "POST", URL: "/x", Body: body, Target: "/openai",
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Block {
+		t.Fatalf("action for scoped target = %v, want %v", action, rules.Block)
+	}
+
+	action, _, _, _, _, err = engine.Evaluate(rules.Request{
+		Method: "POST", URL: "/x", Body: body, Target: "/anthropic",
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action for non-scoped target = %v, want %v (rule must not apply outside its Targets)", action, rules.Allow)
+	}
+}
+
+// TestEngine_BodyRule_KeyScoping_OnlyMatchesConfiguredKey proves the same
+// falls-through-as-if-absent behavior for Keys.
+func TestEngine_BodyRule_KeyScoping_OnlyMatchesConfiguredKey(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		Keys:    []string{"mobile-app"},
+	})
+
+	body := []byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`)
+
+	action, _, _, _, _, err := engine.Evaluate(rules.Request{
+		Method: "POST", URL: "/x", Body: body, Key: "mobile-app",
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Block {
+		t.Fatalf("action for scoped key = %v, want %v", action, rules.Block)
+	}
+
+	action, _, _, _, _, err = engine.Evaluate(rules.Request{
+		Method: "POST", URL: "/x", Body: body, Key: "backend-service",
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action for non-scoped key = %v, want %v (rule must not apply outside its Keys)", action, rules.Allow)
+	}
+}
+
+// TestEngine_BodyRule_TargetAndKeyScoping_BothMustMatch proves that when
+// a rule sets both Targets and Keys, a request must match both — one
+// dimension alone is not enough.
+func TestEngine_BodyRule_TargetAndKeyScoping_BothMustMatch(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		Targets: []string{"/openai"},
+		Keys:    []string{"mobile-app"},
+	})
+
+	body := []byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`)
+
+	cases := []struct {
+		name   string
+		target string
+		key    string
+		want   rules.Action
+	}{
+		{"both match", "/openai", "mobile-app", rules.Block},
+		{"only target matches", "/openai", "backend-service", rules.Allow},
+		{"only key matches", "/anthropic", "mobile-app", rules.Allow},
+		{"neither matches", "/anthropic", "backend-service", rules.Allow},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			action, _, _, _, _, err := engine.Evaluate(rules.Request{
+				Method: "POST", URL: "/x", Body: body, Target: c.target, Key: c.key,
+			})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if action != c.want {
+				t.Fatalf("action = %v, want %v", action, c.want)
+			}
+		})
+	}
+}
+
+// TestEngine_HeaderRule_TargetScoping_OnlyMatchesConfiguredTarget proves
+// scoping applies to the header-scanning path too, not just the body.
+func TestEngine_HeaderRule_TargetScoping_OnlyMatchesConfiguredTarget(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		Targets: []string{"/openai"},
+	})
+
+	req := rules.Request{
+		Method: "POST",
+		URL:    "/x",
+		Body:   []byte(`{"hello":"world"}`),
+		Headers: map[string][]string{
+			"X-Debug-Info": {"AKIAABCDEFGHIJKLMNOP"},
+		},
+	}
+
+	req.Target = "/openai"
+	action, _, _, _, _, err := engine.Evaluate(req)
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Block {
+		t.Fatalf("action for scoped target = %v, want %v", action, rules.Block)
+	}
+
+	req.Target = "/anthropic"
+	action, _, _, _, _, err = engine.Evaluate(req)
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if action != rules.Allow {
+		t.Fatalf("action for non-scoped target = %v, want %v", action, rules.Allow)
+	}
+}
+
+// TestEngine_EvaluateResponse_TargetScoping_OnlyMatchesConfiguredTarget
+// proves the same scoping applies to EvaluateResponse (the non-streaming
+// response scan), using the target/key the originating request itself
+// resolved to.
+func TestEngine_EvaluateResponse_TargetScoping_OnlyMatchesConfiguredTarget(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{
+		Name:    "aws-access-key",
+		Pattern: regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		Action:  rules.Block,
+		Targets: []string{"/openai"},
+	})
+
+	body := []byte(`{"echo":"AKIAABCDEFGHIJKLMNOP"}`)
+
+	action, _, _, _ := engine.EvaluateResponse(body, "/openai", "")
+	if action != rules.Block {
+		t.Fatalf("action for scoped target = %v, want %v", action, rules.Block)
+	}
+
+	action, _, _, _ = engine.EvaluateResponse(body, "/anthropic", "")
+	if action != rules.Allow {
+		t.Fatalf("action for non-scoped target = %v, want %v", action, rules.Allow)
 	}
 }

@@ -1333,6 +1333,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		URL:     r.URL.String(),
 		Body:    body,
 		Headers: filterHeadersForScanning(r.Header),
+		Target:  targetLabel,
+		Key:     auth.label,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1500,7 +1502,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		return err
 	}
 
-	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body)
+	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, reqCtx.targetLabel, reqCtx.clientLabel)
 	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url)
 	if action == rules.Block {
 		s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
@@ -1556,6 +1558,8 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 	tee := &streamTee{
 		src:    resp.Body,
 		engine: s.getEngine(),
+		target: reqCtx.targetLabel,
+		key:    reqCtx.clientLabel,
 		onRedact: func(ruleName string) {
 			s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
 			s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName)
@@ -1636,6 +1640,8 @@ var errResponseBlocked = errors.New("aiproxy: response blocked by rule")
 type streamTee struct {
 	src    io.ReadCloser
 	engine *rules.Engine
+	target string
+	key    string
 
 	tmp     [32 * 1024]byte
 	pending bytes.Buffer // raw bytes read but not yet a complete batch
@@ -1730,7 +1736,7 @@ func (t *streamTee) scan(batch []byte) {
 		return
 	}
 
-	action, ruleName, scanned, dryRunHits := t.engine.EvaluateResponse(batch)
+	action, ruleName, scanned, dryRunHits := t.engine.EvaluateResponse(batch, t.target, t.key)
 	if len(dryRunHits) > 0 && t.onDryRun != nil {
 		t.onDryRun(dryRunHits)
 	}

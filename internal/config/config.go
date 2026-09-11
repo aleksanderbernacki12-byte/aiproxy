@@ -33,6 +33,31 @@ type CustomRule struct {
 	// Meant for trying a new rule out against real traffic before
 	// trusting it to actually enforce anything.
 	DryRun bool `json:"dry_run,omitempty"`
+
+	// Targets, if non-empty, restricts this rule to only requests (and
+	// their responses) routed to one of these targets — matching the
+	// same label used in stats/logs/Prometheus: "default" for the
+	// fallback --target, a configured targets[] entry's own Prefix, or
+	// "model:<name>" for a configured model_routes[] entry. Empty (the
+	// default when the field is absent) applies this rule to every
+	// target, unchanged from before this field existed. Each entry must
+	// name an actually-configured target/route; aiproxy validate and a
+	// cold start both reject an unknown one, the same way an unknown
+	// builtin_rule_actions key is rejected, rather than silently
+	// compiling a rule that can never match.
+	Targets []string `json:"targets,omitempty"`
+
+	// Keys, if non-empty, restricts this rule to only requests (and
+	// their responses) authenticated with one of these named proxy
+	// keys — "default" for the anonymous top-level ProxyAPIKey, or a
+	// ProxyAPIKeyEntry's own Name. Empty (the default when the field is
+	// absent) applies this rule regardless of which key (or none at
+	// all) made the request, unchanged from before this field existed.
+	// When both Targets and Keys are set, a request must match both —
+	// they narrow the same rule together, not independently. Each entry
+	// must name an actually-configured key, same validation rigor as
+	// Targets.
+	Keys []string `json:"keys,omitempty"`
 }
 
 // PathRule is one path-prefix endpoint rule as it appears in the config

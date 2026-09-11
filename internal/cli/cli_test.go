@@ -2389,3 +2389,147 @@ func TestExecute_Validate_EnvVarReference_ExpandsAndValidatesNormally(t *testing
 		t.Fatalf("stdout leaked the resolved env var value: %q", stdout.String())
 	}
 }
+
+// TestRunStart_CustomRuleUnknownTarget_FatalsWithClearMessage proves a
+// cold start rejects an unrecognized custom_rules[].targets entry the
+// same clean way runValidate reports it as a problem — not just at
+// `aiproxy validate` time, but before the process ever starts serving.
+func TestRunStart_CustomRuleUnknownTarget_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"custom_rules": [{"name": "scoped-rule", "pattern": "SECRET_[0-9]+", "targets": ["/does-not-exist"]}]}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_CustomRuleUnknownTarget_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+
+	output := stderr.String()
+	if !strings.Contains(output, "scoped-rule") || !strings.Contains(output, "/does-not-exist") {
+		t.Fatalf("stderr missing expected fatal message: %q", output)
+	}
+}
+
+// TestExecute_Validate_CustomRuleUnknownTarget_ReportsProblem proves a
+// custom_rules entry referencing a target that doesn't actually exist in
+// targets/model_routes (almost always a typo) is rejected, the same
+// rigor resolveBuiltinRuleActions already applies to an unrecognized
+// builtin_rule_actions key — rather than silently compiling a rule that
+// can never match anything.
+func TestExecute_Validate_CustomRuleUnknownTarget_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"targets": [{"prefix": "/openai", "url": "https://api.openai.com"}],
+		"custom_rules": [{"name": "scoped-rule", "pattern": "SECRET_[0-9]+", "targets": ["/does-not-exist"]}]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stdout: %s)", code, stdout.String())
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "scoped-rule") || !strings.Contains(errOut, "/does-not-exist") {
+		t.Errorf("stderr missing the unknown target problem: %q", errOut)
+	}
+}
+
+// TestExecute_Validate_CustomRuleUnknownKey_ReportsProblem is the same
+// check for an unrecognized keys entry.
+func TestExecute_Validate_CustomRuleUnknownKey_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"proxy_api_keys": [{"name": "mobile-app", "key": "some-key"}],
+		"custom_rules": [{"name": "scoped-rule", "pattern": "SECRET_[0-9]+", "keys": ["nonexistent-key"]}]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stdout: %s)", code, stdout.String())
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "scoped-rule") || !strings.Contains(errOut, "nonexistent-key") {
+		t.Errorf("stderr missing the unknown key problem: %q", errOut)
+	}
+}
+
+// TestExecute_Validate_CustomRuleKeyDefaultWithoutProxyAPIKey_ReportsProblem
+// proves "default" is only a valid Keys entry when proxy_api_key is
+// actually set — there's no anonymous "default" caller to scope to
+// otherwise, the same reasoning ProxyAPIKeyEntry.Name reserves "default"
+// for.
+func TestExecute_Validate_CustomRuleKeyDefaultWithoutProxyAPIKey_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": [{"name": "scoped-rule", "pattern": "SECRET_[0-9]+", "keys": ["default"]}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stdout: %s)", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "scoped-rule") {
+		t.Errorf("stderr missing the unknown key problem: %q", stderr.String())
+	}
+}
+
+// TestExecute_Validate_CustomRuleValidTargetsAndKeys_ReturnsZero proves
+// the happy path: a rule scoped to a real targets[] prefix, a real
+// model_routes[] name (as "model:<name>"), "default" (with
+// proxy_api_key set), and a real proxy_api_keys[] name all validate
+// cleanly together.
+func TestExecute_Validate_CustomRuleValidTargetsAndKeys_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"proxy_api_key": "s3cr3t-shared-key",
+		"targets": [{"prefix": "/openai", "url": "https://api.openai.com"}],
+		"model_routes": [{"name": "fast", "models": ["gpt-4*"], "url": "https://api.openai.com"}],
+		"proxy_api_keys": [{"name": "mobile-app", "key": "mobile-key"}],
+		"custom_rules": [
+			{"name": "rule-a", "pattern": "SECRET_[0-9]+", "targets": ["/openai", "model:fast", "default"]},
+			{"name": "rule-b", "pattern": "TOKEN_[0-9]+", "keys": ["default", "mobile-app"]}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}

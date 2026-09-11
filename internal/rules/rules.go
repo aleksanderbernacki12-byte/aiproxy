@@ -80,6 +80,49 @@ type BodyRegexRule struct {
 	Pattern *regexp.Regexp
 	Action  Action
 	DryRun  bool
+
+	// Targets, if non-empty, restricts this rule to matching only a
+	// request/response whose Request.Target (see Evaluate/EvaluateResponse)
+	// is one of these values — a request routed anywhere else is treated
+	// exactly as if this rule didn't exist, falling through to whatever
+	// rule or Default would otherwise apply. Empty (nil, the default)
+	// means this rule applies to every target, unchanged from before this
+	// field existed.
+	Targets []string
+
+	// Keys, if non-empty, restricts this rule to matching only a
+	// request/response whose Request.Key is one of these values — same
+	// falls-through-as-if-absent behavior as Targets. Empty (nil, the
+	// default) means this rule applies regardless of which key (or none)
+	// made the request. When both Targets and Keys are set, both must
+	// match — the two dimensions narrow the same rule together rather
+	// than being alternatives.
+	Keys []string
+}
+
+// inScope reports whether a BodyRegexRule scoped to targets/keys applies
+// to a request resolved to reqTarget/reqKey: true whenever a given list
+// is empty (no restriction on that dimension) or contains the request's
+// value. Two empty lists therefore always return true, the same
+// "applies everywhere" behavior every rule had before Targets/Keys
+// existed.
+func inScope(targets, keys []string, reqTarget, reqKey string) bool {
+	if len(targets) > 0 && !containsString(targets, reqTarget) {
+		return false
+	}
+	if len(keys) > 0 && !containsString(keys, reqKey) {
+		return false
+	}
+	return true
+}
+
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // DryRunMatch records one rule that matched during evaluation but was
@@ -132,6 +175,17 @@ type Request struct {
 	URL     string
 	Body    []byte
 	Headers map[string][]string
+
+	// Target and Key identify which resolved upstream target and which
+	// authenticated proxy key (if any) this request belongs to, purely so
+	// a BodyRegexRule's own Targets/Keys scoping (see BodyRegexRule) can
+	// be checked against it — the engine assigns no other meaning to
+	// either value and never inspects them itself beyond that comparison.
+	// A caller with no such concept (or that never scopes any rule) can
+	// leave both zero-valued: every rule with empty Targets/Keys still
+	// matches unconditionally either way.
+	Target string
+	Key    string
 }
 
 // Engine evaluates requests against ordered rule sets. Path rules are
@@ -218,6 +272,9 @@ func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]str
 	}
 
 	for _, r := range e.bodyRules {
+		if !inScope(r.Targets, r.Keys, req.Target, req.Key) {
+			continue
+		}
 		if r.Pattern.Match(req.Body) {
 			if r.DryRun {
 				dryRunHits = append(dryRunHits, DryRunMatch{RuleName: r.Name, Action: r.Action})
@@ -231,7 +288,7 @@ func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]str
 		}
 	}
 
-	action, ruleName, headers, matched, headerDryRunHits := e.evaluateHeaders(req.Headers)
+	action, ruleName, headers, matched, headerDryRunHits := e.evaluateHeaders(req.Headers, req.Target, req.Key)
 	dryRunHits = dedupeDryRunMatches(append(dryRunHits, headerDryRunHits...))
 	if matched {
 		return action, ruleName, req.Body, headers, dryRunHits, nil
@@ -243,18 +300,25 @@ func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]str
 // EvaluateResponse checks body — an upstream response body, not a
 // request — against the same body regex rules Evaluate uses, entirely
 // ignoring header and path rules: a response has no request path, and
-// its headers are provider metadata, not model-generated content. It
-// returns the action, the name of the rule that produced it (empty when
-// nothing matched, which is always Allow here — there is no Default to
-// fall back to the way Evaluate has for an unmatched request), the body
-// to actually forward (body unchanged, unless the matched rule's Action
-// is Redact, in which case every occurrence of its pattern has been
-// replaced with a "[REDACTED:<rule name>]" placeholder, same convention
-// as Evaluate), and every DryRun rule that matched (nil if none) — see
-// Evaluate for what DryRun means.
-func (e *Engine) EvaluateResponse(body []byte) (Action, string, []byte, []DryRunMatch) {
+// its headers are provider metadata, not model-generated content.
+// target and key are the same values the originating request's own
+// Request.Target/Request.Key carried, so a rule scoped via
+// BodyRegexRule.Targets/Keys applies identically to that request's
+// response as it did to the request itself. It returns the action, the
+// name of the rule that produced it (empty when nothing matched, which
+// is always Allow here — there is no Default to fall back to the way
+// Evaluate has for an unmatched request), the body to actually forward
+// (body unchanged, unless the matched rule's Action is Redact, in which
+// case every occurrence of its pattern has been replaced with a
+// "[REDACTED:<rule name>]" placeholder, same convention as Evaluate),
+// and every DryRun rule that matched (nil if none) — see Evaluate for
+// what DryRun means.
+func (e *Engine) EvaluateResponse(body []byte, target, key string) (Action, string, []byte, []DryRunMatch) {
 	var dryRunHits []DryRunMatch
 	for _, r := range e.bodyRules {
+		if !inScope(r.Targets, r.Keys, target, key) {
+			continue
+		}
 		if r.Pattern.Match(body) {
 			if r.DryRun {
 				dryRunHits = append(dryRunHits, DryRunMatch{RuleName: r.Name, Action: r.Action})
@@ -282,7 +346,7 @@ func (e *Engine) EvaluateResponse(body []byte) (Action, string, []byte, []DryRun
 // that matches a header value is recorded but never returned as the
 // actual action — scanning continues to the next rule/value exactly as
 // if it hadn't matched.
-func (e *Engine) evaluateHeaders(headers map[string][]string) (action Action, ruleName string, result map[string][]string, matched bool, dryRunHits []DryRunMatch) {
+func (e *Engine) evaluateHeaders(headers map[string][]string, reqTarget, reqKey string) (action Action, ruleName string, result map[string][]string, matched bool, dryRunHits []DryRunMatch) {
 	if len(headers) == 0 {
 		return Allow, "", headers, false, nil
 	}
@@ -295,6 +359,9 @@ func (e *Engine) evaluateHeaders(headers map[string][]string) (action Action, ru
 
 	for _, name := range names {
 		for _, r := range e.bodyRules {
+			if !inScope(r.Targets, r.Keys, reqTarget, reqKey) {
+				continue
+			}
 			for _, v := range headers[name] {
 				if !r.Pattern.MatchString(v) {
 					continue

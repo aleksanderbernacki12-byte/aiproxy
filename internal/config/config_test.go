@@ -75,6 +75,35 @@ func TestLoad_ParsesCustomRuleDryRun(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesCustomRuleTargetsAndKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"custom_rules": [
+		{"name": "scoped-rule", "pattern": "SECRET_[0-9]+", "targets": ["/openai", "model:fast"], "keys": ["mobile-app"]},
+		{"name": "unscoped-rule", "pattern": "OTHER_[0-9]+"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.CustomRules[0].Targets) != 2 || cfg.CustomRules[0].Targets[0] != "/openai" || cfg.CustomRules[0].Targets[1] != "model:fast" {
+		t.Fatalf("CustomRules[0].Targets = %v, want [/openai model:fast]", cfg.CustomRules[0].Targets)
+	}
+	if len(cfg.CustomRules[0].Keys) != 1 || cfg.CustomRules[0].Keys[0] != "mobile-app" {
+		t.Fatalf("CustomRules[0].Keys = %v, want [mobile-app]", cfg.CustomRules[0].Keys)
+	}
+	if cfg.CustomRules[1].Targets != nil {
+		t.Fatalf("CustomRules[1].Targets = %v, want nil when absent", cfg.CustomRules[1].Targets)
+	}
+	if cfg.CustomRules[1].Keys != nil {
+		t.Fatalf("CustomRules[1].Keys = %v, want nil when absent", cfg.CustomRules[1].Keys)
+	}
+}
+
 func TestLoad_ParsesBuiltinRuleActions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
