@@ -625,6 +625,40 @@ type Config struct {
 	// this field existed.
 	CacheRequestCoalescing bool `json:"cache_request_coalescing,omitempty"`
 
+	// SemanticCacheEnabled turns on an approximate second cache layer:
+	// when the exact-match cache misses, aiproxy checks whether a
+	// recent, sufficiently similar request (see SemanticCacheThreshold)
+	// already produced a cached answer for this target, using only a
+	// local text-similarity comparison — no external embeddings API, no
+	// added latency or cost on a miss. Global only, no per-target
+	// override, mirroring CacheRequestCoalescing rather than the older
+	// per-target CacheEnabled/CacheTTLSeconds pattern. A hit here is
+	// marked with an X-Semantic-Cache-Hit response header, unlike
+	// CacheRequestCoalescing's deliberately invisible replay: unlike
+	// coalescing, which serves the literal answer the client would have
+	// gotten anyway, a semantic hit can serve the answer to a materially
+	// different request, which the client should be able to detect. Only
+	// meaningful alongside CacheEnabled, same reasoning as
+	// CacheRequestCoalescing: there's no cache key for a semantic match
+	// to point at otherwise. false (the default) means this second
+	// lookup layer never runs at all, unchanged from before this field
+	// existed.
+	SemanticCacheEnabled bool `json:"semantic_cache_enabled,omitempty"`
+
+	// SemanticCacheThreshold is the minimum Jaccard similarity (0
+	// exclusive, 1 inclusive) two requests' extracted prompt text must
+	// reach for the more recent one to be served the older one's cached
+	// answer — see the semcache package. Required whenever
+	// SemanticCacheEnabled is true: unlike CacheTTLSeconds' "zero means
+	// never expire" default, there is no universally safe default
+	// threshold (too low risks serving a mismatched answer, too high
+	// makes the feature a no-op, and the right value is inherently
+	// workload-specific), the same reasoning IdempotencyTTLSeconds
+	// already requires an explicit value for — including that same
+	// field's asymmetry: a threshold set without SemanticCacheEnabled is
+	// not itself flagged as an error, only the reverse.
+	SemanticCacheThreshold float64 `json:"semantic_cache_threshold,omitempty"`
+
 	// IdempotencyEnabled turns on Idempotency-Key deduplication: a
 	// client that sends the same Idempotency-Key header on a retried
 	// request gets back the exact same response instead of triggering a
