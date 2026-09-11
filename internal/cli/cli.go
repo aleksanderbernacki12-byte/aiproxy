@@ -192,6 +192,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.HealthCheckInterval = lc.healthCheckInterval
 	server.HealthCheckPath = lc.healthCheckPath
 	server.TargetCostRates = lc.targetCostRates
+	server.TargetShadowURL = lc.targetShadowURL
+	server.TargetShadowSampleRate = lc.targetShadowSampleRate
 	server.IPLimiter = lc.ipLimiter
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
@@ -257,6 +259,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if len(lc.targetCostRates) > 0 {
 			fmt.Fprintf(stdout, "per-target cost overrides: %d\n", len(lc.targetCostRates))
+		}
+		if len(lc.targetShadowURL) > 0 {
+			fmt.Fprintf(stdout, "shadow traffic: %d target(s) mirrored\n", len(lc.targetShadowURL))
 		}
 		if cfg.CostBudget > 0 {
 			fmt.Fprintf(stdout, "cost budget: %g (alerts once, on/after crossing)\n", cfg.CostBudget)
@@ -458,7 +463,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate)
 
 	label := loadedFrom
 	if label == "" {
@@ -519,6 +524,9 @@ type liveConfig struct {
 	cacheTTL           time.Duration
 	targetCacheTTL     map[string]time.Duration
 	targetCacheEnabled map[string]bool
+
+	targetShadowURL        map[string]*url.URL
+	targetShadowSampleRate map[string]float64
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -648,6 +656,30 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	}
 	if len(targetCacheEnabled) > 0 {
 		lc.targetCacheEnabled = targetCacheEnabled
+	}
+
+	// Built the same way as targetCostRates, above — see
+	// proxy.Server.TargetShadowURL/TargetShadowSampleRate. Only entries
+	// that actually set shadow_url are included; every other label
+	// simply has no shadow target at all, unchanged from before this
+	// field existed.
+	targetShadowURL := make(map[string]*url.URL)
+	targetShadowSampleRate := make(map[string]float64)
+	addShadowOverride := func(label string, shadowURL *url.URL, sampleRate float64) {
+		if shadowURL != nil {
+			targetShadowURL[label] = shadowURL
+			targetShadowSampleRate[label] = sampleRate
+		}
+	}
+	for _, r := range lc.routes {
+		addShadowOverride(r.prefix, r.shadowURL, r.shadowSampleRate)
+	}
+	for _, r := range lc.modelRoutes {
+		addShadowOverride("model:"+r.name, r.shadowURL, r.shadowSampleRate)
+	}
+	if len(targetShadowURL) > 0 {
+		lc.targetShadowURL = targetShadowURL
+		lc.targetShadowSampleRate = targetShadowSampleRate
 	}
 
 	ipAllowList, allowErrs := compileIPList("ip_allow_list", cfg.IPAllowList)
@@ -1207,6 +1239,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
 	fmt.Fprintf(stdout, "  cache max size:          %s\n", cacheMaxSizeDisplay(cfg.CacheMaxSizeBytes))
 	fmt.Fprintf(stdout, "  per-target cache overrides: %d\n", countCacheOverrides(cfg))
+	fmt.Fprintf(stdout, "  shadow traffic targets:  %d\n", countShadowTargets(cfg))
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  cost budget:             %g\n", cfg.CostBudget)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
@@ -1384,6 +1417,23 @@ func countCacheOverrides(cfg *config.Config) int {
 	}
 	for _, r := range cfg.ModelRoutes {
 		if r.CacheEnabled != nil || r.CacheTTLSeconds > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// countShadowTargets counts how many targets/model_routes entries set
+// shadow_url, for the validate summary — mirrors countCacheOverrides.
+func countShadowTargets(cfg *config.Config) int {
+	n := 0
+	for _, t := range cfg.Targets {
+		if t.ShadowURL != "" {
+			n++
+		}
+	}
+	for _, r := range cfg.ModelRoutes {
+		if r.ShadowURL != "" {
 			n++
 		}
 	}
@@ -1708,6 +1758,8 @@ type targetRoute struct {
 	costPer1KTokens      float64
 	cacheEnabled         *bool
 	cacheTTLSeconds      int
+	shadowURL            *url.URL
+	shadowSampleRate     float64
 }
 
 // formatTargetsForDisplay renders a targetRoute's candidate list for the
@@ -1817,8 +1869,17 @@ func compileTargetRoutes(targets []config.Target, globalCacheEnabled bool) ([]ta
 			errs = append(errs, fmt.Errorf("targets: prefix %q: cache_enabled/cache_ttl_seconds requires the top-level cache_enabled to be set (there's no cache for a target override to apply to otherwise)", t.Prefix))
 			continue
 		}
+		if t.ShadowURL == "" && t.ShadowSampleRate != 0 {
+			errs = append(errs, fmt.Errorf("targets: prefix %q: shadow_sample_rate requires shadow_url to be set (there's no shadow target for a sample rate to apply to otherwise)", t.Prefix))
+			continue
+		}
+		shadowURL, shadowSampleRate, shadowErrs := compileShadowTarget(fmt.Sprintf("targets: prefix %q", t.Prefix), t.ShadowURL, t.ShadowSampleRate)
+		if len(shadowErrs) > 0 {
+			errs = append(errs, shadowErrs...)
+			continue
+		}
 
-		tr := targetRoute{prefix: t.Prefix, targets: urls, weights: weights, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute, costPer1KTokens: t.CostPer1KTokens, cacheEnabled: t.CacheEnabled, cacheTTLSeconds: t.CacheTTLSeconds}
+		tr := targetRoute{prefix: t.Prefix, targets: urls, weights: weights, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute, costPer1KTokens: t.CostPer1KTokens, cacheEnabled: t.CacheEnabled, cacheTTLSeconds: t.CacheTTLSeconds, shadowURL: shadowURL, shadowSampleRate: shadowSampleRate}
 		if t.MaxRequestsPerMinute > 0 {
 			tr.limiter = limiter.New(t.MaxRequestsPerMinute, time.Minute)
 		}
@@ -1909,6 +1970,34 @@ func compileURLCandidates(label, rawURL string, rawURLs []string, rawWeightedURL
 	return urls, nil, nil
 }
 
+// compileShadowTarget resolves an entry's shadow_url/shadow_sample_rate
+// fields, shared by compileTargetRoutes and compileModelRoutes the same
+// way compileURLCandidates is. rawURL == "" means no shadowing at all
+// for this entry — the overwhelmingly common case — in which case
+// rawRate is ignored entirely if nonzero (checked by the caller before
+// this runs, same as CacheTTLSeconds requiring CacheEnabled/the
+// top-level cache; see compileTargetRoutes). Otherwise rawURL must pass
+// the same https validation as url/urls, and rawRate, if nonzero, must
+// be in (0, 1] — zero/absent defaults to 1.0 (mirror every forwarded
+// request), see config.Target.ShadowSampleRate.
+func compileShadowTarget(label, rawURL string, rawRate float64) (*url.URL, float64, []error) {
+	if rawURL == "" {
+		return nil, 0, nil
+	}
+	u, err := parseHTTPSURL(rawURL)
+	if err != nil {
+		return nil, 0, []error{fmt.Errorf("%s: shadow_url %w", label, err)}
+	}
+	if rawRate < 0 || rawRate > 1 {
+		return nil, 0, []error{fmt.Errorf("%s: shadow_sample_rate %g must be in (0, 1]", label, rawRate)}
+	}
+	rate := rawRate
+	if rate == 0 {
+		rate = 1.0
+	}
+	return u, rate, nil
+}
+
 // compileModelRoutes validates and parses each model_routes entry from
 // the config file. name must be non-empty and unique; models must be a
 // non-empty list of syntactically valid path.Match glob patterns, and
@@ -1992,8 +2081,17 @@ func compileModelRoutes(routes []config.ModelRoute, globalCacheEnabled bool) ([]
 			errs = append(errs, fmt.Errorf("model_routes: %q: cache_enabled/cache_ttl_seconds requires the top-level cache_enabled to be set (there's no cache for a route override to apply to otherwise)", r.Name))
 			continue
 		}
+		if r.ShadowURL == "" && r.ShadowSampleRate != 0 {
+			errs = append(errs, fmt.Errorf("model_routes: %q: shadow_sample_rate requires shadow_url to be set (there's no shadow target for a sample rate to apply to otherwise)", r.Name))
+			continue
+		}
+		shadowURL, shadowSampleRate, shadowErrs := compileShadowTarget(fmt.Sprintf("model_routes: %q", r.Name), r.ShadowURL, r.ShadowSampleRate)
+		if len(shadowErrs) > 0 {
+			errs = append(errs, shadowErrs...)
+			continue
+		}
 
-		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, weights: weights, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute, costPer1KTokens: r.CostPer1KTokens, cacheEnabled: r.CacheEnabled, cacheTTLSeconds: r.CacheTTLSeconds}
+		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, weights: weights, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute, costPer1KTokens: r.CostPer1KTokens, cacheEnabled: r.CacheEnabled, cacheTTLSeconds: r.CacheTTLSeconds, shadowURL: shadowURL, shadowSampleRate: shadowSampleRate}
 		if r.MaxRequestsPerMinute > 0 {
 			mr.limiter = limiter.New(r.MaxRequestsPerMinute, time.Minute)
 		}
@@ -2021,6 +2119,8 @@ type modelRoute struct {
 	costPer1KTokens      float64
 	cacheEnabled         *bool
 	cacheTTLSeconds      int
+	shadowURL            *url.URL
+	shadowSampleRate     float64
 }
 
 // compileProxyAPIKeys validates and resolves the config file's

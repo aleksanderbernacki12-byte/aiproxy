@@ -39,6 +39,8 @@ type counters struct {
 	responseBlocked  atomic.Int64
 	responseRedacted atomic.Int64
 	failover         atomic.Int64
+	shadowSent       atomic.Int64
+	shadowError      atomic.Int64
 
 	latencyBuckets  [len(latencyBucketsSeconds)]atomic.Int64
 	latencyCount    atomic.Int64
@@ -58,6 +60,8 @@ func (c *counters) snapshot() Snapshot {
 		ResponseBlocked:  c.responseBlocked.Load(),
 		ResponseRedacted: c.responseRedacted.Load(),
 		Failover:         c.failover.Load(),
+		ShadowSent:       c.shadowSent.Load(),
+		ShadowError:      c.shadowError.Load(),
 		Latency:          c.latencySnapshot(),
 	}
 }
@@ -462,6 +466,29 @@ func (s *Stats) RecordFailover(target string) {
 	s.counterFor(target).failover.Add(1)
 }
 
+// RecordShadowSent records one request successfully mirrored to
+// target's own shadow destination — see the proxy package's
+// TargetShadowURL/mirrorToShadow. "Successfully" means delivery only:
+// the shadow response's own status code, body, and latency are
+// discarded entirely and never inspected, so a shadow target that
+// itself answers with a 500 still counts here, not as an error — only
+// a failure to even complete the round trip (a dial/TLS/timeout
+// failure, or the request never being built at all) counts as
+// RecordShadowError instead. Attributed to target (the real route
+// being mirrored, not the shadow destination itself, which has no
+// stats identity of its own) like RecordFailover.
+func (s *Stats) RecordShadowSent(target string) {
+	s.overall.shadowSent.Add(1)
+	s.counterFor(target).shadowSent.Add(1)
+}
+
+// RecordShadowError records one shadow-mirror attempt that never
+// completed a round trip at all — see RecordShadowSent.
+func (s *Stats) RecordShadowError(target string) {
+	s.overall.shadowError.Add(1)
+	s.counterFor(target).shadowError.Add(1)
+}
+
 // RecordLatency records how long one successful upstream RoundTrip took
 // for target — see failoverTransport in the proxy package, the only
 // caller. When a request failed over across candidates before finally
@@ -795,6 +822,14 @@ type Snapshot struct {
 	// failover is always about one specific route's own candidate list.
 	Failover int64 `json:"failover"`
 
+	// ShadowSent/ShadowError count requests mirrored to a target's own
+	// shadow destination — see Stats.RecordShadowSent/RecordShadowError
+	// and the proxy package's TargetShadowURL. Broken down per target
+	// like Failover, same reasoning: a shadow mirror is always about
+	// one specific route's own configured destination.
+	ShadowSent  int64 `json:"shadow_sent"`
+	ShadowError int64 `json:"shadow_error"`
+
 	// Latency summarizes observed upstream response times as a
 	// Prometheus-style histogram — see Stats.RecordLatency. Present at
 	// every level (top-level, and inside each PerTarget entry) same as
@@ -956,6 +991,11 @@ func (s Snapshot) String() string {
 	if s.Failover > 0 {
 		out += fmt.Sprintf("\nFailovers:            %d", s.Failover)
 	}
+	// Same reasoning again: 0 for every run that never configured a
+	// shadow_url anywhere, or that did but sent no traffic through it.
+	if s.ShadowSent > 0 || s.ShadowError > 0 {
+		out += fmt.Sprintf("\nShadow mirrored:      %d (errors: %d)", s.ShadowSent, s.ShadowError)
+	}
 	// Same reasoning again: 0 for every run that never configured
 	// max_tokens_per_minute anywhere, or that did but never actually
 	// tripped it.
@@ -996,6 +1036,9 @@ func (s Snapshot) PerTargetString(rates CostRates) string {
 		}
 		if t.Failover > 0 {
 			fmt.Fprintf(&b, " failover=%d", t.Failover)
+		}
+		if t.ShadowSent > 0 || t.ShadowError > 0 {
+			fmt.Fprintf(&b, " shadow-sent=%d shadow-errors=%d", t.ShadowSent, t.ShadowError)
 		}
 		if t.TokenRateLimited > 0 {
 			fmt.Fprintf(&b, " token-rate-limited=%d", t.TokenRateLimited)

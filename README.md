@@ -1489,6 +1489,62 @@ route already gets (the aggregate `targets[].prefix` label) — if you
 need to compare metrics between the two sides of a split directly, give
 each its own separate route/prefix instead.
 
+### Shadow traffic (mirroring)
+
+Weighted traffic splitting *shares* real traffic between candidates —
+whichever one is picked gets to answer, and that answer is what the
+client actually receives. Shadow traffic is the opposite: every request
+still goes to the real target exactly as before, but a copy is *also*
+sent, in the background, to a second destination purely for
+observation. Its response — success, failure, whatever it says — is
+discarded entirely and can never affect what the client gets back. For
+canary-testing a new model, provider, or version against real
+production traffic with zero risk to what's actually served:
+
+```json
+{
+  "targets": [
+    {
+      "prefix": "/chat",
+      "url": "https://api.openai.com",
+      "shadow_url": "https://api.newmodel.com",
+      "shadow_sample_rate": 0.1
+    }
+  ]
+}
+```
+
+`shadow_url` mirrors a copy of every request this target forwards —
+after the exact same [secret-scanning/redaction](#redacting-instead-of-blocking)
+the real request goes through, so the shadow target can never see
+anything the real one wouldn't also see. `shadow_sample_rate` controls
+what fraction actually gets mirrored (`0.1` above means roughly 10%);
+it's meaningless without `shadow_url` and must be in `(0, 1]` if set.
+Left unset while `shadow_url` *is* set, it defaults to `1.0` — mirror
+*every* forwarded request — since configuring a shadow target at all is
+already a deliberate act; **that doubles the real, possibly billed cost
+of every mirrored call**, so lower it once a full mirror isn't
+necessary. Works the same way on a `model_routes[]` entry. A request the
+rule engine blocks, or that never gets forwarded at all (a cache hit,
+a rate-limited request), is never mirrored — there's nothing genuine to
+compare a shadow target's own behavior against.
+
+The mirror runs entirely on its own goroutine, using its own timeout
+independent of the real request: a slow, hung, or completely
+unreachable shadow target can never add latency to the client's own
+response, or turn into an error for it, in any way. Only whether
+delivery itself succeeded is tracked — `stats.shadow_sent`/
+`stats.shadow_error` and `aiproxy_shadow_sent_total`/
+`aiproxy_shadow_error_total` in Prometheus, both broken down per target
+like `failover` — with a delivery failure additionally logged
+(`[SHADOW ERROR]`); a successful mirror is deliberately not logged
+per-request, so a fully-sampled shadow target doesn't double the log
+stream's volume for the expected, uninteresting case. There's no
+separate per-shadow-candidate breakdown beyond that: if you need real
+metrics comparison between the primary and its shadow, point your own
+monitoring at the shadow target directly, or give it its own separate
+route.
+
 ### Automatically deprioritizing a failing candidate
 
 Failover already moves a request on to the next candidate URL when one

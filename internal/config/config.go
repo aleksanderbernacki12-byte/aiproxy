@@ -259,6 +259,36 @@ type Target struct {
 	// override; this target's entries expire on the top-level TTL
 	// instead (or never, if that's unset too).
 	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
+
+	// ShadowURL, if set, mirrors a copy of every request this target
+	// forwards to a second, independent destination — after the exact
+	// same rule processing (redaction included) the real request goes
+	// through, so the shadow target can never receive anything the
+	// real one wouldn't also see. Runs in the background: its response
+	// (success or failure, whatever its status code) is discarded
+	// entirely and never affects the client's own response in any
+	// way — not its status code, not its latency, not whether it
+	// succeeds at all. For canary-testing a new model/provider/version
+	// against real production traffic with zero risk to what the
+	// client actually receives. Independent of URL/URLs/WeightedURLs:
+	// this target still resolves its own real candidate(s) completely
+	// normally; the shadow is purely an extra, disposable copy sent
+	// alongside, with no failover, retries, or target-ejection
+	// tracking of its own. Must pass the same https validation as URL.
+	// Empty (the default) means no shadowing at all for this target.
+	ShadowURL string `json:"shadow_url,omitempty"`
+
+	// ShadowSampleRate controls what fraction of this target's
+	// forwarded requests actually get mirrored to ShadowURL — a value
+	// in (0, 1]. Meaningless without ShadowURL, same reasoning as
+	// CacheTTLSeconds without CacheEnabled. Zero/absent, when ShadowURL
+	// IS set, defaults to 1.0 (mirror every forwarded request) —
+	// configuring a shadow target at all is already a deliberate act,
+	// so mirroring everything by default is the least surprising
+	// starting point; lower it to reduce the shadow target's own
+	// load/cost (and the real, possibly billed cost of a canary
+	// upstream) once a full mirror isn't necessary.
+	ShadowSampleRate float64 `json:"shadow_sample_rate,omitempty"`
 }
 
 // ModelRoute is one model-name-to-upstream mapping for content-based
@@ -320,6 +350,13 @@ type ModelRoute struct {
 	// "model:<name>" label instead of a targets[] prefix.
 	CacheEnabled    *bool `json:"cache_enabled,omitempty"`
 	CacheTTLSeconds int   `json:"cache_ttl_seconds,omitempty"`
+
+	// ShadowURL/ShadowSampleRate mirror a copy of this route's own
+	// forwarded requests to a second destination — same meaning as
+	// Target.ShadowURL/Target.ShadowSampleRate, keyed under the
+	// "model:<name>" label instead of a targets[] prefix.
+	ShadowURL        string  `json:"shadow_url,omitempty"`
+	ShadowSampleRate float64 `json:"shadow_sample_rate,omitempty"`
 }
 
 // Config is the top-level shape of aiproxy.json.

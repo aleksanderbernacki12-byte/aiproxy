@@ -859,7 +859,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	}
 
 	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	// The freshly reloaded Registry starts cold — no baseline exists
 	// for this client yet, so (correctly, per Detector's own cold-start
@@ -4822,7 +4822,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -4884,7 +4884,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 		}
 	}()
 
@@ -5893,7 +5893,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -7166,7 +7166,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -7498,7 +7498,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -7872,7 +7872,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -8332,7 +8332,7 @@ func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
 
 	tb := breaker.NewRegistry(1, time.Hour)
 	reloadedRoutes := []proxy.Route{{Prefix: "/openai", Targets: []*url.URL{brokenURL, healthyURL}}}
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	get := func() {
 		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
@@ -9215,7 +9215,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -10037,7 +10037,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -10353,7 +10353,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -10708,7 +10708,7 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -11149,7 +11149,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -11188,7 +11188,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
@@ -12107,7 +12107,7 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
 
 	start := time.Now()
 	resp, err := http.Get(frontend.URL + "/v1/chat")
@@ -13661,5 +13661,393 @@ func TestServer_WeightedRouting_CacheKeyTracksTheActuallyChosenCandidate(t *test
 	}
 	if lightHits.Load() != 0 {
 		t.Fatalf("light upstream hits = %d, want 0 (999999:1 weight should never have picked it across these 2 requests)", lightHits.Load())
+	}
+}
+
+// TestServer_ShadowTraffic_MirrorsAllowedRequestToShadowTarget proves
+// the core mechanism: an allowed request forwarded to the real target
+// also, in the background, reaches the configured shadow target with
+// the same method, path, and body.
+func TestServer_ShadowTraffic_MirrorsAllowedRequestToShadowTarget(t *testing.T) {
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("real response"))
+	}))
+	defer real.Close()
+	realURL, err := url.Parse(real.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	type shadowReq struct {
+		method, path, body string
+	}
+	received := make(chan shadowReq, 1)
+	shadow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- shadowReq{method: r.Method, path: r.URL.Path, body: string(body)}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer shadow.Close()
+	shadowURL, err := url.Parse(shadow.URL)
+	if err != nil {
+		t.Fatalf("parse shadow url: %v", err)
+	}
+
+	srv := proxy.New("unused", realURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TargetShadowURL = map[string]*url.URL{"default": shadowURL}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(`{"a":1}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "real response" {
+		t.Fatalf("client response = %q, want %q (must always come from the real target)", body, "real response")
+	}
+
+	select {
+	case got := <-received:
+		if got.method != http.MethodPost {
+			t.Errorf("shadow method = %q, want POST", got.method)
+		}
+		if got.path != "/v1/chat" {
+			t.Errorf("shadow path = %q, want /v1/chat", got.path)
+		}
+		if got.body != `{"a":1}` {
+			t.Errorf("shadow body = %q, want %q", got.body, `{"a":1}`)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shadow target never received a mirrored request")
+	}
+}
+
+// TestServer_ShadowTraffic_ClientResponseUnaffectedByASlowShadowTarget
+// proves shadowing runs entirely in the background: the client's own
+// response returns as soon as the real target answers, never waiting on
+// a shadow target that's still hanging.
+func TestServer_ShadowTraffic_ClientResponseUnaffectedByASlowShadowTarget(t *testing.T) {
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("real response"))
+	}))
+	defer real.Close()
+	realURL, err := url.Parse(real.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	shadowEntered := make(chan struct{})
+	releaseShadow := make(chan struct{})
+	shadow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(shadowEntered)
+		<-releaseShadow
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer shadow.Close()
+	shadowURL, err := url.Parse(shadow.URL)
+	if err != nil {
+		t.Fatalf("parse shadow url: %v", err)
+	}
+
+	srv := proxy.New("unused", realURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TargetShadowURL = map[string]*url.URL{"default": shadowURL}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	start := time.Now()
+	resp, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	elapsed := time.Since(start)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("client response took %s, want well under 1s — it must never wait on the shadow target", elapsed)
+	}
+
+	select {
+	case <-shadowEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shadow target was never even reached")
+	}
+	close(releaseShadow)
+}
+
+// TestServer_ShadowTraffic_ClientResponseUnaffectedByAnUnreachableShadowTarget
+// proves a shadow target that's simply down never turns into an error
+// for the client — the real response is still a clean 200.
+func TestServer_ShadowTraffic_ClientResponseUnaffectedByAnUnreachableShadowTarget(t *testing.T) {
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("real response"))
+	}))
+	defer real.Close()
+	realURL, err := url.Parse(real.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	deadURL, err := url.Parse("http://" + freeLoopbackAddr(t))
+	if err != nil {
+		t.Fatalf("parse dead url: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", realURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(&logBuf, "", 0)
+	srv.TargetShadowURL = map[string]*url.URL{"default": deadURL}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "real response" {
+		t.Fatalf("status=%d body=%q, want 200 %q (an unreachable shadow target must never affect the real response)", resp.StatusCode, body, "real response")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if snap := srv.Stats.Snapshot(); snap.ShadowError == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Stats.ShadowError never reached 1; snapshot = %+v", srv.Stats.Snapshot())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(logBuf.String(), "[SHADOW ERROR]") {
+		t.Fatalf("log missing [SHADOW ERROR] line: %q", logBuf.String())
+	}
+}
+
+// TestServer_ShadowTraffic_BlockedRequestIsNeverMirrored proves a
+// request the rule engine blocks never reaches the shadow target at
+// all — there's nothing genuine to compare a canary's behavior against
+// once the real request was never forwarded either.
+func TestServer_ShadowTraffic_BlockedRequestIsNeverMirrored(t *testing.T) {
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer real.Close()
+	realURL, err := url.Parse(real.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	var shadowHits atomic.Int32
+	shadow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		shadowHits.Add(1)
+	}))
+	defer shadow.Close()
+	shadowURL, err := url.Parse(shadow.URL)
+	if err != nil {
+		t.Fatalf("parse shadow url: %v", err)
+	}
+
+	srv := proxy.New("unused", realURL, rules.NewEngine(rules.Block)) // blocks everything
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TargetShadowURL = map[string]*url.URL{"default": shadowURL}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (blocked)", resp.StatusCode)
+	}
+
+	time.Sleep(200 * time.Millisecond) // give a wrongly-fired mirror a chance to land
+	if got := shadowHits.Load(); got != 0 {
+		t.Fatalf("shadow target received %d requests, want 0 (a blocked request must never be mirrored)", got)
+	}
+}
+
+// TestServer_ShadowTraffic_MirrorsTheRedactedBodyNeverTheRawOne is the
+// feature's central safety property: a shadow target must never see
+// anything the real one wouldn't also see. When a rule redacts a
+// matched secret, the shadow target must receive the SAME redacted
+// body the real target gets — never the raw, unredacted client body.
+func TestServer_ShadowTraffic_MirrorsTheRedactedBodyNeverTheRawOne(t *testing.T) {
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("real response"))
+	}))
+	defer real.Close()
+	realURL, err := url.Parse(real.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	shadowBody := make(chan string, 1)
+	shadow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		shadowBody <- string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer shadow.Close()
+	shadowURL, err := url.Parse(shadow.URL)
+	if err != nil {
+		t.Fatalf("parse shadow url: %v", err)
+	}
+
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "openai-api-key", Pattern: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`), Action: rules.Redact})
+
+	srv := proxy.New("unused", realURL, engine)
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TargetShadowURL = map[string]*url.URL{"default": shadowURL}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const secret = "sk-abcdefghijklmnopqrstuvwx"
+	resp, err := http.Post(frontend.URL+"/v1/chat", "text/plain", strings.NewReader("key="+secret))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-shadowBody:
+		if strings.Contains(got, secret) {
+			t.Fatalf("shadow target received the RAW secret: %q — redaction must apply before mirroring", got)
+		}
+		if !strings.Contains(got, "REDACTED") {
+			t.Fatalf("shadow body = %q, want it to carry the same [REDACTED:...] marker the real target gets", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shadow target never received a mirrored request")
+	}
+}
+
+// TestServer_ShadowTraffic_OnlyTargetsWithShadowURLConfiguredAreMirrored
+// proves shadowing is genuinely per-target: a route with no shadow_url
+// of its own never mirrors anything, even while a different route on
+// the same server does.
+func TestServer_ShadowTraffic_OnlyTargetsWithShadowURLConfiguredAreMirrored(t *testing.T) {
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer real.Close()
+	realURL, err := url.Parse(real.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	var shadowHits atomic.Int32
+	shadow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		shadowHits.Add(1)
+	}))
+	defer shadow.Close()
+	shadowURL, err := url.Parse(shadow.URL)
+	if err != nil {
+		t.Fatalf("parse shadow url: %v", err)
+	}
+
+	srv := proxy.New("unused", realURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	// Only "/mirrored" gets a shadow target — the bare default (-target,
+	// labeled "default") and any other route never do.
+	srv.AddRoute("/mirrored", []*url.URL{realURL}, nil, nil, nil)
+	srv.TargetShadowURL = map[string]*url.URL{"/mirrored": shadowURL}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	get := func(path string) {
+		resp, err := http.Get(frontend.URL + path)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+	get("/unmirrored")
+	get("/unmirrored")
+	time.Sleep(200 * time.Millisecond)
+	if got := shadowHits.Load(); got != 0 {
+		t.Fatalf("shadow target received %d requests from the unconfigured route, want 0", got)
+	}
+
+	get("/mirrored/v1")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if shadowHits.Load() == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shadow target received %d requests from the configured route, want 1", shadowHits.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestServer_ShadowTraffic_SampleRateApproximatesConfiguredFraction
+// statistically proves ShadowSampleRate actually controls what
+// fraction of forwarded requests get mirrored — mirroring the same
+// statistical-dominance style TestServer_WeightedRouting_
+// SplitApproximatesConfiguredWeights already established for weighted
+// routing.
+func TestServer_ShadowTraffic_SampleRateApproximatesConfiguredFraction(t *testing.T) {
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer real.Close()
+	realURL, err := url.Parse(real.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	var shadowHits atomic.Int32
+	shadow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		shadowHits.Add(1)
+	}))
+	defer shadow.Close()
+	shadowURL, err := url.Parse(shadow.URL)
+	if err != nil {
+		t.Fatalf("parse shadow url: %v", err)
+	}
+
+	srv := proxy.New("unused", realURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.TargetShadowURL = map[string]*url.URL{"default": shadowURL}
+	srv.TargetShadowSampleRate = map[string]float64{"default": 0.1}
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const n = 400
+	for i := 0; i < n; i++ {
+		resp, err := http.Get(frontend.URL + "/v1/chat")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var got int32
+	for {
+		got = shadowHits.Load()
+		if got > 0 {
+			// Give any still-in-flight background mirrors a moment to
+			// land before taking the final count.
+			time.Sleep(200 * time.Millisecond)
+			got = shadowHits.Load()
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A 10% rate over 400 requests: expect roughly 40, generously
+	// bounded (5-90) to keep this non-flaky while still proving the
+	// rate is doing SOMETHING — neither ~0% nor ~100%.
+	if got < 5 || got > 90 {
+		t.Fatalf("shadow target received %d/%d requests (%.1f%%), want roughly 10%% (5-90 range)", got, n, 100*float64(got)/n)
 	}
 }

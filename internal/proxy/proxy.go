@@ -482,6 +482,25 @@ type Server struct {
 	// server-wide rate, exactly as aiproxy has always priced tokens.
 	TargetCostRates map[string]float64
 
+	// TargetShadowURL, keyed the same way as TargetCostRates, gives that
+	// target a second, independent destination to mirror a copy of its
+	// own forwarded requests to — see config.Target.ShadowURL. A label
+	// with no entry here is never shadowed at all, exactly as before
+	// this field existed; there is no server-wide default to opt out
+	// of, since shadowing is opt-in per explicitly configured route
+	// only — same scoping as TargetCostRates/TargetCacheEnabled, never
+	// applying to the bare -target default candidate.
+	TargetShadowURL map[string]*url.URL
+
+	// TargetShadowSampleRate, keyed the same way as TargetShadowURL, is
+	// the fraction of that target's own forwarded requests that
+	// actually get mirrored — see config.Target.ShadowSampleRate and
+	// getShadowTarget, which defaults a present TargetShadowURL entry
+	// with no matching rate here to 1.0. nil/absent entries are never
+	// meaningful without a matching TargetShadowURL entry — cli's
+	// buildLiveConfig never produces one otherwise.
+	TargetShadowSampleRate map[string]float64
+
 	// MaxBodyBytes caps how large a request body ServeHTTP will buffer in
 	// memory before rejecting it with a 413. Unlike every other field
 	// above, zero (or negative) does not mean "disabled" — it means
@@ -1017,6 +1036,39 @@ func pickWeightedIndexFrom(weights []int, randIntN func(int) int) int {
 	return len(weights) - 1 // unreachable given the math above; a safe fallback rather than a panic
 }
 
+// shadowRequestTimeout bounds how long a single background shadow-mirror
+// round trip (see mirrorToShadow) is allowed to run before it's
+// abandoned — independent of UpstreamTotalTimeout, which only applies to
+// the real, client-facing request, so a hung or slow shadow target can
+// never accumulate unbounded background goroutines even when
+// UpstreamTotalTimeout itself is unset.
+const shadowRequestTimeout = 30 * time.Second
+
+// shouldMirror decides whether one specific request should be mirrored
+// to a configured shadow target, given that target's own sample rate —
+// already validated to be in (0, 1] by the time it reaches here (see
+// compileTargetRoutes/compileModelRoutes). A rate of exactly 1.0 always
+// returns true without even calling randFloat64, both as a minor
+// optimization and so "never touches the RNG at rate 1.0" is something
+// a test can assert on directly. randFloat64 is injected so this can be
+// exercised deterministically instead of relying on real randomness —
+// the same "deterministic core, real entry point just supplies the real
+// source" split pickWeightedIndexFrom/pickWeightedIndex already
+// established; production always calls it via shouldMirrorNow, which
+// supplies mathrand.Float64.
+func shouldMirror(rate float64, randFloat64 func() float64) bool {
+	if rate >= 1 {
+		return true
+	}
+	return randFloat64() < rate
+}
+
+// shouldMirrorNow is shouldMirror's real entry point, supplying the
+// actual random source production uses.
+func shouldMirrorNow(rate float64) bool {
+	return shouldMirror(rate, mathrand.Float64)
+}
+
 // healthOrdered returns candidates reordered so every currently
 // non-ejected one comes first (preserving their original relative
 // order), followed by every currently ejected one (also in original
@@ -1188,6 +1240,52 @@ func (s *Server) probeTarget(client *http.Client, path string, target *url.URL, 
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	s.recordBreakerSuccess(tb, target.String())
+}
+
+// mirrorToShadow sends one best-effort, fire-and-forget copy of an
+// already-allowed (and, if a rule matched, already-redacted) request to
+// shadowURL — see TargetShadowURL/TargetShadowSampleRate. Always called
+// on its own goroutine from ServeHTTP, using context.Background()
+// rather than the original request's own context, so a shadow round
+// trip is never cancelled just because the client's own response has
+// already been written and its connection closed — that's the entire
+// point of shadowing. header must already be the caller's own private
+// copy (see ServeHTTP's r.Header.Clone() at the call site): concurrent
+// use of the same header map the real request is still forwarding with
+// would be a data race. The shadow response — success or failure,
+// whatever its status code — is read to completion and discarded
+// entirely: never returned to the client, never cached, never counted
+// toward token usage or cost, and never fed into failover/target-
+// ejection tracking for the real target in any way. Only whether
+// delivery itself completed is tracked (Stats.RecordShadowSent), with a
+// failure additionally logged (logShadowError) — a successful mirror is
+// deliberately not logged per-request, the same "don't double the log
+// stream for the expected, uninteresting case" reasoning
+// probeTarget/target-recovery already established.
+func (s *Server) mirrorToShadow(shadowURL *url.URL, method, forwardPath, rawQuery string, header http.Header, body []byte, targetLabel, requestID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), shadowRequestTimeout)
+	defer cancel()
+
+	dest := shadowURL.ResolveReference(&url.URL{Path: forwardPath, RawQuery: rawQuery})
+	req, err := http.NewRequestWithContext(ctx, method, dest.String(), bytes.NewReader(body))
+	if err != nil {
+		s.Stats.RecordShadowError(targetLabel)
+		s.logShadowError(targetLabel, shadowURL.String(), err, requestID)
+		return
+	}
+	req.Header = header
+
+	transport, _ := s.getUpstreamConfig()
+	client := &http.Client{Transport: transport, Timeout: shadowRequestTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		s.Stats.RecordShadowError(targetLabel)
+		s.logShadowError(targetLabel, shadowURL.String(), err, requestID)
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	s.Stats.RecordShadowSent(targetLabel)
 }
 
 // recordBreakerFailure records a transport-level failure against
@@ -1417,6 +1515,27 @@ func (s *Server) getCostRates() stats.CostRates {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return stats.CostRates{Default: s.CostPer1KTokens, PerTarget: s.TargetCostRates}
+}
+
+// getShadowTarget returns target's own configured shadow destination
+// and sample rate, if any — see TargetShadowURL/TargetShadowSampleRate.
+// ok is false when target has no shadow entry at all, in which case
+// shadowURL/sampleRate are the zero value and must not be used. A
+// present TargetShadowURL entry with no matching TargetShadowSampleRate
+// entry defaults sampleRate to 1.0 — see config.Target.ShadowSampleRate
+// for why that's the right default rather than a config error.
+func (s *Server) getShadowTarget(target string) (shadowURL *url.URL, sampleRate float64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.TargetShadowURL[target]
+	if !ok {
+		return nil, 0, false
+	}
+	rate, hasRate := s.TargetShadowSampleRate[target]
+	if !hasRate {
+		rate = 1.0
+	}
+	return u, rate, true
 }
 
 func (s *Server) getMaxBodyBytes() int64 {
@@ -1729,7 +1848,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1773,6 +1892,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.CacheTTL = cacheTTL
 	s.TargetCacheTTL = targetCacheTTL
 	s.TargetCacheEnabled = targetCacheEnabled
+	s.TargetShadowURL = targetShadowURL
+	s.TargetShadowSampleRate = targetShadowSampleRate
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2629,6 +2750,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
+	// Mirrored after every check above a request has to pass to be
+	// forwarded at all (rules, rate limits, anomaly detection) — a
+	// blocked or rate-limited request is never mirrored, since there's
+	// nothing genuine to compare a shadow target's own behavior
+	// against. Uses evaluatedBody/r.Header (already redacted, already
+	// merged) so the shadow target can never see anything the real one
+	// wouldn't — and a private Clone of the header map, since the real
+	// request below is about to forward concurrently with this
+	// goroutine and sharing the same map would be a data race. Fired
+	// entirely in the background: nothing here can delay or otherwise
+	// affect the real response about to be served just below.
+	if shadowURL, sampleRate, ok := s.getShadowTarget(targetLabel); ok && shouldMirrorNow(sampleRate) {
+		go s.mirrorToShadow(shadowURL, r.Method, forwardPath, r.URL.RawQuery, r.Header.Clone(), evaluatedBody, targetLabel, requestID)
+	}
+
 	s.reverseProxy.ServeHTTP(w, r)
 }
 
@@ -3179,6 +3315,23 @@ func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget, requestID
 		return
 	}
 	s.logf("%s[FAILOVER] %s %s - %s unreachable, trying %s%s", ansiBrightYellow, method, reqURL, failedTarget, nextTarget, ansiReset)
+}
+
+// logShadowError logs a background shadow-mirror request that never
+// completed a round trip at all — see mirrorToShadow/
+// Stats.RecordShadowError. Deliberately the only shadow-mirror outcome
+// that gets a per-request log line: a successful mirror is exactly as
+// uninteresting, per-request, as a successful health-check probe (see
+// probeTarget), and logging it too would double the log stream's volume
+// for the expected, common case.
+func (s *Server) logShadowError(targetLabel, shadowURL string, err error, requestID string) {
+	msg := fmt.Sprintf("mirroring %s to %s: %v", targetLabel, shadowURL, err)
+	ev := s.recordLogEvent(logEvent{Level: "shadow_error", RequestID: requestID, Target: shadowURL, Message: msg})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[SHADOW ERROR] %s%s", ansiYellow, msg, ansiReset)
 }
 
 // logTargetEjected logs one candidate upstream URL crossing its
@@ -3861,6 +4014,13 @@ type statsSnapshotJSON struct {
 	// unlike Unauthorized/the dry-run fields below.
 	Failover int64 `json:"failover"`
 
+	// ShadowSent/ShadowError count requests mirrored to this target's
+	// own shadow destination — see stats.Stats.RecordShadowSent/
+	// RecordShadowError. Broken down per target like Failover, always 0
+	// for a target with no shadow_url configured.
+	ShadowSent  int64 `json:"shadow_sent"`
+	ShadowError int64 `json:"shadow_error"`
+
 	// Latency summarizes observed upstream response times — see
 	// stats.LatencySnapshot. Broken down per target like Allowed, same
 	// reasoning as Failover: a target's own latency profile is exactly
@@ -3960,6 +4120,8 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		TargetsEjected:         snap.TargetsEjected,
 		TargetsRecovered:       snap.TargetsRecovered,
 		Failover:               snap.Failover,
+		ShadowSent:             snap.ShadowSent,
+		ShadowError:            snap.ShadowError,
 		Latency:                snap.Latency,
 	}
 }
@@ -4181,6 +4343,8 @@ var promCounters = []struct {
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
 	{"aiproxy_responses_redacted_total", "Total number of upstream responses forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.ResponseRedacted }},
 	{"aiproxy_failover_total", "Total number of times this target's candidate list moved on to the next URL because an earlier one was unreachable.", func(s stats.Snapshot) int64 { return s.Failover }},
+	{"aiproxy_shadow_sent_total", "Total number of requests mirrored to this target's own shadow destination.", func(s stats.Snapshot) int64 { return s.ShadowSent }},
+	{"aiproxy_shadow_error_total", "Total number of shadow-mirror attempts that never completed a round trip.", func(s stats.Snapshot) int64 { return s.ShadowError }},
 }
 
 // promRuleCounters mirrors promCounters for the per-rule breakdown:

@@ -1086,6 +1086,116 @@ func TestExecute_Validate_ValidConfig_WithPerTargetCostRate_ReturnsZero(t *testi
 	}
 }
 
+func TestExecute_Validate_ShadowSampleRateWithoutShadowURL_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "shadow_sample_rate": 0.5}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "shadow_sample_rate requires shadow_url") {
+		t.Fatalf("stderr missing the requires-shadow_url problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_ShadowSampleRateOutOfRange_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "shadow_url": "https://canary.example.com", "shadow_sample_rate": 1.5}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "shadow_sample_rate") || !strings.Contains(errOut, "(0, 1]") {
+		t.Fatalf("stderr missing the out-of-range shadow_sample_rate problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_InvalidShadowURL_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "shadow_url": "not-a-url http://bad host"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "shadow_url") {
+		t.Fatalf("stderr missing the shadow_url problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_ModelRouteShadowSampleRateWithoutShadowURL_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "gpt4", "models": ["gpt-4*"], "url": "https://api.openai.com", "shadow_sample_rate": 0.5}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "shadow_sample_rate requires shadow_url") {
+		t.Fatalf("stderr missing the requires-shadow_url problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithShadowTarget_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "shadow_url": "https://canary.example.com"},
+		{"prefix": "/anthropic", "url": "https://api.anthropic.com", "shadow_url": "https://canary2.example.com", "shadow_sample_rate": 0.1}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "shadow traffic targets:  2") {
+		t.Fatalf("stdout missing shadow traffic targets summary: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithPerTargetRateLimit_ReturnsZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
