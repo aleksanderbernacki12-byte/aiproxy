@@ -1208,6 +1208,101 @@ func TestExecute_Validate_ValidConfig_WithAnomalyDetection_ReturnsZero(t *testin
 	}
 }
 
+func TestExecute_Validate_NegativeUpstreamResponseTimeout_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"upstream_response_timeout_seconds": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "upstream_response_timeout_seconds") {
+		t.Errorf("stderr missing negative upstream_response_timeout_seconds problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_NegativeUpstreamTotalTimeout_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"upstream_total_timeout_seconds": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "upstream_total_timeout_seconds") {
+		t.Errorf("stderr missing negative upstream_total_timeout_seconds problem: %q", stderr.String())
+	}
+}
+
+// TestRunStart_NegativeUpstreamTimeout_FatalsWithClearMessage proves a
+// cold start rejects a negative upstream timeout the same clean way
+// runValidate reports it as a problem, not just at `aiproxy validate`
+// time — mirroring the hard-fail rigor anomaly_multiplier's own
+// negativity check already has in buildLiveConfig.
+func TestRunStart_NegativeUpstreamTimeout_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"upstream_response_timeout_seconds": -1}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_NegativeUpstreamTimeout_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+	if !strings.Contains(stderr.String(), "upstream_response_timeout_seconds") {
+		t.Fatalf("stderr missing expected fatal message: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithUpstreamTimeouts_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"upstream_response_timeout_seconds": 10, "upstream_total_timeout_seconds": 120}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "upstream response timeout: 10s") {
+		t.Fatalf("stdout missing upstream response timeout summary: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "upstream total timeout:    2m0s") {
+		t.Fatalf("stdout missing upstream total timeout summary: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_NegativeCostBudget_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

@@ -253,6 +253,31 @@ type Config struct {
 	// default when the field is absent) disables this breaker entirely.
 	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
 
+	// UpstreamResponseTimeoutSeconds, if greater than zero, caps how
+	// long aiproxy waits for an upstream to begin responding (its
+	// status line and headers) to a forwarded request before giving up
+	// — protects against a hung or dead upstream connection that
+	// accepted the request but never responds at all. It never affects
+	// an upstream that starts responding promptly, no matter how long
+	// the response body or stream itself then takes to finish — see
+	// UpstreamTotalTimeoutSeconds for a cap on that. Zero (the default
+	// when the field is absent) means no limit, Go's stdlib default
+	// behavior — the same one aiproxy has always had.
+	UpstreamResponseTimeoutSeconds int `json:"upstream_response_timeout_seconds,omitempty"`
+
+	// UpstreamTotalTimeoutSeconds, if greater than zero, caps a
+	// forwarded request's entire round trip — connecting, headers, and
+	// reading the complete response or stream, across every failover
+	// candidate tried for it — at this many seconds, aborting it if
+	// it's still running past that point. Unlike
+	// UpstreamResponseTimeoutSeconds, this can cut off a legitimately
+	// long-running streaming completion that's actively sending data;
+	// only set it when a hard ceiling on total request duration is
+	// actually wanted, independent of whether the upstream is still
+	// making progress. Zero (the default when the field is absent)
+	// means no limit.
+	UpstreamTotalTimeoutSeconds int `json:"upstream_total_timeout_seconds,omitempty"`
+
 	// AnomalyMultiplier, if greater than zero, flags — and, unless
 	// AnomalyDryRun is set, rejects with a 429 — a request from a
 	// named proxy client (see ProxyAPIKeys) whose current minute's

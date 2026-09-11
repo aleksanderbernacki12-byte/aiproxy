@@ -338,6 +338,29 @@ type Server struct {
 	// a false positive than an exact pattern match.
 	AnomalyDryRun bool
 
+	// UpstreamTransport performs the actual dial/TLS/request/response
+	// round trip to whichever upstream candidate failoverTransport hands
+	// it — built via NewUpstreamTransport from a clone of
+	// http.DefaultTransport (preserving its connection pooling, dialer,
+	// and TLS defaults) with only ResponseHeaderTimeout overridden. Set
+	// once at construction (see New) and swappable via ReloadConfig like
+	// every other field above; failoverTransport reads it fresh on every
+	// RoundTrip rather than capturing it once, so a reload's new timeout
+	// takes effect starting with the very next request. Never nil.
+	UpstreamTransport *http.Transport
+
+	// UpstreamTotalTimeout, if greater than zero, caps a forwarded
+	// request's entire round trip — connecting, headers, and reading the
+	// complete response or stream, across every failover candidate tried
+	// for it — at this duration, via a context.WithTimeout wrapping the
+	// request passed to UpstreamTransport. Unlike
+	// UpstreamTransport.ResponseHeaderTimeout, this can cut off a
+	// legitimately long-running streaming completion that's actively
+	// sending data — see UpstreamTotalTimeoutSeconds's doc comment in the
+	// config package for the full tradeoff. Zero (the default) means no
+	// limit.
+	UpstreamTotalTimeout time.Duration
+
 	Cache           *cache.Cache // nil disables the response cache
 	CostPer1KTokens float64      // zero omits the shutdown summary's cost line
 	routes          []route
@@ -583,11 +606,12 @@ type logEvent struct {
 // target over HTTPS by default, and enforces engine on every request.
 func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 	s := &Server{
-		Addr:   addr,
-		Target: target,
-		Engine: engine,
-		Logger: log.Default(),
-		Stats:  stats.New(),
+		Addr:              addr,
+		Target:            target,
+		Engine:            engine,
+		Logger:            log.Default(),
+		Stats:             stats.New(),
+		UpstreamTransport: NewUpstreamTransport(0),
 	}
 
 	s.reverseProxy = &httputil.ReverseProxy{
@@ -614,7 +638,7 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 		// was large enough (or the connection closed) before the client
 		// saw anything, defeating the point of streaming.
 		FlushInterval: -1,
-		Transport:     &failoverTransport{base: http.DefaultTransport, server: s},
+		Transport:     &failoverTransport{server: s},
 	}
 
 	return s
@@ -634,8 +658,25 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 // overwhelmingly common case — costs nothing extra: the loop just runs
 // once, exactly as ReverseProxy would have called base directly.
 type failoverTransport struct {
-	base   http.RoundTripper
 	server *Server
+}
+
+// cancelOnCloseBody wraps a response body so closing it also cancels an
+// associated context.CancelFunc — how failoverTransport releases the
+// per-request context.WithTimeout backing UpstreamTotalTimeout as soon
+// as the caller is done with the response, rather than only when the
+// timeout itself eventually fires. Safe to call cancel more than once
+// (context.CancelFunc always is), so an early transport-level error
+// path calling it directly and this Close both firing is never a
+// problem.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelOnCloseBody) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
 }
 
 func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -643,12 +684,34 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	candidates := reqCtx.targets
 	start := time.Now()
 
-	if len(candidates) <= 1 {
-		resp, err := t.base.RoundTrip(req)
-		if err == nil {
-			t.recordLatency(reqCtx, time.Since(start))
+	base, totalTimeout := t.server.getUpstreamConfig()
+	var cancel context.CancelFunc
+	if totalTimeout > 0 {
+		var ctx context.Context
+		ctx, cancel = context.WithTimeout(req.Context(), totalTimeout)
+		req = req.WithContext(ctx)
+	}
+	// wrapBody ties cancel's lifetime to the response body the caller
+	// actually reads and closes, so the context.WithTimeout backing
+	// UpstreamTotalTimeout keeps running (and can still abort a stalled
+	// read) for exactly as long as the body is open — never longer.
+	wrapBody := func(resp *http.Response) *http.Response {
+		if cancel != nil {
+			resp.Body = cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
 		}
-		return resp, err
+		return resp
+	}
+
+	if len(candidates) <= 1 {
+		resp, err := base.RoundTrip(req)
+		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
+			return nil, err
+		}
+		t.recordLatency(reqCtx, time.Since(start))
+		return wrapBody(resp), nil
 	}
 
 	var lastErr error
@@ -667,13 +730,16 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			if req.GetBody != nil {
 				body, err := req.GetBody()
 				if err != nil {
+					if cancel != nil {
+						cancel()
+					}
 					return nil, err
 				}
 				attempt.Body = body
 			}
 		}
 
-		resp, err := t.base.RoundTrip(attempt)
+		resp, err := base.RoundTrip(attempt)
 		if err == nil {
 			// Deliberately timed from the very first attempt, not just
 			// this successful one: retry time spent on an earlier
@@ -681,7 +747,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			// experienced for this request, and hiding it would make a
 			// flaky target's histogram look healthier than it is.
 			t.recordLatency(reqCtx, time.Since(start))
-			return resp, nil
+			return wrapBody(resp), nil
 		}
 		lastErr = err
 
@@ -691,6 +757,9 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			t.server.logFailover(reqCtx.method, reqCtx.url, candidate.String(), next.String())
 			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, candidate.String(), next.String())
 		}
+	}
+	if cancel != nil {
+		cancel()
 	}
 	return nil, lastErr
 }
@@ -953,6 +1022,25 @@ func (s *Server) getAnomalyConfig() (*anomaly.Registry, bool) {
 	return s.AnomalyDetector, s.AnomalyDryRun
 }
 
+// getUpstreamConfig returns UpstreamTransport and UpstreamTotalTimeout
+// under one lock, for failoverTransport.RoundTrip.
+func (s *Server) getUpstreamConfig() (*http.Transport, time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.UpstreamTransport, s.UpstreamTotalTimeout
+}
+
+// NewUpstreamTransport builds the *http.Transport used for every
+// forwarded request: a clone of http.DefaultTransport — preserving its
+// connection pooling, dialer, and TLS defaults — with
+// ResponseHeaderTimeout set to responseTimeout. Zero means unlimited,
+// Go's own stdlib default and the behavior aiproxy has always had.
+func NewUpstreamTransport(responseTimeout time.Duration) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = responseTimeout
+	return t
+}
+
 // checkCountryAccess reports whether r's remote IP's resolved country
 // is allowed to reach the proxy, and that resolved country (empty when
 // it couldn't be resolved at all) for the caller to log — checked
@@ -1084,7 +1172,13 @@ type ModelRoute struct {
 // cold-state-on-reload behavior Limiter/TokenLimiter already have.
 // Pass nil for anomalyDetector to disable the breaker entirely. Also
 // appended at the very end, same reasoning as tokenLim/geoIPTable.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool) {
+//
+// upstreamTransport/upstreamTotalTimeout replace UpstreamTransport/
+// UpstreamTotalTimeout wholesale — upstreamTransport must never be nil
+// (see NewUpstreamTransport; cli.buildLiveConfig always builds one, even
+// when upstream_response_timeout_seconds is absent). Also appended at
+// the very end, same reasoning as tokenLim/geoIPTable/anomalyDetector.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1117,6 +1211,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.CountryDenyList = countryDenyList
 	s.AnomalyDetector = anomalyDetector
 	s.AnomalyDryRun = anomalyDryRun
+	s.UpstreamTransport = upstreamTransport
+	s.UpstreamTotalTimeout = upstreamTotalTimeout
 	s.mu.Unlock()
 
 	if oldLogFile != nil {

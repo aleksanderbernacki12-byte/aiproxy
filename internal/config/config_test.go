@@ -175,6 +175,45 @@ func TestLoad_MaxBodySizeBytesDefaultsToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesUpstreamTimeouts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"upstream_response_timeout_seconds": 5, "upstream_total_timeout_seconds": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.UpstreamResponseTimeoutSeconds != 5 {
+		t.Fatalf("UpstreamResponseTimeoutSeconds = %d, want 5", cfg.UpstreamResponseTimeoutSeconds)
+	}
+	if cfg.UpstreamTotalTimeoutSeconds != 30 {
+		t.Fatalf("UpstreamTotalTimeoutSeconds = %d, want 30", cfg.UpstreamTotalTimeoutSeconds)
+	}
+}
+
+func TestLoad_UpstreamTimeoutsDefaultToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.UpstreamResponseTimeoutSeconds != 0 {
+		t.Fatalf("UpstreamResponseTimeoutSeconds = %d, want 0 when absent", cfg.UpstreamResponseTimeoutSeconds)
+	}
+	if cfg.UpstreamTotalTimeoutSeconds != 0 {
+		t.Fatalf("UpstreamTotalTimeoutSeconds = %d, want 0 when absent", cfg.UpstreamTotalTimeoutSeconds)
+	}
+}
+
 func TestLoad_ParsesWebhookURL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

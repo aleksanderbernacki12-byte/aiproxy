@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -179,6 +180,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.CountryDenyList = lc.countryDenyList
 	server.AnomalyDetector = lc.anomalyDetector
 	server.AnomalyDryRun = lc.anomalyDryRun
+	server.UpstreamTransport = lc.upstreamTransport
+	server.UpstreamTotalTimeout = lc.upstreamTotalTimeout
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
@@ -270,6 +273,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			} else {
 				fmt.Fprintf(stdout, "anomaly detection: %gx baseline\n", cfg.AnomalyMultiplier)
 			}
+		}
+		if cfg.UpstreamResponseTimeoutSeconds > 0 {
+			fmt.Fprintf(stdout, "upstream response timeout: %s\n", timeoutDisplay(cfg.UpstreamResponseTimeoutSeconds))
+		}
+		if cfg.UpstreamTotalTimeoutSeconds > 0 {
+			fmt.Fprintf(stdout, "upstream total timeout: %s\n", timeoutDisplay(cfg.UpstreamTotalTimeoutSeconds))
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -391,7 +400,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout)
 
 	label := loadedFrom
 	if label == "" {
@@ -425,6 +434,9 @@ type liveConfig struct {
 	countryDenyList  []string
 	anomalyDetector  *anomaly.Registry
 	anomalyDryRun    bool
+
+	upstreamTransport    *http.Transport
+	upstreamTotalTimeout time.Duration
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -438,7 +450,7 @@ type liveConfig struct {
 // (a reload).
 func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	engine, errs := buildEngine(cfg)
-	lc := &liveConfig{engine: engine}
+	lc := &liveConfig{engine: engine, upstreamTransport: proxy.NewUpstreamTransport(0)}
 	if cfg == nil {
 		return lc, errs
 	}
@@ -538,6 +550,16 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 		errs = append(errs, fmt.Errorf("anomaly_dry_run requires anomaly_multiplier to be set (there's nothing to dry-run otherwise)"))
 	}
 	lc.anomalyDryRun = cfg.AnomalyDryRun
+
+	if cfg.UpstreamResponseTimeoutSeconds < 0 {
+		errs = append(errs, fmt.Errorf("upstream_response_timeout_seconds: %d must not be negative", cfg.UpstreamResponseTimeoutSeconds))
+	} else if cfg.UpstreamResponseTimeoutSeconds > 0 {
+		lc.upstreamTransport = proxy.NewUpstreamTransport(time.Duration(cfg.UpstreamResponseTimeoutSeconds) * time.Second)
+	}
+	if cfg.UpstreamTotalTimeoutSeconds < 0 {
+		errs = append(errs, fmt.Errorf("upstream_total_timeout_seconds: %d must not be negative", cfg.UpstreamTotalTimeoutSeconds))
+	}
+	lc.upstreamTotalTimeout = time.Duration(cfg.UpstreamTotalTimeoutSeconds) * time.Second
 
 	return lc, errs
 }
@@ -866,6 +888,13 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, "anomaly_dry_run requires anomaly_multiplier to be set (there's nothing to dry-run otherwise)")
 	}
 
+	if cfg.UpstreamResponseTimeoutSeconds < 0 {
+		problems = append(problems, fmt.Sprintf("upstream_response_timeout_seconds: %d must not be negative", cfg.UpstreamResponseTimeoutSeconds))
+	}
+	if cfg.UpstreamTotalTimeoutSeconds < 0 {
+		problems = append(problems, fmt.Sprintf("upstream_total_timeout_seconds: %d must not be negative", cfg.UpstreamTotalTimeoutSeconds))
+	}
+
 	_, pathRuleErrs := compilePathRules(cfg.PathRules)
 	for _, e := range pathRuleErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
@@ -961,8 +990,21 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  country allow list:      %d\n", len(cfg.CountryAllowList))
 	fmt.Fprintf(stdout, "  country deny list:       %d\n", len(cfg.CountryDenyList))
 	fmt.Fprintf(stdout, "  anomaly detection:       %s\n", anomalyDisplay(cfg.AnomalyMultiplier, cfg.AnomalyDryRun))
+	fmt.Fprintf(stdout, "  upstream response timeout: %s\n", timeoutDisplay(cfg.UpstreamResponseTimeoutSeconds))
+	fmt.Fprintf(stdout, "  upstream total timeout:    %s\n", timeoutDisplay(cfg.UpstreamTotalTimeoutSeconds))
 	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
+}
+
+// timeoutDisplay renders an upstream_response_timeout_seconds/
+// upstream_total_timeout_seconds value for the validate summary:
+// "unlimited" for the default/absent zero, otherwise the resolved
+// duration in the same shape a user would type it back in.
+func timeoutDisplay(seconds int) string {
+	if seconds <= 0 {
+		return "unlimited"
+	}
+	return (time.Duration(seconds) * time.Second).String()
 }
 
 // geoIPRangesFileDisplay renders geoip_ranges_file for the validate

@@ -1120,6 +1120,47 @@ as forwarding to a single, entirely-down target has always produced —
 this adds a chance to recover before that happens, not a guarantee
 against it.
 
+### Configurable upstream timeouts
+
+By default, forwarding a request to an upstream uses Go's own
+unlimited-by-default HTTP client behavior — no cap on how long aiproxy
+will wait for a response, or on how long a slow/hung upstream can hold a
+connection open. Two independent, optional settings add limits:
+
+```json
+{
+  "upstream_response_timeout_seconds": 30,
+  "upstream_total_timeout_seconds": 300
+}
+```
+
+`upstream_response_timeout_seconds` caps how long aiproxy waits for an
+upstream to *begin* responding (its status line and headers) before
+giving up — this catches a hung or dead upstream that accepted the
+connection but never answers at all. It never affects an upstream that
+starts responding promptly, no matter how long the response body or
+stream itself then takes to finish; a long but genuinely active LLM
+completion is never cut short by this setting alone.
+
+`upstream_total_timeout_seconds` caps the *entire* round trip instead —
+connecting, headers, and reading the complete response or stream,
+across every [failover](#failover-across-multiple-upstreams) candidate
+tried for it — aborting the request if it's still running past that
+point. Unlike the response-only timeout, this **can** cut off a
+legitimately long-running streaming completion that's still actively
+sending data; only set it when a hard ceiling on total request duration
+is actually wanted, independent of whether the upstream is still making
+progress.
+
+The two are deliberately independent — set either, both, or neither.
+Both default to `0` (unlimited), the same behavior aiproxy has always
+had. A request an upstream timeout aborts gets a `502`-class error
+response, the same one a completely unreachable target has always
+produced; there's no separate counter or webhook event for a timeout
+specifically, since (like every other transport-level forwarding
+failure) it isn't attributable to a rule or breaker aiproxy itself
+enforced.
+
 ### Model-based routing
 
 `targets` routes by URL path prefix; `model_routes` routes by the
