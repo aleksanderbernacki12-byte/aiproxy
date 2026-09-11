@@ -436,6 +436,29 @@ type Server struct {
 	TLSCertFile string
 	TLSKeyFile  string
 
+	// AdminAddr, if non-empty, moves the whole admin surface — statsPath,
+	// metricsPath, dashboardPath, cacheClearPath — onto a second listener
+	// bound to this address instead of Addr: ListenAndServe starts a
+	// second http.Server for it, serving nothing but that surface (see
+	// adminMux), gated by exactly the same IPAllowList/IPDenyList/
+	// CountryAllowList/CountryDenyList/ProxyAPIKey checks as ever —
+	// moving where the admin surface is reachable from doesn't change
+	// what's required to reach it. healthzPath is deliberately NOT moved:
+	// it stays reachable on Addr unconditionally (an orchestrator's
+	// liveness probe targets the same port the service actually listens
+	// on) and is additionally served on AdminAddr too, for an operator
+	// who'd rather probe the admin listener instead. Once AdminAddr is
+	// set, Addr no longer serves the admin surface at all — a request for
+	// one of those paths there gets a plain 404, never silently forwarded
+	// upstream, since these paths were always reserved specifically to
+	// never collide with a real upstream route. Empty (the default) means
+	// everything is served on Addr alone, unchanged from before this
+	// field existed. CLI-only, not hot-reloadable via SIGHUP — same
+	// reasoning as TLSCertFile/TLSKeyFile: binding a second listener is a
+	// process-level operation a live config swap was never meant to
+	// cover.
+	AdminAddr string
+
 	// LogFile, if non-nil, is an open, append-mode file every log event
 	// (including the shutdown summary) is also written to as one JSON
 	// line, independent of LogFormat — see recordLogEvent. Opening,
@@ -466,8 +489,9 @@ type Server struct {
 	// section.
 	AuditChain *auditlog.Chain
 
-	reverseProxy *httputil.ReverseProxy
-	httpServer   *http.Server
+	reverseProxy    *httputil.ReverseProxy
+	httpServer      *http.Server
+	adminHTTPServer *http.Server
 }
 
 // LogFormat selects Server's log output shape.
@@ -1201,14 +1225,30 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 // the request, and either blocks it or restores the body and forwards
 // it intact to the resolved target (Target by default, or a
 // path-prefix route added via AddRoute) over HTTPS.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == healthzPath {
-		// See healthzPath's doc comment: deliberately checked before
-		// even the IP allow/deny list, since it's the one reserved path
-		// with no exception's worth of information to protect.
-		s.serveHealthz(w, r)
-		return
+// isReservedAdminPath reports whether path is one of the admin surface's
+// reserved paths that AdminAddr, once set, moves off of Addr entirely —
+// every reserved path except healthzPath, which always stays on Addr
+// too regardless of AdminAddr (see AdminAddr's doc comment).
+func isReservedAdminPath(path string) bool {
+	switch path {
+	case statsPath, metricsPath, dashboardPath, cacheClearPath:
+		return true
+	default:
+		return false
 	}
+}
+
+// checkNetworkAndAuthAccess runs the three independent gates every
+// request — whether ordinary proxy traffic or a request for the admin
+// surface — must pass before anything else happens: the IP allow/deny
+// list, the GeoIP country allow/deny list, and proxy_api_key
+// authentication, in that order, responding and returning ok=false at
+// the first one that rejects the request. Shared by ServeHTTP and
+// adminMux.ServeHTTP so a request for the admin surface is gated
+// identically whether it arrives on Addr (AdminAddr unset) or on
+// AdminAddr's own listener — moving where the admin surface is
+// reachable from was never meant to change what's required to reach it.
+func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request) (clientAuth, bool) {
 	if !s.checkIPAccess(r) {
 		// Checked before even proxy authentication: a network-level
 		// access decision is more foundational than an application-level
@@ -1218,7 +1258,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String())
 		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String())
 		http.Error(w, "access denied", http.StatusForbidden)
-		return
+		return clientAuth{}, false
 	}
 	if allowed, country := s.checkCountryAccess(r); !allowed {
 		// Checked right after checkIPAccess, for the same reason — a
@@ -1230,7 +1270,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String())
 		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String())
 		http.Error(w, "access denied", http.StatusForbidden)
-		return
+		return clientAuth{}, false
 	}
 
 	auth, ok := s.checkProxyAuth(r)
@@ -1243,6 +1283,63 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "")
 		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+		return clientAuth{}, false
+	}
+	return auth, true
+}
+
+// adminMux is AdminAddr's own http.Handler, when configured: it serves
+// nothing but healthzPath and the admin surface (statsPath, metricsPath,
+// dashboardPath, cacheClearPath), gated by exactly the same checks as
+// Addr applies to them (see checkNetworkAndAuthAccess) — it never
+// forwards to the upstream target, since that was never this listener's
+// job to begin with.
+type adminMux struct {
+	server *Server
+}
+
+func (h adminMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s := h.server
+	if r.URL.Path == healthzPath {
+		s.serveHealthz(w, r)
+		return
+	}
+	if _, ok := s.checkNetworkAndAuthAccess(w, r); !ok {
+		return
+	}
+	switch r.URL.Path {
+	case statsPath:
+		s.serveStats(w, r)
+	case metricsPath:
+		s.serveMetrics(w, r)
+	case dashboardPath:
+		s.serveDashboard(w, r)
+	case cacheClearPath:
+		s.serveCacheClear(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == healthzPath {
+		// See healthzPath's doc comment: deliberately checked before
+		// even the IP allow/deny list, since it's the one reserved path
+		// with no exception's worth of information to protect.
+		s.serveHealthz(w, r)
+		return
+	}
+	if s.AdminAddr != "" && isReservedAdminPath(r.URL.Path) {
+		// The admin surface has moved to its own listener (see
+		// AdminAddr's doc comment) — Addr must never forward one of
+		// these paths upstream as if it were an ordinary route, since
+		// "reserved" always meant exactly that.
+		http.NotFound(w, r)
+		return
+	}
+
+	auth, ok := s.checkNetworkAndAuthAccess(w, r)
+	if !ok {
 		return
 	}
 	if r.URL.Path == statsPath {
@@ -2990,7 +3087,14 @@ func (w errorLogWriter) Write(p []byte) (int, error) {
 // ListenAndServe starts the proxy and blocks until ctx is cancelled or a
 // fatal server error occurs. Serves plain HTTP unless both TLSCertFile
 // and TLSKeyFile are set, in which case it terminates TLS itself via
-// http.Server.ListenAndServeTLS instead.
+// http.Server.ListenAndServeTLS instead. When AdminAddr is also set, a
+// second http.Server is started for it, serving adminMux instead of s
+// (see AdminAddr's doc comment) — under the same TLS configuration as
+// the main listener, so a caller who wants the admin surface isolated
+// on its own network boundary doesn't also have to manage a second
+// certificate purely to keep both listeners on equal footing. A fatal
+// error on either listener stops both; ctx cancellation shuts both down
+// gracefully together.
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	s.httpServer = &http.Server{
 		Addr:     s.Addr,
@@ -2998,24 +3102,39 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		ErrorLog: log.New(errorLogWriter{server: s}, "", 0),
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
+	errCh := make(chan error, 2)
+	serve := func(srv *http.Server) {
 		var err error
 		if s.TLSCertFile != "" && s.TLSKeyFile != "" {
-			err = s.httpServer.ListenAndServeTLS(s.TLSCertFile, s.TLSKeyFile)
+			err = srv.ListenAndServeTLS(s.TLSCertFile, s.TLSKeyFile)
 		} else {
-			err = s.httpServer.ListenAndServe()
+			err = srv.ListenAndServe()
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
-	}()
+	}
+	go serve(s.httpServer)
+
+	if s.AdminAddr != "" {
+		s.adminHTTPServer = &http.Server{
+			Addr:     s.AdminAddr,
+			Handler:  adminMux{server: s},
+			ErrorLog: log.New(errorLogWriter{server: s}, "", 0),
+		}
+		go serve(s.adminHTTPServer)
+	}
 
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err := s.httpServer.Shutdown(shutdownCtx)
+		if s.adminHTTPServer != nil {
+			if adminErr := s.adminHTTPServer.Shutdown(shutdownCtx); adminErr != nil && err == nil {
+				err = adminErr
+			}
+		}
 		s.logSummary()
 		return err
 	case err := <-errCh:

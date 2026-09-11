@@ -77,6 +77,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", "127.0.0.1:8080", "address for the proxy to listen on")
+	adminAddr := fs.String("admin-addr", "", "address for a second listener serving only the admin surface (GET /_aiproxy/stats, /_aiproxy/metrics, /_aiproxy/dashboard, POST /_aiproxy/cache/clear), gated by the same proxy_api_key/IP/GeoIP checks as -addr; when set, -addr stops serving those paths entirely (404). /_aiproxy/healthz stays reachable on both. Empty (default) keeps everything on -addr")
 	target := fs.String("target", "", "HTTPS URL to forward requests to (required)")
 	configPath := fs.String("config", "", "path to a JSON config file (custom rules, rate limit, cache, cost estimation, extra target routes; default: aiproxy.json in the working directory, if present)")
 	logFormat := fs.String("log-format", "text", `log output format: "text" (colored, human-readable) or "json" (one JSON object per line, safe to pipe into a log aggregator)`)
@@ -100,6 +101,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	if (*tlsCert == "") != (*tlsKey == "") {
 		fmt.Fprintln(stderr, "aiproxy: -tls-cert and -tls-key must be set together, or not at all")
+		return 2
+	}
+
+	if *adminAddr != "" && *adminAddr == *addr {
+		fmt.Fprintln(stderr, "aiproxy: -admin-addr must be different from -addr (there's no isolation in binding the same address twice)")
 		return 2
 	}
 
@@ -176,6 +182,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
+	server.AdminAddr = *adminAddr
 	for _, r := range lc.routes {
 		server.AddRoute(r.prefix, r.targets, r.limiter, r.tokenLimiter)
 	}
@@ -314,6 +321,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		scheme = "https"
 	}
 	fmt.Fprintf(stdout, "aiproxy listening on %s://%s, forwarding to %s\n", scheme, *addr, targetURL)
+	if *adminAddr != "" {
+		fmt.Fprintf(stdout, "admin surface (stats/metrics/dashboard/cache-clear) listening separately on %s://%s\n", scheme, *adminAddr)
+	}
 	if err := server.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
 		return 1

@@ -33,6 +33,10 @@ aiproxy start --target https://api.example.com
 - `--audit-log-key-file`: path to a secret key file — see
   [Audit log signing](#audit-log-signing). Requires `log_file` to be
   configured; off by default.
+- `--admin-addr`: address for a second listener serving only
+  `/_aiproxy/stats`/`metrics`/`dashboard`/`cache/clear` — see
+  [Isolating the admin surface on its own port](#isolating-the-admin-surface-on-its-own-port).
+  Must differ from `--addr`; everything stays on `--addr` by default.
 
 Point your client at `http://127.0.0.1:8080` instead of the real API.
 Allowed requests are logged in green (`[ALLOW] POST /endpoint`); blocked
@@ -1634,6 +1638,57 @@ exactly the kind of path a self-hosted LLM gateway upstream might
 already be using for its own metrics. Same reserved-path rules as
 `/_aiproxy/stats` apply: never forwarded upstream, never counted in the
 stats it reports, and any method other than `GET` gets a 405.
+
+## Isolating the admin surface on its own port
+
+By default, `GET /_aiproxy/stats`, `/_aiproxy/metrics`,
+`/_aiproxy/dashboard`, and `POST /_aiproxy/cache/clear` all live on the
+same listener as the actual proxy traffic (`--addr`). `--admin-addr`
+moves all four onto a second, independent listener instead:
+
+```
+aiproxy start --target https://api.openai.com \
+  --addr 0.0.0.0:8080 --admin-addr 127.0.0.1:9090
+```
+
+Once set, `--addr` stops serving those four paths entirely — a request
+for one of them there gets a plain 404, never silently forwarded
+upstream as if it were an ordinary route, since "reserved path" always
+meant exactly that. They're only reachable on `--admin-addr` now,
+gated by exactly the same `ip_allow_list`/`ip_deny_list`,
+`country_allow_list`/`country_deny_list`, and `proxy_api_key` checks
+as before — moving *where* the admin surface is reachable from doesn't
+change *what's* required to reach it. That matters in particular if
+`--admin-addr` itself ever ends up bound more broadly than intended
+(`0.0.0.0` instead of `127.0.0.1`, say): the existing auth still stands
+between it and the world, rather than the isolation being the only
+thing protecting it.
+
+[`/_aiproxy/healthz`](#health-check) is the one exception — it stays
+reachable on `--addr` unconditionally either way, since an
+orchestrator's liveness/readiness probe targets the same port the
+service actually listens on, and moving it would break that for zero
+security benefit (it's the one reserved path with nothing worth
+protecting in the first place). It's also served on `--admin-addr`, for
+an operator who'd rather probe the admin listener instead.
+
+The typical motivation is keeping a public-facing proxy port and a
+private observability port on genuinely different network exposure —
+`--addr` on a public interface or load balancer, `--admin-addr` bound
+to `127.0.0.1` or a private/VPC-only interface for Prometheus, the
+dashboard, and stats polling, so the admin surface never shares the
+public port's attack surface at all, defense-in-depth on top of its
+existing auth rather than instead of it. `--admin-addr` reuses whatever
+TLS configuration is already active (`--tls-cert`/`--tls-key`, see
+[Serving over TLS](#serving-over-tls)) rather than needing its own
+certificate — both listeners end up on equal footing, plain HTTP or
+both HTTPS. It must be a different address than `--addr` (rejected at
+startup otherwise — there's no isolation in binding the same address
+twice) and, like `--tls-cert`/`--tls-key`/`--audit-log-key-file`, is
+CLI-only and not hot-reloadable via SIGHUP: binding a second listener
+is a process-level operation a live config swap was never meant to
+cover. Empty/absent (the default) keeps everything on `--addr` alone,
+completely unchanged from before this flag existed.
 
 ## Webhook alerts
 

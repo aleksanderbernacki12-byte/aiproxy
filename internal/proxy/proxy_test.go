@@ -10457,3 +10457,217 @@ func TestServer_CustomRuleKeyScoping_OnlyBlocksConfiguredKey(t *testing.T) {
 		t.Fatalf("body = %q, want the upstream's response", body)
 	}
 }
+
+// TestServer_AdminAddr_MovesAdminSurfaceOffMainListener proves the core
+// AdminAddr claim end to end through the real ListenAndServe entry
+// point (not httptest.NewServer, which never exercises the two-listener
+// path at all): once AdminAddr is set, the admin surface (statsPath
+// here) is completely gone from Addr — a plain 404, not the request
+// falling through and getting forwarded upstream as if it were an
+// ordinary route — while it's fully reachable, correctly, on AdminAddr
+// itself. Ordinary proxy traffic on Addr is unaffected either way.
+func TestServer_AdminAddr_MovesAdminSurfaceOffMainListener(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("upstream response"))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	addr := freeLoopbackAddr(t)
+	adminAddr := freeLoopbackAddr(t)
+
+	srv := proxy.New(addr, targetURL, rules.NewEngine(rules.Allow))
+	srv.AdminAddr = adminAddr
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitForServerUp(t, addr, time.Second)
+	waitForServerUp(t, adminAddr, time.Second)
+
+	// Ordinary proxy traffic on Addr still works.
+	resp, err := http.Get("http://" + addr + "/v1/chat")
+	if err != nil {
+		t.Fatalf("GET %s/v1/chat: %v", addr, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy traffic status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// statsPath on Addr is gone entirely — a plain 404, not forwarded.
+	resp, err = http.Get("http://" + addr + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET %s/_aiproxy/stats: %v", addr, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("stats on Addr status = %d, want %d (must move entirely to AdminAddr)", resp.StatusCode, http.StatusNotFound)
+	}
+
+	// statsPath on AdminAddr works correctly.
+	resp, err = http.Get("http://" + adminAddr + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET %s/_aiproxy/stats: %v", adminAddr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stats on AdminAddr status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stats body: %v", err)
+	}
+	if !strings.Contains(string(body), `"allowed"`) {
+		t.Fatalf("stats body = %q, want it to look like a real stats snapshot", body)
+	}
+}
+
+// TestServer_AdminAddr_NeverForwardsOrdinaryTrafficToUpstream proves
+// AdminAddr's own listener only ever serves the admin surface plus
+// healthz — a path that would be ordinary proxy traffic on Addr gets a
+// 404 on AdminAddr instead of ever reaching the upstream target, since
+// forwarding was never this listener's job.
+func TestServer_AdminAddr_NeverForwardsOrdinaryTrafficToUpstream(t *testing.T) {
+	var upstreamHit bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.Write([]byte("upstream response"))
+	}))
+	defer upstream.Close()
+
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	addr := freeLoopbackAddr(t)
+	adminAddr := freeLoopbackAddr(t)
+
+	srv := proxy.New(addr, targetURL, rules.NewEngine(rules.Allow))
+	srv.AdminAddr = adminAddr
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitForServerUp(t, adminAddr, time.Second)
+
+	resp, err := http.Get("http://" + adminAddr + "/v1/chat")
+	if err != nil {
+		t.Fatalf("GET %s/v1/chat: %v", adminAddr, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (AdminAddr must never forward ordinary traffic)", resp.StatusCode, http.StatusNotFound)
+	}
+	if upstreamHit {
+		t.Fatal("upstream was hit — AdminAddr must never forward to the upstream target")
+	}
+}
+
+// TestServer_AdminAddr_StillGatedByProxyAPIKey proves the confirmed
+// design choice — moving the admin surface to its own listener changes
+// nothing about what's required to reach it — end to end: a request to
+// AdminAddr without the configured proxy_api_key is rejected exactly
+// like it would be on Addr, and the correct key succeeds.
+func TestServer_AdminAddr_StillGatedByProxyAPIKey(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	addr := freeLoopbackAddr(t)
+	adminAddr := freeLoopbackAddr(t)
+
+	srv := proxy.New(addr, targetURL, rules.NewEngine(rules.Allow))
+	srv.AdminAddr = adminAddr
+	srv.ProxyAPIKey = "s3cr3t-key"
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitForServerUp(t, adminAddr, time.Second)
+
+	resp, err := http.Get("http://" + adminAddr + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET without key: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status without key = %d, want %d (AdminAddr must stay gated by proxy_api_key)", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+
+	resp = getWithProxyAuth(t, "http://"+adminAddr+"/_aiproxy/stats", "s3cr3t-key")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status with correct key = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_AdminAddr_HealthzReachableOnBothListeners proves healthz
+// stays on Addr unconditionally (an orchestrator's liveness probe keeps
+// working against the same port the service always listened on) while
+// also being served on AdminAddr, for an operator who'd rather probe
+// the admin listener instead.
+func TestServer_AdminAddr_HealthzReachableOnBothListeners(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	addr := freeLoopbackAddr(t)
+	adminAddr := freeLoopbackAddr(t)
+
+	srv := proxy.New(addr, targetURL, rules.NewEngine(rules.Allow))
+	srv.AdminAddr = adminAddr
+	srv.ProxyAPIKey = "s3cr3t-key" // healthz must stay exempt even so
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitForServerUp(t, addr, time.Second)
+	waitForServerUp(t, adminAddr, time.Second)
+
+	for _, a := range []string{addr, adminAddr} {
+		resp, err := http.Get("http://" + a + "/_aiproxy/healthz")
+		if err != nil {
+			t.Fatalf("GET %s/_aiproxy/healthz: %v", a, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("healthz on %s status = %d, want %d", a, resp.StatusCode, http.StatusOK)
+		}
+	}
+}

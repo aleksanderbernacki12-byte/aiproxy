@@ -294,6 +294,25 @@ func TestRunStart_TLSKeyWithoutCert_ReturnsErrorExitCode(t *testing.T) {
 	}
 }
 
+// TestRunStart_AdminAddrSameAsAddr_ReturnsErrorExitCode proves binding
+// -admin-addr to the exact same address as -addr is rejected up front —
+// there's no isolation in listening on the same address twice, and the
+// second bind would just fail with "address already in use" anyway,
+// with a far less clear error. Checked before target/config parsing
+// (same as the -tls-cert/-tls-key pairing check), so this runs directly
+// in-process without needing -target.
+func TestRunStart_AdminAddrSameAsAddr_ReturnsErrorExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-addr", "127.0.0.1:8080", "-admin-addr", "127.0.0.1:8080"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-admin-addr must be different from -addr") {
+		t.Fatalf("stderr missing a clear -admin-addr error: %q", stderr.String())
+	}
+}
+
 // TestRunStart_AuditLogKeyFileWithoutLogFile_ReturnsErrorExitCode proves
 // -audit-log-key-file is rejected up front when log_file isn't
 // configured — there'd be nothing to chain — before any config loading
