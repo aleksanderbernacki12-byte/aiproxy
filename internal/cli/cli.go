@@ -328,7 +328,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	startReloadOnSIGHUP(ctx, server, *configPath)
+	startReloadOnSIGHUP(ctx, server, *configPath, cfg)
 
 	scheme := "http"
 	if *tlsCert != "" {
@@ -353,10 +353,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 // server's current configuration completely untouched: a bad edit
 // followed by a SIGHUP must never blank out a running proxy's rules or
 // crash it, only fail to apply.
-func startReloadOnSIGHUP(ctx context.Context, server *proxy.Server, configPath string) {
+// startReloadOnSIGHUP wires SIGHUP to reloadConfig, threading the
+// currently-live config forward through successive reloads (in prevCfg,
+// updated after each call) purely so each one can report exactly what
+// changed relative to the reload before it — see diffConfig. initialCfg
+// is the config runStart already loaded at cold start, the correct
+// baseline for the very first SIGHUP this process ever receives.
+func startReloadOnSIGHUP(ctx context.Context, server *proxy.Server, configPath string, initialCfg *config.Config) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 
+	prevCfg := initialCfg
 	go func() {
 		defer signal.Stop(hup)
 		for {
@@ -364,17 +371,26 @@ func startReloadOnSIGHUP(ctx context.Context, server *proxy.Server, configPath s
 			case <-ctx.Done():
 				return
 			case <-hup:
-				reloadConfig(server, configPath)
+				prevCfg = reloadConfig(server, configPath, prevCfg)
 			}
 		}
 	}()
 }
 
-func reloadConfig(server *proxy.Server, configPath string) {
+// reloadConfig re-reads configPath and, if it's valid, swaps it into
+// server — the exact same construction path a cold start uses (see
+// buildLiveConfig), so a reload can never produce something a cold
+// start couldn't. Returns the config that's actually live in server
+// once this call returns: prevCfg unchanged on any failure (the
+// previous config, and only it, is still what's running), or the newly
+// loaded one on success — the caller (startReloadOnSIGHUP) threads this
+// back in as prevCfg for the *next* reload, so a chain of reloads always
+// diffs against what's truly running, not just what was last attempted.
+func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Config) *config.Config {
 	cfg, loadedFrom, err := resolveConfig(configPath)
 	if err != nil {
 		server.LogEvent("reload_error", fmt.Sprintf("aiproxy: reload failed: %v", err))
-		return
+		return prevCfg
 	}
 
 	lc, errs := buildLiveConfig(cfg)
@@ -394,7 +410,7 @@ func reloadConfig(server *proxy.Server, configPath string) {
 			"aiproxy: reload failed, keeping previous config (%d problem(s)): %s",
 			len(errs), strings.Join(msgs, "; "),
 		))
-		return
+		return prevCfg
 	}
 
 	routes := make([]proxy.Route, len(lc.routes))
@@ -411,7 +427,16 @@ func reloadConfig(server *proxy.Server, configPath string) {
 	if label == "" {
 		label = "built-in rules only (no config file)"
 	}
-	server.LogEvent("reload", fmt.Sprintf("aiproxy: reloaded config from %s", label))
+
+	changes := diffConfig(prevCfg, cfg)
+	if len(changes) == 0 {
+		server.LogEvent("reload", fmt.Sprintf("aiproxy: reloaded config from %s (no changes)", label))
+		return cfg
+	}
+	diffSummary := summarizeConfigDiff(changes)
+	server.LogEvent("reload", fmt.Sprintf("aiproxy: reloaded config from %s: %s", label, diffSummary))
+	server.NotifyEvent("config_changed", fmt.Sprintf("aiproxy: config reloaded from %s: %s", label, diffSummary))
+	return cfg
 }
 
 // liveConfig holds every piece of a Server's configuration that can be
@@ -1414,6 +1439,7 @@ var webhookEventNames = map[string]bool{
 	"anomaly_detected":        true,
 	"target_ejected":          true,
 	"target_recovered":        true,
+	"config_changed":          true,
 }
 
 // compileWebhookTargets validates and resolves the config file's

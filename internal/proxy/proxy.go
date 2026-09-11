@@ -1357,6 +1357,21 @@ func (s *Server) LogEvent(level, message string) {
 	s.logf("%s", message)
 }
 
+// NotifyEvent delivers a minimal webhook alert for a one-off,
+// non-request-scoped event from outside the proxy package — e.g. the
+// CLI's SIGHUP reload handler reporting exactly what changed. No
+// method/URL/rule, the same shape already used internally for an event
+// with no one client request to attribute (see
+// notifyTargetEjectedWebhook) — text becomes the payload's Text field
+// verbatim. Exported for the same reason LogEvent already is.
+func (s *Server) NotifyEvent(event, text string) {
+	s.deliverWebhookPayload(webhookAlert{
+		Text:  text,
+		Event: event,
+		Time:  time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // proxyAuthScheme is the credential scheme checkProxyAuth expects in the
 // Proxy-Authorization header, matching how every LLM API in this
 // project's own examples presents a bearer credential.

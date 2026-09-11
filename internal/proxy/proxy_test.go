@@ -11654,3 +11654,51 @@ func TestServer_AdminPathMovedOff_JSONNotFoundWhenAccepted(t *testing.T) {
 		t.Fatalf("Error = %q, want not_found", got.Error)
 	}
 }
+
+// TestServer_NotifyEvent_DeliversWebhookWithEventAndText proves the
+// exported NotifyEvent — the CLI package's own entry point for
+// reporting a process-level event (a config-reload diff) it detects
+// outside of ServeHTTP's own request handling — delivers a real webhook
+// with no method/URL/rule, the same shape as every other
+// no-single-request-to-attribute event (target_ejected/target_recovered).
+func TestServer_NotifyEvent_DeliversWebhookWithEventAndText(t *testing.T) {
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("webhook received invalid JSON: %v", err)
+		}
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	srv.NotifyEvent("config_changed", "aiproxy: config reloaded from aiproxy.json: max_requests_per_minute: 60 -> 100")
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "config_changed" {
+			t.Errorf("event = %v, want config_changed", payload["event"])
+		}
+		if payload["text"] != "aiproxy: config reloaded from aiproxy.json: max_requests_per_minute: 60 -> 100" {
+			t.Errorf("text = %v, want the exact diff summary", payload["text"])
+		}
+		if payload["method"] != nil && payload["method"] != "" {
+			t.Errorf("method = %v, want empty (not tied to any one request)", payload["method"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never received the config_changed event")
+	}
+}

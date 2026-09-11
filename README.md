@@ -665,6 +665,34 @@ crashes or blanks out its rules because of a bad edit. `--target`,
 `--addr`, and `--log-format` are startup-only and unaffected by a
 reload — those still require a real restart.
 
+### Seeing exactly what a reload changed
+
+A successful reload's log line doesn't just say "reload succeeded" — it
+reports exactly which config fields actually changed, compared to
+whatever was running immediately before:
+
+```
+[RELOAD] aiproxy: reloaded config from aiproxy.json: max_requests_per_minute: 60 -> 100; cache_enabled: false -> true
+```
+
+A reload that finds nothing different says so plainly instead
+(`... (no changes)`) rather than repeating an empty diff. When there
+*is* a diff, it's also delivered as a `config_changed`
+[webhook alert](#webhook-alerts) carrying the same summary in `text` —
+useful for keeping an audit trail of who changed what in production
+without needing shell access to grep the log file.
+
+A `custom_rules`, `targets`, `proxy_api_keys`, `webhooks`, or any other
+list/map field is only ever reported as an entry count (`"2 entries ->
+3 entries"`), never its actual contents — this keeps a long rule or
+route list from producing an unreadable diff line, and, more
+importantly, means a list of named keys or webhook destinations can
+never leak one of its own entries' secret values through a diff.
+`proxy_api_key` and `webhook_url` get the same treatment for the same
+reason, redacted to `(hidden)` on both sides even though they're plain
+strings: reporting *that* a credential changed is useful, echoing it
+into a log file or a webhook payload never is.
+
 ## Referencing environment variables in config
 
 Any string field in `aiproxy.json` — `proxy_api_key` and `webhook_url`
@@ -1894,8 +1922,8 @@ Every alertable event — `block`, `redact`, `response_block`,
 `response_redact`, `rate_limited`, `token_rate_limited`, `ip_denied`,
 `country_denied`, `anomaly_detected`, `unauthorized`, `dry_run_block`,
 `dry_run_redact`, `response_dry_run_block`, `response_dry_run_redact`,
-`budget_exceeded`, `failover`, `target_ejected`, or `target_recovered`
-— POSTs this JSON body to that URL:
+`budget_exceeded`, `failover`, `target_ejected`, `target_recovered`, or
+`config_changed` — POSTs this JSON body to that URL:
 
 ```json
 {
@@ -1977,6 +2005,23 @@ text:
   "url": "",
   "rule": "",
   "target": "https://backup.example.com",
+  "time": "2026-01-01T12:00:00Z"
+}
+```
+
+A `config_changed` alert — fired by a
+[SIGHUP reload](#seeing-exactly-what-a-reload-changed) that actually
+changed something — likewise has no `method`/`url`/`rule`: a config
+reload isn't tied to any one client request either, and the whole diff
+summary already lives in `text`:
+
+```json
+{
+  "text": "aiproxy: config reloaded from aiproxy.json: max_requests_per_minute: 60 -> 100",
+  "event": "config_changed",
+  "method": "",
+  "url": "",
+  "rule": "",
   "time": "2026-01-01T12:00:00Z"
 }
 ```
