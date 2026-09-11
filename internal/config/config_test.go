@@ -641,6 +641,51 @@ func TestLoad_ParsesTargetCostPer1KTokens(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesTargetWeightedURLs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/split", "weighted_urls": [
+			{"url": "https://api.openai.com", "weight": 90},
+			{"url": "https://api.newmodel.com", "weight": 10}
+		]}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Targets[0].WeightedURLs) != 2 {
+		t.Fatalf("len(WeightedURLs) = %d, want 2", len(cfg.Targets[0].WeightedURLs))
+	}
+	if cfg.Targets[0].WeightedURLs[0].URL != "https://api.openai.com" || cfg.Targets[0].WeightedURLs[0].Weight != 90 {
+		t.Errorf("WeightedURLs[0] = %+v, want {https://api.openai.com 90}", cfg.Targets[0].WeightedURLs[0])
+	}
+	if cfg.Targets[0].WeightedURLs[1].URL != "https://api.newmodel.com" || cfg.Targets[0].WeightedURLs[1].Weight != 10 {
+		t.Errorf("WeightedURLs[1] = %+v, want {https://api.newmodel.com 10}", cfg.Targets[0].WeightedURLs[1])
+	}
+}
+
+func TestLoad_TargetWeightedURLsDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [{"prefix": "/x", "url": "https://api.example.com"}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Targets[0].WeightedURLs) != 0 {
+		t.Fatalf("WeightedURLs = %v, want empty when absent", cfg.Targets[0].WeightedURLs)
+	}
+}
+
 func TestLoad_ParsesTargetCacheOverrides(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

@@ -793,7 +793,7 @@ func TestExecute_Validate_TargetNeitherURLNorURLsSet_ReportsProblem(t *testing.T
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "must set one of url or urls") {
+	if !strings.Contains(stderr.String(), "must set one of url, urls, or weighted_urls") {
 		t.Fatalf("stderr missing missing-url problem: %q", stderr.String())
 	}
 }
@@ -907,6 +907,75 @@ func TestExecute_Validate_NegativeTargetCostPer1KTokens_ReportsProblem(t *testin
 	errOut := stderr.String()
 	if !strings.Contains(errOut, "/openai") || !strings.Contains(errOut, "cost_per_1k_tokens") {
 		t.Fatalf("stderr missing the negative per-target cost rate problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_WeightedURLNonPositiveWeight_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/split", "weighted_urls": [
+			{"url": "https://api.openai.com", "weight": 90},
+			{"url": "https://api.newmodel.com", "weight": 0}
+		]}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "weighted_urls[1]") || !strings.Contains(errOut, "must be positive") {
+		t.Fatalf("stderr missing the non-positive weight problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_URLAndWeightedURLsMutuallyExclusive_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/split", "url": "https://api.openai.com", "weighted_urls": [
+			{"url": "https://api.newmodel.com", "weight": 10}
+		]}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "mutually exclusive") {
+		t.Fatalf("stderr missing the mutually-exclusive problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithWeightedURLs_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/split", "weighted_urls": [
+			{"url": "https://api.openai.com", "weight": 90},
+			{"url": "https://api.newmodel.com", "weight": 10}
+		]}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 	}
 }
 

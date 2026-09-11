@@ -1430,6 +1430,65 @@ as forwarding to a single, entirely-down target has always produced —
 this adds a chance to recover before that happens, not a guarantee
 against it.
 
+### Weighted traffic splitting
+
+`urls` is an ordered *failover* list — candidates meant to be
+interchangeable backups of the very same logical destination, only
+falling back when one is actually unreachable. `weighted_urls`, set
+instead, deliberately *splits* traffic between candidates by
+configured proportion, even while everything is healthy — a canary
+rollout, or an A/B comparison between two genuinely different
+destinations (a new model, a different provider):
+
+```json
+{
+  "targets": [
+    {
+      "prefix": "/chat",
+      "weighted_urls": [
+        { "url": "https://api.openai.com", "weight": 90 },
+        { "url": "https://api.newmodel.com", "weight": 10 }
+      ]
+    }
+  ]
+}
+```
+
+One candidate is chosen at random, in proportion to its own `weight`
+relative to the others, fresh for every request — weights don't need
+to add up to 100 or any particular total, only their relative
+proportions to each other matter (`{90, 10}` and `{9, 1}` behave
+identically). Across many requests, the actual traffic split
+approximates the configured ratio. `url`, `urls`, and `weighted_urls`
+are mutually exclusive; set exactly one per target (or `model_routes[]`
+entry — the same field works there too).
+
+The chosen candidate still gets exactly the same
+[failover](#failover-across-multiple-upstreams) and [target
+ejection](#automatically-deprioritizing-a-failing-candidate) protection
+every other route already has: if it happens to be unreachable, aiproxy
+still tries the rest, in their declared order, rather than failing the
+request outright — the same "never refuse a genuine attempt when a
+healthier alternative exists" principle ejection itself already
+established. In practice this means a real outage on the smaller side
+of a split can temporarily skew the actual ratio toward the healthier
+side, favoring uptime over strict adherence to the configured
+proportion, for as long as the outage lasts.
+
+The [cache](#custom-rules-rate-limiting-caching-and-cost-estimation)
+key for a weighted route is computed from whichever candidate was
+*actually chosen* for that specific request, not a single fixed
+identity the way a plain failover list's own cache key always is — a
+90/10 split between two real, different models must never let one
+candidate's cached response leak into a request that was "supposed" to
+go to the other, since (unlike failover's own interchangeable
+candidates) a weighted split's whole point is that they're genuinely
+different destinations. There's no separate per-candidate breakdown in
+stats/logs for a weighted route beyond what every other multi-candidate
+route already gets (the aggregate `targets[].prefix` label) — if you
+need to compare metrics between the two sides of a split directly, give
+each its own separate route/prefix instead.
+
 ### Automatically deprioritizing a failing candidate
 
 Failover already moves a request on to the next candidate URL when one

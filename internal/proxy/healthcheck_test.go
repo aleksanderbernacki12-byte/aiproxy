@@ -25,8 +25,8 @@ func TestAllCandidateTargets_DeduplicatesAcrossTargetAndRoutes(t *testing.T) {
 	}
 
 	s := New("unused", a, rules.NewEngine(rules.Allow))
-	s.AddRoute("/openai", []*url.URL{a, b}, nil, nil)
-	s.AddModelRoute("claude", []string{"claude-*"}, []*url.URL{b}, nil, nil)
+	s.AddRoute("/openai", []*url.URL{a, b}, nil, nil, nil)
+	s.AddModelRoute("claude", []string{"claude-*"}, []*url.URL{b}, nil, nil, nil)
 
 	got := s.allCandidateTargets()
 	if len(got) != 2 {
@@ -171,7 +171,7 @@ func TestRunHealthChecks_EjectsDeadTargetProactivelyWithoutAnyRealRequest(t *tes
 	s.Logger = log.New(io.Discard, "", 0)
 	s.TargetBreaker = breaker.NewRegistry(1, time.Hour)
 	s.HealthCheckInterval = 20 * time.Millisecond
-	s.AddRoute("/openai", []*url.URL{healthyURL, deadURL}, nil, nil)
+	s.AddRoute("/openai", []*url.URL{healthyURL, deadURL}, nil, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

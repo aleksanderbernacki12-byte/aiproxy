@@ -198,10 +198,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.AuditChain = auditChain
 	server.AdminAddr = *adminAddr
 	for _, r := range lc.routes {
-		server.AddRoute(r.prefix, r.targets, r.limiter, r.tokenLimiter)
+		server.AddRoute(r.prefix, r.targets, r.weights, r.limiter, r.tokenLimiter)
 	}
 	for _, r := range lc.modelRoutes {
-		server.AddModelRoute(r.name, r.models, r.targets, r.limiter, r.tokenLimiter)
+		server.AddModelRoute(r.name, r.models, r.targets, r.weights, r.limiter, r.tokenLimiter)
 	}
 
 	if cfg != nil {
@@ -339,6 +339,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		for _, r := range lc.routes {
 			dest := formatTargetsForDisplay(r.targets)
+			if r.weights != nil {
+				dest = formatWeightedTargetsForDisplay(r.targets, r.weights)
+			}
 			if limits := formatRateLimitsForDisplay(r.maxRequestsPerMinute, r.maxTokensPerMinute); limits != "" {
 				fmt.Fprintf(stdout, "route: %s -> %s (rate limit: %s)\n", r.prefix, dest, limits)
 			} else {
@@ -347,6 +350,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		for _, r := range lc.modelRoutes {
 			dest := formatTargetsForDisplay(r.targets)
+			if r.weights != nil {
+				dest = formatWeightedTargetsForDisplay(r.targets, r.weights)
+			}
 			models := strings.Join(r.models, ", ")
 			if limits := formatRateLimitsForDisplay(r.maxRequestsPerMinute, r.maxTokensPerMinute); limits != "" {
 				fmt.Fprintf(stdout, "model route: %s (%s) -> %s (rate limit: %s)\n", r.name, models, dest, limits)
@@ -446,11 +452,11 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 
 	routes := make([]proxy.Route, len(lc.routes))
 	for i, r := range lc.routes {
-		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
+		routes[i] = proxy.Route{Prefix: r.prefix, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
 	modelRoutes := make([]proxy.ModelRoute, len(lc.modelRoutes))
 	for i, r := range lc.modelRoutes {
-		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
+		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
 	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled)
 
@@ -1694,6 +1700,7 @@ func compileWebhookTargets(targets []config.WebhookTarget) ([]proxy.WebhookTarge
 type targetRoute struct {
 	prefix               string
 	targets              []*url.URL
+	weights              []int
 	maxRequestsPerMinute int
 	limiter              *limiter.Limiter
 	maxTokensPerMinute   int
@@ -1717,6 +1724,19 @@ func formatTargetsForDisplay(targets []*url.URL) string {
 		strs[i] = u.String()
 	}
 	return strings.Join(strs, " -> ")
+}
+
+// formatWeightedTargetsForDisplay is formatTargetsForDisplay's
+// counterpart for a weighted route — used instead whenever weights is
+// non-nil, showing each candidate's own configured share rather than
+// the " -> " failover-chain arrow, since a weighted split isn't an
+// ordered fallback chain the way a plain multi-candidate route is.
+func formatWeightedTargetsForDisplay(targets []*url.URL, weights []int) string {
+	strs := make([]string, len(targets))
+	for i, u := range targets {
+		strs[i] = fmt.Sprintf("%s (%d)", u.String(), weights[i])
+	}
+	return strings.Join(strs, " | ")
 }
 
 // formatRateLimitsForDisplay renders a route/model route's own
@@ -1770,7 +1790,7 @@ func compileTargetRoutes(targets []config.Target, globalCacheEnabled bool) ([]ta
 		}
 		seenPrefixes[t.Prefix] = true
 
-		urls, urlErrs := compileURLCandidates(fmt.Sprintf("targets: prefix %q", t.Prefix), t.URL, t.URLs)
+		urls, weights, urlErrs := compileURLCandidates(fmt.Sprintf("targets: prefix %q", t.Prefix), t.URL, t.URLs, t.WeightedURLs)
 		if len(urlErrs) > 0 {
 			errs = append(errs, urlErrs...)
 			continue
@@ -1798,7 +1818,7 @@ func compileTargetRoutes(targets []config.Target, globalCacheEnabled bool) ([]ta
 			continue
 		}
 
-		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute, costPer1KTokens: t.CostPer1KTokens, cacheEnabled: t.CacheEnabled, cacheTTLSeconds: t.CacheTTLSeconds}
+		tr := targetRoute{prefix: t.Prefix, targets: urls, weights: weights, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute, costPer1KTokens: t.CostPer1KTokens, cacheEnabled: t.CacheEnabled, cacheTTLSeconds: t.CacheTTLSeconds}
 		if t.MaxRequestsPerMinute > 0 {
 			tr.limiter = limiter.New(t.MaxRequestsPerMinute, time.Minute)
 		}
@@ -1819,24 +1839,62 @@ func compileTargetRoutes(targets []config.Target, globalCacheEnabled bool) ([]ta
 // `model_routes: "anthropic"`) so the caller's own identity is clear
 // without this helper needing to know which kind of route it's for.
 // Shared by compileTargetRoutes and compileModelRoutes.
-func compileURLCandidates(label, rawURL string, rawURLs []string) ([]*url.URL, []error) {
-	if rawURL != "" && len(rawURLs) > 0 {
-		return nil, []error{fmt.Errorf("%s: url and urls are mutually exclusive — set exactly one", label)}
+// compileURLCandidates resolves an entry's url/urls/weighted_urls
+// fields into an ordered, non-empty list of upstream URLs — exactly
+// one of the three must be set. weights is nil unless weighted_urls
+// was the one actually set, in which case it's the same length as the
+// returned URL list, weights[i] being urls[i]'s own configured Weight
+// — see config.WeightedURL.
+func compileURLCandidates(label, rawURL string, rawURLs []string, rawWeightedURLs []config.WeightedURL) (urls []*url.URL, weights []int, errs []error) {
+	set := 0
+	if rawURL != "" {
+		set++
 	}
-	if rawURL == "" && len(rawURLs) == 0 {
-		return nil, []error{fmt.Errorf("%s: must set one of url or urls", label)}
+	if len(rawURLs) > 0 {
+		set++
+	}
+	if len(rawWeightedURLs) > 0 {
+		set++
+	}
+	if set > 1 {
+		return nil, nil, []error{fmt.Errorf("%s: url, urls, and weighted_urls are mutually exclusive — set exactly one", label)}
+	}
+	if set == 0 {
+		return nil, nil, []error{fmt.Errorf("%s: must set one of url, urls, or weighted_urls", label)}
 	}
 
 	if rawURL != "" {
 		u, err := parseHTTPSURL(rawURL)
 		if err != nil {
-			return nil, []error{fmt.Errorf("%s: url %w", label, err)}
+			return nil, nil, []error{fmt.Errorf("%s: url %w", label, err)}
 		}
-		return []*url.URL{u}, nil
+		return []*url.URL{u}, nil, nil
 	}
 
-	urls := make([]*url.URL, 0, len(rawURLs))
-	var errs []error
+	if len(rawWeightedURLs) > 0 {
+		urls := make([]*url.URL, 0, len(rawWeightedURLs))
+		weights := make([]int, 0, len(rawWeightedURLs))
+		var errs []error
+		for i, wu := range rawWeightedURLs {
+			u, err := parseHTTPSURL(wu.URL)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: weighted_urls[%d] %w", label, i, err))
+				continue
+			}
+			if wu.Weight <= 0 {
+				errs = append(errs, fmt.Errorf("%s: weighted_urls[%d]: weight %d must be positive", label, i, wu.Weight))
+				continue
+			}
+			urls = append(urls, u)
+			weights = append(weights, wu.Weight)
+		}
+		if len(errs) > 0 {
+			return nil, nil, errs
+		}
+		return urls, weights, nil
+	}
+
+	urls = make([]*url.URL, 0, len(rawURLs))
 	for i, raw := range rawURLs {
 		u, err := parseHTTPSURL(raw)
 		if err != nil {
@@ -1846,9 +1904,9 @@ func compileURLCandidates(label, rawURL string, rawURLs []string) ([]*url.URL, [
 		urls = append(urls, u)
 	}
 	if len(errs) > 0 {
-		return nil, errs
+		return nil, nil, errs
 	}
-	return urls, nil
+	return urls, nil, nil
 }
 
 // compileModelRoutes validates and parses each model_routes entry from
@@ -1907,7 +1965,7 @@ func compileModelRoutes(routes []config.ModelRoute, globalCacheEnabled bool) ([]
 			continue
 		}
 
-		urls, urlErrs := compileURLCandidates(fmt.Sprintf("model_routes: %q", r.Name), r.URL, r.URLs)
+		urls, weights, urlErrs := compileURLCandidates(fmt.Sprintf("model_routes: %q", r.Name), r.URL, r.URLs, r.WeightedURLs)
 		if len(urlErrs) > 0 {
 			errs = append(errs, urlErrs...)
 			continue
@@ -1935,7 +1993,7 @@ func compileModelRoutes(routes []config.ModelRoute, globalCacheEnabled bool) ([]
 			continue
 		}
 
-		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute, costPer1KTokens: r.CostPer1KTokens, cacheEnabled: r.CacheEnabled, cacheTTLSeconds: r.CacheTTLSeconds}
+		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, weights: weights, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute, costPer1KTokens: r.CostPer1KTokens, cacheEnabled: r.CacheEnabled, cacheTTLSeconds: r.CacheTTLSeconds}
 		if r.MaxRequestsPerMinute > 0 {
 			mr.limiter = limiter.New(r.MaxRequestsPerMinute, time.Minute)
 		}
@@ -1955,6 +2013,7 @@ type modelRoute struct {
 	name                 string
 	models               []string
 	targets              []*url.URL
+	weights              []int
 	maxRequestsPerMinute int
 	limiter              *limiter.Limiter
 	maxTokensPerMinute   int

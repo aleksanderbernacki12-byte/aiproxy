@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mathrand "math/rand/v2"
 	"mime"
 	"net"
 	"net/http"
@@ -159,6 +160,7 @@ type requestContextInfo struct {
 type route struct {
 	prefix       string
 	targets      []*url.URL
+	weights      []int
 	limiter      *limiter.Limiter
 	tokenLimiter *limiter.TokenLimiter
 }
@@ -171,6 +173,7 @@ type modelRoute struct {
 	name         string
 	models       []string
 	targets      []*url.URL
+	weights      []int
 	limiter      *limiter.Limiter
 	tokenLimiter *limiter.TokenLimiter
 }
@@ -920,6 +923,65 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	return nil, lastErr
 }
 
+// weightedOrdered returns candidates reordered so one, chosen at
+// random in proportion to weights (weights[i] is candidates[i]'s own
+// relative weight), comes first — the rest follow in their original
+// relative order, unchanged. Called fresh on every request (see
+// resolveRoute/resolveModelRoute), so across many requests the actual
+// traffic split approximates the configured weights. weights == nil
+// means candidates is a plain ordered failover list, not a weighted
+// one — returned completely unchanged, the exact behavior every route
+// had before weighted routing existed. The candidate this picks still
+// gets exactly the same failover/target-ejection protection every
+// other route already has once handed to failoverTransport — if it
+// turns out to be unreachable, the rest are still tried, in their
+// declared order, rather than failing the request outright; see
+// config.WeightedURL's own doc comment for the full reasoning.
+func weightedOrdered(candidates []*url.URL, weights []int) []*url.URL {
+	if weights == nil || len(candidates) <= 1 {
+		return candidates
+	}
+	i := pickWeightedIndex(weights)
+	if i == 0 {
+		return candidates
+	}
+	out := make([]*url.URL, 0, len(candidates))
+	out = append(out, candidates[i])
+	out = append(out, candidates[:i]...)
+	out = append(out, candidates[i+1:]...)
+	return out
+}
+
+// pickWeightedIndex returns an index into weights chosen at random,
+// with the probability of index i being weights[i] divided by the sum
+// of every weight — see weightedOrdered. Callers only ever invoke this
+// with a non-empty weights slice where every entry is positive (see
+// config.WeightedURL's own validation), so the loop below is always
+// guaranteed to return before falling through.
+func pickWeightedIndex(weights []int) int {
+	return pickWeightedIndexFrom(weights, mathrand.IntN)
+}
+
+// pickWeightedIndexFrom is the deterministic core of pickWeightedIndex,
+// taking the random-index source as a parameter so it can be exercised
+// precisely (and without real randomness) by tests — the same
+// "deterministic core, real entry point just supplies the real source"
+// split as limiter.Limiter's own allow(now)/Allow.
+func pickWeightedIndexFrom(weights []int, randIntN func(int) int) int {
+	total := 0
+	for _, w := range weights {
+		total += w
+	}
+	r := randIntN(total)
+	for i, w := range weights {
+		if r < w {
+			return i
+		}
+		r -= w
+	}
+	return len(weights) - 1 // unreachable given the math above; a safe fallback rather than a panic
+}
+
 // healthOrdered returns candidates reordered so every currently
 // non-ejected one comes first (preserving their original relative
 // order), followed by every currently ejected one (also in original
@@ -1149,8 +1211,13 @@ func (t *failoverTransport) recordLatency(reqCtx requestContextInfo, d time.Dura
 // route that should just share whatever Limiter (if any) the server is
 // configured with, same as every route did before per-target limits
 // existed. tokenLim behaves the same way for TokenLimiter.
-func (s *Server) AddRoute(prefix string, targets []*url.URL, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
-	s.routes = append(s.routes, route{prefix: prefix, targets: targets, limiter: lim, tokenLimiter: tokenLim})
+//
+// weights, if non-nil, must be the same length as targets: targets[i]'s
+// own relative share of traffic is weights[i] — see weightedOrdered and
+// config.WeightedURL. nil means targets is a plain ordered failover
+// list instead, unchanged from before weighted routing existed.
+func (s *Server) AddRoute(prefix string, targets []*url.URL, weights []int, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
+	s.routes = append(s.routes, route{prefix: prefix, targets: targets, weights: weights, limiter: lim, tokenLimiter: tokenLim})
 }
 
 // resolveRoute matches path against the registered routes and returns
@@ -1164,6 +1231,13 @@ func (s *Server) AddRoute(prefix string, targets []*url.URL, lim *limiter.Limite
 // Limiter/TokenLimiter (nil if those are unset too, meaning no limiting
 // at all). It falls back to a single-element list holding the default
 // Target, unmodified path, when nothing matches.
+//
+// For a route with weights configured, the returned list is freshly
+// reordered on every call — see weightedOrdered — so the candidate
+// actually tried first (and used to compute the cache key, since that
+// happens right after this returns) varies request to request in
+// proportion to the configured weights, instead of always being
+// targets[0] the way a plain failover list's own primary always is.
 func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1181,7 +1255,7 @@ func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath stri
 			if effectiveTokenLimiter == nil {
 				effectiveTokenLimiter = s.TokenLimiter
 			}
-			return r.targets, stripped, r.prefix, effectiveLimiter, effectiveTokenLimiter
+			return weightedOrdered(r.targets, r.weights), stripped, r.prefix, effectiveLimiter, effectiveTokenLimiter
 		}
 	}
 	return []*url.URL{s.Target}, path, "default", s.Limiter, s.TokenLimiter
@@ -1197,9 +1271,10 @@ func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath stri
 // to keep it visually and collision-free distinct from a path prefix's
 // own label. See resolveModelRoute for matching order and precedence
 // over path-prefix routes. tokenLim behaves like AddRoute's own
+// parameter of the same name. weights behaves like AddRoute's own
 // parameter of the same name.
-func (s *Server) AddModelRoute(name string, models []string, targets []*url.URL, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
-	s.modelRoutes = append(s.modelRoutes, modelRoute{name: name, models: models, targets: targets, limiter: lim, tokenLimiter: tokenLim})
+func (s *Server) AddModelRoute(name string, models []string, targets []*url.URL, weights []int, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
+	s.modelRoutes = append(s.modelRoutes, modelRoute{name: name, models: models, targets: targets, weights: weights, limiter: lim, tokenLimiter: tokenLim})
 }
 
 // modelField pulls just the top-level "model" string out of a request
@@ -1236,7 +1311,7 @@ func (s *Server) resolveModelRoute(body []byte) (targets []*url.URL, label strin
 	for _, r := range s.modelRoutes {
 		for _, pattern := range r.models {
 			if ok, err := path.Match(pattern, mf.Model); err == nil && ok {
-				return r.targets, "model:" + r.name, r.limiter, r.tokenLimiter, true
+				return weightedOrdered(r.targets, r.weights), "model:" + r.name, r.limiter, r.tokenLimiter, true
 			}
 		}
 	}
@@ -1527,6 +1602,10 @@ func (s *Server) getLogFile() *os.File {
 type Route struct {
 	Prefix  string
 	Targets []*url.URL
+	// Weights, if non-nil, makes Targets a weighted split instead of a
+	// plain ordered failover list — see AddRoute's own Weights
+	// parameter.
+	Weights []int
 	// Limiter, if non-nil, gives this route its own dedicated rate
 	// limit instead of sharing whatever Limiter ReloadConfig sets.
 	Limiter *limiter.Limiter
@@ -1545,6 +1624,10 @@ type ModelRoute struct {
 	Name    string
 	Models  []string
 	Targets []*url.URL
+	// Weights, if non-nil, makes Targets a weighted split instead of a
+	// plain ordered failover list — see AddRoute's own Weights
+	// parameter.
+	Weights []int
 	// Limiter, if non-nil, gives this route its own dedicated rate
 	// limit instead of sharing whatever Limiter ReloadConfig sets.
 	Limiter *limiter.Limiter
@@ -1614,11 +1697,11 @@ type ModelRoute struct {
 func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
-		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
+		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
 	}
 	newModelRoutes := make([]modelRoute, len(modelRoutes))
 	for i, r := range modelRoutes {
-		newModelRoutes[i] = modelRoute{name: r.Name, models: r.Models, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
+		newModelRoutes[i] = modelRoute{name: r.Name, models: r.Models, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
 	}
 
 	s.mu.Lock()

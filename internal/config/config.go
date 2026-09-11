@@ -146,6 +146,18 @@ type ProxyAPIKeyEntry struct {
 	CostBudget float64 `json:"cost_budget,omitempty"`
 }
 
+// WeightedURL is one candidate in a Target's or ModelRoute's own
+// WeightedURLs list — a single upstream URL plus its relative share of
+// traffic. Weight must be positive; the actual probability of this
+// candidate being chosen for any one request is Weight divided by the
+// sum of every candidate's own Weight in the same list (weights don't
+// need to add up to 100 or any particular total — only their relative
+// proportions to each other matter).
+type WeightedURL struct {
+	URL    string `json:"url"`
+	Weight int    `json:"weight"`
+}
+
 // Target is one path-prefix-to-upstream mapping for multi-target
 // routing, as it appears in the config file, before URL/URLs has been
 // parsed.
@@ -168,6 +180,29 @@ type Target struct {
 	// billed, LLM call being the textbook case for this proxy. At least
 	// one URL is required when this is set.
 	URLs []string `json:"urls,omitempty"`
+
+	// WeightedURLs, set instead of URL/URLs, gives this target a set of
+	// candidates split by deliberate, configured proportion — a canary
+	// rollout or an A/B comparison between two genuinely different
+	// destinations (a new model, a different provider), unlike URLs'
+	// own ordered failover list, which exists for candidates meant to
+	// be interchangeable backups of the very same logical destination.
+	// One candidate is chosen at random, in proportion to its own
+	// Weight relative to the others, fresh for every request, so across
+	// many requests the actual traffic split approximates the
+	// configured weights. The chosen candidate still gets exactly the
+	// same failover/target-ejection protection every other route
+	// already has — if it happens to be unreachable, aiproxy still
+	// tries the rest, in their declared order, rather than failing the
+	// request outright, the same "never refuse a genuine attempt when
+	// there's a healthier alternative" principle target_ejection_threshold
+	// already established; a real outage on the smaller side of a split
+	// can therefore temporarily skew the actual ratio toward the
+	// healthier side, favoring uptime over strict adherence to the
+	// configured proportion. At least two candidates are expected (a
+	// single one makes the weight meaningless), though only one is
+	// technically required, same as URLs.
+	WeightedURLs []WeightedURL `json:"weighted_urls,omitempty"`
 
 	// MaxRequestsPerMinute, if greater than zero, gives this target its
 	// own dedicated rate limit instead of sharing the top-level
@@ -254,6 +289,11 @@ type ModelRoute struct {
 	// list — same meaning and same never-retry-on-5xx safety boundary
 	// as Target.URLs.
 	URLs []string `json:"urls,omitempty"`
+
+	// WeightedURLs, set instead of URL/URLs, splits this route's own
+	// traffic by deliberate, configured proportion — same meaning as
+	// Target.WeightedURLs.
+	WeightedURLs []WeightedURL `json:"weighted_urls,omitempty"`
 
 	// MaxRequestsPerMinute, if greater than zero, gives this route its
 	// own dedicated rate limit instead of sharing the top-level

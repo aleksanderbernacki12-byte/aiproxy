@@ -2580,7 +2580,7 @@ func TestServer_ListenAndServe_HealthCheckEjectsDeadTargetProactively(t *testing
 	srv.Logger = log.New(io.Discard, "", 0)
 	srv.TargetBreaker = breaker.NewRegistry(1, time.Hour)
 	srv.HealthCheckInterval = 20 * time.Millisecond
-	srv.AddRoute("/openai", []*url.URL{healthyURL, deadURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{healthyURL, deadURL}, nil, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -2707,8 +2707,8 @@ func TestServer_MultiTargetRouting_RoutesByPathPrefixAndStripsPrefix(t *testing.
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -2786,8 +2786,8 @@ func TestServer_MultiTargetRouting_CacheKeysDifferPerTarget(t *testing.T) {
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", openaiURL, engine)
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil, nil)
 	srv.Cache = c
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -2883,8 +2883,8 @@ func TestServer_MultiTargetRouting_StatsBreakDownPerTarget(t *testing.T) {
 	})
 
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil, nil)
 	srv.CostPer1KTokens = 0.02
 	srv.Logger = log.New(io.Discard, "", 0)
 
@@ -3309,7 +3309,7 @@ func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
 	}
 
 	srv.CostPer1KTokens = 0.02
-	srv.AddRoute("/other", []*url.URL{otherURL}, nil, nil)
+	srv.AddRoute("/other", []*url.URL{otherURL}, nil, nil, nil)
 	resp2, err := http.Get(frontend.URL + "/other/y")
 	if err != nil {
 		t.Fatalf("GET /other/y: %v", err)
@@ -3360,8 +3360,8 @@ func TestServer_StatsEndpoint_PerTargetCostOverrideAffectsOnlyThatTargetAndTheTr
 	srv.Logger = log.New(io.Discard, "", 0)
 	srv.CostPer1KTokens = 0.03
 	srv.TargetCostRates = map[string]float64{"/anthropic": 0.08}
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -3767,7 +3767,7 @@ func TestServer_MetricsEndpoint_IncludesCostOnlyWhenConfiguredAndLabelsEveryTarg
 	}
 
 	srv.CostPer1KTokens = 0.02
-	srv.AddRoute("/other", []*url.URL{otherURL}, nil, nil)
+	srv.AddRoute("/other", []*url.URL{otherURL}, nil, nil, nil)
 	resp2, err := http.Get(frontend.URL + "/other/y")
 	if err != nil {
 		t.Fatalf("GET /other/y: %v", err)
@@ -3810,8 +3810,8 @@ func TestServer_MetricsEndpoint_PerTargetCostOverridePricesEachSeriesAtItsOwnRat
 	srv.Logger = log.New(io.Discard, "", 0)
 	srv.CostPer1KTokens = 0.03
 	srv.TargetCostRates = map[string]float64{"/anthropic": 0.08}
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -3874,8 +3874,8 @@ func TestServer_MultiTargetRouting_PerTargetLimiterActsIndependently(t *testing.
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", sharedURL, engine)
 	srv.Limiter = limiter.New(5, time.Minute) // generous shared budget
-	srv.AddRoute("/strict", []*url.URL{strictURL}, limiter.New(1, time.Minute), nil)
-	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil, nil) // no override: shares srv.Limiter
+	srv.AddRoute("/strict", []*url.URL{strictURL}, nil, limiter.New(1, time.Minute), nil)
+	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil, nil, nil) // no override: shares srv.Limiter
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -3947,8 +3947,8 @@ func TestServer_MultiTargetRouting_PerTargetTokenLimiterActsIndependently(t *tes
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", sharedURL, engine)
 	srv.TokenLimiter = limiter.NewTokenLimiter(1000, time.Minute) // generous shared budget
-	srv.AddRoute("/strict", []*url.URL{strictURL}, nil, limiter.NewTokenLimiter(100, time.Minute))
-	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil, nil) // no override: shares srv.TokenLimiter
+	srv.AddRoute("/strict", []*url.URL{strictURL}, nil, nil, limiter.NewTokenLimiter(100, time.Minute))
+	srv.AddRoute("/shared", []*url.URL{sharedURL}, nil, nil, nil) // no override: shares srv.TokenLimiter
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -4001,7 +4001,7 @@ func TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget(
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", targetURL, engine)
-	srv.AddRoute("/limited", []*url.URL{targetURL}, limiter.New(1, time.Minute), nil)
+	srv.AddRoute("/limited", []*url.URL{targetURL}, nil, limiter.New(1, time.Minute), nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -7424,7 +7424,7 @@ func TestServer_Failover_FailsOverToNextCandidateWhenFirstUnreachable(t *testing
 	var logBuf syncBuffer
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(&logBuf, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -7486,7 +7486,7 @@ func TestServer_Failover_NeverRetriesOnHTTPLevelErrorResponse(t *testing.T) {
 
 	srv := proxy.New("unused", failingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{failingURL, secondURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{failingURL, secondURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -7529,7 +7529,7 @@ func TestServer_Failover_AllCandidatesUnreachable_StillReturnsAnErrorResponse(t 
 
 	srv := proxy.New("unused", firstDead, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{firstDead, secondDead}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{firstDead, secondDead}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -7569,7 +7569,7 @@ func TestServer_Failover_ReusesBufferedBodyAcrossAttempts(t *testing.T) {
 
 	srv := proxy.New("unused", echoingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, echoingURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, echoingURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -7635,7 +7635,7 @@ func TestServer_TargetBreaker_PrefersHealthyCandidateAfterEjection(t *testing.T)
 	srv := proxy.New("unused", healthyURL, rules.NewEngine(rules.Allow))
 	srv.TargetBreaker = breaker.NewRegistry(3, time.Hour)
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{brokenURL, healthyURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{brokenURL, healthyURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -7847,7 +7847,7 @@ func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", healthyURL, engine)
-	srv.AddRoute("/openai", []*url.URL{brokenURL, healthyURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{brokenURL, healthyURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
@@ -7908,7 +7908,7 @@ func TestServer_Webhook_FiresOnFailoverWithExpectedPayload(t *testing.T) {
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.WebhookURL = webhookURL
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -7963,7 +7963,7 @@ func TestServer_StatsEndpoint_ReportsFailoverPerTarget(t *testing.T) {
 
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -8009,7 +8009,7 @@ func TestServer_MetricsEndpoint_ReportsFailoverCounter(t *testing.T) {
 
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -8217,7 +8217,7 @@ func TestServer_Latency_RecordedOnceEvenAfterFailover(t *testing.T) {
 
 	srv := proxy.New("unused", workingURL, rules.NewEngine(rules.Allow))
 	srv.Logger = log.New(io.Discard, "", 0)
-	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{unreachableURL, workingURL}, nil, nil, nil)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -9130,8 +9130,8 @@ func TestServer_ModelRouting_RoutesByBodyModelFieldAndLeavesPathUnchanged(t *tes
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{anthropicURL}, nil, nil)
-	srv.AddModelRoute("openai", []string{"gpt-*", "o1*"}, []*url.URL{openaiURL}, nil, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{anthropicURL}, nil, nil, nil)
+	srv.AddModelRoute("openai", []string{"gpt-*", "o1*"}, []*url.URL{openaiURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -9206,8 +9206,8 @@ func TestServer_ModelRouting_TakesPriorityOverPathPrefixRouting(t *testing.T) {
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", pathURL, engine)
-	srv.AddRoute("/v1", []*url.URL{pathURL}, nil, nil)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil, nil)
+	srv.AddRoute("/v1", []*url.URL{pathURL}, nil, nil, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -9261,8 +9261,8 @@ func TestServer_ModelRouting_FirstMatchingRouteWinsInConfiguredOrder(t *testing.
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", firstURL, engine)
-	srv.AddModelRoute("first", []string{"claude-*"}, []*url.URL{firstURL}, nil, nil)
-	srv.AddModelRoute("second", []string{"claude-3-*"}, []*url.URL{secondURL}, nil, nil)
+	srv.AddModelRoute("first", []string{"claude-*"}, []*url.URL{firstURL}, nil, nil, nil)
+	srv.AddModelRoute("second", []string{"claude-3-*"}, []*url.URL{secondURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -9297,7 +9297,7 @@ func TestServer_ModelRouting_PerTargetStatsLabeledByModelRouteName(t *testing.T)
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", upstreamURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -9343,7 +9343,7 @@ func TestServer_ModelRouting_OwnRateLimitTakesPrecedenceOverServerWide(t *testin
 	// — if the route's own limiter isn't what's actually enforced, this
 	// request would never be rate-limited within the test.
 	srv.Limiter = limiter.New(1000, time.Minute)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, limiter.New(1, time.Minute), nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil, limiter.New(1, time.Minute), nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -9386,7 +9386,7 @@ func TestServer_ModelRouting_OwnTokenRateLimitTakesPrecedenceOverServerWide(t *t
 	// enforced, this request would never be token-rate-limited within
 	// the test.
 	srv.TokenLimiter = limiter.NewTokenLimiter(1000000, time.Minute)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil, limiter.NewTokenLimiter(100, time.Minute))
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{upstreamURL}, nil, nil, limiter.NewTokenLimiter(100, time.Minute))
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -9430,7 +9430,7 @@ func TestServer_ModelRouting_FailoverAcrossCandidatesWorksLikePathRoutes(t *test
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", workingURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{unreachable, workingURL}, nil, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{unreachable, workingURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -9483,7 +9483,7 @@ func TestServer_ModelRouting_UnparseableOrMissingModelFieldFallsBackToPathRoutin
 
 	engine := rules.NewEngine(rules.Allow)
 	srv := proxy.New("unused", defaultURL, engine)
-	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil, nil)
+	srv.AddModelRoute("anthropic", []string{"claude-*"}, []*url.URL{modelURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -11083,8 +11083,8 @@ func TestServer_CustomRuleTargetScoping_OnlyBlocksConfiguredTarget(t *testing.T)
 	})
 
 	srv := proxy.New("unused", anthropicURL, engine)
-	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
-	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 
 	frontend := httptest.NewServer(srv)
@@ -12863,8 +12863,8 @@ func TestServer_TargetCacheTTL_OverridesGlobalTTLForOnlyThatTarget(t *testing.T)
 	srv.Cache = c
 	srv.CacheTTL = time.Hour // the default: effectively never expires for this test's timescale
 	srv.TargetCacheTTL = map[string]time.Duration{"/short": 30 * time.Millisecond}
-	srv.AddRoute("/short", []*url.URL{shortURL}, nil, nil)
-	srv.AddRoute("/long", []*url.URL{longURL}, nil, nil)
+	srv.AddRoute("/short", []*url.URL{shortURL}, nil, nil, nil)
+	srv.AddRoute("/long", []*url.URL{longURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
@@ -12928,8 +12928,8 @@ func TestServer_TargetCacheEnabled_FalseOptsOutEvenWithGlobalCachingOn(t *testin
 	srv.Cache = c
 	falseVal := false
 	srv.TargetCacheEnabled = map[string]bool{"/never-cache": falseVal}
-	srv.AddRoute("/never-cache", []*url.URL{neverURL}, nil, nil)
-	srv.AddRoute("/always-cache", []*url.URL{alwaysURL}, nil, nil)
+	srv.AddRoute("/never-cache", []*url.URL{neverURL}, nil, nil, nil)
+	srv.AddRoute("/always-cache", []*url.URL{alwaysURL}, nil, nil, nil)
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
@@ -12995,5 +12995,193 @@ func TestServer_TargetCacheEnabled_TrueNeverWidensWhenCacheIsNil(t *testing.T) {
 
 	if got := upstreamHits.Load(); got != 2 {
 		t.Fatalf("upstream hits = %d, want 2 — a per-target cache_enabled=true override must never widen caching on when Server.Cache is nil", got)
+	}
+}
+
+// TestServer_WeightedRouting_SplitApproximatesConfiguredWeights proves
+// the real, end-to-end weighted-routing behavior: with a heavily
+// lopsided 995:5 split across many real requests, the heavy candidate
+// gets the large majority of traffic and the light candidate still
+// gets a genuine, non-zero share — a real statistical split, not a
+// disguised failover list.
+func TestServer_WeightedRouting_SplitApproximatesConfiguredWeights(t *testing.T) {
+	var heavyHits, lightHits atomic.Int32
+	heavy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		heavyHits.Add(1)
+		w.Write([]byte("heavy"))
+	}))
+	defer heavy.Close()
+	light := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lightHits.Add(1)
+		w.Write([]byte("light"))
+	}))
+	defer light.Close()
+
+	heavyURL, err := url.Parse(heavy.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	lightURL, err := url.Parse(light.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", heavyURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/split", []*url.URL{heavyURL, lightURL}, []int{995, 5}, nil, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const trials = 400
+	for i := 0; i < trials; i++ {
+		// A distinct body every time so this never hits the (disabled
+		// here) cache and always genuinely re-resolves the route.
+		resp, err := http.Post(frontend.URL+"/split/v1", "application/json", strings.NewReader(fmt.Sprintf(`{"n":%d}`, i)))
+		if err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	total := heavyHits.Load() + lightHits.Load()
+	if total != trials {
+		t.Fatalf("total hits = %d, want %d", total, trials)
+	}
+	if lightHits.Load() == 0 {
+		t.Fatal("light candidate (weight 5/1000) never received a single request across 400 trials — the split isn't actually random")
+	}
+	// Loose bound purely to catch a badly broken split (e.g. always
+	// picking the same candidate, or a roughly 50/50 split instead of
+	// 995:5) without being flaky — heavy should get comfortably more
+	// than 3/4 of all traffic.
+	if heavyHits.Load() < trials*3/4 {
+		t.Fatalf("heavy candidate (weight 995/1000) only received %d/%d requests, want a large majority", heavyHits.Load(), trials)
+	}
+}
+
+// TestServer_WeightedRouting_FailoverStillProtectsTheChosenCandidate
+// proves a weighted pick still gets the same failover protection every
+// other route already has: if the weighted-chosen primary is
+// unreachable, the request still succeeds against the other declared
+// candidate rather than failing outright.
+func TestServer_WeightedRouting_FailoverStillProtectsTheChosenCandidate(t *testing.T) {
+	dead := httptest.NewServer(hijackAndClose(t))
+	defer dead.Close()
+	deadURL, err := url.Parse(dead.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer healthy.Close()
+	healthyURL, err := url.Parse(healthy.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", healthyURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	// Weight the dead candidate overwhelmingly so it's (almost) always
+	// the one chosen first — proving failover rescues the request even
+	// when the weighted pick itself lands on the unreachable one.
+	srv.AddRoute("/split", []*url.URL{deadURL, healthyURL}, []int{999, 1}, nil, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/split/v1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d — failover must rescue a weighted pick that lands on a dead candidate", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("body = %q, want the healthy candidate's own response", body)
+	}
+}
+
+// TestServer_WeightedRouting_CacheKeyTracksTheActuallyChosenCandidate
+// proves the cache key for a weighted route is computed from whichever
+// candidate was actually chosen for THIS request, not a fixed
+// declared-first candidate the way a plain failover list's own cache
+// key always is — otherwise one candidate's cached response could
+// silently leak into a request that was "supposed" to go to a
+// genuinely different destination, defeating the entire point of a
+// deliberate split between non-interchangeable candidates. Uses an
+// overwhelming weight so the SAME candidate is picked (and its
+// response cached) consistently enough to assert on, then confirms a
+// second identical request is a genuine cache hit serving that exact
+// same candidate's own response — not the other one's.
+func TestServer_WeightedRouting_CacheKeyTracksTheActuallyChosenCandidate(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var heavyHits, lightHits atomic.Int32
+	heavy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		heavyHits.Add(1)
+		w.Write([]byte("response-from-heavy"))
+	}))
+	defer heavy.Close()
+	light := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lightHits.Add(1)
+		w.Write([]byte("response-from-light"))
+	}))
+	defer light.Close()
+
+	heavyURL, err := url.Parse(heavy.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	lightURL, err := url.Parse(light.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	srv := proxy.New("unused", heavyURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.AddRoute("/split", []*url.URL{heavyURL, lightURL}, []int{999999, 1}, nil, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"x":1}`
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/split/v1", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	first := post()
+	firstBody, _ := io.ReadAll(first.Body)
+	first.Body.Close()
+	if string(firstBody) != "response-from-heavy" {
+		t.Fatalf("first response = %q, want response-from-heavy (999999:1 weight)", firstBody)
+	}
+
+	second := post() // identical body: should be a genuine cache hit
+	defer second.Body.Close()
+	secondBody, _ := io.ReadAll(second.Body)
+	if string(secondBody) != "response-from-heavy" {
+		t.Fatalf("second (cached) response = %q, want response-from-heavy — the cache entry populated by the heavy candidate must never surface the light candidate's response, or vice versa", secondBody)
+	}
+	if got := second.Header.Get("Age"); got == "" {
+		t.Fatal("second response missing Age header, want a genuine cache hit")
+	}
+	if heavyHits.Load() != 1 {
+		t.Fatalf("heavy upstream hits = %d, want exactly 1 (first request only; the second must be served from cache)", heavyHits.Load())
+	}
+	if lightHits.Load() != 0 {
+		t.Fatalf("light upstream hits = %d, want 0 (999999:1 weight should never have picked it across these 2 requests)", lightHits.Load())
 	}
 }
