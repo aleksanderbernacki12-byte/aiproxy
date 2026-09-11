@@ -641,6 +641,36 @@ func TestLoad_ParsesTargetCostPer1KTokens(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesTargetCacheOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "targets": [
+		{"prefix": "/volatile", "url": "https://api.example.com", "cache_enabled": false},
+		{"prefix": "/short-ttl", "url": "https://api.example.com", "cache_ttl_seconds": 30},
+		{"prefix": "/default", "url": "https://api.example.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Targets[0].CacheEnabled == nil || *cfg.Targets[0].CacheEnabled != false {
+		t.Fatalf("Targets[0].CacheEnabled = %v, want a pointer to false", cfg.Targets[0].CacheEnabled)
+	}
+	if cfg.Targets[1].CacheTTLSeconds != 30 {
+		t.Fatalf("Targets[1].CacheTTLSeconds = %d, want 30", cfg.Targets[1].CacheTTLSeconds)
+	}
+	if cfg.Targets[2].CacheEnabled != nil {
+		t.Fatalf("Targets[2].CacheEnabled = %v, want nil (absent, no override)", cfg.Targets[2].CacheEnabled)
+	}
+	if cfg.Targets[2].CacheTTLSeconds != 0 {
+		t.Fatalf("Targets[2].CacheTTLSeconds = %d, want 0 (absent, no override)", cfg.Targets[2].CacheTTLSeconds)
+	}
+}
+
 func TestLoad_ModelRoutesDefaultsToEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

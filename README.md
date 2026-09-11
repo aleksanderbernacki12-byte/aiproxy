@@ -1136,6 +1136,45 @@ than just reading it. Responds `{"cleared": true}` on success, a 404 if
 `proxy_api_key` exactly like the read-only endpoints if configured — if
 anything, a mutating endpoint deserves at least as much protection.
 
+### Per-target cache settings
+
+`cache_enabled`/`cache_ttl_seconds` are global by default — every
+target shares one policy. `targets[].cache_enabled`/
+`targets[].cache_ttl_seconds` (and the equivalent `model_routes[]`
+fields) override them for just one target's own traffic:
+
+```json
+{
+  "cache_enabled": true,
+  "cache_ttl_seconds": 300,
+  "targets": [
+    { "prefix": "/volatile", "url": "https://api.example.com", "cache_enabled": false },
+    { "prefix": "/stable", "url": "https://api.example.com", "cache_ttl_seconds": 3600 }
+  ]
+}
+```
+
+`/volatile`'s own responses are never cached at all, even though
+caching is on server-wide — useful for a target whose responses change
+too quickly to be worth caching, or are too sensitive to ever persist
+to disk. `/stable`'s own entries get a full hour instead of the
+5-minute server default. Any target with no override of its own just
+keeps sharing the top-level setting, unchanged from before per-target
+overrides existed.
+
+`cache_enabled: true` on a target only ever narrows *back* into the
+already-on server-wide policy — it can't turn caching on for one
+target when `cache_enabled` itself is unset or false at the top level.
+Standing up the real on-disk `.aiproxy_cache/` directory is always a
+top-level decision; `aiproxy validate` rejects any target/model route
+that sets `cache_enabled`/`cache_ttl_seconds` without the top-level
+`cache_enabled` also being true, the same "requires" pattern
+`cache_ttl_seconds` itself already follows at the top level.
+`cache_max_size_bytes`, by contrast, stays global-only — a size cap is
+inherently a whole-cache-directory budget shared across every entry
+regardless of target, not something that makes sense to scope per
+target the way TTL/enabled do.
+
 `cost_per_1k_tokens` is optional and off by default (no cost line at
 all). aiproxy has no built-in, inevitably-stale pricing table — you tell
 it what rate applies to your own usage (whatever your provider actually

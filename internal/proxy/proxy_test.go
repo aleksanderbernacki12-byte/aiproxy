@@ -859,7 +859,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	}
 
 	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	// The freshly reloaded Registry starts cold — no baseline exists
 	// for this client yet, so (correctly, per Detector's own cold-start
@@ -1378,10 +1378,10 @@ func TestServer_CacheTTL_ExpiredEntryForcesFreshUpstreamHit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache.New: %v", err)
 	}
-	c.TTL = 30 * time.Millisecond
 
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.Cache = c
+	srv.CacheTTL = 30 * time.Millisecond
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
@@ -1485,11 +1485,11 @@ func TestServer_CacheHit_StaleAfterThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache.New: %v", err)
 	}
-	c.TTL = 2 * time.Second // staleness threshold at 1.6s
 
 	var logBuf syncBuffer
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.Cache = c
+	srv.CacheTTL = 2 * time.Second // staleness threshold at 1.6s
 	srv.Logger = log.New(&logBuf, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
@@ -1569,11 +1569,11 @@ func TestServer_CacheHit_NotStaleBeforeThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache.New: %v", err)
 	}
-	c.TTL = 500 * time.Millisecond // staleness threshold at 400ms
 
 	var logBuf syncBuffer
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.Cache = c
+	srv.CacheTTL = 500 * time.Millisecond // staleness threshold at 400ms
 	srv.Logger = log.New(&logBuf, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
@@ -2102,7 +2102,7 @@ func TestServer_StreamingResponse_AbortedStreamIsNeverCached(t *testing.T) {
 
 	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
 	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
-	if _, hit, _, err := c.Get(key); err != nil {
+	if _, hit, _, err := c.Get(key, 0); err != nil {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {
 		t.Fatal("an aborted stream must never be cached, but a cache entry was found")
@@ -2278,7 +2278,7 @@ func TestServer_ResponseSecretScanning_BlocksStreamOnSecretAndNeverCaches(t *tes
 
 	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
 	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
-	if _, hit, _, err := c.Get(key); err != nil {
+	if _, hit, _, err := c.Get(key, 0); err != nil {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {
 		t.Fatal("a stream cut short by a response Block rule must never be cached, but a cache entry was found")
@@ -4344,7 +4344,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -4406,7 +4406,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 		}
 	}()
 
@@ -5415,7 +5415,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -6688,7 +6688,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -7020,7 +7020,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -7394,7 +7394,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7854,7 +7854,7 @@ func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
 
 	tb := breaker.NewRegistry(1, time.Hour)
 	reloadedRoutes := []proxy.Route{{Prefix: "/openai", Targets: []*url.URL{brokenURL, healthyURL}}}
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil, 0, nil, nil)
 
 	get := func() {
 		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
@@ -8737,7 +8737,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -9559,7 +9559,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -9875,7 +9875,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -10230,7 +10230,7 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -10671,7 +10671,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -10710,7 +10710,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
@@ -11629,7 +11629,7 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil, 0, nil, nil)
 
 	start := time.Now()
 	resp, err := http.Get(frontend.URL + "/v1/chat")
@@ -12824,5 +12824,176 @@ func TestServer_IPRateLimit_StatsAndLogReflectRejection(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "[IP RATE LIMITED]") {
 		t.Fatalf("log missing [IP RATE LIMITED] line: %q", logBuf.String())
+	}
+}
+
+// TestServer_TargetCacheTTL_OverridesGlobalTTLForOnlyThatTarget proves
+// a target's own TargetCacheTTL entry is used instead of the
+// server-wide CacheTTL for its own cache entries, while a different
+// target with no override keeps using the global default unaffected.
+func TestServer_TargetCacheTTL_OverridesGlobalTTLForOnlyThatTarget(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var shortHits, longHits atomic.Int32
+	short := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		shortHits.Add(1)
+		w.Write([]byte("short"))
+	}))
+	defer short.Close()
+	long := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		longHits.Add(1)
+		w.Write([]byte("long"))
+	}))
+	defer long.Close()
+
+	shortURL, err := url.Parse(short.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	longURL, err := url.Parse(long.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	srv := proxy.New("unused", longURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.CacheTTL = time.Hour // the default: effectively never expires for this test's timescale
+	srv.TargetCacheTTL = map[string]time.Duration{"/short": 30 * time.Millisecond}
+	srv.AddRoute("/short", []*url.URL{shortURL}, nil, nil)
+	srv.AddRoute("/long", []*url.URL{longURL}, nil, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func(path string) {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	post("/short/v1/x")
+	post("/long/v1/x")
+	time.Sleep(50 * time.Millisecond) // past /short's own 30ms override, nowhere near /long's 1h default
+	post("/short/v1/x")
+	post("/long/v1/x")
+
+	if got := shortHits.Load(); got != 2 {
+		t.Fatalf("/short upstream hits = %d, want 2 (its own 30ms override expired the cached entry)", got)
+	}
+	if got := longHits.Load(); got != 1 {
+		t.Fatalf("/long upstream hits = %d, want 1 (still cached under the 1h global default, unaffected by /short's own override)", got)
+	}
+}
+
+// TestServer_TargetCacheEnabled_FalseOptsOutEvenWithGlobalCachingOn
+// proves a target's own TargetCacheEnabled=false entry disables
+// caching for just that target's traffic, while every other target
+// keeps caching normally under the server-wide default.
+func TestServer_TargetCacheEnabled_FalseOptsOutEvenWithGlobalCachingOn(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var neverHits, alwaysHits atomic.Int32
+	never := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		neverHits.Add(1)
+		w.Write([]byte("never"))
+	}))
+	defer never.Close()
+	always := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		alwaysHits.Add(1)
+		w.Write([]byte("always"))
+	}))
+	defer always.Close()
+
+	neverURL, err := url.Parse(never.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	alwaysURL, err := url.Parse(always.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	srv := proxy.New("unused", alwaysURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	falseVal := false
+	srv.TargetCacheEnabled = map[string]bool{"/never-cache": falseVal}
+	srv.AddRoute("/never-cache", []*url.URL{neverURL}, nil, nil)
+	srv.AddRoute("/always-cache", []*url.URL{alwaysURL}, nil, nil)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func(path string) {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	post("/never-cache/v1/x")
+	post("/always-cache/v1/x")
+	post("/never-cache/v1/x") // identical body/path again
+	post("/always-cache/v1/x")
+
+	if got := neverHits.Load(); got != 2 {
+		t.Fatalf("/never-cache upstream hits = %d, want 2 (caching disabled for this target, every request must reach upstream)", got)
+	}
+	if got := alwaysHits.Load(); got != 1 {
+		t.Fatalf("/always-cache upstream hits = %d, want 1 (a genuine cache hit on the second identical request)", got)
+	}
+}
+
+// TestServer_TargetCacheEnabled_TrueNeverWidensWhenCacheIsNil proves a
+// target's own TargetCacheEnabled=true override has no effect at all
+// when Server.Cache itself is nil — a per-target setting alone must
+// never be what silently stands up real on-disk cache infrastructure;
+// that decision always starts at the top-level cache_enabled.
+func TestServer_TargetCacheEnabled_TrueNeverWidensWhenCacheIsNil(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	// srv.Cache deliberately left nil — global caching off entirely.
+	trueVal := true
+	srv.TargetCacheEnabled = map[string]bool{"default": trueVal}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func() {
+		resp, err := http.Post(frontend.URL+"/v1/x", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	post()
+	post() // identical request again
+
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("upstream hits = %d, want 2 — a per-target cache_enabled=true override must never widen caching on when Server.Cache is nil", got)
 	}
 }

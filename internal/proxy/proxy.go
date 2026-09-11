@@ -404,8 +404,40 @@ type Server struct {
 	// unchanged. Only meaningful alongside HealthCheckInterval.
 	HealthCheckPath string
 
-	Cache           *cache.Cache // nil disables the response cache
-	CostPer1KTokens float64      // zero omits the shutdown summary's cost line
+	Cache *cache.Cache // nil disables the response cache
+
+	// CacheTTL is the server-wide default TTL passed to Cache.Get/
+	// Cache.IsStale for a target with no override of its own — see
+	// TargetCacheTTL. Zero means entries never expire on their own,
+	// same meaning (and same default) as before per-target overrides
+	// existed; only meaningful when Cache is non-nil.
+	CacheTTL time.Duration
+
+	// TargetCacheTTL, keyed by target label (a targets[].prefix, or
+	// "model:<name>" for a model_routes[] entry — the exact same labels
+	// used everywhere else in this package), overrides CacheTTL for
+	// that one target's own cache entries. A label with no entry here
+	// simply falls back to CacheTTL, unchanged from before this field
+	// existed. Only ever consulted for a target whose caching is
+	// actually active — see TargetCacheEnabled — since a target-only
+	// TTL with no way to enable caching for it in the first place would
+	// have nothing to apply to.
+	TargetCacheTTL map[string]time.Duration
+
+	// TargetCacheEnabled, keyed the same way as TargetCacheTTL, lets one
+	// target opt OUT of caching even while Cache itself is enabled
+	// server-wide — e.g. a target whose responses are highly volatile,
+	// or too sensitive to ever persist to disk, alongside others that
+	// are safe to cache normally. A label with no entry here simply
+	// inherits whether Cache is non-nil, unchanged from before this
+	// field existed. Deliberately cannot widen — turn caching ON for a
+	// target when Cache itself is nil — since that would mean silently
+	// standing up real on-disk cache infrastructure from a narrow
+	// per-target setting alone; that decision always starts at the
+	// top-level cache_enabled, same as it always has.
+	TargetCacheEnabled map[string]bool
+
+	CostPer1KTokens float64 // zero omits the shutdown summary's cost line
 	routes          []route
 	modelRoutes     []modelRoute
 
@@ -1227,6 +1259,33 @@ func (s *Server) getCache() *cache.Cache {
 	return s.Cache
 }
 
+// cacheEnabledForTarget reports whether caching is actually active for
+// target — its own TargetCacheEnabled override if it has one,
+// otherwise simply whether Cache itself is non-nil. See
+// TargetCacheEnabled's own doc comment for why an override can only
+// ever narrow (disable one target), never widen (enable a target when
+// Cache is nil).
+func (s *Server) cacheEnabledForTarget(target string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if enabled, ok := s.TargetCacheEnabled[target]; ok {
+		return enabled && s.Cache != nil
+	}
+	return s.Cache != nil
+}
+
+// resolveCacheTTL returns target's own TargetCacheTTL override if it
+// has one, otherwise the server-wide CacheTTL default — see
+// TargetCacheTTL's own doc comment.
+func (s *Server) resolveCacheTTL(target string) time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if ttl, ok := s.TargetCacheTTL[target]; ok {
+		return ttl
+	}
+	return s.CacheTTL
+}
+
 func (s *Server) getCostPer1KTokens() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1552,7 +1611,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1593,6 +1652,9 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.HealthCheckPath = healthCheckPath
 	s.TargetCostRates = targetCostRates
 	s.IPLimiter = ipLimiter
+	s.CacheTTL = cacheTTL
+	s.TargetCacheTTL = targetCacheTTL
+	s.TargetCacheEnabled = targetCacheEnabled
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2270,10 +2332,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// placeholder are still cached separately, which only ever costs an
 	// extra upstream call, never an incorrect one.
 	var cacheKey string
-	if cch := s.getCache(); cch != nil {
+	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
+		ttl := s.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
 		cacheKey = cache.Key(r.Method, targets[0].ResolveReference(destURL).String(), body)
-		if cached, hit, age, err := cch.Get(cacheKey); err == nil && hit {
+		if cached, hit, age, err := cch.Get(cacheKey, ttl); err == nil && hit {
 			defer cached.Body.Close()
 			copyHeader(w.Header(), cached.Header)
 			// Set after copyHeader, so this always wins over whatever
@@ -2281,7 +2344,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// have carried — that value described a different cache's
 			// own staleness, not aiproxy's.
 			w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
-			stale := cch.IsStale(age)
+			stale := cch.IsStale(age, ttl)
 			w.WriteHeader(cached.StatusCode)
 			io.Copy(w, cached.Body)
 			s.Stats.RecordCacheHit(targetLabel)

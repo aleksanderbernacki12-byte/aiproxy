@@ -199,6 +199,31 @@ type Target struct {
 	// no override and simply shares the top-level rate, same as before
 	// per-target rates existed.
 	CostPer1KTokens float64 `json:"cost_per_1k_tokens,omitempty"`
+
+	// CacheEnabled, if set, overrides the top-level Config.CacheEnabled
+	// for just this one target's own traffic: false opts this target
+	// out of caching even while the top-level cache is on (a target
+	// whose responses are highly volatile, or too sensitive to ever
+	// persist to disk, alongside others that are safe to cache
+	// normally); true is only meaningful — and requires — the top-level
+	// cache already being on, since a per-target setting alone should
+	// never be what silently stands up real on-disk cache
+	// infrastructure. nil (the default when the field is absent) means
+	// this target has no override and simply inherits the top-level
+	// setting, same as before per-target overrides existed. A pointer,
+	// not a plain bool, so "explicitly false" is distinguishable from
+	// "not set at all."
+	CacheEnabled *bool `json:"cache_enabled,omitempty"`
+
+	// CacheTTLSeconds, if greater than zero, overrides the top-level
+	// Config.CacheTTLSeconds for just this one target's own cache
+	// entries — same meaning, just scoped to this target. Requires
+	// caching to actually be active for this target (either the
+	// top-level cache_enabled, or this same entry's own CacheEnabled
+	// override). Zero (the default when the field is absent) means no
+	// override; this target's entries expire on the top-level TTL
+	// instead (or never, if that's unset too).
+	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
 }
 
 // ModelRoute is one model-name-to-upstream mapping for content-based
@@ -248,6 +273,13 @@ type ModelRoute struct {
 	// keyed under the "model:<name>" label instead of a targets[]
 	// prefix.
 	CostPer1KTokens float64 `json:"cost_per_1k_tokens,omitempty"`
+
+	// CacheEnabled/CacheTTLSeconds override the top-level cache settings
+	// for just this route's own traffic — same meaning as
+	// Target.CacheEnabled/Target.CacheTTLSeconds, keyed under the
+	// "model:<name>" label instead of a targets[] prefix.
+	CacheEnabled    *bool `json:"cache_enabled,omitempty"`
+	CacheTTLSeconds int   `json:"cache_ttl_seconds,omitempty"`
 }
 
 // Config is the top-level shape of aiproxy.json.

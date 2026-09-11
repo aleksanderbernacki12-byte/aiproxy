@@ -24,16 +24,16 @@ import (
 const DirName = ".aiproxy_cache"
 
 // Cache stores and retrieves cached HTTP responses on disk under dir.
+// Unlike MaxSizeBytes below, expiry has no field of its own on Cache:
+// since aiproxy v0.66.0, a target can override the server-wide TTL for
+// just its own traffic (see proxy.Server.TargetCacheTTL), so there is
+// no longer one single TTL value this type could own — Get/IsStale
+// both take the caller-resolved TTL to check against explicitly
+// instead, keeping this package itself unaware of targets, overrides,
+// or anything proxy-specific, the same isolation discipline every
+// other internal package here holds to.
 type Cache struct {
 	dir string
-
-	// TTL, if greater than zero, expires an entry this long after it was
-	// last written (Set) — Get treats an older entry as a plain cache
-	// miss and removes it. Zero (the default) means entries never expire
-	// on their own, the same behavior as before this field existed.
-	// Exported so the cli package can set it directly after New,
-	// mirroring how proxy.Server's own tunables work.
-	TTL time.Duration
 
 	// MaxSizeBytes, if greater than zero, caps the total size of every
 	// entry on disk under dir combined — once a Set would push the
@@ -150,15 +150,20 @@ func (c *Cache) path(key string) string {
 
 // Get returns the cached response for key, if present and not expired,
 // along with its age — how long ago it was written (Set), regardless of
-// whether TTL is even configured — so a caller can report exactly how
-// fresh a cache hit actually is (see IsStale). The second return value
-// reports whether a live cache entry existed; a false with a nil error
-// means a plain cache miss — including an entry that existed but was
-// older than TTL, which Get also removes from disk on its way out, the
-// same as if it had never been cached at all (age is always zero
-// alongside a miss). A real hit marks key most-recently-used in the LRU
-// index, protecting it from the next Set's size-based eviction.
-func (c *Cache) Get(key string) (*http.Response, bool, time.Duration, error) {
+// whether ttl is even nonzero — so a caller can report exactly how
+// fresh a cache hit actually is (see IsStale). ttl is the caller-
+// resolved expiry to check against — the server-wide default, or a
+// target's own override, whichever applies to this specific request
+// (see proxy.Server.TargetCacheTTL) — zero meaning entries never expire
+// on their own, same as before per-target overrides existed. The
+// second return value reports whether a live cache entry existed; a
+// false with a nil error means a plain cache miss — including an entry
+// that existed but was older than ttl, which Get also removes from
+// disk on its way out, the same as if it had never been cached at all
+// (age is always zero alongside a miss). A real hit marks key
+// most-recently-used in the LRU index, protecting it from the next
+// Set's size-based eviction.
+func (c *Cache) Get(key string, ttl time.Duration) (*http.Response, bool, time.Duration, error) {
 	path := c.path(key)
 
 	info, err := os.Stat(path)
@@ -169,7 +174,7 @@ func (c *Cache) Get(key string) (*http.Response, bool, time.Duration, error) {
 		return nil, false, 0, err
 	}
 	age := time.Since(info.ModTime())
-	if c.TTL > 0 && age > c.TTL {
+	if ttl > 0 && age > ttl {
 		os.Remove(path) // best-effort: a failed cleanup just leaves a stale, inert file behind
 		c.forget(key)
 		return nil, false, 0, nil
@@ -202,16 +207,17 @@ func (c *Cache) Get(key string) (*http.Response, bool, time.Duration, error) {
 const staleThresholdRatio = 0.8
 
 // IsStale reports whether age — a cache hit's own age, as returned by
-// Get — has crossed staleThresholdRatio of c.TTL, a signal that this
-// entry will need refreshing soon. Always false when TTL itself is
-// unset (c.TTL <= 0): there is no "getting old relative to TTL" without
-// a TTL to be relative to, the same as an entry that never expires on
-// its own having nothing to warn about.
-func (c *Cache) IsStale(age time.Duration) bool {
-	if c.TTL <= 0 {
+// Get — has crossed staleThresholdRatio of ttl (the same
+// caller-resolved value passed to the Get call age came from), a
+// signal that this entry will need refreshing soon. Always false when
+// ttl itself is unset (ttl <= 0): there is no "getting old relative to
+// TTL" without a TTL to be relative to, the same as an entry that
+// never expires on its own having nothing to warn about.
+func (c *Cache) IsStale(age, ttl time.Duration) bool {
+	if ttl <= 0 {
 		return false
 	}
-	return age >= time.Duration(float64(c.TTL)*staleThresholdRatio)
+	return age >= time.Duration(float64(ttl)*staleThresholdRatio)
 }
 
 // Set dumps resp, including its body, and stores it under key. A

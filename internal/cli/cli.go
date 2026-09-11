@@ -167,6 +167,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.Limiter = lc.limiter
 	server.TokenLimiter = lc.tokenLimiter
 	server.Cache = lc.cache
+	server.CacheTTL = lc.cacheTTL
+	server.TargetCacheTTL = lc.targetCacheTTL
+	server.TargetCacheEnabled = lc.targetCacheEnabled
 	server.CostPer1KTokens = lc.cost
 	server.CostBudget = lc.costBudget
 	server.MaxBodyBytes = lc.maxBodyBytes
@@ -238,6 +241,16 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			if cfg.CacheMaxSizeBytes > 0 {
 				fmt.Fprintf(stdout, "response cache: size-capped at %d bytes (LRU eviction)\n", cfg.CacheMaxSizeBytes)
 			}
+		}
+		if len(lc.targetCacheTTL) > 0 || len(lc.targetCacheEnabled) > 0 {
+			overriddenLabels := make(map[string]bool, len(lc.targetCacheTTL)+len(lc.targetCacheEnabled))
+			for label := range lc.targetCacheTTL {
+				overriddenLabels[label] = true
+			}
+			for label := range lc.targetCacheEnabled {
+				overriddenLabels[label] = true
+			}
+			fmt.Fprintf(stdout, "per-target cache overrides: %d\n", len(overriddenLabels))
 		}
 		if cfg.CostPer1KTokens > 0 {
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
@@ -439,7 +452,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled)
 
 	label := loadedFrom
 	if label == "" {
@@ -496,6 +509,10 @@ type liveConfig struct {
 	targetCostRates map[string]float64
 
 	ipLimiter *iplimiter.Registry
+
+	cacheTTL           time.Duration
+	targetCacheTTL     map[string]time.Duration
+	targetCacheEnabled map[string]bool
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -531,9 +548,9 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cache: %w", err))
 		} else {
-			c.TTL = time.Duration(cfg.CacheTTLSeconds) * time.Second
 			c.MaxSizeBytes = cfg.CacheMaxSizeBytes
 			lc.cache = c
+			lc.cacheTTL = time.Duration(cfg.CacheTTLSeconds) * time.Second
 		}
 	}
 
@@ -569,11 +586,11 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 		}
 	}
 
-	routes, routeErrs := compileTargetRoutes(cfg.Targets)
+	routes, routeErrs := compileTargetRoutes(cfg.Targets, cfg.CacheEnabled)
 	errs = append(errs, routeErrs...)
 	lc.routes = routes
 
-	modelRoutes, modelRouteErrs := compileModelRoutes(cfg.ModelRoutes)
+	modelRoutes, modelRouteErrs := compileModelRoutes(cfg.ModelRoutes, cfg.CacheEnabled)
 	errs = append(errs, modelRouteErrs...)
 	lc.modelRoutes = modelRoutes
 
@@ -597,6 +614,34 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	}
 	if len(targetCostRates) > 0 {
 		lc.targetCostRates = targetCostRates
+	}
+
+	// Built the same way as targetCostRates, just above — see
+	// proxy.Server.TargetCacheTTL/TargetCacheEnabled. A target's own
+	// cache_ttl_seconds is only included when actually set (> 0); its
+	// own cache_enabled is only included when explicitly set at all
+	// (nil means "no override," not "override to false").
+	targetCacheTTL := make(map[string]time.Duration)
+	targetCacheEnabled := make(map[string]bool)
+	addCacheOverride := func(label string, enabled *bool, ttlSeconds int) {
+		if enabled != nil {
+			targetCacheEnabled[label] = *enabled
+		}
+		if ttlSeconds > 0 {
+			targetCacheTTL[label] = time.Duration(ttlSeconds) * time.Second
+		}
+	}
+	for _, r := range lc.routes {
+		addCacheOverride(r.prefix, r.cacheEnabled, r.cacheTTLSeconds)
+	}
+	for _, r := range lc.modelRoutes {
+		addCacheOverride("model:"+r.name, r.cacheEnabled, r.cacheTTLSeconds)
+	}
+	if len(targetCacheTTL) > 0 {
+		lc.targetCacheTTL = targetCacheTTL
+	}
+	if len(targetCacheEnabled) > 0 {
+		lc.targetCacheEnabled = targetCacheEnabled
 	}
 
 	ipAllowList, allowErrs := compileIPList("ip_allow_list", cfg.IPAllowList)
@@ -983,12 +1028,12 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
 	}
 
-	_, routeErrs := compileTargetRoutes(cfg.Targets)
+	_, routeErrs := compileTargetRoutes(cfg.Targets, cfg.CacheEnabled)
 	for _, e := range routeErrs {
 		problems = append(problems, e.Error())
 	}
 
-	_, modelRouteErrs := compileModelRoutes(cfg.ModelRoutes)
+	_, modelRouteErrs := compileModelRoutes(cfg.ModelRoutes, cfg.CacheEnabled)
 	for _, e := range modelRouteErrs {
 		problems = append(problems, e.Error())
 	}
@@ -1155,6 +1200,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
 	fmt.Fprintf(stdout, "  cache max size:          %s\n", cacheMaxSizeDisplay(cfg.CacheMaxSizeBytes))
+	fmt.Fprintf(stdout, "  per-target cache overrides: %d\n", countCacheOverrides(cfg))
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  cost budget:             %g\n", cfg.CostBudget)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
@@ -1317,6 +1363,25 @@ func cacheTTLDisplay(seconds int) string {
 		return "none (entries never expire on their own)"
 	}
 	return fmt.Sprintf("%ds", seconds)
+}
+
+// countCacheOverrides counts how many distinct targets/model_routes set
+// their own cache_enabled and/or cache_ttl_seconds, for the validate
+// summary — mirrors exactly how buildLiveConfig itself decides which
+// labels get an entry in Server.TargetCacheTTL/TargetCacheEnabled.
+func countCacheOverrides(cfg *config.Config) int {
+	n := 0
+	for _, t := range cfg.Targets {
+		if t.CacheEnabled != nil || t.CacheTTLSeconds > 0 {
+			n++
+		}
+	}
+	for _, r := range cfg.ModelRoutes {
+		if r.CacheEnabled != nil || r.CacheTTLSeconds > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // cacheMaxSizeDisplay renders cache_max_size_bytes for the validate
@@ -1634,6 +1699,8 @@ type targetRoute struct {
 	maxTokensPerMinute   int
 	tokenLimiter         *limiter.TokenLimiter
 	costPer1KTokens      float64
+	cacheEnabled         *bool
+	cacheTTLSeconds      int
 }
 
 // formatTargetsForDisplay renders a targetRoute's candidate list for the
@@ -1688,7 +1755,7 @@ func formatIPNets(nets []*net.IPNet) []string {
 // collected and returned rather than stopping at the first one — the
 // caller decides whether that's fatal (runStart) or just a reported
 // problem (runValidate).
-func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
+func compileTargetRoutes(targets []config.Target, globalCacheEnabled bool) ([]targetRoute, []error) {
 	compiled := make([]targetRoute, 0, len(targets))
 	var errs []error
 	seenPrefixes := make(map[string]bool, len(targets))
@@ -1721,8 +1788,17 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 			errs = append(errs, fmt.Errorf("targets: prefix %q: cost_per_1k_tokens %g must not be negative", t.Prefix, t.CostPer1KTokens))
 			continue
 		}
+		if t.CacheTTLSeconds < 0 {
+			errs = append(errs, fmt.Errorf("targets: prefix %q: cache_ttl_seconds %d must not be negative", t.Prefix, t.CacheTTLSeconds))
+			continue
+		}
+		targetWantsCache := (t.CacheEnabled != nil && *t.CacheEnabled) || t.CacheTTLSeconds > 0
+		if targetWantsCache && !globalCacheEnabled {
+			errs = append(errs, fmt.Errorf("targets: prefix %q: cache_enabled/cache_ttl_seconds requires the top-level cache_enabled to be set (there's no cache for a target override to apply to otherwise)", t.Prefix))
+			continue
+		}
 
-		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute, costPer1KTokens: t.CostPer1KTokens}
+		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute, costPer1KTokens: t.CostPer1KTokens, cacheEnabled: t.CacheEnabled, cacheTTLSeconds: t.CacheTTLSeconds}
 		if t.MaxRequestsPerMinute > 0 {
 			tr.limiter = limiter.New(t.MaxRequestsPerMinute, time.Minute)
 		}
@@ -1788,7 +1864,7 @@ func compileURLCandidates(label, rawURL string, rawURLs []string) ([]*url.URL, [
 // returned rather than stopping at the first one — the caller decides
 // whether that's fatal (runStart) or just a reported problem
 // (runValidate).
-func compileModelRoutes(routes []config.ModelRoute) ([]modelRoute, []error) {
+func compileModelRoutes(routes []config.ModelRoute, globalCacheEnabled bool) ([]modelRoute, []error) {
 	compiled := make([]modelRoute, 0, len(routes))
 	var errs []error
 	seenNames := make(map[string]bool, len(routes))
@@ -1849,8 +1925,17 @@ func compileModelRoutes(routes []config.ModelRoute) ([]modelRoute, []error) {
 			errs = append(errs, fmt.Errorf("model_routes: %q: cost_per_1k_tokens %g must not be negative", r.Name, r.CostPer1KTokens))
 			continue
 		}
+		if r.CacheTTLSeconds < 0 {
+			errs = append(errs, fmt.Errorf("model_routes: %q: cache_ttl_seconds %d must not be negative", r.Name, r.CacheTTLSeconds))
+			continue
+		}
+		routeWantsCache := (r.CacheEnabled != nil && *r.CacheEnabled) || r.CacheTTLSeconds > 0
+		if routeWantsCache && !globalCacheEnabled {
+			errs = append(errs, fmt.Errorf("model_routes: %q: cache_enabled/cache_ttl_seconds requires the top-level cache_enabled to be set (there's no cache for a route override to apply to otherwise)", r.Name))
+			continue
+		}
 
-		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute, costPer1KTokens: r.CostPer1KTokens}
+		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute, costPer1KTokens: r.CostPer1KTokens, cacheEnabled: r.CacheEnabled, cacheTTLSeconds: r.CacheTTLSeconds}
 		if r.MaxRequestsPerMinute > 0 {
 			mr.limiter = limiter.New(r.MaxRequestsPerMinute, time.Minute)
 		}
@@ -1875,6 +1960,8 @@ type modelRoute struct {
 	maxTokensPerMinute   int
 	tokenLimiter         *limiter.TokenLimiter
 	costPer1KTokens      float64
+	cacheEnabled         *bool
+	cacheTTLSeconds      int
 }
 
 // compileProxyAPIKeys validates and resolves the config file's

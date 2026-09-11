@@ -910,6 +910,72 @@ func TestExecute_Validate_NegativeTargetCostPer1KTokens_ReportsProblem(t *testin
 	}
 }
 
+func TestExecute_Validate_NegativeTargetCacheTTLSeconds_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "cache_ttl_seconds": -30}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "/openai") || !strings.Contains(errOut, "cache_ttl_seconds") {
+		t.Fatalf("stderr missing the negative per-target cache_ttl_seconds problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_TargetCacheOverrideWithoutTopLevelCacheEnabled_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "cache_ttl_seconds": 30}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "requires the top-level cache_enabled") {
+		t.Fatalf("stderr missing the requires-top-level-cache_enabled problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithTargetCacheOverrides_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "targets": [
+		{"prefix": "/volatile", "url": "https://api.example.com", "cache_enabled": false},
+		{"prefix": "/short-ttl", "url": "https://api.example.com", "cache_ttl_seconds": 30}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "per-target cache overrides: 2") {
+		t.Fatalf("stdout missing per-target cache overrides summary: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_NegativeModelRouteCostPer1KTokens_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
