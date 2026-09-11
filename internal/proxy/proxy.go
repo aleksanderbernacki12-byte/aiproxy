@@ -1563,6 +1563,72 @@ type modelField struct {
 	Model string `json:"model"`
 }
 
+// promptFields is a shallow, best-effort decode of the request body
+// looking for text meaningful to semantic caching — the same
+// "recognize the common shape, don't guess at the rest" discipline
+// modelField already uses for the "model" field. Covers the two
+// dominant chat-message conventions (OpenAI/Anthropic-shaped
+// messages[].content) plus the legacy single-string prompt/input
+// fields. A body that matches none of these simply never participates
+// in semantic caching — the existing exact-match cache is unaffected
+// either way.
+type promptFields struct {
+	Prompt   string `json:"prompt"`
+	Input    string `json:"input"`
+	Messages []struct {
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+}
+
+// contentBlock is one entry of a "content blocks" array, e.g.
+// [{"type":"text","text":"..."}] — the shape both OpenAI and Anthropic
+// use for multi-part (text + image, etc.) message content.
+type contentBlock struct {
+	Text string `json:"text"`
+}
+
+// extractPromptText returns the concatenated text aiproxy recognizes in
+// body for semantic caching, and whether any was found at all.
+// messages[].content is decoded permissively: a plain JSON string is
+// used directly, a JSON array of content blocks has every block's text
+// field concatenated in order. Extraction concatenates, in order: every
+// message's content, then Prompt, then Input.
+func extractPromptText(body []byte) (string, bool) {
+	var pf promptFields
+	if err := json.Unmarshal(body, &pf); err != nil {
+		return "", false
+	}
+
+	var b strings.Builder
+	for _, m := range pf.Messages {
+		if len(m.Content) == 0 {
+			continue
+		}
+		var asString string
+		if err := json.Unmarshal(m.Content, &asString); err == nil {
+			b.WriteString(asString)
+			b.WriteByte(' ')
+			continue
+		}
+		var blocks []contentBlock
+		if err := json.Unmarshal(m.Content, &blocks); err == nil {
+			for _, blk := range blocks {
+				b.WriteString(blk.Text)
+				b.WriteByte(' ')
+			}
+		}
+	}
+	b.WriteString(pf.Prompt)
+	b.WriteByte(' ')
+	b.WriteString(pf.Input)
+
+	text := strings.TrimSpace(b.String())
+	if text == "" {
+		return "", false
+	}
+	return text, true
+}
+
 // resolveModelRoute checks body's "model" field against every
 // registered model route, in the order they were added, and returns the
 // first match's candidate targets, stats/log label ("model:" plus the
