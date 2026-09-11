@@ -474,8 +474,12 @@ its usage is only ever reflected in the server-wide budget (if one is
 set) and in its own `per_client` stats — same as before this field
 existed. A key's own budget and the server-wide one are entirely
 independent: either, both, or neither can fire for the same request,
-and each is alert-only — nothing is ever blocked, throttled, or
-otherwise changed by crossing it. Same rule as the top-level
+and each is alert-only by default — nothing is blocked, throttled, or
+otherwise changed by crossing it — unless this key's own
+[`cost_budget_hard_stop`](#cost-budget-hard-stop) is also set, in which
+case only *this key's* own traffic is rejected once its own budget is
+crossed, independent of the server-wide hard-stop (if any) and of every
+other key's own. Same rule as the top-level
 `cost_budget`: setting this on a key without the top-level
 `cost_per_1k_tokens` also being set is a config error, since there's no
 rate to price that key's tokens at. Hot-reloadable via
@@ -1243,6 +1247,55 @@ every request past the threshold; a budget alert is meant to be a single
 "you've gone over" notice, not a recurring one. `aiproxy validate`
 rejects `cost_budget` set without `cost_per_1k_tokens` — a budget with no
 rate to price tokens at has nothing to compare against.
+
+### Cost budget hard-stop
+
+`cost_budget` on its own is visibility only — it never changes how a
+request is handled. Add `cost_budget_hard_stop` to make it a real cost
+ceiling instead: once the running total cost reaches or passes
+`cost_budget`, every subsequent request is rejected outright (`402
+Payment Required`) instead of being forwarded:
+
+```json
+{
+  "cost_per_1k_tokens": 0.03,
+  "cost_budget": 10,
+  "cost_budget_hard_stop": true
+}
+```
+
+The very first request that actually crosses the budget is still
+allowed through — its own cost isn't known until its response comes
+back, so it can never be rejected in advance of itself — but every
+request *after* that one is rejected, and stays rejected for the rest
+of the process's life: there's no time window and no automatic reset,
+the same "budgets never expire on their own" behavior `cost_budget`'s
+own one-time alert already has. A cache hit is never rejected — it
+costs nothing additional, so blocking it would be pure, pointless
+punishment with no cost-saving benefit. Each rejection is logged
+(`[BUDGET REJECTED]`, yellow; `"budget_rejected"` under `--log-format
+json`) and counted separately from the one-time alert, in
+`stats.budget_rejected` and the Prometheus
+`aiproxy_budget_rejected_total` counter — but, unlike the alert itself,
+never fires a webhook per rejection, since a busy proxy that's crossed
+its budget could otherwise reject (and therefore alert on) thousands of
+requests in a row. `aiproxy validate` rejects `cost_budget_hard_stop`
+set without `cost_budget` — a hard stop with no budget to enforce is a
+config error, same reasoning as `cost_budget` requiring
+`cost_per_1k_tokens`.
+
+A [named key's own `cost_budget`](#per-key-cost-budgets) can set its own
+`cost_budget_hard_stop` too, independent of the server-wide one and of
+every other key's own — a team that's burned through its own budget
+gets cut off without affecting anyone else's traffic:
+
+```json
+{
+  "proxy_api_keys": [
+    { "name": "team-a", "key": "team-a-long-random-key", "cost_budget": 25, "cost_budget_hard_stop": true }
+  ]
+}
+```
 
 `max_body_size_bytes` caps how large a single request body aiproxy will
 buffer in memory before rejecting it with a 413 — every request is read

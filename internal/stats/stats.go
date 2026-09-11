@@ -149,6 +149,14 @@ type clientCounters struct {
 	anomalyDetected  atomic.Int64
 	totalTokens      atomic.Int64
 
+	// budgetRejected counts requests this client's own cost_budget_hard_stop
+	// actually rejected — see Stats.RecordClientBudgetRejected. Distinct
+	// from budgetAlerted below: that latch fires the one-time alert the
+	// instant the budget is first crossed, this counts every individual
+	// request rejected afterward, for as long as hard-stop enforcement
+	// stays on and the running cost stays at or above budget.
+	budgetRejected atomic.Int64
+
 	// budgetAlerted is this client's own one-shot latch for
 	// CrossedClientBudget — separate from Stats.budgetAlerted (the
 	// global one), so a named key's own cost_budget and the
@@ -165,6 +173,7 @@ func (c *clientCounters) snapshot() ClientSnapshot {
 		TokenRateLimited: c.tokenRateLimited.Load(),
 		AnomalyDetected:  c.anomalyDetected.Load(),
 		TotalTokens:      c.totalTokens.Load(),
+		BudgetRejected:   c.budgetRejected.Load(),
 	}
 }
 
@@ -193,6 +202,7 @@ type Stats struct {
 	targetsEjected   atomic.Int64
 	targetsRecovered atomic.Int64
 	budgetAlerted    atomic.Bool
+	budgetRejected   atomic.Int64
 
 	mu        sync.Mutex
 	perTarget map[string]*counters
@@ -306,6 +316,19 @@ func (s *Stats) RecordClientAnomalyDetected(client string) {
 		return
 	}
 	s.clientCounterFor(client).anomalyDetected.Add(1)
+}
+
+// RecordClientBudgetRejected records one request this client's own
+// cost_budget_hard_stop actually rejected — see Stats.ClientOverBudget
+// and the proxy package's own hard-stop check. Distinct from the
+// one-shot budgetAlerted latch: this counts every individual rejected
+// request, not just the first time the budget was crossed. Same
+// no-op-on-empty-label discipline as every other RecordClient* method.
+func (s *Stats) RecordClientBudgetRejected(client string) {
+	if client == "" {
+		return
+	}
+	s.clientCounterFor(client).budgetRejected.Add(1)
 }
 
 func (s *Stats) RecordClientTokensUsed(client string, n int) {
@@ -637,6 +660,41 @@ func (s *Stats) CrossedClientBudget(client string, costPer1KTokens, budget float
 	return cost, c.budgetAlerted.CompareAndSwap(false, true)
 }
 
+// OverBudget is CrossedBudget's non-latching counterpart: a plain,
+// repeatable "is the running cost currently at or past budget" read,
+// with no one-shot alert semantics — meant to be checked before every
+// request once cost_budget_hard_stop enforcement is on (see the proxy
+// package), not just once. budget <= 0 (unset) is never over. cost is
+// always returned, same as CrossedBudget.
+func (s *Stats) OverBudget(rates CostRates, budget float64) (cost float64, over bool) {
+	cost = s.totalCost(rates)
+	return cost, budget > 0 && cost >= budget
+}
+
+// RecordBudgetRejected records one request the server-wide
+// cost_budget_hard_stop actually rejected — see OverBudget. Distinct
+// from the one-shot budgetAlerted latch CrossedBudget uses: this counts
+// every individual rejected request, not just the first time the
+// budget was crossed. No target parameter, same reasoning as
+// RecordIPDenied: a rejected request never gets far enough to resolve
+// one.
+func (s *Stats) RecordBudgetRejected() {
+	s.budgetRejected.Add(1)
+}
+
+// ClientOverBudget is CrossedClientBudget's non-latching counterpart —
+// see OverBudget for the same reasoning, scoped to one client the same
+// way CrossedClientBudget itself is. client == "" is never over
+// (nothing to attribute a budget to).
+func (s *Stats) ClientOverBudget(client string, costPer1KTokens, budget float64) (cost float64, over bool) {
+	if client == "" {
+		return 0, false
+	}
+	c := s.clientCounterFor(client)
+	cost = float64(c.totalTokens.Load()) / 1000 * costPer1KTokens
+	return cost, budget > 0 && cost >= budget
+}
+
 // LatencyBucket is one cumulative "le" (less-than-or-equal) point of a
 // LatencySnapshot's histogram, rendered the way Prometheus's text
 // exposition format expects a bucket's bound: a decimal string for a
@@ -712,6 +770,12 @@ type ClientSnapshot struct {
 	// traffic.
 	AnomalyDetected int64 `json:"anomaly_detected"`
 	TotalTokens     int64 `json:"total_tokens"`
+
+	// BudgetRejected counts requests this client's own cost_budget_hard_stop
+	// actually rejected — see Stats.RecordClientBudgetRejected. Zero for
+	// every client whose own cost_budget never set cost_budget_hard_stop,
+	// or that did but was never actually crossed.
+	BudgetRejected int64 `json:"budget_rejected"`
 }
 
 // EstimatedCost prices TotalTokens at costPer1KTokens, the same unit
@@ -788,6 +852,12 @@ type Snapshot struct {
 	// reasoning as IPDenied: a draining proxy rejects everything
 	// uniformly, before any target is resolved.
 	DrainRejected int64 `json:"drain_rejected"`
+
+	// BudgetRejected counts requests rejected by the server-wide
+	// cost_budget_hard_stop — see Stats.RecordBudgetRejected/OverBudget.
+	// Never broken down per target, same reasoning as DrainRejected: a
+	// rejected request never gets far enough to resolve one.
+	BudgetRejected int64 `json:"budget_rejected"`
 
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
@@ -873,6 +943,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.IPDenied = s.ipDenied.Load()
 	snap.IPRateLimited = s.ipRateLimited.Load()
 	snap.DrainRejected = s.drainRejected.Load()
+	snap.BudgetRejected = s.budgetRejected.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()
@@ -958,6 +1029,12 @@ func (s Snapshot) String() string {
 	// did but no request happened to arrive during the drain window.
 	if s.DrainRejected > 0 {
 		out += fmt.Sprintf("\nDrain-rejected (503): %d", s.DrainRejected)
+	}
+	// Same reasoning again: 0 for every run that never configured
+	// cost_budget_hard_stop, or that did but the budget was never
+	// actually crossed.
+	if s.BudgetRejected > 0 {
+		out += fmt.Sprintf("\nBudget-rejected (402): %d", s.BudgetRejected)
 	}
 	// Same reasoning again: 0 for every run that never configured
 	// country_allow_list/country_deny_list, or that did but never

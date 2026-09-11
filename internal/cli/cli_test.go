@@ -2114,6 +2114,83 @@ func TestExecute_Validate_ValidConfig_WithCostBudget_ReportsSummary(t *testing.T
 	}
 }
 
+func TestExecute_Validate_CostBudgetHardStopWithoutCostBudget_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "cost_budget_hard_stop": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cost_budget_hard_stop requires cost_budget") {
+		t.Errorf("stderr missing cost_budget_hard_stop-requires-cost_budget problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithCostBudgetHardStop_ReportsSummary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "cost_budget": 10.5, "cost_budget_hard_stop": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cost budget hard stop:   true") {
+		t.Fatalf("stdout missing cost budget hard stop summary line: %q", stdout.String())
+	}
+}
+
+func TestExecute_Validate_ProxyAPIKeyCostBudgetHardStopWithoutCostBudget_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "proxy_api_keys": [
+		{"name": "team-a", "key": "key-a", "cost_budget_hard_stop": true}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cost_budget_hard_stop requires this key's own cost_budget") {
+		t.Errorf("stderr missing the per-key cost_budget_hard_stop problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithProxyAPIKeyCostBudgetHardStop_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cost_per_1k_tokens": 0.03, "proxy_api_keys": [
+		{"name": "team-a", "key": "key-a", "cost_budget": 5, "cost_budget_hard_stop": true}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithLogFile_ReportsPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

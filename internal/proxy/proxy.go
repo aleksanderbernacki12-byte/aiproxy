@@ -467,10 +467,25 @@ type Server struct {
 	// CostBudget, if greater than zero, is a threshold in the same units
 	// as CostPer1KTokens; once the running total cost reaches or passes
 	// it, ServeHTTP logs and webhook-alerts a budget_exceeded event once
-	// — see stats.Stats.CrossedBudget. It never blocks or otherwise
-	// changes how a request is handled. Zero (the default) disables the
-	// check entirely.
+	// — see stats.Stats.CrossedBudget. Alert-only by default — see
+	// CostBudgetHardStop for actual enforcement. Zero (the default)
+	// disables the check entirely.
 	CostBudget float64
+
+	// CostBudgetHardStop, if true, turns CostBudget from a one-time
+	// alert into real enforcement: once the running total cost has
+	// reached or passed CostBudget (see stats.Stats.OverBudget, checked
+	// fresh on every request while this is on — unlike CrossedBudget's
+	// own one-shot latch, which only ever answers "did we JUST cross
+	// it"), every subsequent request is rejected with 402 Payment
+	// Required instead of being forwarded, for the rest of the
+	// process's life — there's no time window or reset. Checked in
+	// ServeHTTP after the cache-hit branch (a cache hit costs nothing
+	// additional, so it's never rejected) and after rule-blocking (a
+	// blocked request was never going to cost anything either), but
+	// before forwarding. false (the default) keeps CostBudget
+	// alert-only, unchanged from before this field existed.
+	CostBudgetHardStop bool
 
 	// TargetCostRates, keyed by target label (a targets[].prefix, or
 	// "model:<name>" for a model_routes[] entry — the exact same labels
@@ -1531,6 +1546,12 @@ func (s *Server) getCostBudget() float64 {
 	return s.CostBudget
 }
 
+func (s *Server) getCostBudgetHardStop() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CostBudgetHardStop
+}
+
 // getCostRates returns CostPer1KTokens and TargetCostRates combined
 // into one stats.CostRates, under one lock — for every cost
 // computation that needs to resolve a specific target's own rate
@@ -1873,7 +1894,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1919,6 +1940,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.TargetCacheEnabled = targetCacheEnabled
 	s.TargetShadowURL = targetShadowURL
 	s.TargetShadowSampleRate = targetShadowSampleRate
+	s.CostBudgetHardStop = costBudgetHardStop
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -1984,6 +2006,12 @@ type ProxyKey struct {
 	// independently of Server.CostBudget (the server-wide one) and of
 	// every other key's own budget.
 	CostBudget float64
+
+	// CostBudgetHardStop, if true, turns this key's own CostBudget from
+	// a one-time alert into real enforcement — see
+	// Server.CostBudgetHardStop, checked independently of the
+	// server-wide one and of every other key's own.
+	CostBudgetHardStop bool
 }
 
 // clientAuth is checkProxyAuth's result: which key (if any) matched,
@@ -1996,10 +2024,11 @@ type clientAuth struct {
 	// label is "default" for the anonymous Server.ProxyAPIKey, a named
 	// ProxyKey's Name, or "" when the auth check is disabled entirely
 	// (nothing to attribute a request to).
-	label        string
-	limiter      *limiter.Limiter
-	tokenLimiter *limiter.TokenLimiter
-	costBudget   float64
+	label              string
+	limiter            *limiter.Limiter
+	tokenLimiter       *limiter.TokenLimiter
+	costBudget         float64
+	costBudgetHardStop bool
 }
 
 // checkProxyAuth reports whether r is allowed to use the proxy at all,
@@ -2030,7 +2059,7 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 	}
 	for _, k := range proxyAPIKeys {
 		if subtle.ConstantTimeCompare(gotBytes, []byte(k.Key)) == 1 {
-			return clientAuth{label: k.Name, limiter: k.Limiter, tokenLimiter: k.TokenLimiter, costBudget: k.CostBudget}, true
+			return clientAuth{label: k.Name, limiter: k.Limiter, tokenLimiter: k.TokenLimiter, costBudget: k.CostBudget, costBudgetHardStop: k.CostBudgetHardStop}, true
 		}
 	}
 	return clientAuth{}, false
@@ -2706,6 +2735,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Cost budget hard-stop: unlike the request/token rate limiters
+	// above (which reset every window) or the one-shot budget_exceeded
+	// alert (CrossedBudget, fired later from logUsageFromBody once this
+	// request's own usage is known), a running total cost that's
+	// already at or past budget never resets on its own — so once
+	// enabled, every subsequent request is rejected, not just the one
+	// that happened to cross it. Gated on getCostBudgetHardStop() first
+	// so the (fairly cheap, but non-zero) per-target cost walk
+	// OverBudget does is never paid at all for the overwhelmingly
+	// common case where hard-stop isn't configured.
+	if s.getCostBudgetHardStop() {
+		if cost, over := s.Stats.OverBudget(s.getCostRates(), s.getCostBudget()); over {
+			s.Stats.RecordBudgetRejected()
+			s.logBudgetRejected(r.Method, r.URL.String(), requestID, cost, s.getCostBudget())
+			writeError(w, r, http.StatusPaymentRequired, "cost_budget_exceeded", "cost budget exceeded", "")
+			return
+		}
+	}
+	if auth.costBudgetHardStop {
+		if cost, over := s.Stats.ClientOverBudget(auth.label, s.getCostPer1KTokens(), auth.costBudget); over {
+			s.Stats.RecordClientBudgetRejected(auth.label)
+			s.logClientBudgetRejected(r.Method, r.URL.String(), auth.label, requestID, cost, auth.costBudget)
+			writeError(w, r, http.StatusPaymentRequired, "cost_budget_exceeded", "cost budget exceeded", "")
+			return
+		}
+	}
+
 	// A third, independent breaker, unlike Limiter/TokenLimiter keyed
 	// on this one client's own recent baseline rather than a fixed
 	// threshold — see anomaly.Registry. No-ops entirely for an
@@ -3318,6 +3374,33 @@ func (s *Server) logClientBudgetExceeded(method, reqURL, client, requestID strin
 		return
 	}
 	s.logf("%s[BUDGET EXCEEDED] %s %s - client %s: estimated cost %.4f exceeds budget %.4f%s", ansiYellow, method, reqURL, client, cost, budget, ansiReset)
+}
+
+// logBudgetRejected logs one request rejected by the server-wide
+// cost_budget_hard_stop — see Stats.OverBudget. Unlike logBudgetExceeded
+// (fired once, the instant the budget is first crossed), this fires on
+// every individual rejected request for as long as hard-stop stays on
+// and the running cost stays at or above budget — the same
+// "per-request log, distinct from the one-time transition event"
+// relationship logDrainRejected has to logDrainStarted.
+func (s *Server) logBudgetRejected(method, reqURL, requestID string, cost, budget float64) {
+	ev := s.recordLogEvent(logEvent{Level: "budget_rejected", Method: method, URL: reqURL, RequestID: requestID, Cost: cost, Budget: budget})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[BUDGET REJECTED] %s %s - estimated cost %.4f at or past budget %.4f (cost_budget_hard_stop)%s", ansiYellow, method, reqURL, cost, budget, ansiReset)
+}
+
+// logClientBudgetRejected is logBudgetRejected's per-client counterpart
+// — see Stats.ClientOverBudget.
+func (s *Server) logClientBudgetRejected(method, reqURL, client, requestID string, cost, budget float64) {
+	ev := s.recordLogEvent(logEvent{Level: "budget_rejected", Method: method, URL: reqURL, RequestID: requestID, Client: client, Cost: cost, Budget: budget})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[BUDGET REJECTED] %s %s - client %s: estimated cost %.4f at or past budget %.4f (cost_budget_hard_stop)%s", ansiYellow, method, reqURL, client, cost, budget, ansiReset)
 }
 
 // logAnomalyDetected logs a client's request rate spiking past its own
@@ -4080,6 +4163,10 @@ type statsSnapshotJSON struct {
 	// always 0 inside per_target — same reasoning as IPDenied.
 	DrainRejected int64 `json:"drain_rejected"`
 
+	// BudgetRejected is likewise only meaningful at the top level, and
+	// always 0 inside per_target — same reasoning as IPDenied.
+	BudgetRejected int64 `json:"budget_rejected"`
+
 	// CountryDenied is likewise only meaningful at the top level, and
 	// always 0 inside per_target — same reasoning as IPDenied.
 	CountryDenied int64 `json:"country_denied"`
@@ -4140,6 +4227,7 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		IPDenied:               snap.IPDenied,
 		IPRateLimited:          snap.IPRateLimited,
 		DrainRejected:          snap.DrainRejected,
+		BudgetRejected:         snap.BudgetRejected,
 		CountryDenied:          snap.CountryDenied,
 		AnomalyDetected:        snap.AnomalyDetected,
 		TargetsEjected:         snap.TargetsEjected,
@@ -4425,6 +4513,7 @@ var promClientCounters = []struct {
 	{"aiproxy_client_rate_limited_total", "Total number of requests rejected by the rate limiter, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.RateLimited }},
 	{"aiproxy_client_token_rate_limited_total", "Total number of requests rejected by the token-based rate limiter, authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.TokenRateLimited }},
 	{"aiproxy_client_anomaly_detected_total", "Total number of requests rejected for spiking past this client's own recent baseline request rate.", func(c stats.ClientSnapshot) int64 { return c.AnomalyDetected }},
+	{"aiproxy_client_budget_rejected_total", "Total number of requests rejected by this proxy API key's own cost_budget_hard_stop.", func(c stats.ClientSnapshot) int64 { return c.BudgetRejected }},
 	{"aiproxy_client_tokens_used_total", "Total number of tokens reported in upstream response usage fields, for requests authenticated with this proxy API key.", func(c stats.ClientSnapshot) int64 { return c.TotalTokens }},
 }
 
@@ -4542,6 +4631,12 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 	fmt.Fprintln(w, "# HELP aiproxy_drain_rejected_total Total number of requests rejected because the proxy was draining.")
 	fmt.Fprintln(w, "# TYPE aiproxy_drain_rejected_total counter")
 	fmt.Fprintf(w, "aiproxy_drain_rejected_total %d\n", snap.DrainRejected)
+
+	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
+	// budget-rejected request never gets far enough to resolve a target.
+	fmt.Fprintln(w, "# HELP aiproxy_budget_rejected_total Total number of requests rejected by the server-wide cost_budget_hard_stop.")
+	fmt.Fprintln(w, "# TYPE aiproxy_budget_rejected_total counter")
+	fmt.Fprintf(w, "aiproxy_budget_rejected_total %d\n", snap.BudgetRejected)
 
 	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
 	// country-denied request never gets far enough to resolve a target.

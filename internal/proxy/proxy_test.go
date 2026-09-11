@@ -859,7 +859,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	}
 
 	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	// The freshly reloaded Registry starts cold — no baseline exists
 	// for this client yet, so (correctly, per Detector's own cold-start
@@ -4822,7 +4822,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -4884,7 +4884,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 		}
 	}()
 
@@ -5893,7 +5893,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -7166,7 +7166,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -7498,7 +7498,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -7555,6 +7555,317 @@ func TestServer_CostBudget_NeverBlocksOrAffectsTraffic(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "total_tokens") {
 		t.Errorf("body = %q, want the upstream response delivered unchanged", body)
+	}
+}
+
+// TestServer_CostBudgetHardStop_RejectsOnceBudgetCrossedButNotBefore
+// proves the core hard-stop mechanism: the very first request that
+// crosses the budget is still allowed through — its own cost isn't
+// known until its response comes back, so it can never be rejected in
+// advance of itself — but every request AFTER that one is rejected
+// with 402, unlike CostBudget's own alert-only default (see
+// TestServer_CostBudget_NeverBlocksOrAffectsTraffic).
+func TestServer_CostBudgetHardStop_RejectsOnceBudgetCrossedButNotBefore(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // cost = 10.0 per request, already over budget after the first
+	srv.CostBudget = 1.0
+	srv.CostBudgetHardStop = true
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	first, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post 1: %v", err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200 (its own cost isn't known until its response arrives)", first.StatusCode)
+	}
+
+	second, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("post 2: %v", err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("second request status = %d, want %d (budget already crossed by the first)", second.StatusCode, http.StatusPaymentRequired)
+	}
+
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream received %d requests, want 1 (the rejected second request must never reach it)", got)
+	}
+}
+
+// TestServer_CostBudgetHardStop_StaysRejectingAcrossManyRequests proves
+// hard-stop enforcement is NOT a one-shot the way the budget_exceeded
+// alert is (see stats.Stats.CrossedBudget) — once tripped, it keeps
+// rejecting every subsequent request, indefinitely, not just the next
+// one.
+func TestServer_CostBudgetHardStop_StaysRejectingAcrossManyRequests(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0
+	srv.CostBudget = 1.0
+	srv.CostBudgetHardStop = true
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+	post().Body.Close() // crosses the budget
+
+	for i := 0; i < 5; i++ {
+		resp := post()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusPaymentRequired {
+			t.Fatalf("request %d after crossing: status = %d, want %d (hard-stop must keep rejecting, not just once)", i, resp.StatusCode, http.StatusPaymentRequired)
+		}
+	}
+}
+
+// TestServer_CostBudgetHardStop_CacheHitStillServedEvenOverBudget
+// proves a cache hit is never rejected once hard-stop has tripped — it
+// costs nothing additional regardless of the budget, so blocking it
+// would be pure, pointless punishment with no cost-saving benefit.
+func TestServer_CostBudgetHardStop_CacheHitStillServedEvenOverBudget(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.CostPer1KTokens = 1.0
+	srv.CostBudget = 1.0
+	srv.CostBudgetHardStop = true
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"n":1}`
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	first := post() // crosses the budget, also populates the cache
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200", first.StatusCode)
+	}
+
+	// A brand-new, never-cached request is now rejected...
+	fresh, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"n":2}`))
+	if err != nil {
+		t.Fatalf("post fresh: %v", err)
+	}
+	fresh.Body.Close()
+	if fresh.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("fresh request status = %d, want %d", fresh.StatusCode, http.StatusPaymentRequired)
+	}
+
+	// ...but a repeat of the exact same, already-cached request still
+	// gets served normally.
+	cached := post()
+	defer cached.Body.Close()
+	if cached.StatusCode != http.StatusOK {
+		t.Fatalf("cached request status = %d, want 200 (a cache hit must never be rejected by hard-stop)", cached.StatusCode)
+	}
+	if got := cached.Header.Get("Age"); got == "" {
+		t.Fatal("cached response missing Age header, want a genuine cache hit")
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream received %d requests, want 1 (only the first, budget-crossing one)", got)
+	}
+}
+
+// TestServer_CostBudgetHardStop_StatsAndLogReflectRejection proves each
+// hard-stop rejection is counted (Stats.BudgetRejected) and logged
+// ([BUDGET REJECTED]), same discipline as every other rejection kind.
+func TestServer_CostBudgetHardStop_StatsAndLogReflectRejection(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0
+	srv.CostBudget = 1.0
+	srv.CostBudgetHardStop = true
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+	post().Body.Close() // crosses the budget
+	rejected := post()
+	rejected.Body.Close()
+	if rejected.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want %d", rejected.StatusCode, http.StatusPaymentRequired)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.BudgetRejected != 1 {
+		t.Fatalf("Stats.BudgetRejected = %d, want 1", snap.BudgetRejected)
+	}
+	if !strings.Contains(logBuf.String(), "[BUDGET REJECTED]") {
+		t.Fatalf("log missing [BUDGET REJECTED] line: %q", logBuf.String())
+	}
+}
+
+// TestServer_ClientCostBudgetHardStop_RejectsOnlyThatKeysOwnTraffic
+// proves a named key's own cost_budget_hard_stop is independent both of
+// the server-wide one and of every other key's own — matching
+// CostBudget's own existing independence (see
+// TestServer_ClientCostBudget_IndependentFromServerWideBudget).
+func TestServer_ClientCostBudgetHardStop_RejectsOnlyThatKeysOwnTraffic(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0 // no server-wide CostBudget/hard-stop at all
+	srv.ProxyAPIKeys = []proxy.ProxyKey{
+		{Name: "limited", Key: "limited-key", CostBudget: 1.0, CostBudgetHardStop: true},
+		{Name: "unlimited", Key: "unlimited-key"},
+	}
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func(key string) *http.Response {
+		req, err := http.NewRequest(http.MethodPost, frontend.URL+"/chat", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	first := post("limited-key") // crosses "limited"'s own budget
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first request (limited key) status = %d, want 200", first.StatusCode)
+	}
+
+	limitedAgain := post("limited-key")
+	limitedAgain.Body.Close()
+	if limitedAgain.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("limited key's second request status = %d, want %d", limitedAgain.StatusCode, http.StatusPaymentRequired)
+	}
+
+	// A completely different key, with no budget of its own, is
+	// entirely unaffected.
+	unlimited := post("unlimited-key")
+	defer unlimited.Body.Close()
+	if unlimited.StatusCode != http.StatusOK {
+		t.Fatalf("unlimited key's request status = %d, want 200 (a different key's own hard-stop must never affect it)", unlimited.StatusCode)
+	}
+}
+
+// TestServer_ReloadConfig_UpdatesCostBudgetHardStop proves
+// CostBudgetHardStop is actually swapped in by a live SIGHUP-style
+// reload, not just settable at construction — mirrors
+// TestServer_ReloadConfig_UpdatesCostBudget.
+func TestServer_ReloadConfig_UpdatesCostBudgetHardStop(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":10000}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 1.0
+	srv.CostBudget = 1.0
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/chat", "text/plain", strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	before := post() // hard-stop off: crosses the budget but still succeeds
+	before.Body.Close()
+	if before.StatusCode != http.StatusOK {
+		t.Fatalf("before reload: status = %d, want 200", before.StatusCode)
+	}
+
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 1.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, true)
+
+	after := post()
+	after.Body.Close()
+	if after.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("after reload: status = %d, want %d (hard-stop must be live)", after.StatusCode, http.StatusPaymentRequired)
 	}
 }
 
@@ -7872,7 +8183,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -8332,7 +8643,7 @@ func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
 
 	tb := breaker.NewRegistry(1, time.Hour)
 	reloadedRoutes := []proxy.Route{{Prefix: "/openai", Targets: []*url.URL{brokenURL, healthyURL}}}
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	get := func() {
 		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
@@ -9215,7 +9526,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -10037,7 +10348,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -10353,7 +10664,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -10708,7 +11019,7 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -11149,7 +11460,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -11188,7 +11499,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
@@ -12107,7 +12418,7 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false)
 
 	start := time.Now()
 	resp, err := http.Get(frontend.URL + "/v1/chat")

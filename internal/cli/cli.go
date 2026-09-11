@@ -189,6 +189,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.TargetCacheEnabled = lc.targetCacheEnabled
 	server.CostPer1KTokens = lc.cost
 	server.CostBudget = lc.costBudget
+	server.CostBudgetHardStop = lc.costBudgetHardStop
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
 	server.Webhooks = lc.webhooks
@@ -282,7 +283,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "shadow traffic: %d target(s) mirrored\n", len(lc.targetShadowURL))
 		}
 		if cfg.CostBudget > 0 {
-			fmt.Fprintf(stdout, "cost budget: %g (alerts once, on/after crossing)\n", cfg.CostBudget)
+			if cfg.CostBudgetHardStop {
+				fmt.Fprintf(stdout, "cost budget: %g (hard stop: requests rejected once crossed)\n", cfg.CostBudget)
+			} else {
+				fmt.Fprintf(stdout, "cost budget: %g (alerts once, on/after crossing)\n", cfg.CostBudget)
+			}
 		}
 		if cfg.MaxBodyBytes > 0 {
 			fmt.Fprintf(stdout, "max request body size: %d bytes\n", cfg.MaxBodyBytes)
@@ -485,7 +490,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop)
 
 	label := loadedFrom
 	if label == "" {
@@ -507,27 +512,28 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 // rebuilt from an aiproxy.json: everything runStart wires in at startup,
 // and everything a SIGHUP reload replaces via Server.ReloadConfig.
 type liveConfig struct {
-	engine           *rules.Engine
-	limiter          *limiter.Limiter
-	tokenLimiter     *limiter.TokenLimiter
-	cache            *cache.Cache
-	cost             float64
-	costBudget       float64
-	maxBodyBytes     int64
-	webhookURL       *url.URL
-	webhooks         []proxy.WebhookTarget
-	proxyAPIKey      string
-	proxyAPIKeys     []proxy.ProxyKey
-	logFile          *os.File
-	routes           []targetRoute
-	modelRoutes      []modelRoute
-	ipAllowList      []*net.IPNet
-	ipDenyList       []*net.IPNet
-	geoIPTable       *geoip.Table
-	countryAllowList []string
-	countryDenyList  []string
-	anomalyDetector  *anomaly.Registry
-	anomalyDryRun    bool
+	engine             *rules.Engine
+	limiter            *limiter.Limiter
+	tokenLimiter       *limiter.TokenLimiter
+	cache              *cache.Cache
+	cost               float64
+	costBudget         float64
+	costBudgetHardStop bool
+	maxBodyBytes       int64
+	webhookURL         *url.URL
+	webhooks           []proxy.WebhookTarget
+	proxyAPIKey        string
+	proxyAPIKeys       []proxy.ProxyKey
+	logFile            *os.File
+	routes             []targetRoute
+	modelRoutes        []modelRoute
+	ipAllowList        []*net.IPNet
+	ipDenyList         []*net.IPNet
+	geoIPTable         *geoip.Table
+	countryAllowList   []string
+	countryDenyList    []string
+	anomalyDetector    *anomaly.Registry
+	anomalyDryRun      bool
 
 	upstreamTransport    *http.Transport
 	upstreamTotalTimeout time.Duration
@@ -592,6 +598,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 
 	lc.cost = cfg.CostPer1KTokens
 	lc.costBudget = cfg.CostBudget
+	lc.costBudgetHardStop = cfg.CostBudgetHardStop
 	lc.maxBodyBytes = cfg.MaxBodyBytes
 
 	if cfg.WebhookURL != "" {
@@ -1224,6 +1231,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.CostBudget > 0 && cfg.CostPer1KTokens <= 0 {
 		problems = append(problems, "cost_budget requires cost_per_1k_tokens to be set (there's no rate to price tokens at otherwise)")
 	}
+	if cfg.CostBudgetHardStop && cfg.CostBudget <= 0 {
+		problems = append(problems, "cost_budget_hard_stop requires cost_budget to be set (there's no budget to enforce otherwise)")
+	}
 	if cfg.MaxBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
 	}
@@ -1283,6 +1293,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  shadow traffic targets:  %d\n", countShadowTargets(cfg))
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  cost budget:             %g\n", cfg.CostBudget)
+	fmt.Fprintf(stdout, "  cost budget hard stop:   %v\n", cfg.CostBudgetHardStop)
 	fmt.Fprintf(stdout, "  built-in rule overrides: %d\n", len(cfg.BuiltinRuleActions))
 	fmt.Fprintf(stdout, "  max request body size:   %d bytes\n", effectiveMaxBodyBytes(cfg.MaxBodyBytes))
 	fmt.Fprintf(stdout, "  webhook alerts:          %v\n", cfg.WebhookURL != "")
@@ -2221,8 +2232,12 @@ func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry, costPer1KTokens floa
 			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget requires the top-level cost_per_1k_tokens to be set (there's no rate to price tokens at otherwise)", e.Name))
 			continue
 		}
+		if e.CostBudgetHardStop && e.CostBudget <= 0 {
+			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget_hard_stop requires this key's own cost_budget to be set (there's no budget to enforce otherwise)", e.Name))
+			continue
+		}
 
-		pk := proxy.ProxyKey{Name: e.Name, Key: e.Key, CostBudget: e.CostBudget}
+		pk := proxy.ProxyKey{Name: e.Name, Key: e.Key, CostBudget: e.CostBudget, CostBudgetHardStop: e.CostBudgetHardStop}
 		if e.MaxRequestsPerMinute > 0 {
 			pk.Limiter = limiter.New(e.MaxRequestsPerMinute, time.Minute)
 		}

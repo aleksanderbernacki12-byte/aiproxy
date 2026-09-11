@@ -134,16 +134,32 @@ type ProxyAPIKeyEntry struct {
 	// CostPer1KTokens) reaches or passes it, aiproxy logs and
 	// webhook-alerts a budget_exceeded event carrying this key's Name,
 	// independent of the server-wide CostBudget (if any) and of every
-	// other key's own budget — each fires once, on its own. Same
-	// alert-only (never enforcement) semantics as the top-level
-	// CostBudget: this never blocks or otherwise changes how a request
-	// is handled. Only meaningful alongside the top-level
-	// CostPer1KTokens: a budget with no rate to price tokens at has
-	// nothing to compare against, so setting this without
-	// CostPer1KTokens is a config error, same reasoning as the top-level
-	// CostBudget. Zero (the default) means this key has no budget of
-	// its own.
+	// other key's own budget — each fires once, on its own. Alert-only
+	// by default, same as the top-level CostBudget — see
+	// CostBudgetHardStop for actual enforcement. Only meaningful
+	// alongside the top-level CostPer1KTokens: a budget with no rate to
+	// price tokens at has nothing to compare against, so setting this
+	// without CostPer1KTokens is a config error, same reasoning as the
+	// top-level CostBudget. Zero (the default) means this key has no
+	// budget of its own.
 	CostBudget float64 `json:"cost_budget,omitempty"`
+
+	// CostBudgetHardStop, if true, turns this key's own CostBudget from
+	// a one-time alert into real enforcement: once its running cost has
+	// reached or passed CostBudget, every subsequent request
+	// authenticated with this key is rejected (402) instead of being
+	// forwarded — independent of the server-wide CostBudgetHardStop (if
+	// any) and of every other key's own, the same independence CostBudget
+	// itself already has. A cache hit is never rejected — it costs
+	// nothing additional regardless. Stays rejecting for the rest of the
+	// process's life once tripped; there's no time window or reset, the
+	// same "budgets never expire on their own" behavior CostBudget's own
+	// one-shot alert already has. Only meaningful alongside CostBudget —
+	// a hard stop with no budget to enforce is a config error, same
+	// reasoning as CostBudget requiring CostPer1KTokens. false (the
+	// default) keeps this key's own CostBudget alert-only, unchanged
+	// from before this field existed.
+	CostBudgetHardStop bool `json:"cost_budget_hard_stop,omitempty"`
 }
 
 // WeightedURL is one candidate in a Target's or ModelRoute's own
@@ -665,15 +681,32 @@ type Config struct {
 	// CostPer1KTokens — once the running total cost (TotalTokens priced
 	// at CostPer1KTokens) reaches or passes it, aiproxy logs a
 	// budget_exceeded event, alerts WebhookURL if set, and reports it in
-	// GET /_aiproxy/stats and the Prometheus endpoint. It never blocks or
-	// otherwise affects traffic — this is visibility only, not
-	// enforcement. Fires once per process lifetime, not on every request
-	// past the threshold. Only meaningful alongside CostPer1KTokens: a
-	// budget with no rate to price tokens at has nothing to compare
-	// against, so setting this without CostPer1KTokens is a config error.
-	// Zero (the default when the field is absent) disables the check
+	// GET /_aiproxy/stats and the Prometheus endpoint. Alert-only by
+	// default — see CostBudgetHardStop for actual enforcement. Fires
+	// once per process lifetime, not on every request past the
+	// threshold. Only meaningful alongside CostPer1KTokens: a budget
+	// with no rate to price tokens at has nothing to compare against,
+	// so setting this without CostPer1KTokens is a config error. Zero
+	// (the default when the field is absent) disables the check
 	// entirely.
 	CostBudget float64 `json:"cost_budget,omitempty"`
+
+	// CostBudgetHardStop, if true, turns CostBudget from a one-time
+	// alert into real enforcement: once the running total cost has
+	// reached or passed CostBudget, every subsequent request is
+	// rejected (402 Payment Required) instead of being forwarded — not
+	// just the one that happened to cross it, every one after, for the
+	// rest of the process's life (there's no time window or reset). A
+	// cache hit is never rejected — it costs nothing additional
+	// regardless of the budget. Applies uniformly across every
+	// target/route; a named proxy_api_key can additionally set its own
+	// cost_budget_hard_stop (see ProxyAPIKeyEntry.CostBudgetHardStop),
+	// checked independently. Only meaningful alongside CostBudget — a
+	// hard stop with no budget to enforce is a config error, same
+	// reasoning as CostBudget requiring CostPer1KTokens. false (the
+	// default) keeps CostBudget alert-only, unchanged from before this
+	// field existed.
+	CostBudgetHardStop bool `json:"cost_budget_hard_stop,omitempty"`
 
 	// ProxyAPIKey, if set, requires every request to the proxy — not
 	// just the ones forwarded upstream, but GET /_aiproxy/stats and
