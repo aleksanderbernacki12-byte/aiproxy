@@ -10,6 +10,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -597,6 +599,29 @@ type Server struct {
 	// to take effect, the same limitation a plain `http.Server` has.
 	TLSCertFile string
 	TLSKeyFile  string
+
+	// ClientCAPool, if non-nil, turns on mutual TLS: every connection
+	// must present a client certificate signed by one of the CAs in
+	// this pool, verified during the TLS handshake itself, before the
+	// connection is accepted at all — never something ServeHTTP or
+	// checkNetworkAndAuthAccess gets a chance to react to, since a
+	// handshake that fails this check never produces an HTTP request in
+	// the first place. Composes with ProxyAPIKey/ProxyAPIKeys as a
+	// genuinely independent, additive gate exactly like every other
+	// access control this proxy has (IPAllowList, CountryAllowList): if
+	// both are configured, a caller needs a valid client certificate
+	// AND a valid Proxy-Authorization key, never either on its own.
+	// Requires TLSCertFile/TLSKeyFile to already be set — mutual TLS is
+	// meaningless without the proxy first terminating TLS itself — the
+	// cli package's flag parsing rejects setting this without those
+	// before either ever reaches here. Built once at startup from a PEM
+	// CA bundle file (see the cli package); nil (the default) means
+	// ordinary one-way TLS (or plain HTTP), unchanged from before this
+	// field existed. Not hot-reloadable via SIGHUP, same reasoning as
+	// TLSCertFile/TLSKeyFile: this changes the listener's own TLS
+	// handshake policy, not a value ReloadConfig's atomic field swaps
+	// were ever meant to cover.
+	ClientCAPool *x509.CertPool
 
 	// AdminAddr, if non-empty, moves the whole admin surface — statsPath,
 	// metricsPath, dashboardPath, cacheClearPath — onto a second listener
@@ -4672,19 +4697,33 @@ func (w errorLogWriter) Write(p []byte) (int, error) {
 // ListenAndServe starts the proxy and blocks until ctx is cancelled or a
 // fatal server error occurs. Serves plain HTTP unless both TLSCertFile
 // and TLSKeyFile are set, in which case it terminates TLS itself via
-// http.Server.ListenAndServeTLS instead. When AdminAddr is also set, a
-// second http.Server is started for it, serving adminMux instead of s
-// (see AdminAddr's doc comment) — under the same TLS configuration as
-// the main listener, so a caller who wants the admin surface isolated
-// on its own network boundary doesn't also have to manage a second
-// certificate purely to keep both listeners on equal footing. A fatal
-// error on either listener stops both; ctx cancellation shuts both down
-// gracefully together.
+// http.Server.ListenAndServeTLS instead. When ClientCAPool is also set,
+// both listeners additionally require and verify a client certificate
+// during the handshake itself (mutual TLS) — see ClientCAPool's own
+// doc comment. When AdminAddr is also set, a second http.Server is
+// started for it, serving adminMux instead of s (see AdminAddr's doc
+// comment) — under the same TLS (and, if configured, mutual TLS)
+// configuration as the main listener, so a caller who wants the admin
+// surface isolated on its own network boundary doesn't also have to
+// manage a second certificate purely to keep both listeners on equal
+// footing. A fatal error on either listener stops both; ctx
+// cancellation shuts both down gracefully together.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	// nil unless ClientCAPool is set — passed as-is to http.Server's own
+	// TLSConfig field for both listeners; ListenAndServeTLS below still
+	// loads TLSCertFile/TLSKeyFile into it (via the file-path arguments
+	// it's given), it just also carries ClientCAs/ClientAuth alongside
+	// that certificate rather than using a bare, zero-value tls.Config.
+	var tlsConfig *tls.Config
+	if s.ClientCAPool != nil {
+		tlsConfig = &tls.Config{ClientCAs: s.ClientCAPool, ClientAuth: tls.RequireAndVerifyClientCert}
+	}
+
 	s.httpServer = &http.Server{
-		Addr:     s.Addr,
-		Handler:  s,
-		ErrorLog: log.New(errorLogWriter{server: s}, "", 0),
+		Addr:      s.Addr,
+		Handler:   s,
+		ErrorLog:  log.New(errorLogWriter{server: s}, "", 0),
+		TLSConfig: tlsConfig,
 	}
 
 	errCh := make(chan error, 2)
@@ -4703,9 +4742,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	if s.AdminAddr != "" {
 		s.adminHTTPServer = &http.Server{
-			Addr:     s.AdminAddr,
-			Handler:  adminMux{server: s},
-			ErrorLog: log.New(errorLogWriter{server: s}, "", 0),
+			Addr:      s.AdminAddr,
+			Handler:   adminMux{server: s},
+			ErrorLog:  log.New(errorLogWriter{server: s}, "", 0),
+			TLSConfig: tlsConfig.Clone(),
 		}
 		go serve(s.adminHTTPServer)
 	}

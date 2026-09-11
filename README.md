@@ -131,6 +131,45 @@ limitation a plain `net/http` server has. If you need automatic
 certificate rotation with no downtime, put a real reverse proxy or load
 balancer in front of aiproxy instead and let it handle TLS.
 
+### Mutual TLS (client certificate authentication)
+
+`--tls-cert`/`--tls-key` alone is ordinary one-way TLS: the client
+knows it's really talking to aiproxy, but aiproxy still can't tell one
+caller from another beyond whatever `proxy_api_key` says. Add
+`--client-ca-file` to require every caller to also present a client
+certificate, verified during the TLS handshake itself:
+
+```
+aiproxy start --target https://api.example.com --addr 0.0.0.0:8443 \
+  --tls-cert cert.pem --tls-key key.pem --client-ca-file ca.pem
+```
+
+`--client-ca-file` points at a PEM file of one or more CA certificates;
+once set, a connection presenting no client certificate — or one signed
+by a CA outside this file — is refused at the TLS handshake itself,
+before an HTTP request is ever produced, let alone reaches
+[rule-checking or the rate limiter](#custom-rules-rate-limiting-caching-and-cost-estimation).
+Requires `--tls-cert`/`--tls-key` to already be set — mutual TLS is
+meaningless without the proxy first terminating TLS itself — rejected
+immediately at startup otherwise, the same way `--tls-key` without
+`--tls-cert` is. A missing or unparseable CA file is also a fatal
+startup error, rather than silently producing a pool mutual TLS could
+never actually be satisfied against.
+
+Composes with [`proxy_api_key`/`proxy_api_keys`](#authenticating-requests-to-the-proxy)
+as a genuinely independent, additive gate — the same "every configured
+check must pass, never just one of them" rule
+[`ip_allow_list`](#restricting-access-by-ip) and
+[`country_allow_list`](#geoip-based-blocking) already follow. Set both,
+and a caller needs a valid client certificate *and* a valid
+`Proxy-Authorization` key; a certificate alone never exempts a request
+from also needing the key. When [`--admin-addr`](#isolating-the-admin-surface-on-its-own-port)
+is also set, its own listener requires the exact same client
+certificate — both listeners end up on equal footing, the same
+reasoning `--tls-cert`/`--tls-key` themselves already follow. Like
+every other TLS-adjacent setting, `--client-ca-file` is CLI-only and
+not hot-reloadable via SIGHUP.
+
 ## Restricting access by IP
 
 `ip_allow_list` and `ip_deny_list` restrict which client IPs may reach

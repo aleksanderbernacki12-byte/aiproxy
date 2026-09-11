@@ -294,6 +294,68 @@ func TestRunStart_TLSKeyWithoutCert_ReturnsErrorExitCode(t *testing.T) {
 	}
 }
 
+// TestRunStart_ClientCAFileWithoutTLSCert_ReturnsErrorExitCode proves
+// -client-ca-file is validated up front, same tier as -tls-cert/
+// -tls-key: mutual TLS is meaningless without the proxy already
+// terminating TLS itself, so setting it alone is rejected immediately
+// with a clear message and exit code 2, never silently ignored.
+func TestRunStart_ClientCAFileWithoutTLSCert_ReturnsErrorExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-client-ca-file", "ca.pem"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-client-ca-file requires -tls-cert/-tls-key") {
+		t.Fatalf("stderr missing a clear -client-ca-file error: %q", stderr.String())
+	}
+}
+
+// TestRunStart_ClientCAFileDoesNotExist_ReturnsErrorExitCode proves a
+// -client-ca-file that can't even be read is a fatal startup error
+// (exit code 1, a file-I/O problem — not 2, a flag-combination
+// problem), same tier as -audit-log-key-file pointing at a missing
+// file.
+func TestRunStart_ClientCAFileDoesNotExist_ReturnsErrorExitCode(t *testing.T) {
+	dir := t.TempDir()
+
+	// -tls-cert/-tls-key are never opened this early in runStart (only
+	// -client-ca-file is, to build the pool) — so any non-empty paths
+	// satisfy the pairing check without needing to be real certificates.
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-target", "https://api.example.com", "-tls-cert", "cert.pem", "-tls-key", "key.pem", "-client-ca-file", filepath.Join(dir, "does-not-exist.pem")}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "client_ca_file") {
+		t.Fatalf("stderr missing a clear client_ca_file error: %q", stderr.String())
+	}
+}
+
+// TestRunStart_ClientCAFileNotValidPEM_ReturnsErrorExitCode proves a
+// -client-ca-file that exists but contains no valid PEM-encoded
+// certificate is also a fatal startup error, rather than silently
+// producing a pool mutual TLS could never actually be satisfied
+// against.
+func TestRunStart_ClientCAFileNotValidPEM_ReturnsErrorExitCode(t *testing.T) {
+	dir := t.TempDir()
+	badCA := filepath.Join(dir, "bad-ca.pem")
+	if err := os.WriteFile(badCA, []byte("not a certificate"), 0o644); err != nil {
+		t.Fatalf("write bad CA file: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"start", "-target", "https://api.example.com", "-tls-cert", "cert.pem", "-tls-key", "key.pem", "-client-ca-file", badCA}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no valid PEM-encoded certificates") {
+		t.Fatalf("stderr missing a clear client_ca_file error: %q", stderr.String())
+	}
+}
+
 // TestRunStart_AdminAddrSameAsAddr_ReturnsErrorExitCode proves binding
 // -admin-addr to the exact same address as -addr is rejected up front —
 // there's no isolation in listening on the same address twice, and the

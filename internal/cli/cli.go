@@ -5,6 +5,7 @@ package cli
 
 import (
 	"context"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
@@ -86,6 +87,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	logFormat := fs.String("log-format", "text", `log output format: "text" (colored, human-readable) or "json" (one JSON object per line, safe to pipe into a log aggregator)`)
 	tlsCert := fs.String("tls-cert", "", "path to a PEM certificate file — combined with -tls-key, makes the proxy terminate TLS itself instead of listening on plain HTTP")
 	tlsKey := fs.String("tls-key", "", "path to a PEM private key file — see -tls-cert")
+	clientCAFile := fs.String("client-ca-file", "", "path to a PEM file of CA certificates trusted to sign client certificates — requires -tls-cert/-tls-key. Once set, every connection to -addr and -admin-addr must present a valid client certificate signed by one of these CAs, verified during the TLS handshake itself (mutual TLS), composing with proxy_api_key as an independent, additive gate rather than replacing it. Empty (default) is ordinary one-way TLS")
 	auditLogKeyFile := fs.String("audit-log-key-file", "", "path to a secret key file — when set, every line appended to log_file is HMAC-chained so later tampering is detectable with `aiproxy verify-log`; requires log_file to be configured")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -104,6 +106,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	if (*tlsCert == "") != (*tlsKey == "") {
 		fmt.Fprintln(stderr, "aiproxy: -tls-cert and -tls-key must be set together, or not at all")
+		return 2
+	}
+
+	if *clientCAFile != "" && *tlsCert == "" {
+		fmt.Fprintln(stderr, "aiproxy: -client-ca-file requires -tls-cert/-tls-key to be set (mutual TLS needs the proxy to already be terminating TLS itself)")
 		return 2
 	}
 
@@ -146,6 +153,16 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		auditChain = auditlog.NewChain(key, prevHash)
+	}
+
+	var clientCAPool *x509.CertPool
+	if *clientCAFile != "" {
+		pool, err := loadClientCAPool(*clientCAFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+			return 1
+		}
+		clientCAPool = pool
 	}
 
 	lc, errs := buildLiveConfig(cfg)
@@ -197,6 +214,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.IPLimiter = lc.ipLimiter
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
+	server.ClientCAPool = clientCAPool
 	server.AuditChain = auditChain
 	server.AdminAddr = *adminAddr
 	for _, r := range lc.routes {
@@ -376,9 +394,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if *tlsCert != "" {
 		scheme = "https"
 	}
-	fmt.Fprintf(stdout, "aiproxy listening on %s://%s, forwarding to %s\n", scheme, *addr, targetURL)
+	mtlsNotice := ""
+	if clientCAPool != nil {
+		mtlsNotice = " (mutual TLS: client certificate required)"
+	}
+	fmt.Fprintf(stdout, "aiproxy listening on %s://%s, forwarding to %s%s\n", scheme, *addr, targetURL, mtlsNotice)
 	if *adminAddr != "" {
-		fmt.Fprintf(stdout, "admin surface (stats/metrics/dashboard/cache-clear) listening separately on %s://%s\n", scheme, *adminAddr)
+		fmt.Fprintf(stdout, "admin surface (stats/metrics/dashboard/cache-clear/drain) listening separately on %s://%s%s\n", scheme, *adminAddr, mtlsNotice)
 	}
 	if err := server.ListenAndServe(ctx); err != nil {
 		fmt.Fprintf(stderr, "aiproxy: %v\n", err)
@@ -851,6 +873,25 @@ func openLogFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("log_file: %w", err)
 	}
 	return f, nil
+}
+
+// loadClientCAPool reads path as a PEM file and returns a CertPool of
+// every CA certificate it contains, for -client-ca-file (see
+// proxy.Server.ClientCAPool). A file that parses to zero certificates
+// (empty, or containing nothing PEM-decodable as a certificate) is
+// rejected as a config error rather than silently producing a pool
+// mutual TLS could never actually be satisfied against — the operator
+// almost certainly pointed this at the wrong file.
+func loadClientCAPool(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("client_ca_file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("client_ca_file: %s contains no valid PEM-encoded certificates", path)
+	}
+	return pool, nil
 }
 
 // builtinRules lists the name and pattern of each of aiproxy's built-in
