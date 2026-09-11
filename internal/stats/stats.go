@@ -182,6 +182,7 @@ type Stats struct {
 	dryRun           dryRunCounters
 	unauthorized     atomic.Int64
 	ipDenied         atomic.Int64
+	ipRateLimited    atomic.Int64
 	countryDenied    atomic.Int64
 	anomalyDetected  atomic.Int64
 	targetsEjected   atomic.Int64
@@ -365,6 +366,18 @@ func (s *Stats) RecordUnauthorized() {
 // authentication.
 func (s *Stats) RecordIPDenied() {
 	s.ipDenied.Add(1)
+}
+
+// RecordIPRateLimited records one request rejected by the per-IP rate
+// limiter — see the iplimiter package. No target parameter, same
+// reasoning as RecordIPDenied: checked before any target is resolved,
+// and before proxy authentication (a caller's IP-level budget applies
+// whether or not it ever presents a valid key). Distinct from
+// RecordRateLimited for the same reason RecordTokenRateLimited is: a
+// different breaker tripping for a different reason should never be
+// folded into the same counter.
+func (s *Stats) RecordIPRateLimited() {
+	s.ipRateLimited.Add(1)
 }
 
 // RecordCountryDenied records one request rejected by the GeoIP
@@ -727,6 +740,11 @@ type Snapshot struct {
 	// broken down per target — see Stats.RecordIPDenied.
 	IPDenied int64 `json:"ip_denied"`
 
+	// IPRateLimited counts requests rejected by the per-IP rate limiter
+	// — see Stats.RecordIPRateLimited/the iplimiter package. Never
+	// broken down per target, same reasoning as IPDenied.
+	IPRateLimited int64 `json:"ip_rate_limited"`
+
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
 	// IPDenied (a different rejection reason), never broken down per
@@ -801,6 +819,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.ResponseDryRunRedacted = s.dryRun.responseRedacted.Load()
 	snap.Unauthorized = s.unauthorized.Load()
 	snap.IPDenied = s.ipDenied.Load()
+	snap.IPRateLimited = s.ipRateLimited.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()
@@ -875,6 +894,12 @@ func (s Snapshot) String() string {
 	// anything.
 	if s.IPDenied > 0 {
 		out += fmt.Sprintf("\nIP denied (403):      %d", s.IPDenied)
+	}
+	// Same reasoning again: 0 for every run that never configured
+	// max_requests_per_minute_per_ip, or that did but never actually
+	// rate-limited anything.
+	if s.IPRateLimited > 0 {
+		out += fmt.Sprintf("\nIP rate-limited (429): %d", s.IPRateLimited)
 	}
 	// Same reasoning again: 0 for every run that never configured
 	// country_allow_list/country_deny_list, or that did but never

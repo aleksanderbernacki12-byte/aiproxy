@@ -33,6 +33,7 @@ import (
 	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/geoip"
+	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/rules"
 	"aiproxy/internal/stats"
@@ -463,6 +464,18 @@ type Server struct {
 	// matches an entry here, regardless of IPAllowList — see
 	// checkIPAccess. Empty (the default) denies nothing.
 	IPDenyList []*net.IPNet
+
+	// IPLimiter, if non-nil, gives every distinct caller IP its own
+	// dedicated request budget — independent of ProxyAPIKey/
+	// ProxyAPIKeys identity, so a caller that never presents a key (or
+	// one aiproxy doesn't even require) still can't monopolize the
+	// proxy the way it could sharing one server-wide Limiter with every
+	// other unidentified caller. Checked in checkNetworkAndAuthAccess,
+	// the same network-layer point as IPAllowList/IPDenyList, before
+	// proxy authentication. nil (the default, whenever
+	// max_requests_per_minute_per_ip isn't configured) disables this
+	// entirely.
+	IPLimiter *iplimiter.Registry
 
 	// GeoIPTable resolves a client IP to its country code, for
 	// CountryAllowList/CountryDenyList — nil (the default, whenever
@@ -943,6 +956,35 @@ func (s *Server) runHealthChecks(ctx context.Context) {
 	}
 }
 
+// ipLimiterSweepInterval is how often runIPLimiterSweep asks IPLimiter
+// to forget an IP that's gone idle — see iplimiter.Registry.Sweep.
+// Fixed rather than configurable, the same "one reasonable default"
+// reasoning as healthCheckIdlePollInterval.
+const ipLimiterSweepInterval = time.Minute
+
+// runIPLimiterSweep runs until ctx is cancelled (see ListenAndServe),
+// periodically evicting IPLimiter's idle per-IP entries so a
+// long-running process doesn't remember every distinct caller IP it
+// has ever seen — see iplimiter's own package doc comment for why that
+// matters here specifically (unlike a target or a named key, the set
+// of IPs a real deployment sees is unbounded and attacker-influenced).
+// A no-op loop, at the same fixed cadence, whenever IPLimiter is nil —
+// re-read fresh every iteration, so enabling max_requests_per_minute_per_ip
+// via a live SIGHUP reload starts actually sweeping on the very next
+// tick, no restart needed.
+func (s *Server) runIPLimiterSweep(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(ipLimiterSweepInterval):
+		}
+		if ipLimiter := s.getIPLimiter(); ipLimiter != nil {
+			ipLimiter.Sweep()
+		}
+	}
+}
+
 // allCandidateTargets returns every distinct candidate upstream URL
 // currently configured — Target plus every route's and model route's
 // own targets — deduplicated by URL string so a candidate reused
@@ -1245,6 +1287,13 @@ func (s *Server) getIPLists() ([]*net.IPNet, []*net.IPNet) {
 	return s.IPAllowList, s.IPDenyList
 }
 
+// getIPLimiter returns IPLimiter under lock, for checkNetworkAndAuthAccess.
+func (s *Server) getIPLimiter() *iplimiter.Registry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.IPLimiter
+}
+
 // clientIP extracts and parses the remote TCP peer's IP address from
 // r.RemoteAddr — deliberately never a client-supplied header like
 // X-Forwarded-For, which any caller could set to whatever value they
@@ -1503,7 +1552,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1543,6 +1592,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.HealthCheckInterval = healthCheckInterval
 	s.HealthCheckPath = healthCheckPath
 	s.TargetCostRates = targetCostRates
+	s.IPLimiter = ipLimiter
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2045,6 +2095,40 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
 		writeError(w, r, http.StatusForbidden, "country_denied", "access denied", "")
 		return clientAuth{}, false
+	}
+
+	if ipLimiter := s.getIPLimiter(); ipLimiter != nil {
+		// A third, independent network-layer gate, checked after
+		// checkIPAccess/checkCountryAccess (same "before any
+		// application-level credential check" reasoning) but still
+		// before checkProxyAuth: a caller's own IP-level budget applies
+		// whether or not it ever presents a valid proxy_api_key — the
+		// whole point is protection for a caller with no identity of
+		// its own to be rate-limited by otherwise.
+		ip := clientIP(r)
+		if ip == nil {
+			// Same "can't evaluate it, so deny" precedent checkIPAccess
+			// already established for an unparseable RemoteAddr — here,
+			// there's no way to attribute (or even look up) a per-IP
+			// budget for this caller at all.
+			s.Stats.RecordIPRateLimited()
+			s.logIPRateLimited(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
+			return clientAuth{}, false
+		}
+		ipStr := ip.String()
+		allowed := ipLimiter.Allow(ipStr)
+		max, remaining, resetIn := ipLimiter.Info(ipStr)
+		setRateLimitHeaders(w, "Ip", max, remaining, resetIn)
+		if !allowed {
+			s.Stats.RecordIPRateLimited()
+			s.logIPRateLimited(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
+			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
+			return clientAuth{}, false
+		}
 	}
 
 	auth, ok := s.checkProxyAuth(r)
@@ -2808,6 +2892,20 @@ func (s *Server) logIPDenied(remoteIP, method, reqURL, requestID string) {
 	s.logf("%s[IP DENIED] %s %s - %s not in ip_allow_list, or in ip_deny_list%s", ansiBrightRed, method, reqURL, remoteIP, ansiReset)
 }
 
+// logIPRateLimited is logIPDenied's counterpart for the per-IP rate
+// limiter — see the iplimiter package. Kept as its own Level
+// ("ip_rate_limited", not "rate_limited" or "ip_denied") so it's
+// distinguishable in a JSON log stream or GET /_aiproxy/stats from
+// both the identity-based breaker and an outright IP deny.
+func (s *Server) logIPRateLimited(remoteIP, method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "ip_rate_limited", Method: method, URL: reqURL, RequestID: requestID, RemoteIP: remoteIP})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[IP RATE LIMITED] %s %s - %s exceeded max_requests_per_minute_per_ip%s", ansiYellow, method, reqURL, remoteIP, ansiReset)
+}
+
 func (s *Server) logCountryDenied(remoteIP, country, method, reqURL, requestID string) {
 	ev := s.recordLogEvent(logEvent{Level: "country_denied", Method: method, URL: reqURL, RequestID: requestID, RemoteIP: remoteIP, Country: country})
 	if s.LogFormat == LogFormatJSON {
@@ -3331,6 +3429,23 @@ func (s *Server) notifyIPDeniedWebhook(remoteIP, method, reqURL, requestID strin
 	})
 }
 
+// notifyIPRateLimitedWebhook builds and delivers a webhookAlert for the
+// ip_rate_limited event — kept separate from notifyWebhook for the
+// same reason as notifyIPDeniedWebhook: this event carries a remote IP
+// instead of a rule name.
+func (s *Server) notifyIPRateLimitedWebhook(remoteIP, method, reqURL, requestID string) {
+	text := fmt.Sprintf("[IP_RATE_LIMITED] %s %s - %s exceeded max_requests_per_minute_per_ip", method, reqURL, remoteIP)
+	s.deliverWebhookPayload(webhookAlert{
+		Text:      text,
+		Event:     "ip_rate_limited",
+		Method:    method,
+		URL:       reqURL,
+		RequestID: requestID,
+		Time:      time.Now().UTC().Format(time.RFC3339),
+		RemoteIP:  remoteIP,
+	})
+}
+
 // notifyCountryDeniedWebhook builds and delivers a webhookAlert for the
 // country_denied event — kept separate from notifyWebhook for the same
 // reason as notifyIPDeniedWebhook: this event carries a remote IP (and
@@ -3508,6 +3623,10 @@ type statsSnapshotJSON struct {
 	// to resolve a target either.
 	IPDenied int64 `json:"ip_denied"`
 
+	// IPRateLimited is likewise only meaningful at the top level, and
+	// always 0 inside per_target — same reasoning as IPDenied.
+	IPRateLimited int64 `json:"ip_rate_limited"`
+
 	// CountryDenied is likewise only meaningful at the top level, and
 	// always 0 inside per_target — same reasoning as IPDenied.
 	CountryDenied int64 `json:"country_denied"`
@@ -3566,6 +3685,7 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		ResponseDryRunRedacted: snap.ResponseDryRunRedacted,
 		Unauthorized:           snap.Unauthorized,
 		IPDenied:               snap.IPDenied,
+		IPRateLimited:          snap.IPRateLimited,
 		CountryDenied:          snap.CountryDenied,
 		AnomalyDetected:        snap.AnomalyDetected,
 		TargetsEjected:         snap.TargetsEjected,
@@ -3861,6 +3981,13 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 	fmt.Fprintln(w, "# TYPE aiproxy_ip_denied_total counter")
 	fmt.Fprintf(w, "aiproxy_ip_denied_total %d\n", snap.IPDenied)
 
+	// Unlabeled, same reasoning as aiproxy_ip_denied_total: an
+	// IP-rate-limited request never gets far enough to resolve a target
+	// either.
+	fmt.Fprintln(w, "# HELP aiproxy_ip_rate_limited_total Total number of requests rejected by the per-IP rate limiter.")
+	fmt.Fprintln(w, "# TYPE aiproxy_ip_rate_limited_total counter")
+	fmt.Fprintf(w, "aiproxy_ip_rate_limited_total %d\n", snap.IPRateLimited)
+
 	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
 	// country-denied request never gets far enough to resolve a target.
 	fmt.Fprintln(w, "# HELP aiproxy_country_denied_total Total number of requests rejected by the GeoIP country allow/deny list.")
@@ -4054,6 +4181,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 
 	go s.runHealthChecks(ctx)
+	go s.runIPLimiterSweep(ctx)
 
 	select {
 	case <-ctx.Done():

@@ -26,6 +26,7 @@ import (
 	"aiproxy/internal/cache"
 	"aiproxy/internal/config"
 	"aiproxy/internal/geoip"
+	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
@@ -188,6 +189,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.HealthCheckInterval = lc.healthCheckInterval
 	server.HealthCheckPath = lc.healthCheckPath
 	server.TargetCostRates = lc.targetCostRates
+	server.IPLimiter = lc.ipLimiter
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
@@ -223,6 +225,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if cfg.MaxTokensPerMinute > 0 {
 			fmt.Fprintf(stdout, "token circuit breaker: %d tokens/minute\n", cfg.MaxTokensPerMinute)
+		}
+		if cfg.MaxRequestsPerMinutePerIP > 0 {
+			fmt.Fprintf(stdout, "per-IP circuit breaker: %d requests/minute per caller IP\n", cfg.MaxRequestsPerMinutePerIP)
 		}
 		if cfg.CacheEnabled {
 			if cfg.CacheTTLSeconds > 0 {
@@ -434,7 +439,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter)
 
 	label := loadedFrom
 	if label == "" {
@@ -489,6 +494,8 @@ type liveConfig struct {
 	healthCheckPath     string
 
 	targetCostRates map[string]float64
+
+	ipLimiter *iplimiter.Registry
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -512,6 +519,11 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	}
 	if cfg.MaxTokensPerMinute > 0 {
 		lc.tokenLimiter = limiter.NewTokenLimiter(cfg.MaxTokensPerMinute, time.Minute)
+	}
+	if cfg.MaxRequestsPerMinutePerIP < 0 {
+		errs = append(errs, fmt.Errorf("max_requests_per_minute_per_ip: %d must not be negative", cfg.MaxRequestsPerMinutePerIP))
+	} else if cfg.MaxRequestsPerMinutePerIP > 0 {
+		lc.ipLimiter = iplimiter.NewRegistry(cfg.MaxRequestsPerMinutePerIP, time.Minute)
 	}
 
 	if cfg.CacheEnabled {
@@ -1076,6 +1088,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.MaxTokensPerMinute < 0 {
 		problems = append(problems, fmt.Sprintf("max_tokens_per_minute: %d must not be negative", cfg.MaxTokensPerMinute))
 	}
+	if cfg.MaxRequestsPerMinutePerIP < 0 {
+		problems = append(problems, fmt.Sprintf("max_requests_per_minute_per_ip: %d must not be negative", cfg.MaxRequestsPerMinutePerIP))
+	}
 	if cfg.CostPer1KTokens < 0 {
 		problems = append(problems, fmt.Sprintf("cost_per_1k_tokens: %g must not be negative", cfg.CostPer1KTokens))
 	}
@@ -1136,6 +1151,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  model routes:            %d\n", len(cfg.ModelRoutes))
 	fmt.Fprintf(stdout, "  max requests per minute: %d\n", cfg.MaxRequestsPerMinute)
 	fmt.Fprintf(stdout, "  max tokens per minute:   %d\n", cfg.MaxTokensPerMinute)
+	fmt.Fprintf(stdout, "  max requests/min per IP: %d\n", cfg.MaxRequestsPerMinutePerIP)
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
 	fmt.Fprintf(stdout, "  cache max size:          %s\n", cacheMaxSizeDisplay(cfg.CacheMaxSizeBytes))

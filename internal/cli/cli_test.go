@@ -1712,6 +1712,44 @@ func TestRunStart_TargetHealthCheckIntervalWithoutEjectionThreshold_FatalsWithCl
 	}
 }
 
+func TestExecute_Validate_NegativeMaxRequestsPerMinutePerIP_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"max_requests_per_minute_per_ip": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "max_requests_per_minute_per_ip") {
+		t.Errorf("stderr missing negative max_requests_per_minute_per_ip problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithMaxRequestsPerMinutePerIP_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"max_requests_per_minute_per_ip": 30}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "max requests/min per IP: 30") {
+		t.Fatalf("stdout missing max requests/min per IP summary: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_NegativeCostBudget_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

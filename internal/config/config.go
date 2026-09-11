@@ -273,6 +273,17 @@ type Config struct {
 	// default when the field is absent) disables this breaker entirely.
 	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
 
+	// MaxRequestsPerMinutePerIP, if greater than zero, gives every
+	// distinct caller IP its own dedicated request budget of this many
+	// requests per rolling minute — independent of, and checked before,
+	// proxy_api_key/proxy_api_keys identity, so a caller that never
+	// presents a key (or one aiproxy doesn't even require) still can't
+	// monopolize the proxy the way it could sharing one pool with every
+	// other unidentified caller. A network-layer gate, checked alongside
+	// ip_allow_list/ip_deny_list — see the iplimiter package. Zero (the
+	// default when the field is absent) disables this entirely.
+	MaxRequestsPerMinutePerIP int `json:"max_requests_per_minute_per_ip,omitempty"`
+
 	// UpstreamResponseTimeoutSeconds, if greater than zero, caps how
 	// long aiproxy waits for an upstream to begin responding (its
 	// status line and headers) to a forwarded request before giving up

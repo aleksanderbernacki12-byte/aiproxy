@@ -35,6 +35,7 @@ import (
 	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/geoip"
+	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
@@ -858,7 +859,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	}
 
 	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	// The freshly reloaded Registry starts cold — no baseline exists
 	// for this client yet, so (correctly, per Detector's own cold-start
@@ -4343,7 +4344,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -4405,7 +4406,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 		}
 	}()
 
@@ -5414,7 +5415,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -6687,7 +6688,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -7019,7 +7020,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -7393,7 +7394,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7853,7 +7854,7 @@ func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
 
 	tb := breaker.NewRegistry(1, time.Hour)
 	reloadedRoutes := []proxy.Route{{Prefix: "/openai", Targets: []*url.URL{brokenURL, healthyURL}}}
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil)
 
 	get := func() {
 		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
@@ -8736,7 +8737,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -9558,7 +9559,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -9874,7 +9875,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -10229,7 +10230,7 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -10670,7 +10671,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -10709,7 +10710,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
@@ -11628,7 +11629,7 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil)
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil)
 
 	start := time.Now()
 	resp, err := http.Get(frontend.URL + "/v1/chat")
@@ -12645,5 +12646,183 @@ func TestServer_RequestID_IncludedInWebhookPayload(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("webhook never received the unauthorized event")
+	}
+}
+
+// TestServer_IPRateLimit_SixthRequestFromOneIPGets429AndHeaders proves
+// the core per-IP budget: 5 requests from the same caller IP succeed,
+// the 6th is rejected with 429 and the X-RateLimit-*-Ip headers/
+// Retry-After a real client can act on. Uses a synthetic request with
+// a manually-set RemoteAddr (rather than a real httptest.NewServer
+// connection, which always originates from 127.0.0.1) so two
+// different-IP scenarios can actually be distinguished — see
+// TestServer_IPRateLimit_DifferentIPsHaveIndependentBudgets.
+func TestServer_IPRateLimit_SixthRequestFromOneIPGets429AndHeaders(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.IPLimiter = iplimiter.NewRegistry(5, time.Minute)
+
+	doRequest := func(remoteAddr string) *http.Response {
+		req := httptest.NewRequest(http.MethodGet, "/endpoint", nil)
+		req.RemoteAddr = remoteAddr
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	for i := 1; i <= 5; i++ {
+		resp := doRequest("203.0.113.5:1234")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d", i, resp.StatusCode, http.StatusOK)
+		}
+		if got := resp.Header.Get("X-Ratelimit-Limit-Ip"); got != "5" {
+			t.Errorf("request %d: X-RateLimit-Limit-Ip = %q, want 5", i, got)
+		}
+	}
+	if upstreamHits.Load() != 5 {
+		t.Fatalf("upstream hits = %d, want exactly 5", upstreamHits.Load())
+	}
+
+	resp := doRequest("203.0.113.5:1234")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("6th request: status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+	if got := resp.Header.Get("X-Ratelimit-Remaining-Ip"); got != "0" {
+		t.Errorf("6th request: X-RateLimit-Remaining-Ip = %q, want 0", got)
+	}
+	retryAfter, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || retryAfter <= 0 || retryAfter > 60 {
+		t.Errorf("6th request: Retry-After = %q, want a positive integer up to 60", resp.Header.Get("Retry-After"))
+	}
+	if upstreamHits.Load() != 5 {
+		t.Fatalf("upstream hits after the 6th (rejected) request = %d, want still exactly 5", upstreamHits.Load())
+	}
+}
+
+// TestServer_IPRateLimit_DifferentIPsHaveIndependentBudgets proves one
+// caller IP exhausting its own budget never throttles a different IP
+// — the whole point of per-IP (rather than one shared) limiting.
+func TestServer_IPRateLimit_DifferentIPsHaveIndependentBudgets(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.IPLimiter = iplimiter.NewRegistry(1, time.Minute)
+
+	doRequest := func(remoteAddr string) *http.Response {
+		req := httptest.NewRequest(http.MethodGet, "/endpoint", nil)
+		req.RemoteAddr = remoteAddr
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	if resp := doRequest("203.0.113.1:1"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("IP #1 first request: status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if resp := doRequest("203.0.113.1:1"); resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("IP #1 second request: status = %d, want %d (its own 1-request budget exhausted)", resp.StatusCode, http.StatusTooManyRequests)
+	}
+	// A completely different IP must still get its own fresh request
+	// through, unaffected by IP #1's own exhausted budget.
+	if resp := doRequest("203.0.113.2:1"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("IP #2 first request: status = %d, want %d (independent budget from IP #1)", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestServer_IPRateLimit_AppliesRegardlessOfProxyAuth proves the
+// per-IP breaker is checked before, and independent of,
+// proxy_api_key authentication — protection for a caller with no
+// identity of its own, not something an authenticated caller can
+// bypass or that only applies to unauthenticated ones.
+func TestServer_IPRateLimit_AppliesRegardlessOfProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.IPLimiter = iplimiter.NewRegistry(1, time.Minute)
+	srv.ProxyAPIKey = "secret"
+
+	doRequest := func() *http.Response {
+		req := httptest.NewRequest(http.MethodGet, "/endpoint", nil)
+		req.RemoteAddr = "203.0.113.9:1"
+		req.Header.Set("Proxy-Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	if resp := doRequest(); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first authenticated request: status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	resp := doRequest()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second authenticated request: status = %d, want %d (per-IP budget applies even with a valid proxy_api_key)", resp.StatusCode, http.StatusTooManyRequests)
+	}
+}
+
+// TestServer_IPRateLimit_StatsAndLogReflectRejection proves a genuine
+// rejection is counted (global-only, per Stats.RecordIPRateLimited)
+// and logged under its own distinct ip_rate_limited level, never
+// folded into the identity-based rate_limited counter/level.
+func TestServer_IPRateLimit_StatsAndLogReflectRejection(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	var logBuf bytes.Buffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(&logBuf, "", 0)
+	srv.IPLimiter = iplimiter.NewRegistry(1, time.Minute)
+
+	doRequest := func() *http.Response {
+		req := httptest.NewRequest(http.MethodGet, "/endpoint", nil)
+		req.RemoteAddr = "203.0.113.7:1"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	doRequest()
+	doRequest()
+
+	snap := srv.Stats.Snapshot()
+	if snap.IPRateLimited != 1 {
+		t.Fatalf("Stats.IPRateLimited = %d, want 1", snap.IPRateLimited)
+	}
+	if snap.RateLimited != 0 {
+		t.Fatalf("Stats.RateLimited = %d, want 0 (must never be folded into the identity-based counter)", snap.RateLimited)
+	}
+	if !strings.Contains(logBuf.String(), "[IP RATE LIMITED]") {
+		t.Fatalf("log missing [IP RATE LIMITED] line: %q", logBuf.String())
 	}
 }

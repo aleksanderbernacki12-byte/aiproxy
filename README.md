@@ -178,6 +178,47 @@ event carrying the denied `remote_ip`. Hot-reloadable via
 [SIGHUP](#reloading-config-without-restarting) like everything else in
 this README.
 
+### Per-IP rate limiting
+
+`max_requests_per_minute`/`max_tokens_per_minute` (and their per-key
+overrides) only ever protect callers that actually authenticate with a
+[`proxy_api_key`](#authenticating-requests-to-the-proxy) — without one
+configured, or for a caller that never presents a key, every
+unidentified request shares one pool. `max_requests_per_minute_per_ip`
+gives every distinct caller IP its own dedicated budget instead,
+independent of identity entirely:
+
+```json
+{
+  "max_requests_per_minute_per_ip": 30
+}
+```
+
+Checked as a third, independent network-layer gate alongside
+`ip_allow_list`/`ip_deny_list` — after them, but still *before* proxy
+authentication, so a single noisy or malicious caller IP can't
+monopolize the proxy, key or no key. The match is against the same
+`r.RemoteAddr` TCP peer address `ip_allow_list` uses, with the same
+caveat about running behind another reverse proxy or load balancer.
+A rejected request gets the same [`X-RateLimit-*`
+headers](#rate-limit-response-headers) as every other breaker
+(`X-RateLimit-{Limit,Remaining,Reset}-Ip` plus `Retry-After`), is
+counted separately from the identity-based breaker (`GET
+/_aiproxy/stats`'s `ip_rate_limited` field and the Prometheus
+endpoint's `aiproxy_ip_rate_limited_total`, both global-only — an
+IP-rejected request never resolves a target to break it down by), and
+logged/alerted under its own `ip_rate_limited` level/event, distinct
+from `rate_limited` for the same reason `token_rate_limited` is: a
+different breaker tripping for a different reason.
+
+Unlike a per-target or per-key limiter, the number of distinct IPs a
+real deployment sees over time is unbounded — aiproxy periodically
+forgets an IP's own state once it's gone idle for a while (about two
+minutes with no requests from it) rather than remembering every caller
+it has ever seen for the life of the process. Zero/absent (the
+default) disables this entirely — the exact behavior aiproxy has
+always had.
+
 ## GeoIP-based blocking
 
 `country_allow_list` and `country_deny_list` restrict which client
