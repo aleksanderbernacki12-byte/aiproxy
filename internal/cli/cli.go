@@ -184,6 +184,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.UpstreamTransport = lc.upstreamTransport
 	server.UpstreamTotalTimeout = lc.upstreamTotalTimeout
 	server.TargetBreaker = lc.targetBreaker
+	server.CORS = lc.cors
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
@@ -284,6 +285,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if lc.targetBreaker != nil {
 			fmt.Fprintf(stdout, "target ejection: after %d consecutive failures, %ds cooldown\n", cfg.TargetEjectionThreshold, cfg.TargetEjectionCooldownSeconds)
+		}
+		if lc.cors != nil {
+			fmt.Fprintf(stdout, "CORS: enabled for %s\n", strings.Join(cfg.CORSAllowedOrigins, ", "))
 		}
 		if lc.proxyAPIKey != "" {
 			// Deliberately never prints the key itself, same discipline
@@ -421,7 +425,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors)
 
 	label := loadedFrom
 	if label == "" {
@@ -469,6 +473,8 @@ type liveConfig struct {
 	upstreamTotalTimeout time.Duration
 
 	targetBreaker *breaker.Registry
+
+	cors *proxy.CORSConfig
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -607,6 +613,30 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	}
 	if cfg.TargetEjectionThreshold > 0 && cfg.TargetEjectionCooldownSeconds > 0 {
 		lc.targetBreaker = breaker.NewRegistry(cfg.TargetEjectionThreshold, time.Duration(cfg.TargetEjectionCooldownSeconds)*time.Second)
+	}
+
+	if cfg.CORSMaxAgeSeconds < 0 {
+		errs = append(errs, fmt.Errorf("cors_max_age_seconds: %d must not be negative", cfg.CORSMaxAgeSeconds))
+	}
+	if len(cfg.CORSAllowedOrigins) == 0 {
+		switch {
+		case len(cfg.CORSAllowedMethods) > 0:
+			errs = append(errs, fmt.Errorf("cors_allowed_methods requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)"))
+		case len(cfg.CORSAllowedHeaders) > 0:
+			errs = append(errs, fmt.Errorf("cors_allowed_headers requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)"))
+		case cfg.CORSAllowCredentials:
+			errs = append(errs, fmt.Errorf("cors_allow_credentials requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)"))
+		case cfg.CORSMaxAgeSeconds > 0:
+			errs = append(errs, fmt.Errorf("cors_max_age_seconds requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)"))
+		}
+	} else {
+		lc.cors = &proxy.CORSConfig{
+			AllowedOrigins:   cfg.CORSAllowedOrigins,
+			AllowedMethods:   cfg.CORSAllowedMethods,
+			AllowedHeaders:   cfg.CORSAllowedHeaders,
+			AllowCredentials: cfg.CORSAllowCredentials,
+			MaxAgeSeconds:    cfg.CORSMaxAgeSeconds,
+		}
 	}
 
 	return lc, errs
@@ -956,6 +986,22 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, "target_ejection_cooldown_seconds requires target_ejection_threshold to be set (there's no breaker for it to time)")
 	}
 
+	if cfg.CORSMaxAgeSeconds < 0 {
+		problems = append(problems, fmt.Sprintf("cors_max_age_seconds: %d must not be negative", cfg.CORSMaxAgeSeconds))
+	}
+	if len(cfg.CORSAllowedOrigins) == 0 {
+		switch {
+		case len(cfg.CORSAllowedMethods) > 0:
+			problems = append(problems, "cors_allowed_methods requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)")
+		case len(cfg.CORSAllowedHeaders) > 0:
+			problems = append(problems, "cors_allowed_headers requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)")
+		case cfg.CORSAllowCredentials:
+			problems = append(problems, "cors_allow_credentials requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)")
+		case cfg.CORSMaxAgeSeconds > 0:
+			problems = append(problems, "cors_max_age_seconds requires cors_allowed_origins to be set (there's nothing to answer a preflight for otherwise)")
+		}
+	}
+
 	_, pathRuleErrs := compilePathRules(cfg.PathRules)
 	for _, e := range pathRuleErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
@@ -1054,8 +1100,17 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  upstream response timeout: %s\n", timeoutDisplay(cfg.UpstreamResponseTimeoutSeconds))
 	fmt.Fprintf(stdout, "  upstream total timeout:    %s\n", timeoutDisplay(cfg.UpstreamTotalTimeoutSeconds))
 	fmt.Fprintf(stdout, "  target ejection:         %s\n", targetEjectionDisplay(cfg.TargetEjectionThreshold, cfg.TargetEjectionCooldownSeconds))
+	fmt.Fprintf(stdout, "  CORS:                    %s\n", corsDisplay(cfg.CORSAllowedOrigins))
 	fmt.Fprintf(stdout, "  log file:                %s\n", logFileDisplay(cfg.LogFile))
 	return 0
+}
+
+// corsDisplay renders cors_allowed_origins for the validate summary.
+func corsDisplay(origins []string) string {
+	if len(origins) == 0 {
+		return "disabled"
+	}
+	return strings.Join(origins, ", ")
 }
 
 // targetEjectionDisplay renders target_ejection_threshold/

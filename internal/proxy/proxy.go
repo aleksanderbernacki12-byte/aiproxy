@@ -376,6 +376,14 @@ type Server struct {
 	// existed.
 	TargetBreaker *breaker.Registry
 
+	// CORS, if non-nil, makes ServeHTTP and adminMux.ServeHTTP answer
+	// CORS preflight requests and add CORS response headers to every
+	// response — see CORSConfig's own doc comment. nil (the default,
+	// whenever cors_allowed_origins isn't configured) disables this
+	// entirely, the exact behavior aiproxy had before this feature
+	// existed.
+	CORS *CORSConfig
+
 	Cache           *cache.Cache // nil disables the response cache
 	CostPer1KTokens float64      // zero omits the shutdown summary's cost line
 	routes          []route
@@ -1145,6 +1153,14 @@ func (s *Server) getTargetBreaker() *breaker.Registry {
 	return s.TargetBreaker
 }
 
+// getCORSConfig returns CORS under lock, for ServeHTTP, adminMux, and
+// the response paths that stamp CORS headers.
+func (s *Server) getCORSConfig() *CORSConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CORS
+}
+
 // NewUpstreamTransport builds the *http.Transport used for every
 // forwarded request: a clone of http.DefaultTransport — preserving its
 // connection pooling, dialer, and TLS defaults — with
@@ -1300,7 +1316,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1336,6 +1352,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.UpstreamTransport = upstreamTransport
 	s.UpstreamTotalTimeout = upstreamTotalTimeout
 	s.TargetBreaker = targetBreaker
+	s.CORS = cors
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -1572,6 +1589,110 @@ func isReservedAdminPath(path string) bool {
 	}
 }
 
+// CORSConfig holds aiproxy's own CORS (Cross-Origin Resource Sharing)
+// handling settings — see CORSAllowedOrigins's doc comment in the
+// config package for the full behavior and rationale. Built once from
+// config.Config by the cli package (see buildLiveConfig) and swapped
+// under Server.mu like every other reloadable field (Server.CORS).
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	AllowCredentials bool
+	MaxAgeSeconds    int
+}
+
+// allowedOrigin reports whether origin — the request's own Origin
+// header value — is permitted by c.AllowedOrigins, and if so returns
+// the exact value to echo back in Access-Control-Allow-Origin: always
+// origin itself, never the literal "*", even when "*" is what matched.
+// This is simultaneously always spec-correct (a literal "*" is
+// forbidden alongside Access-Control-Allow-Credentials: true) and
+// simpler than a separate credentials-aware branch.
+func (c *CORSConfig) allowedOrigin(origin string) (string, bool) {
+	if origin == "" {
+		return "", false
+	}
+	for _, allowed := range c.AllowedOrigins {
+		if allowed == "*" || allowed == origin {
+			return origin, true
+		}
+	}
+	return "", false
+}
+
+// applyCORSHeaders sets header's CORS response headers for r, when
+// cors is non-nil and r carries an Origin header allowedOrigin
+// accepts; a nil cors or a disallowed/absent Origin leaves header
+// untouched. Uses Set (never Add) so it's safe to call more than once
+// for the same response.
+//
+// Called exactly once per request, at the very top of
+// checkNetworkAndAuthAccess — before the IP/country/proxy-auth checks,
+// same as healthzPath's own precedent, since a browser's CORS
+// preflight can never carry those credentials in the first place (see
+// corsPreflightRequest). That single call covers every response this
+// request can end up producing — an early rejection, an admin
+// endpoint, a cache hit, or a live-forwarded response — because it
+// sets the header on the ResponseWriter's own header map before
+// anything else runs, and nothing downstream (including copyHeader's
+// Add-based merge of a cached or upstream response's headers) ever
+// clears an already-Set header, only adds alongside it under different
+// keys.
+func applyCORSHeaders(cors *CORSConfig, header http.Header, r *http.Request) {
+	if cors == nil {
+		return
+	}
+	origin, ok := cors.allowedOrigin(r.Header.Get("Origin"))
+	if !ok {
+		return
+	}
+	header.Set("Access-Control-Allow-Origin", origin)
+	header.Set("Vary", "Origin")
+	if cors.AllowCredentials {
+		header.Set("Access-Control-Allow-Credentials", "true")
+	}
+}
+
+// corsPreflightRequest reports whether r is a browser's CORS preflight
+// — an OPTIONS request carrying Access-Control-Request-Method, the
+// browser's own signal that this OPTIONS exists purely to ask
+// permission for a cross-origin request, never a real one. Must be
+// answered before rules, rate limiting, or forwarding: a real request
+// following it carries the caller's own credentials, but the preflight
+// itself never does.
+func corsPreflightRequest(r *http.Request) bool {
+	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+}
+
+// handleCORSPreflight answers a CORS preflight request per cors's
+// configuration: 204 No Content plus Access-Control-Allow-Methods,
+// Access-Control-Allow-Headers (reflecting back whatever the browser's
+// own Access-Control-Request-Headers asked for when cors.AllowedHeaders
+// is empty — see CORSAllowedHeaders's doc comment for why that's the
+// safer default), and Access-Control-Max-Age when configured.
+// applyCORSHeaders must already have been called for this response
+// before this runs.
+func handleCORSPreflight(cors *CORSConfig, w http.ResponseWriter, r *http.Request) {
+	methods := cors.AllowedMethods
+	if len(methods) == 0 {
+		methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+	}
+	w.Header().Set("Access-Control-Allow-Methods", strings.Join(methods, ", "))
+
+	if len(cors.AllowedHeaders) > 0 {
+		w.Header().Set("Access-Control-Allow-Headers", strings.Join(cors.AllowedHeaders, ", "))
+	} else if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+		w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+	}
+
+	if cors.MaxAgeSeconds > 0 {
+		w.Header().Set("Access-Control-Max-Age", strconv.Itoa(cors.MaxAgeSeconds))
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // checkNetworkAndAuthAccess runs the three independent gates every
 // request — whether ordinary proxy traffic or a request for the admin
 // surface — must pass before anything else happens: the IP allow/deny
@@ -1582,7 +1703,18 @@ func isReservedAdminPath(path string) bool {
 // identically whether it arrives on Addr (AdminAddr unset) or on
 // AdminAddr's own listener — moving where the admin surface is
 // reachable from was never meant to change what's required to reach it.
+//
+// CORS handling — applying Access-Control-Allow-Origin and friends,
+// and short-circuiting a preflight entirely — runs first, before any
+// of the three gates: see corsPreflightRequest's doc comment for why.
 func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request) (clientAuth, bool) {
+	if cors := s.getCORSConfig(); cors != nil {
+		applyCORSHeaders(cors, w.Header(), r)
+		if corsPreflightRequest(r) {
+			handleCORSPreflight(cors, w, r)
+			return clientAuth{}, false
+		}
+	}
 	if !s.checkIPAccess(r) {
 		// Checked before even proxy authentication: a network-level
 		// access decision is more foundational than an application-level

@@ -1895,6 +1895,67 @@ is a process-level operation a live config swap was never meant to
 cover. Empty/absent (the default) keeps everything on `--addr` alone,
 completely unchanged from before this flag existed.
 
+## Cross-origin requests (CORS)
+
+A browser-based client calling aiproxy directly from its own page's
+JavaScript (`fetch()`, not a server-side call) needs aiproxy to answer
+CORS — otherwise the browser's own same-origin policy blocks the page
+from reading the response, or even sending it in the first place for
+anything beyond a "simple" request. `cors_allowed_origins` turns this
+on:
+
+```json
+{
+  "cors_allowed_origins": ["https://app.example.com"],
+  "cors_allowed_methods": ["GET", "POST", "OPTIONS"],
+  "cors_allowed_headers": ["Content-Type", "X-Api-Key"],
+  "cors_allow_credentials": true,
+  "cors_max_age_seconds": 600
+}
+```
+
+`cors_allowed_origins` is the only required field — everything else is
+optional and only meaningful alongside it. `"*"` matches any origin;
+otherwise list exact `scheme://host[:port]` origins. Whichever origin a
+request actually carries, aiproxy always echoes back that *specific*
+value in `Access-Control-Allow-Origin` — never the literal `"*"` string,
+even when `"*"` is what matched. That's both simpler (one code path
+instead of a separate credentials-aware branch) and the only spec-legal
+option once `cors_allow_credentials` is set: a literal `*` is forbidden
+alongside `Access-Control-Allow-Credentials: true`.
+
+A browser that's about to send anything beyond a simple GET/POST first
+sends a **preflight** — an `OPTIONS` request carrying
+`Access-Control-Request-Method` — to ask permission before the real
+request goes out. aiproxy answers it directly with `204 No Content`
+and the relevant `Access-Control-Allow-*` headers, before rules, rate
+limiting, `proxy_api_key` authentication, or forwarding ever run: a
+preflight never carries the browser's own credentials for the real
+request that follows it (browsers never attach them to an `OPTIONS`
+preflight), so gating it behind those checks would make CORS unusable
+for any authenticated aiproxy setup. `cors_allowed_methods` defaults to
+`GET, POST, PUT, PATCH, DELETE, OPTIONS` when left unset.
+`cors_allowed_headers`, left unset, defaults to reflecting back
+whatever the browser's own preflight actually asked for
+(`Access-Control-Request-Headers`) rather than a hardcoded allowlist —
+deliberately, so an incomplete manually-typed list can never end up
+silently breaking `Authorization`/`Proxy-Authorization`/`X-Api-Key` for
+an operator who forgot to include it; CORS exists to protect a server
+from a malicious *page*, not the other way around.
+`cors_max_age_seconds`, if set, lets the browser cache a preflight's
+answer instead of repeating it before every real request.
+
+The CORS header is added to *every* response this feature applies to —
+including one a rule blocked, the rate limiter rejected, or
+`proxy_api_key` auth refused — so a browser-based client's own error
+handling can actually see why a call failed instead of just an opaque,
+generic CORS failure masking the real reason. It's applied identically
+on both `--addr` and [`--admin-addr`](#isolating-the-admin-surface-on-its-own-port).
+Empty/absent `cors_allowed_origins` (the default) disables CORS
+handling entirely — the exact behavior aiproxy had before this feature
+existed, and still the right choice for a purely server-to-server
+setup with no browser-based caller.
+
 ## Webhook alerts
 
 Stats and metrics are pull-based — something has to go and look at them.

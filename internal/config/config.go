@@ -278,6 +278,58 @@ type Config struct {
 	// means no limit.
 	UpstreamTotalTimeoutSeconds int `json:"upstream_total_timeout_seconds,omitempty"`
 
+	// CORSAllowedOrigins, if non-empty, makes aiproxy answer CORS
+	// preflight requests (an OPTIONS request carrying an
+	// Access-Control-Request-Method header — the browser's own signal
+	// that this OPTIONS exists purely to ask permission for a
+	// cross-origin request, never reaching rules, rate limiting, auth,
+	// or the upstream target) and add CORS response headers to every
+	// response aiproxy produces, including a rejection (block,
+	// rate-limited, ip_denied, ...) — so a browser-based client's own
+	// error handling actually sees why a request failed instead of an
+	// opaque CORS failure masking the real reason. "*" matches any
+	// origin; anything else must be an exact "scheme://host[:port]"
+	// origin (no path/query/fragment), checked against the request's
+	// own Origin header — aiproxy always echoes back that specific
+	// origin value in Access-Control-Allow-Origin, never the literal
+	// "*", the one echo shape that's always spec-correct whether or not
+	// CORSAllowCredentials is set (a literal "*" is forbidden alongside
+	// credentials). Empty (the default when the field is absent)
+	// disables CORS handling entirely — the exact behavior aiproxy had
+	// before this feature existed.
+	CORSAllowedOrigins []string `json:"cors_allowed_origins,omitempty"`
+
+	// CORSAllowedMethods lists the HTTP methods a preflight response
+	// advertises as allowed. Only meaningful alongside
+	// CORSAllowedOrigins. Defaults to "GET, POST, PUT, PATCH, DELETE,
+	// OPTIONS" when CORSAllowedOrigins is set but this is left
+	// empty/absent — a reasonable default covering every method a
+	// typical LLM API and aiproxy's own admin endpoints actually use.
+	CORSAllowedMethods []string `json:"cors_allowed_methods,omitempty"`
+
+	// CORSAllowedHeaders, if set, restricts which request headers a
+	// preflight response advertises as allowed, instead of aiproxy's
+	// own default of reflecting back whatever the browser's preflight
+	// actually asked for (via Access-Control-Request-Headers) — the
+	// same permissive-but-safe default most CORS middleware uses, since
+	// CORS exists to protect a server from a malicious *page*, not the
+	// other way around, and a hand-typed allowlist here risks silently
+	// breaking Proxy-Authorization/Authorization/X-Api-Key the moment
+	// one is left off. Only meaningful alongside CORSAllowedOrigins.
+	CORSAllowedHeaders []string `json:"cors_allowed_headers,omitempty"`
+
+	// CORSAllowCredentials, if true, adds
+	// Access-Control-Allow-Credentials: true to every CORS-eligible
+	// response. Only meaningful alongside CORSAllowedOrigins.
+	CORSAllowCredentials bool `json:"cors_allow_credentials,omitempty"`
+
+	// CORSMaxAgeSeconds, if greater than zero, is how long (via
+	// Access-Control-Max-Age) a browser may cache a preflight response
+	// before sending a new one for the same request shape. Zero/absent
+	// (the default) omits the header, leaving the browser's own default
+	// in effect. Only meaningful alongside CORSAllowedOrigins.
+	CORSMaxAgeSeconds int `json:"cors_max_age_seconds,omitempty"`
+
 	// TargetEjectionThreshold, if greater than zero, temporarily
 	// deprioritizes a candidate upstream URL once it has failed this
 	// many times in a row with a transport-level error (dial/TLS/timeout

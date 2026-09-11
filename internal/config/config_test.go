@@ -253,6 +253,63 @@ func TestLoad_TargetEjectionSettingsDefaultToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesCORSSettings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{
+		"cors_allowed_origins": ["https://app.example.com", "https://other.example.com"],
+		"cors_allowed_methods": ["GET", "POST"],
+		"cors_allowed_headers": ["Content-Type", "X-Api-Key"],
+		"cors_allow_credentials": true,
+		"cors_max_age_seconds": 600
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.CORSAllowedOrigins) != 2 || cfg.CORSAllowedOrigins[0] != "https://app.example.com" {
+		t.Fatalf("CORSAllowedOrigins = %v, want the two configured origins", cfg.CORSAllowedOrigins)
+	}
+	if len(cfg.CORSAllowedMethods) != 2 {
+		t.Fatalf("CORSAllowedMethods = %v, want 2 entries", cfg.CORSAllowedMethods)
+	}
+	if len(cfg.CORSAllowedHeaders) != 2 {
+		t.Fatalf("CORSAllowedHeaders = %v, want 2 entries", cfg.CORSAllowedHeaders)
+	}
+	if !cfg.CORSAllowCredentials {
+		t.Fatal("CORSAllowCredentials = false, want true")
+	}
+	if cfg.CORSMaxAgeSeconds != 600 {
+		t.Fatalf("CORSMaxAgeSeconds = %d, want 600", cfg.CORSMaxAgeSeconds)
+	}
+}
+
+func TestLoad_CORSSettingsDefaultToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.CORSAllowedOrigins) != 0 {
+		t.Fatalf("CORSAllowedOrigins = %v, want empty when absent", cfg.CORSAllowedOrigins)
+	}
+	if cfg.CORSAllowCredentials {
+		t.Fatal("CORSAllowCredentials = true, want false when absent")
+	}
+	if cfg.CORSMaxAgeSeconds != 0 {
+		t.Fatalf("CORSMaxAgeSeconds = %d, want 0 when absent", cfg.CORSMaxAgeSeconds)
+	}
+}
+
 func TestLoad_ParsesWebhookURL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
