@@ -488,7 +488,7 @@ func TestServer_ReloadConfig_UpdatesCoalescer(t *testing.T) {
 	defer frontend.Close()
 
 	group := coalesce.NewGroup(5 * time.Second)
-	srv.ReloadConfig(srv.Engine, nil, c, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, group)
+	srv.ReloadConfig(srv.Engine, nil, c, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, group, nil, 0)
 
 	go func() {
 		resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"n":1}`))

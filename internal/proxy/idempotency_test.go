@@ -539,7 +539,7 @@ func TestServer_ReloadConfig_UpdatesIdempotency(t *testing.T) {
 	}
 
 	reg := idempotency.NewRegistry(time.Minute, time.Second)
-	srv.ReloadConfig(srv.Engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, reg, nil)
+	srv.ReloadConfig(srv.Engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, reg, nil, nil, 0)
 
 	post().Body.Close() // populate the record post-reload
 	after := post()

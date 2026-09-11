@@ -43,6 +43,7 @@ import (
 	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/rules"
+	"aiproxy/internal/semcache"
 	"aiproxy/internal/stats"
 )
 
@@ -158,6 +159,16 @@ type requestContextInfo struct {
 	// in every one of those cases there is no claim this request holds
 	// to complete.
 	coalesceOwned bool
+
+	// semanticFingerprint is this request's own extracted-prompt
+	// fingerprint (see semcache.Fingerprint), computed once in ServeHTTP
+	// alongside cacheKey — nil whenever semantic caching is disabled or
+	// no recognizable prompt text could be extracted from the body.
+	// Carried through to bufferResponse/streamResponse so they can index
+	// it (Server.SemanticIndex.Add) once this request's own real
+	// response is known, the same way cacheKey lets them write the
+	// on-disk cache entry.
+	semanticFingerprint []uint64
 
 	// tokenLimiter is the effective token-based rate limiter for this
 	// request (the authenticated key's own, else the resolved route's,
@@ -463,6 +474,26 @@ type Server struct {
 	// independently, unchanged from before this field existed. Only
 	// meaningful alongside Cache being non-nil.
 	Coalescer *coalesce.Group
+
+	// SemanticIndex, if non-nil, is checked right after an exact-match
+	// cache lookup misses: it finds the most recent, sufficiently
+	// similar (see SemanticCacheThreshold) prior request's own cache key
+	// for this target, using only a local text-similarity comparison —
+	// see the semcache package's own doc comment. A hit here is marked
+	// with an X-Semantic-Cache-Hit response header, unlike Coalescer's
+	// deliberately invisible replay: unlike coalescing, which serves the
+	// literal answer the client would have gotten anyway, a semantic hit
+	// can serve the answer to a materially different request. nil (the
+	// default, whenever semantic_cache_enabled isn't configured)
+	// disables this second lookup layer entirely. Only meaningful
+	// alongside Cache being non-nil.
+	SemanticIndex *semcache.Index
+
+	// SemanticCacheThreshold is the minimum Jaccard similarity (see
+	// semcache.Similarity) two requests' extracted prompt text must
+	// reach for SemanticIndex to treat them as a match. Only meaningful
+	// alongside SemanticIndex being non-nil.
+	SemanticCacheThreshold float64
 
 	// CacheTTL is the server-wide default TTL passed to Cache.Get/
 	// Cache.IsStale for a target with no override of its own — see
@@ -1714,6 +1745,18 @@ func (s *Server) getCoalescer() *coalesce.Group {
 	return s.Coalescer
 }
 
+func (s *Server) getSemanticIndex() *semcache.Index {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.SemanticIndex
+}
+
+func (s *Server) getSemanticCacheThreshold() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.SemanticCacheThreshold
+}
+
 // clientIP extracts and parses the remote TCP peer's IP address from
 // r.RemoteAddr — deliberately never a client-supplied header like
 // X-Forwarded-For, which any caller could set to whatever value they
@@ -1980,7 +2023,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group, semanticIndex *semcache.Index, semanticCacheThreshold float64) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -2029,6 +2072,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.CostBudgetHardStop = costBudgetHardStop
 	s.Idempotency = idempotencyRegistry
 	s.Coalescer = coalescer
+	s.SemanticIndex = semanticIndex
+	s.SemanticCacheThreshold = semanticCacheThreshold
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
