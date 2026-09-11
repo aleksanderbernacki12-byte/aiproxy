@@ -888,6 +888,69 @@ func TestExecute_Validate_NegativeTargetMaxTokensPerMinute_ReportsProblem(t *tes
 	}
 }
 
+func TestExecute_Validate_NegativeTargetCostPer1KTokens_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/openai", "url": "https://api.openai.com", "cost_per_1k_tokens": -0.01}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "/openai") || !strings.Contains(errOut, "cost_per_1k_tokens") {
+		t.Fatalf("stderr missing the negative per-target cost rate problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_NegativeModelRouteCostPer1KTokens_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com", "cost_per_1k_tokens": -0.01}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "anthropic") || !strings.Contains(errOut, "cost_per_1k_tokens") {
+		t.Fatalf("stderr missing the negative model-route cost rate problem: %q", errOut)
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithPerTargetCostRate_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/anthropic", "url": "https://api.anthropic.com", "cost_per_1k_tokens": 0.08},
+		{"prefix": "/openai", "url": "https://api.openai.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithPerTargetRateLimit_ReturnsZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

@@ -414,6 +414,18 @@ type Server struct {
 	// check entirely.
 	CostBudget float64
 
+	// TargetCostRates, keyed by target label (a targets[].prefix, or
+	// "model:<name>" for a model_routes[] entry — the exact same labels
+	// used everywhere else in stats/logs/Prometheus), overrides
+	// CostPer1KTokens for that one target's own tokens — see
+	// stats.CostRates.RateFor. A label with no entry here simply falls
+	// back to CostPer1KTokens, unchanged from before this field existed;
+	// a target CAN have its own rate even when CostPer1KTokens itself is
+	// zero/unset, pricing only that target while leaving everything else
+	// unpriced. nil (the default) means every target shares the one
+	// server-wide rate, exactly as aiproxy has always priced tokens.
+	TargetCostRates map[string]float64
+
 	// MaxBodyBytes caps how large a request body ServeHTTP will buffer in
 	// memory before rejecting it with a 413. Unlike every other field
 	// above, zero (or negative) does not mean "disabled" — it means
@@ -1170,6 +1182,17 @@ func (s *Server) getCostBudget() float64 {
 	return s.CostBudget
 }
 
+// getCostRates returns CostPer1KTokens and TargetCostRates combined
+// into one stats.CostRates, under one lock — for every cost
+// computation that needs to resolve a specific target's own rate
+// (falling back to the server-wide default), not just the flat
+// default alone.
+func (s *Server) getCostRates() stats.CostRates {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return stats.CostRates{Default: s.CostPer1KTokens, PerTarget: s.TargetCostRates}
+}
+
 func (s *Server) getMaxBodyBytes() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1465,7 +1488,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1504,6 +1527,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.CORS = cors
 	s.HealthCheckInterval = healthCheckInterval
 	s.HealthCheckPath = healthCheckPath
+	s.TargetCostRates = targetCostRates
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2614,7 +2638,7 @@ func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 		s.Stats.RecordTokensUsed(reqCtx.targetLabel, tokens)
 		s.Stats.RecordClientTokensUsed(reqCtx.clientLabel, tokens)
 		s.logUsage(reqCtx.method, reqCtx.url, tokens)
-		if cost, crossed := s.Stats.CrossedBudget(s.getCostPer1KTokens(), s.getCostBudget()); crossed {
+		if cost, crossed := s.Stats.CrossedBudget(s.getCostRates(), s.getCostBudget()); crossed {
 			s.logBudgetExceeded(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
 			s.notifyBudgetWebhook(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
 		}
@@ -3411,8 +3435,13 @@ type statsSnapshotJSON struct {
 	CostBudget *float64 `json:"cost_budget,omitempty"`
 }
 
-func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnapshotJSON {
-	out := statsSnapshotJSON{
+// baseSnapshotJSON copies every plain counter field shared by the
+// top-level payload and each PerTarget leaf entry — everything except
+// EstimatedCost (priced differently at each level, see
+// toStatsSnapshotJSON/targetSnapshotJSON) and PerTarget/PerRule/
+// PerClient (only ever set on the top-level payload).
+func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
+	return statsSnapshotJSON{
 		Allowed:                snap.Allowed,
 		Blocked:                snap.Blocked,
 		Redacted:               snap.Redacted,
@@ -3436,14 +3465,39 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		Failover:               snap.Failover,
 		Latency:                snap.Latency,
 	}
+}
+
+// targetSnapshotJSON converts one PerTarget leaf entry — which, unlike
+// the top level, never has its own nested PerTarget (see Snapshot's
+// own doc comment) — pricing it at the single already-resolved rate
+// for whichever target it represents.
+func targetSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnapshotJSON {
+	out := baseSnapshotJSON(snap)
 	if costPer1KTokens > 0 {
 		cost := snap.EstimatedCost(costPer1KTokens)
+		out.EstimatedCost = &cost
+	}
+	return out
+}
+
+// toStatsSnapshotJSON converts the top-level snap into the wire shape
+// GET /_aiproxy/stats and the shutdown summary's JSON line both serve.
+// rates resolves each target's own price (see stats.CostRates);
+// EstimatedCost is the true sum of every target's own tokens at its
+// own rate (see Snapshot.EstimatedCostAcrossTargets) — not
+// snap.TotalTokens priced at a single flat rate, which would silently
+// misprice the total the moment any target's own rate diverges from
+// rates.Default.
+func toStatsSnapshotJSON(snap stats.Snapshot, rates stats.CostRates) statsSnapshotJSON {
+	out := baseSnapshotJSON(snap)
+	if rates.Default > 0 || len(rates.PerTarget) > 0 {
+		cost := snap.EstimatedCostAcrossTargets(rates)
 		out.EstimatedCost = &cost
 	}
 	if len(snap.PerTarget) > 0 {
 		out.PerTarget = make(map[string]statsSnapshotJSON, len(snap.PerTarget))
 		for name, t := range snap.PerTarget {
-			out.PerTarget[name] = toStatsSnapshotJSON(t, costPer1KTokens)
+			out.PerTarget[name] = targetSnapshotJSON(t, rates.RateFor(name))
 		}
 	}
 	if len(snap.PerRule) > 0 {
@@ -3487,7 +3541,7 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
 		return
 	}
-	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens()), s.getCostBudget())
+	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostRates()), s.getCostBudget())
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		s.logError("aiproxy: stats: failed to encode response: %v", err)
@@ -3617,7 +3671,7 @@ func promLabelValue(v string) string {
 // same reasoning as the JSON stats endpoint: a metrics scrape needs a
 // structurally predictable shape every time, not a human-friendly
 // summary. targets are sorted for a stable scrape-to-scrape diff.
-func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBudget float64) {
+func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, costBudget float64) {
 	names := make([]string, 0, len(snap.PerTarget))
 	for name := range snap.PerTarget {
 		names = append(names, name)
@@ -3634,12 +3688,12 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 
 	writeLatencyHistogram(w, snap.PerTarget, names)
 
-	if costPer1KTokens > 0 {
-		fmt.Fprintln(w, "# HELP aiproxy_estimated_cost Estimated cost of tokens used so far, at the configured cost_per_1k_tokens rate.")
+	if rates.Default > 0 || len(rates.PerTarget) > 0 {
+		fmt.Fprintln(w, "# HELP aiproxy_estimated_cost Estimated cost of tokens used so far, priced at each target's own cost_per_1k_tokens override, or the server-wide default when a target has none of its own.")
 		fmt.Fprintln(w, "# TYPE aiproxy_estimated_cost counter")
 		for _, name := range names {
 			t := snap.PerTarget[name]
-			fmt.Fprintf(w, "aiproxy_estimated_cost{target=%q} %g\n", promLabelValue(name), t.EstimatedCost(costPer1KTokens))
+			fmt.Fprintf(w, "aiproxy_estimated_cost{target=%q} %g\n", promLabelValue(name), t.EstimatedCost(rates.RateFor(name)))
 		}
 	}
 
@@ -3677,12 +3731,12 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, costPer1KTokens, costBud
 		}
 	}
 
-	if costPer1KTokens > 0 && len(clientNames) > 0 {
-		fmt.Fprintln(w, "# HELP aiproxy_client_estimated_cost Estimated cost of tokens used so far, for requests authenticated with this proxy API key.")
+	if rates.Default > 0 && len(clientNames) > 0 {
+		fmt.Fprintln(w, "# HELP aiproxy_client_estimated_cost Estimated cost of tokens used so far, for requests authenticated with this proxy API key, at the server-wide default cost_per_1k_tokens rate — a client's own traffic isn't necessarily confined to one target, so a per-target override can't be attributed to it the way aiproxy_estimated_cost's own target label can.")
 		fmt.Fprintln(w, "# TYPE aiproxy_client_estimated_cost counter")
 		for _, name := range clientNames {
 			c := snap.PerClient[name]
-			fmt.Fprintf(w, "aiproxy_client_estimated_cost{client=%q} %g\n", promLabelValue(name), c.EstimatedCost(costPer1KTokens))
+			fmt.Fprintf(w, "aiproxy_client_estimated_cost{client=%q} %g\n", promLabelValue(name), c.EstimatedCost(rates.Default))
 		}
 	}
 
@@ -3764,35 +3818,44 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	writePromMetrics(w, s.Stats.Snapshot(), s.getCostPer1KTokens(), s.getCostBudget())
+	writePromMetrics(w, s.Stats.Snapshot(), s.getCostRates(), s.getCostBudget())
 }
 
 // Summary renders the current stats snapshot as the same block of text
 // printed on shutdown, appending an estimated cost line only when
-// CostPer1KTokens has been configured, and a cost budget line — flagged
-// "(EXCEEDED)" once crossed — only when CostBudget has been configured.
+// CostPer1KTokens and/or TargetCostRates prices something, and a cost
+// budget line — flagged "(EXCEEDED)" once crossed — only when
+// CostBudget has been configured. The cost total is always the true
+// sum of every target's own tokens at its own resolved rate (see
+// stats.Snapshot.EstimatedCostAcrossTargets), so it stays correct even
+// once a target's own rate diverges from the server-wide default.
 func (s *Server) Summary() string {
-	cost := s.getCostPer1KTokens()
+	rates := s.getCostRates()
 	budget := s.getCostBudget()
 	snap := s.Stats.Snapshot()
 	summary := snap.String()
-	if cost > 0 {
-		summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", snap.EstimatedCost(cost), cost)
+	cost := snap.EstimatedCostAcrossTargets(rates)
+	if rates.Default > 0 || len(rates.PerTarget) > 0 {
+		if len(rates.PerTarget) > 0 {
+			summary += fmt.Sprintf("\nEstimated cost:      %.4f (per-target rates apply — see breakdown below)", cost)
+		} else {
+			summary += fmt.Sprintf("\nEstimated cost:      %.4f (at %g/1K tokens)", cost, rates.Default)
+		}
 	}
 	if budget > 0 {
 		line := fmt.Sprintf("\nCost budget:         %.4f", budget)
-		if snap.EstimatedCost(cost) >= budget {
+		if cost >= budget {
 			line += " (EXCEEDED)"
 		}
 		summary += line
 	}
-	if breakdown := snap.PerTargetString(cost); breakdown != "" {
+	if breakdown := snap.PerTargetString(rates); breakdown != "" {
 		summary += "\n" + breakdown
 	}
 	if breakdown := snap.PerRuleString(); breakdown != "" {
 		summary += "\n" + breakdown
 	}
-	if breakdown := snap.PerClientString(cost); breakdown != "" {
+	if breakdown := snap.PerClientString(rates.Default); breakdown != "" {
 		summary += "\n" + breakdown
 	}
 	return summary
@@ -3807,7 +3870,7 @@ func (s *Server) logSummary() {
 	// The JSON shape is computed and written to LogFile unconditionally
 	// — a durable on-disk record should include the session's own final
 	// summary regardless of what --log-format the terminal is showing.
-	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostPer1KTokens()), s.getCostBudget())
+	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostRates()), s.getCostBudget())
 	data, err := json.Marshal(payload)
 	if err != nil {
 		s.logError("aiproxy: summary: failed to encode: %v", err)

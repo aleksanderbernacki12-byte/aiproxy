@@ -599,6 +599,48 @@ func TestLoad_ParsesModelRouteMaxTokensPerMinute(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesModelRouteCostPer1KTokens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"model_routes": [
+		{"name": "anthropic", "models": ["claude-*"], "url": "https://api.anthropic.com", "cost_per_1k_tokens": 0.08}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.ModelRoutes[0].CostPer1KTokens != 0.08 {
+		t.Fatalf("ModelRoutes[0].CostPer1KTokens = %g, want 0.08", cfg.ModelRoutes[0].CostPer1KTokens)
+	}
+}
+
+func TestLoad_ParsesTargetCostPer1KTokens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"targets": [
+		{"prefix": "/anthropic", "url": "https://api.anthropic.com", "cost_per_1k_tokens": 0.08},
+		{"prefix": "/openai", "url": "https://api.openai.com"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Targets[0].CostPer1KTokens != 0.08 {
+		t.Fatalf("Targets[0].CostPer1KTokens = %g, want 0.08", cfg.Targets[0].CostPer1KTokens)
+	}
+	if cfg.Targets[1].CostPer1KTokens != 0 {
+		t.Fatalf("Targets[1].CostPer1KTokens = %g, want 0 (absent, no override)", cfg.Targets[1].CostPer1KTokens)
+	}
+}
+
 func TestLoad_ModelRoutesDefaultsToEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

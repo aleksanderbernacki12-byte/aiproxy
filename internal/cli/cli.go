@@ -187,6 +187,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.CORS = lc.cors
 	server.HealthCheckInterval = lc.healthCheckInterval
 	server.HealthCheckPath = lc.healthCheckPath
+	server.TargetCostRates = lc.targetCostRates
 	server.TLSCertFile = *tlsCert
 	server.TLSKeyFile = *tlsKey
 	server.AuditChain = auditChain
@@ -235,6 +236,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if cfg.CostPer1KTokens > 0 {
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
+		}
+		if len(lc.targetCostRates) > 0 {
+			fmt.Fprintf(stdout, "per-target cost overrides: %d\n", len(lc.targetCostRates))
 		}
 		if cfg.CostBudget > 0 {
 			fmt.Fprintf(stdout, "cost budget: %g (alerts once, on/after crossing)\n", cfg.CostBudget)
@@ -430,7 +434,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates)
 
 	label := loadedFrom
 	if label == "" {
@@ -483,6 +487,8 @@ type liveConfig struct {
 
 	healthCheckInterval time.Duration
 	healthCheckPath     string
+
+	targetCostRates map[string]float64
 }
 
 // buildLiveConfig builds a liveConfig from cfg, which may be nil (no
@@ -558,6 +564,28 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	modelRoutes, modelRouteErrs := compileModelRoutes(cfg.ModelRoutes)
 	errs = append(errs, modelRouteErrs...)
 	lc.modelRoutes = modelRoutes
+
+	// Built from the already-compiled routes/model routes, keyed by the
+	// exact same target label stats/logs/Prometheus already use for
+	// each one (a targets[].prefix, or "model:<name>") — see
+	// proxy.Server.TargetCostRates. Only overrides actually set (> 0)
+	// are included; every other label simply falls back to the
+	// top-level cost_per_1k_tokens, unchanged from before this field
+	// existed.
+	targetCostRates := make(map[string]float64)
+	for _, r := range lc.routes {
+		if r.costPer1KTokens > 0 {
+			targetCostRates[r.prefix] = r.costPer1KTokens
+		}
+	}
+	for _, r := range lc.modelRoutes {
+		if r.costPer1KTokens > 0 {
+			targetCostRates["model:"+r.name] = r.costPer1KTokens
+		}
+	}
+	if len(targetCostRates) > 0 {
+		lc.targetCostRates = targetCostRates
+	}
 
 	ipAllowList, allowErrs := compileIPList("ip_allow_list", cfg.IPAllowList)
 	errs = append(errs, allowErrs...)
@@ -1589,6 +1617,7 @@ type targetRoute struct {
 	limiter              *limiter.Limiter
 	maxTokensPerMinute   int
 	tokenLimiter         *limiter.TokenLimiter
+	costPer1KTokens      float64
 }
 
 // formatTargetsForDisplay renders a targetRoute's candidate list for the
@@ -1672,8 +1701,12 @@ func compileTargetRoutes(targets []config.Target) ([]targetRoute, []error) {
 			errs = append(errs, fmt.Errorf("targets: prefix %q: max_tokens_per_minute %d must not be negative", t.Prefix, t.MaxTokensPerMinute))
 			continue
 		}
+		if t.CostPer1KTokens < 0 {
+			errs = append(errs, fmt.Errorf("targets: prefix %q: cost_per_1k_tokens %g must not be negative", t.Prefix, t.CostPer1KTokens))
+			continue
+		}
 
-		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute}
+		tr := targetRoute{prefix: t.Prefix, targets: urls, maxRequestsPerMinute: t.MaxRequestsPerMinute, maxTokensPerMinute: t.MaxTokensPerMinute, costPer1KTokens: t.CostPer1KTokens}
 		if t.MaxRequestsPerMinute > 0 {
 			tr.limiter = limiter.New(t.MaxRequestsPerMinute, time.Minute)
 		}
@@ -1796,8 +1829,12 @@ func compileModelRoutes(routes []config.ModelRoute) ([]modelRoute, []error) {
 			errs = append(errs, fmt.Errorf("model_routes: %q: max_tokens_per_minute %d must not be negative", r.Name, r.MaxTokensPerMinute))
 			continue
 		}
+		if r.CostPer1KTokens < 0 {
+			errs = append(errs, fmt.Errorf("model_routes: %q: cost_per_1k_tokens %g must not be negative", r.Name, r.CostPer1KTokens))
+			continue
+		}
 
-		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute}
+		mr := modelRoute{name: r.Name, models: r.Models, targets: urls, maxRequestsPerMinute: r.MaxRequestsPerMinute, maxTokensPerMinute: r.MaxTokensPerMinute, costPer1KTokens: r.CostPer1KTokens}
 		if r.MaxRequestsPerMinute > 0 {
 			mr.limiter = limiter.New(r.MaxRequestsPerMinute, time.Minute)
 		}
@@ -1821,6 +1858,7 @@ type modelRoute struct {
 	limiter              *limiter.Limiter
 	maxTokensPerMinute   int
 	tokenLimiter         *limiter.TokenLimiter
+	costPer1KTokens      float64
 }
 
 // compileProxyAPIKeys validates and resolves the config file's

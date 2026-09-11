@@ -504,9 +504,31 @@ func (s *Stats) RecordResponseDryRunRedact(ruleName string) {
 	s.ruleCounterFor(ruleName).responseDryRunRedacted.Add(1)
 }
 
-// CrossedBudget reports whether the running total cost — TotalTokens
-// priced at costPer1KTokens — has just reached or passed budget for the
-// first time since this Stats was created, via a one-shot CAS on
+// CostRates resolves the per-1,000-token price for a given target
+// label, falling back to Default when that target has no override of
+// its own — see EstimatedCost/EstimatedCostAcrossTargets/CrossedBudget
+// and the proxy package's own Server.TargetCostRates for how this gets
+// built from targets[]/model_routes[]' own cost_per_1k_tokens fields.
+// The zero value (Default 0, PerTarget nil) prices everything at 0,
+// the same as no cost_per_1k_tokens ever being configured at all.
+type CostRates struct {
+	Default   float64
+	PerTarget map[string]float64
+}
+
+// RateFor returns rates.PerTarget[target] when target has its own
+// override, otherwise rates.Default.
+func (rates CostRates) RateFor(target string) float64 {
+	if rate, ok := rates.PerTarget[target]; ok {
+		return rate
+	}
+	return rates.Default
+}
+
+// CrossedBudget reports whether the running total cost — every
+// target's own recorded tokens priced at that target's own resolved
+// rate (see CostRates), summed — has just reached or passed budget for
+// the first time since this Stats was created, via a one-shot CAS on
 // budgetAlerted so a long-running proxy alerts exactly once rather than
 // on every request past the threshold. budget <= 0 (unset) never
 // crosses. cost is always returned (even when not crossed, or when
@@ -515,12 +537,28 @@ func (s *Stats) RecordResponseDryRunRedact(ruleName string) {
 // of the process: a budget alert is meant to be a single "you've gone
 // over" notice, not a recurring one, even if budget is later raised via
 // a config reload.
-func (s *Stats) CrossedBudget(costPer1KTokens, budget float64) (cost float64, crossed bool) {
-	cost = float64(s.overall.totalTokens.Load()) / 1000 * costPer1KTokens
+func (s *Stats) CrossedBudget(rates CostRates, budget float64) (cost float64, crossed bool) {
+	cost = s.totalCost(rates)
 	if budget <= 0 || cost < budget {
 		return cost, false
 	}
 	return cost, s.budgetAlerted.CompareAndSwap(false, true)
+}
+
+// totalCost sums every target's own recorded tokens priced at its own
+// resolved rate — the same total EstimatedCostAcrossTargets computes
+// from a Snapshot, but read directly from the live counters (a plain
+// atomic load per target under one lock) rather than building a full
+// Snapshot's heavier read (latency histogram, per-rule, per-client
+// breakdowns) just to price tokens on every token-bearing request.
+func (s *Stats) totalCost(rates CostRates) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var total float64
+	for name, c := range s.perTarget {
+		total += float64(c.totalTokens.Load()) / 1000 * rates.RateFor(name)
+	}
+	return total
 }
 
 // CrossedClientBudget is CrossedBudget's per-client counterpart: it
@@ -782,6 +820,25 @@ func (s Snapshot) EstimatedCost(costPer1KTokens float64) float64 {
 	return float64(s.TotalTokens) / 1000 * costPer1KTokens
 }
 
+// EstimatedCostAcrossTargets sums every PerTarget entry's own
+// TotalTokens priced at ITS OWN resolved rate (see CostRates) — the
+// mathematically correct total once per-target rates diverge, reusing
+// exactly the same per-target breakdown PerTargetString already
+// renders, so no new tracking is needed to support this. s.TotalTokens
+// priced at a single flat rate would silently misprice the total the
+// moment any target's own rate differs from another's. Only meaningful
+// on a top-level Snapshot: a Snapshot that is itself already one
+// PerTarget entry never has its own nested PerTarget (see Snapshot's
+// own doc comment), so this always returns 0 for one of those — use
+// EstimatedCost with CostRates.RateFor(name) directly instead.
+func (s Snapshot) EstimatedCostAcrossTargets(rates CostRates) float64 {
+	var total float64
+	for name, t := range s.PerTarget {
+		total += t.EstimatedCost(rates.RateFor(name))
+	}
+	return total
+}
+
 // String renders the snapshot as a short, aligned, human-readable block.
 // The two dry-run lines are omitted entirely when no dry_run rule has
 // ever matched — most runs have none configured, and four zeroes would
@@ -864,11 +921,12 @@ func (s Snapshot) String() string {
 }
 
 // PerTargetString renders a per-target breakdown, sorted by target name,
-// pricing each target's tokens at costPer1KTokens (omitted when zero).
-// It returns "" when fewer than two targets were ever recorded — a
-// single-target run's breakdown would just repeat the block above, so
-// there is nothing worth adding.
-func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
+// pricing each target's own tokens at its own resolved rate (see
+// CostRates.RateFor; omitted when that resolves to zero). It returns ""
+// when fewer than two targets were ever recorded — a single-target
+// run's breakdown would just repeat the block above, so there is
+// nothing worth adding.
+func (s Snapshot) PerTargetString(rates CostRates) string {
 	if len(s.PerTarget) < 2 {
 		return ""
 	}
@@ -885,8 +943,8 @@ func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
 		t := s.PerTarget[name]
 		fmt.Fprintf(&b, "\n[%s] allowed=%d blocked=%d redacted=%d rate-limited=%d cache-hits=%d tokens=%d response-blocked=%d response-redacted=%d",
 			name, t.Allowed, t.Blocked, t.Redacted, t.RateLimited, t.CacheHits, t.TotalTokens, t.ResponseBlocked, t.ResponseRedacted)
-		if costPer1KTokens > 0 {
-			fmt.Fprintf(&b, " cost=%.4f", t.EstimatedCost(costPer1KTokens))
+		if rate := rates.RateFor(name); rate > 0 {
+			fmt.Fprintf(&b, " cost=%.4f", t.EstimatedCost(rate))
 		}
 		if t.Failover > 0 {
 			fmt.Fprintf(&b, " failover=%d", t.Failover)

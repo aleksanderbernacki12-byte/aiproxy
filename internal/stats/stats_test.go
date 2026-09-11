@@ -285,16 +285,70 @@ func TestSnapshot_EstimatedCost(t *testing.T) {
 	}
 }
 
+func TestCostRates_RateFor(t *testing.T) {
+	rates := stats.CostRates{Default: 0.03, PerTarget: map[string]float64{"/anthropic": 0.08}}
+
+	if got := rates.RateFor("/anthropic"); got != 0.08 {
+		t.Errorf("RateFor(/anthropic) = %v, want the override 0.08", got)
+	}
+	if got := rates.RateFor("/openai"); got != 0.03 {
+		t.Errorf("RateFor(/openai) = %v, want the Default 0.03 (no override)", got)
+	}
+}
+
+func TestCostRates_RateFor_ZeroValueReturnsZero(t *testing.T) {
+	var rates stats.CostRates
+	if got := rates.RateFor("anything"); got != 0 {
+		t.Errorf("RateFor on the zero value = %v, want 0", got)
+	}
+}
+
+func TestSnapshot_EstimatedCostAcrossTargets_SumsEachTargetAtItsOwnRate(t *testing.T) {
+	snap := stats.Snapshot{PerTarget: map[string]stats.Snapshot{
+		"/openai":    {TotalTokens: 1000}, // no override -> Default
+		"/anthropic": {TotalTokens: 1000}, // its own override
+	}}
+	rates := stats.CostRates{Default: 0.03, PerTarget: map[string]float64{"/anthropic": 0.08}}
+
+	got := snap.EstimatedCostAcrossTargets(rates)
+	want := 0.03 + 0.08 // 1000 tokens each = exactly 1x each rate
+	if got != want {
+		t.Errorf("EstimatedCostAcrossTargets() = %v, want %v (0.03 for /openai at the default rate + 0.08 for /anthropic at its own override)", got, want)
+	}
+}
+
+func TestSnapshot_EstimatedCostAcrossTargets_MatchesFlatRateWhenNoOverridesExist(t *testing.T) {
+	snap := stats.Snapshot{PerTarget: map[string]stats.Snapshot{
+		"/openai":    {TotalTokens: 1000},
+		"/anthropic": {TotalTokens: 2000},
+	}}
+	rates := stats.CostRates{Default: 0.03}
+
+	got := snap.EstimatedCostAcrossTargets(rates)
+	want := 1000.0/1000*0.03 + 2000.0/1000*0.03
+	if got != want {
+		t.Errorf("EstimatedCostAcrossTargets() = %v, want %v — with no per-target overrides, this must equal the plain flat-rate total", got, want)
+	}
+}
+
+func TestSnapshot_EstimatedCostAcrossTargets_EmptyPerTargetIsZero(t *testing.T) {
+	snap := stats.Snapshot{TotalTokens: 5000}
+	rates := stats.CostRates{Default: 0.03}
+	if got := snap.EstimatedCostAcrossTargets(rates); got != 0 {
+		t.Errorf("EstimatedCostAcrossTargets() on a Snapshot with no PerTarget breakdown = %v, want 0 (nothing to sum)", got)
+	}
+}
+
 func TestSnapshot_PerTargetString_EmptyWithFewerThanTwoTargets(t *testing.T) {
 	empty := stats.Snapshot{}
-	if got := empty.PerTargetString(0); got != "" {
+	if got := empty.PerTargetString(stats.CostRates{Default: 0}); got != "" {
 		t.Errorf("PerTargetString() with no targets = %q, want \"\"", got)
 	}
 
 	oneTarget := stats.Snapshot{PerTarget: map[string]stats.Snapshot{
 		"default": {Allowed: 5},
 	}}
-	if got := oneTarget.PerTargetString(0); got != "" {
+	if got := oneTarget.PerTargetString(stats.CostRates{Default: 0}); got != "" {
 		t.Errorf("PerTargetString() with one target = %q, want \"\" (nothing new to say)", got)
 	}
 }
@@ -305,7 +359,7 @@ func TestSnapshot_PerTargetString_RendersSortedBreakdownWithCost(t *testing.T) {
 		"/openai":    {Allowed: 2, Blocked: 1, TotalTokens: 10},
 	}}
 
-	rendered := snap.PerTargetString(0.02)
+	rendered := snap.PerTargetString(stats.CostRates{Default: 0.02})
 
 	if !strings.HasPrefix(rendered, "=== per-target breakdown ===") {
 		t.Fatalf("PerTargetString() = %q, want it to start with the breakdown header", rendered)
@@ -326,13 +380,30 @@ func TestSnapshot_PerTargetString_RendersSortedBreakdownWithCost(t *testing.T) {
 	}
 }
 
+func TestSnapshot_PerTargetString_UsesEachTargetsOwnOverrideRate(t *testing.T) {
+	snap := stats.Snapshot{PerTarget: map[string]stats.Snapshot{
+		"/anthropic": {Allowed: 1, TotalTokens: 1000},
+		"/openai":    {Allowed: 1, TotalTokens: 1000},
+	}}
+	rates := stats.CostRates{Default: 0.03, PerTarget: map[string]float64{"/anthropic": 0.08}}
+
+	rendered := snap.PerTargetString(rates)
+
+	if !strings.Contains(rendered, "[/anthropic]") || !strings.Contains(rendered, "cost=0.0800") {
+		t.Errorf("PerTargetString() missing /anthropic priced at its own 0.08 override: %q", rendered)
+	}
+	if !strings.Contains(rendered, "[/openai]") || !strings.Contains(rendered, "cost=0.0300") {
+		t.Errorf("PerTargetString() missing /openai priced at the 0.03 default: %q", rendered)
+	}
+}
+
 func TestSnapshot_PerTargetString_OmitsCostWhenRateIsZero(t *testing.T) {
 	snap := stats.Snapshot{PerTarget: map[string]stats.Snapshot{
 		"/openai":    {Allowed: 1, TotalTokens: 10},
 		"/anthropic": {Allowed: 1, TotalTokens: 30},
 	}}
 
-	rendered := snap.PerTargetString(0)
+	rendered := snap.PerTargetString(stats.CostRates{Default: 0})
 	if strings.Contains(rendered, "cost=") {
 		t.Errorf("PerTargetString(0) = %q, want no cost field when the rate is zero", rendered)
 	}
@@ -591,7 +662,7 @@ func TestStats_CrossedBudget_UnsetBudgetNeverCrosses(t *testing.T) {
 	s := stats.New()
 	s.RecordTokensUsed("default", 1_000_000)
 
-	if _, crossed := s.CrossedBudget(1.0, 0); crossed {
+	if _, crossed := s.CrossedBudget(stats.CostRates{Default: 1.0}, 0); crossed {
 		t.Error("CrossedBudget with budget=0 (unset) reported crossed, want never")
 	}
 }
@@ -600,7 +671,7 @@ func TestStats_CrossedBudget_BelowBudgetNeverCrosses(t *testing.T) {
 	s := stats.New()
 	s.RecordTokensUsed("default", 1000) // cost = 1000/1000*0.01 = 0.01
 
-	cost, crossed := s.CrossedBudget(0.01, 10.0)
+	cost, crossed := s.CrossedBudget(stats.CostRates{Default: 0.01}, 10.0)
 	if crossed {
 		t.Error("CrossedBudget reported crossed while cost is well under budget")
 	}
@@ -613,7 +684,7 @@ func TestStats_CrossedBudget_FiresExactlyOnce(t *testing.T) {
 	s := stats.New()
 	s.RecordTokensUsed("default", 10_000) // cost = 10_000/1000*1.0 = 10.0
 
-	cost, crossed := s.CrossedBudget(1.0, 5.0)
+	cost, crossed := s.CrossedBudget(stats.CostRates{Default: 1.0}, 5.0)
 	if !crossed {
 		t.Fatal("first CrossedBudget call over budget reported crossed=false, want true")
 	}
@@ -624,7 +695,7 @@ func TestStats_CrossedBudget_FiresExactlyOnce(t *testing.T) {
 	// Further requests keep pushing the cost up, but the alert must not
 	// fire again — it's a one-time notice, not a recurring one.
 	s.RecordTokensUsed("default", 10_000)
-	if _, crossed := s.CrossedBudget(1.0, 5.0); crossed {
+	if _, crossed := s.CrossedBudget(stats.CostRates{Default: 1.0}, 5.0); crossed {
 		t.Error("second CrossedBudget call reported crossed=true, want the one-shot latch to suppress it")
 	}
 }
@@ -633,8 +704,26 @@ func TestStats_CrossedBudget_ExactlyAtBudgetCounts(t *testing.T) {
 	s := stats.New()
 	s.RecordTokensUsed("default", 5_000) // cost = 5.0, exactly at budget
 
-	if _, crossed := s.CrossedBudget(1.0, 5.0); !crossed {
+	if _, crossed := s.CrossedBudget(stats.CostRates{Default: 1.0}, 5.0); !crossed {
 		t.Error("CrossedBudget at exactly the threshold reported crossed=false, want true (>=, not >)")
+	}
+}
+
+func TestStats_CrossedBudget_SumsPerTargetOverrideRates(t *testing.T) {
+	s := stats.New()
+	s.RecordTokensUsed("/openai", 1000)    // priced at Default = 0.03 -> 0.03
+	s.RecordTokensUsed("/anthropic", 1000) // priced at its own override = 0.08 -> 0.08
+	// True total = 0.11, which crosses a 0.10 budget — a single flat
+	// Default rate (0.03) applied to the combined 2000 tokens would
+	// only reach 0.06 and wrongly report this as still under budget.
+	rates := stats.CostRates{Default: 0.03, PerTarget: map[string]float64{"/anthropic": 0.08}}
+
+	cost, crossed := s.CrossedBudget(rates, 0.10)
+	if !crossed {
+		t.Fatalf("cost = %v, want crossed=true once real per-target pricing (0.11) passes the 0.10 budget", cost)
+	}
+	if cost < 0.109 || cost > 0.111 {
+		t.Errorf("cost = %v, want approximately 0.11 (0.03 + 0.08)", cost)
 	}
 }
 
@@ -725,7 +814,7 @@ func TestStats_CrossedClientBudget_IndependentFromGlobalBudget(t *testing.T) {
 	s.RecordTokensUsed("default", 10_000)      // feeds the global/overall counter
 	s.RecordClientTokensUsed("team-a", 10_000) // feeds team-a's own counter
 
-	if _, crossed := s.CrossedBudget(1.0, 5.0); !crossed {
+	if _, crossed := s.CrossedBudget(stats.CostRates{Default: 1.0}, 5.0); !crossed {
 		t.Fatal("global CrossedBudget: want crossed=true")
 	}
 	if _, crossed := s.CrossedClientBudget("team-a", 1.0, 5.0); !crossed {
@@ -824,7 +913,7 @@ func TestSnapshot_PerTargetString_IncludesAvgLatency(t *testing.T) {
 		"a": {Allowed: 1, Latency: stats.LatencySnapshot{Count: 2, SumSeconds: 0.2}},
 		"b": {Allowed: 1},
 	}}
-	rendered := snap.PerTargetString(0)
+	rendered := snap.PerTargetString(stats.CostRates{Default: 0})
 	if !strings.Contains(rendered, "[a]") || !strings.Contains(rendered, "avg-latency=100.0ms") {
 		t.Errorf("PerTargetString() = %q, want target a's avg-latency", rendered)
 	}

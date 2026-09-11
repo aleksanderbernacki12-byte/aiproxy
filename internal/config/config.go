@@ -186,6 +186,19 @@ type Target struct {
 	// target has no override and simply shares the top-level breaker,
 	// same as MaxRequestsPerMinute.
 	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
+
+	// CostPer1KTokens, if greater than zero, prices this one target's
+	// own tokens at its own rate instead of the top-level
+	// Config.CostPer1KTokens — useful once traffic is actually routed
+	// across providers with genuinely different pricing (OpenAI vs.
+	// Anthropic vs. a self-hosted model, say), where a single global
+	// rate would misprice every target that doesn't happen to match it.
+	// A target CAN set this even when the top-level rate is zero/unset,
+	// pricing only that target while leaving everything else unpriced.
+	// Zero (the default when the field is absent) means this target has
+	// no override and simply shares the top-level rate, same as before
+	// per-target rates existed.
+	CostPer1KTokens float64 `json:"cost_per_1k_tokens,omitempty"`
 }
 
 // ModelRoute is one model-name-to-upstream mapping for content-based
@@ -228,6 +241,13 @@ type ModelRoute struct {
 	// max_tokens_per_minute breaker with every other target — same
 	// meaning as Target.MaxTokensPerMinute.
 	MaxTokensPerMinute int `json:"max_tokens_per_minute,omitempty"`
+
+	// CostPer1KTokens, if greater than zero, prices this route's own
+	// tokens at its own rate instead of the top-level
+	// Config.CostPer1KTokens — same meaning as Target.CostPer1KTokens,
+	// keyed under the "model:<name>" label instead of a targets[]
+	// prefix.
+	CostPer1KTokens float64 `json:"cost_per_1k_tokens,omitempty"`
 }
 
 // Config is the top-level shape of aiproxy.json.

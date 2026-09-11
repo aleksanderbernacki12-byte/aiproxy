@@ -858,7 +858,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	}
 
 	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	// The freshly reloaded Registry starts cold — no baseline exists
 	// for this client yet, so (correctly, per Detector's own cold-start
@@ -2636,6 +2636,35 @@ func TestServer_SummaryText_IncludesCostLineOnlyWhenConfigured(t *testing.T) {
 	}
 }
 
+// TestServer_SummaryText_PerTargetCostRatesSumToTheTrueTotal proves the
+// shutdown summary's own "Estimated cost" line reflects the true sum
+// of each target's own tokens at its own resolved rate once
+// TargetCostRates overrides diverge from the server-wide default — not
+// TotalTokens priced at a single flat rate, which would silently
+// misprice it.
+func TestServer_SummaryText_PerTargetCostRatesSumToTheTrueTotal(t *testing.T) {
+	targetURL, err := url.Parse("https://example.com")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.CostPer1KTokens = 0.03
+	srv.TargetCostRates = map[string]float64{"/anthropic": 0.08}
+	srv.Stats.RecordTokensUsed("/openai", 1000)
+	srv.Stats.RecordTokensUsed("/anthropic", 1000)
+
+	summary := srv.Summary()
+	if !strings.Contains(summary, "Estimated cost:      0.1100 (per-target rates apply — see breakdown below)") {
+		t.Fatalf("summary missing correct true-sum cost line (0.03 + 0.08 = 0.11): %q", summary)
+	}
+	if !strings.Contains(summary, "[/openai]") || !strings.Contains(summary, "cost=0.0300") {
+		t.Fatalf("per-target breakdown missing /openai at the 0.03 default: %q", summary)
+	}
+	if !strings.Contains(summary, "[/anthropic]") || !strings.Contains(summary, "cost=0.0800") {
+		t.Fatalf("per-target breakdown missing /anthropic at its own 0.08 override: %q", summary)
+	}
+}
+
 // TestServer_MultiTargetRouting_RoutesByPathPrefixAndStripsPrefix proves
 // AddRoute's core contract: a request whose path starts with a
 // registered prefix goes to that route's target with the prefix
@@ -3301,6 +3330,74 @@ func TestServer_StatsEndpoint_IncludesCostOnlyWhenConfiguredAndTracksEveryTarget
 	}
 }
 
+// TestServer_StatsEndpoint_PerTargetCostOverrideAffectsOnlyThatTargetAndTheTrueTotal
+// proves TargetCostRates correctly prices ONE target at its own rate,
+// leaves an unconfigured target at the server-wide default, and — the
+// core correctness claim of per-target pricing — that the top-level
+// estimated_cost is the true sum of both, not the (wrong) result of
+// pricing every token at a single flat rate.
+func TestServer_StatsEndpoint_PerTargetCostOverrideAffectsOnlyThatTargetAndTheTrueTotal(t *testing.T) {
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":1000}}`))
+	}))
+	defer openai.Close()
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":1000}}`))
+	}))
+	defer anthropic.Close()
+
+	openaiURL, err := url.Parse(openai.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	anthropicURL, err := url.Parse(anthropic.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", openaiURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.CostPer1KTokens = 0.03
+	srv.TargetCostRates = map[string]float64{"/anthropic": 0.08}
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for _, path := range []string{"/openai/v1/chat", "/anthropic/v1/messages"} {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	var got statsJSONResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	openaiCost := got.PerTarget["/openai"].EstimatedCost
+	if openaiCost == nil || *openaiCost != 0.03 {
+		t.Fatalf("/openai estimated_cost = %v, want 0.03 (1000 tokens at the 0.03 default rate)", openaiCost)
+	}
+	anthropicCost := got.PerTarget["/anthropic"].EstimatedCost
+	if anthropicCost == nil || *anthropicCost != 0.08 {
+		t.Fatalf("/anthropic estimated_cost = %v, want 0.08 (1000 tokens at its own 0.08 override)", anthropicCost)
+	}
+	if got.EstimatedCost == nil {
+		t.Fatal("top-level estimated_cost missing")
+	}
+	if *got.EstimatedCost < 0.109 || *got.EstimatedCost > 0.111 {
+		t.Fatalf("top-level estimated_cost = %v, want approximately 0.11 (0.03 + 0.08, the true sum) — a single flat 0.03 rate across both targets' combined 2000 tokens would wrongly give 0.06", *got.EstimatedCost)
+	}
+}
+
 // TestServer_MetricsEndpoint_ReturnsPrometheusFormatWithCurrentCounts
 // proves metricsPath renders the same counters as statsPath, but in
 // Prometheus's text exposition format, labeled by target.
@@ -3682,6 +3779,65 @@ func TestServer_MetricsEndpoint_IncludesCostOnlyWhenConfiguredAndLabelsEveryTarg
 	}
 	if !strings.Contains(withBoth, `target="default"`) || !strings.Contains(withBoth, `target="/other"`) {
 		t.Fatalf("missing per-target series for both targets: %q", withBoth)
+	}
+}
+
+// TestServer_MetricsEndpoint_PerTargetCostOverridePricesEachSeriesAtItsOwnRate
+// proves each target's own aiproxy_estimated_cost series reflects ITS
+// OWN resolved rate — an override where set, the server-wide default
+// otherwise — not one flat rate applied uniformly to every target.
+func TestServer_MetricsEndpoint_PerTargetCostOverridePricesEachSeriesAtItsOwnRate(t *testing.T) {
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":1000}}`))
+	}))
+	defer openai.Close()
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":1000}}`))
+	}))
+	defer anthropic.Close()
+
+	openaiURL, err := url.Parse(openai.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	anthropicURL, err := url.Parse(anthropic.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", openaiURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.CostPer1KTokens = 0.03
+	srv.TargetCostRates = map[string]float64{"/anthropic": 0.08}
+	srv.AddRoute("/openai", []*url.URL{openaiURL}, nil, nil)
+	srv.AddRoute("/anthropic", []*url.URL{anthropicURL}, nil, nil)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	for _, path := range []string{"/openai/v1/chat", "/anthropic/v1/messages"} {
+		resp, err := http.Post(frontend.URL+path, "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/metrics")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	metrics := string(body)
+
+	if !strings.Contains(metrics, `aiproxy_estimated_cost{target="/openai"} 0.03`) {
+		t.Fatalf("missing /openai priced at the 0.03 default: %q", metrics)
+	}
+	if !strings.Contains(metrics, `aiproxy_estimated_cost{target="/anthropic"} 0.08`) {
+		t.Fatalf("missing /anthropic priced at its own 0.08 override: %q", metrics)
 	}
 }
 
@@ -4164,7 +4320,7 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 	strictLimiter := limiter.New(1, time.Minute)
 	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -4226,7 +4382,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 		}
 	}()
 
@@ -5235,7 +5391,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -6508,7 +6664,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -6840,7 +6996,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -7214,7 +7370,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -7674,7 +7830,7 @@ func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
 
 	tb := breaker.NewRegistry(1, time.Hour)
 	reloadedRoutes := []proxy.Route{{Prefix: "/openai", Targets: []*url.URL{brokenURL, healthyURL}}}
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "")
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil)
 
 	get := func() {
 		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
@@ -8557,7 +8713,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -9379,7 +9535,7 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -9695,7 +9851,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -10050,7 +10206,7 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -10491,7 +10647,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -10530,7 +10686,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "")
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil)
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
@@ -11449,7 +11605,7 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "")
+	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil)
 
 	start := time.Now()
 	resp, err := http.Get(frontend.URL + "/v1/chat")

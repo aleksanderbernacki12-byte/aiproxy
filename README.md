@@ -1226,6 +1226,42 @@ top-level limiter (or share "no limit at all", if the top-level field is
 itself unset). `targets[].max_tokens_per_minute` works exactly the same
 way for [the token-based breaker](#token-based-rate-limiting).
 
+`targets[].cost_per_1k_tokens` (and `model_routes[].cost_per_1k_tokens`)
+works the same way again, for [cost estimation](#custom-rules-rate-limiting-caching-and-cost-estimation)
+— genuinely necessary once traffic is actually routed across providers
+with different real pricing, where a single global rate would misprice
+every target that doesn't happen to match it:
+
+```json
+{
+  "cost_per_1k_tokens": 0.03,
+  "targets": [
+    { "prefix": "/anthropic", "url": "https://api.anthropic.com", "cost_per_1k_tokens": 0.08 },
+    { "prefix": "/openai", "url": "https://api.openai.com" }
+  ]
+}
+```
+
+`/anthropic`'s own tokens are priced at its own 0.08 rate; `/openai`
+has no override, so it keeps sharing the top-level 0.03 rate. A target
+can set its own rate even when the top-level `cost_per_1k_tokens` is
+itself unset, pricing only that one target while leaving everything
+else unpriced. This affects every cost figure that breaks down by
+target — the `per_target` entries in `GET /_aiproxy/stats`, each
+target's own `aiproxy_estimated_cost{target="..."}` Prometheus series,
+and the shutdown summary's per-target breakdown — and the **total**
+cost everywhere it's shown (the summary's own top-line figure,
+`estimated_cost` at the top of the stats JSON, `cost_budget`
+crossing) is always the true sum of every target's own tokens at its
+own rate, never the combined token count priced at one flat rate,
+which would silently misprice it the moment any target's rate
+diverges from the default. The one exception is
+[per-key cost tracking](#multiple-named-keys-with-per-key-stats-and-rate-limits):
+a named proxy key's own traffic isn't necessarily confined to one
+target, so its cost is always priced at the server-wide default rate
+regardless of any per-target overrides — a known, accepted
+approximation for that one narrower dimension.
+
 ### Failover across multiple upstreams
 
 Give a target `urls` instead of `url` for an ordered list of candidate
