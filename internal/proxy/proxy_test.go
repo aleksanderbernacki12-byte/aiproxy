@@ -13510,7 +13510,13 @@ func TestServer_WeightedRouting_SplitApproximatesConfiguredWeights(t *testing.T)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	const trials = 400
+	// 3000, not the smaller trial count an earlier version of this test
+	// used: light's own 0.5% share means its expected count is only 15,
+	// and at 400 trials the chance of it landing on exactly zero by pure
+	// chance was P = 0.995^400 ≈ 13.5% — a real, not theoretical, flake
+	// rate for a CI test that should essentially never fail on its own.
+	// At 3000 trials that same probability drops to 0.995^3000 ≈ 3e-7.
+	const trials = 3000
 	for i := 0; i < trials; i++ {
 		// A distinct body every time so this never hits the (disabled
 		// here) cache and always genuinely re-resolves the route.
@@ -13526,7 +13532,7 @@ func TestServer_WeightedRouting_SplitApproximatesConfiguredWeights(t *testing.T)
 		t.Fatalf("total hits = %d, want %d", total, trials)
 	}
 	if lightHits.Load() == 0 {
-		t.Fatal("light candidate (weight 5/1000) never received a single request across 400 trials — the split isn't actually random")
+		t.Fatalf("light candidate (weight 5/1000) never received a single request across %d trials — the split isn't actually random", trials)
 	}
 	// Loose bound purely to catch a badly broken split (e.g. always
 	// picking the same candidate, or a roughly 50/50 split instead of
