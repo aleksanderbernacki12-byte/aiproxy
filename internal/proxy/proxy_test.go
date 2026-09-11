@@ -4029,13 +4029,14 @@ func TestServer_MultiTargetRouting_RateLimitedRequestsAttributedToCorrectTarget(
 
 // jsonLogLine mirrors the shape of one LogFormatJSON log line.
 type jsonLogLine struct {
-	Time    string `json:"time"`
-	Level   string `json:"level"`
-	Method  string `json:"method,omitempty"`
-	URL     string `json:"url,omitempty"`
-	Rule    string `json:"rule,omitempty"`
-	Tokens  int    `json:"tokens,omitempty"`
-	Message string `json:"message,omitempty"`
+	Time      string `json:"time"`
+	Level     string `json:"level"`
+	Method    string `json:"method,omitempty"`
+	URL       string `json:"url,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	Rule      string `json:"rule,omitempty"`
+	Tokens    int    `json:"tokens,omitempty"`
+	Message   string `json:"message,omitempty"`
 }
 
 // TestServer_JSONLogging_EmitsOneValidJSONObjectPerEvent drives one
@@ -4131,6 +4132,28 @@ func TestServer_JSONLogging_EmitsOneValidJSONObjectPerEvent(t *testing.T) {
 	}
 	if events[3].Rule != "test-secret" {
 		t.Errorf("block event rule = %q, want test-secret", events[3].Rule)
+	}
+
+	// events 0-2 (allow, latency, usage) all belong to the very same
+	// first POST — they must share one request_id. Every other event
+	// belongs to a different request and must carry its own distinct
+	// one.
+	seen := make(map[int]bool)
+	for i, ev := range events {
+		if ev.RequestID == "" {
+			t.Errorf("event %d (%s) missing request_id", i, ev.Level)
+		}
+		seen[i] = true
+	}
+	if events[0].RequestID != events[1].RequestID || events[1].RequestID != events[2].RequestID {
+		t.Errorf("events 0-2 (one request's own allow/latency/usage) have differing request_id: %q, %q, %q", events[0].RequestID, events[1].RequestID, events[2].RequestID)
+	}
+	ids := map[string]bool{events[0].RequestID: true}
+	for _, i := range []int{3, 4, 5} {
+		if ids[events[i].RequestID] {
+			t.Errorf("event %d (%s) request_id %q collides with an earlier, different request", i, events[i].Level, events[i].RequestID)
+		}
+		ids[events[i].RequestID] = true
 	}
 }
 
@@ -12419,5 +12442,208 @@ func TestServer_RateLimitHeaders_AbsentOnCacheHit(t *testing.T) {
 	defer second.Body.Close()
 	if got := second.Header.Get("X-Ratelimit-Remaining-Requests"); got != "" {
 		t.Fatalf("cache-hit X-RateLimit-Remaining-Requests = %q, want absent (a cache hit never consults the limiter)", got)
+	}
+}
+
+// TestServer_RequestID_GeneratedAndEchoedOnASuccessfulResponse proves a
+// client that never sends its own X-Request-Id still gets a real,
+// freshly generated one back on the response — every response carries
+// one, not only a rejection.
+func TestServer_RequestID_GeneratedAndEchoedOnASuccessfulResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("X-Request-Id"); got == "" {
+		t.Fatal("X-Request-Id missing on a successful response")
+	}
+}
+
+// TestServer_RequestID_ClientSuppliedIDIsEchoedBackVerbatim proves a
+// client's own X-Request-Id is reused rather than replaced, so a
+// caller that already generates its own correlation ID (a gateway
+// further upstream, say) can still tie aiproxy's own logs back to that
+// exact value.
+func TestServer_RequestID_ClientSuppliedIDIsEchoedBackVerbatim(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/endpoint", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Request-Id", "caller-generated-id-42")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("X-Request-Id"); got != "caller-generated-id-42" {
+		t.Fatalf("X-Request-Id = %q, want the client's own caller-generated-id-42 echoed back", got)
+	}
+}
+
+// TestServer_RequestID_UnsafeClientSuppliedIDIsReplaced proves a
+// client-supplied X-Request-Id containing characters that could break
+// a log line or enable header injection if echoed back is never
+// trusted — aiproxy generates its own instead, silently, rather than
+// rejecting the request over what's ultimately just a logging nicety.
+func TestServer_RequestID_UnsafeClientSuppliedIDIsReplaced(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/endpoint", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	// Go's own net/http client refuses to send a header value containing
+	// a raw CR/LF itself, so the unsafe shape tested here is a
+	// double-quote — still outside aiproxy's safe charset, but a value
+	// an HTTP client will actually transmit.
+	req.Header.Set("X-Request-Id", `unsafe"value`)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("X-Request-Id"); got == `unsafe"value` {
+		t.Fatal("X-Request-Id echoed back the unsafe client-supplied value verbatim, want a fresh generated one instead")
+	}
+	if resp.Header.Get("X-Request-Id") == "" {
+		t.Fatal("X-Request-Id missing entirely after rejecting the unsafe client value")
+	}
+}
+
+// TestServer_RequestID_PresentOnRejectionAndDistinctPerRequest proves
+// the header is present on a genuine rejection too (not only a
+// forwarded response), and that two different requests never collide
+// on the same ID.
+func TestServer_RequestID_PresentOnRejectionAndDistinctPerRequest(t *testing.T) {
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.ProxyAPIKey = "secret"
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	first, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d", first.StatusCode, http.StatusProxyAuthRequired)
+	}
+	firstID := first.Header.Get("X-Request-Id")
+	if firstID == "" {
+		t.Fatal("X-Request-Id missing on a rejected (407) response")
+	}
+
+	second, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	defer second.Body.Close()
+	secondID := second.Header.Get("X-Request-Id")
+	if secondID == "" {
+		t.Fatal("X-Request-Id missing on the second rejected response")
+	}
+	if firstID == secondID {
+		t.Fatalf("two different requests got the same X-Request-Id: %q", firstID)
+	}
+}
+
+// TestServer_RequestID_IncludedInWebhookPayload proves a webhook alert
+// carries the same request_id as the log line for the request that
+// triggered it, so an operator can correlate a Slack/webhook alert
+// with the exact log lines for that one request.
+func TestServer_RequestID_IncludedInWebhookPayload(t *testing.T) {
+	received := make(chan map[string]any, 1)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	targetURL, err := url.Parse("https://example.invalid")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.WebhookURL = webhookURL
+	srv.ProxyAPIKey = "secret"
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/endpoint", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Request-Id", "webhook-correlation-test-id")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["request_id"] != "webhook-correlation-test-id" {
+			t.Errorf("webhook payload request_id = %v, want webhook-correlation-test-id", payload["request_id"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never received the unauthorized event")
 	}
 }

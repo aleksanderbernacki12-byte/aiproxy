@@ -8,6 +8,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -108,6 +109,7 @@ type requestContextKey struct{}
 type requestContextInfo struct {
 	method      string
 	url         string
+	requestID   string
 	cacheKey    string
 	targets     []*url.URL
 	forwardPath string
@@ -593,6 +595,19 @@ type logEvent struct {
 	Level  string `json:"level"`
 	Method string `json:"method,omitempty"`
 	URL    string `json:"url,omitempty"`
+
+	// RequestID is set on every event actually tied to one specific
+	// client request — see resolveRequestID — so a line in this log can
+	// be correlated with the client's own logs (it either supplied this
+	// value itself via the X-Request-Id request header, or is shown it
+	// via the same header on the response) and with every other line
+	// this same request produced. Empty on a process-level event with
+	// no one request to attribute (error, target_ejected/
+	// target_recovered, config_changed) — the same "not every event is
+	// request-scoped" reasoning FailedTarget/NextTarget's own doc
+	// comment already describes.
+	RequestID string `json:"request_id,omitempty"`
+
 	Rule   string `json:"rule,omitempty"`
 	Tokens int    `json:"tokens,omitempty"`
 
@@ -850,8 +865,8 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if i+1 < len(orderedCandidates) {
 			next := orderedCandidates[i+1]
 			t.server.Stats.RecordFailover(reqCtx.targetLabel)
-			t.server.logFailover(reqCtx.method, reqCtx.url, candidate.String(), next.String())
-			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, candidate.String(), next.String())
+			t.server.logFailover(reqCtx.method, reqCtx.url, candidate.String(), next.String(), reqCtx.requestID)
+			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, candidate.String(), next.String(), reqCtx.requestID)
 		}
 	}
 	if cancel != nil {
@@ -1903,6 +1918,76 @@ func handleCORSPreflight(cors *CORSConfig, w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// requestIDHeader is the header aiproxy both reads an inbound
+// correlation ID from and always stamps on its own response — see
+// resolveRequestID.
+const requestIDHeader = "X-Request-Id"
+
+// maxRequestIDLen caps how long a client-supplied X-Request-Id is
+// still trusted at — long enough for any real ID scheme (a UUID is 36
+// characters, a W3C traceparent-style ID longer still) with headroom
+// to spare, short enough that a client can never use this header to
+// smuggle an outsized value into every log line/webhook payload this
+// one request produces.
+const maxRequestIDLen = 128
+
+// resolveRequestID returns r's own X-Request-Id header value when
+// it's present and safe to log and echo back verbatim, otherwise a
+// freshly generated one — always stamped on the response either way
+// (see checkNetworkAndAuthAccess), so a client that didn't send one
+// still gets told what aiproxy is calling this request, for its own
+// logs. "Safe" means non-empty, no longer than maxRequestIDLen, and
+// made up only of characters that can never break a log line (JSON or
+// plain text) or be used for header/response-splitting injection if
+// echoed back — letters, digits, and -_.: — the same conservative
+// shape real request-ID conventions (UUIDs, ULIDs, W3C traceparent)
+// already fit inside. A client that sends something outside that shape
+// gets a fresh server-generated ID instead of a rejection: an
+// untrustworthy correlation ID is still just a missing one, never a
+// reason to fail the request it's attached to.
+func resolveRequestID(r *http.Request) string {
+	if id := r.Header.Get(requestIDHeader); id != "" && validRequestID(id) {
+		return id
+	}
+	return generateRequestID()
+}
+
+func validRequestID(id string) bool {
+	if len(id) > maxRequestIDLen {
+		return false
+	}
+	for _, c := range id {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.' || c == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// generateRequestID returns a fresh random ID in the same 8-4-4-4-12
+// hex shape as a UUIDv4 (RFC 4122 §4.4), using crypto/rand rather than
+// pulling in a dependency — generating one ID is a small enough amount
+// of code to not need a library just for this, matching aiproxy's own
+// zero-dependency discipline everywhere else.
+func generateRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand.Read failing at all means the OS's own CSPRNG is
+		// unavailable — an environment-level problem no fallback here
+		// could meaningfully paper over. A request ID existing at all
+		// is far less important than that: return a recognizable
+		// all-zeros placeholder rather than panicking or blocking a
+		// real request over a logging nicety.
+		return "00000000-0000-0000-0000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // checkNetworkAndAuthAccess runs the three independent gates every
 // request — whether ordinary proxy traffic or a request for the admin
 // surface — must pass before anything else happens: the IP allow/deny
@@ -1917,7 +2002,20 @@ func handleCORSPreflight(cors *CORSConfig, w http.ResponseWriter, r *http.Reques
 // CORS handling — applying Access-Control-Allow-Origin and friends,
 // and short-circuiting a preflight entirely — runs first, before any
 // of the three gates: see corsPreflightRequest's doc comment for why.
-func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request) (clientAuth, bool) {
+//
+// requestID is this request's own correlation ID — see
+// resolveRequestID — already resolved and already stamped as the
+// X-Request-Id response header by the caller before this runs, so it's
+// available for every rejection this function can produce too.
+func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request, requestID string) (clientAuth, bool) {
+	// Stamped first, unconditionally, exactly like applyCORSHeaders'
+	// own top-of-function stamp just below — a plain Set (not Add) on
+	// the ResponseWriter's own header map, so it's never touched by
+	// copyHeader's/ReverseProxy's own Add-based merge of a cached or
+	// upstream response's headers later, and covers every response
+	// shape this request can end up producing: a rejection here, an
+	// admin endpoint, a cache hit, or a live-forwarded response.
+	w.Header().Set(requestIDHeader, requestID)
 	if cors := s.getCORSConfig(); cors != nil {
 		applyCORSHeaders(cors, w.Header(), r)
 		if corsPreflightRequest(r) {
@@ -1931,8 +2029,8 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		// credential check, and should reject a completely unknown
 		// source before it can so much as present a key.
 		s.Stats.RecordIPDenied()
-		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String())
-		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String())
+		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 		writeError(w, r, http.StatusForbidden, "ip_denied", "access denied", "")
 		return clientAuth{}, false
 	}
@@ -1943,8 +2041,8 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		// this nor checkIPAccess is an exemption from the other, see
 		// CountryAllowList's doc comment.
 		s.Stats.RecordCountryDenied()
-		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String())
-		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String())
+		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
+		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
 		writeError(w, r, http.StatusForbidden, "country_denied", "access denied", "")
 		return clientAuth{}, false
 	}
@@ -1955,8 +2053,8 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		// configured, gates the whole proxy, monitoring endpoints
 		// included, not just traffic actually forwarded upstream.
 		s.Stats.RecordUnauthorized()
-		s.logUnauthorized(r.Method, r.URL.String())
-		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "")
+		s.logUnauthorized(r.Method, r.URL.String(), requestID)
+		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "", requestID)
 		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
 		writeError(w, r, http.StatusProxyAuthRequired, "unauthorized", "proxy authentication required", "")
 		return clientAuth{}, false
@@ -1980,7 +2078,7 @@ func (h adminMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveHealthz(w, r)
 		return
 	}
-	if _, ok := s.checkNetworkAndAuthAccess(w, r); !ok {
+	if _, ok := s.checkNetworkAndAuthAccess(w, r, resolveRequestID(r)); !ok {
 		return
 	}
 	switch r.URL.Path {
@@ -2014,7 +2112,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth, ok := s.checkNetworkAndAuthAccess(w, r)
+	requestID := resolveRequestID(r)
+	auth, ok := s.checkNetworkAndAuthAccess(w, r, requestID)
 	if !ok {
 		return
 	}
@@ -2105,7 +2204,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if stale {
 				s.Stats.RecordStaleCacheHit(targetLabel)
 			}
-			s.logCacheHit(r.Method, r.URL.String(), age, stale)
+			s.logCacheHit(r.Method, r.URL.String(), requestID, age, stale)
 			return
 		}
 	}
@@ -2122,14 +2221,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "bad_request", err.Error(), "")
 		return
 	}
-	s.handleRequestDryRunHits(dryRunHits, r.Method, r.URL.String())
+	s.handleRequestDryRunHits(dryRunHits, r.Method, r.URL.String(), requestID)
 	if action == rules.Block {
 		// The matched secret itself must never reach the log, only the
 		// static rule name that identifies which pattern triggered it.
 		s.Stats.RecordBlock(targetLabel, ruleName)
 		s.Stats.RecordClientBlock(auth.label)
-		s.logBlock(r.Method, r.URL.String(), ruleName)
-		s.notifyWebhook("block", r.Method, r.URL.String(), ruleName)
+		s.logBlock(r.Method, r.URL.String(), ruleName, requestID)
+		s.notifyWebhook("block", r.Method, r.URL.String(), ruleName, requestID)
 		writeError(w, r, http.StatusForbidden, "block", "blocked by aiproxy rules", ruleName)
 		return
 	}
@@ -2141,8 +2240,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			s.Stats.RecordRateLimited(targetLabel)
 			s.Stats.RecordClientRateLimited(auth.label)
-			s.logRateLimited(r.Method, r.URL.String())
-			s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "")
+			s.logRateLimited(r.Method, r.URL.String(), requestID)
+			s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "", requestID)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
 			writeError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded", "")
 			return
@@ -2163,8 +2262,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			s.Stats.RecordTokenRateLimited(targetLabel)
 			s.Stats.RecordClientTokenRateLimited(auth.label)
-			s.logTokenRateLimited(r.Method, r.URL.String())
-			s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "")
+			s.logTokenRateLimited(r.Method, r.URL.String(), requestID)
+			s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "", requestID)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
 			writeError(w, r, http.StatusTooManyRequests, "token_rate_limited", "token rate limit exceeded", "")
 			return
@@ -2181,8 +2280,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if anomalous, currentCount, baseline := anomalyDetector.Check(auth.label); anomalous {
 			s.Stats.RecordAnomalyDetected()
 			s.Stats.RecordClientAnomalyDetected(auth.label)
-			s.logAnomalyDetected(auth.label, r.Method, r.URL.String(), currentCount, baseline)
-			s.notifyAnomalyWebhook(auth.label, r.Method, r.URL.String(), currentCount, baseline)
+			s.logAnomalyDetected(auth.label, r.Method, r.URL.String(), requestID, currentCount, baseline)
+			s.notifyAnomalyWebhook(auth.label, r.Method, r.URL.String(), requestID, currentCount, baseline)
 			if !anomalyDryRun {
 				writeError(w, r, http.StatusTooManyRequests, "anomaly_detected", "anomalous traffic pattern detected", "")
 				return
@@ -2212,12 +2311,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if action == rules.Redact {
 		s.Stats.RecordRedact(targetLabel, ruleName)
 		s.Stats.RecordClientRedact(auth.label)
-		s.logRedact(r.Method, r.URL.String(), ruleName)
-		s.notifyWebhook("redact", r.Method, r.URL.String(), ruleName)
+		s.logRedact(r.Method, r.URL.String(), ruleName, requestID)
+		s.notifyWebhook("redact", r.Method, r.URL.String(), ruleName, requestID)
 	} else {
 		s.Stats.RecordAllow(targetLabel)
 		s.Stats.RecordClientAllow(auth.label)
-		s.logAllow(r.Method, r.URL.String())
+		s.logAllow(r.Method, r.URL.String(), requestID)
 	}
 
 	// Carry the client-facing method/URL, the cache key, and the resolved
@@ -2228,6 +2327,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqCtx := requestContextInfo{
 		method:           r.Method,
 		url:              r.URL.String(),
+		requestID:        requestID,
 		cacheKey:         cacheKey,
 		targets:          targets,
 		forwardPath:      forwardPath,
@@ -2263,7 +2363,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	// real traffic — failoverTransport.RoundTrip always sets it by the
 	// time modifyResponse can even be reached.
 	if reqCtx.latency != nil {
-		s.logLatency(reqCtx.method, reqCtx.url, *reqCtx.latency)
+		s.logLatency(reqCtx.method, reqCtx.url, reqCtx.requestID, *reqCtx.latency)
 	}
 
 	if isEventStream(resp) {
@@ -2297,18 +2397,18 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	}
 
 	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, reqCtx.targetLabel, reqCtx.clientLabel)
-	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url)
+	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url, reqCtx.requestID)
 	if action == rules.Block {
 		s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
-		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
-		s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
+		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
+		s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		writeResponseBlockedBody(resp, "response blocked by aiproxy rules")
 		return nil
 	}
 	if action == rules.Redact {
 		s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
-		s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName)
-		s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName)
+		s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
+		s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		body = scannedBody
 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
@@ -2351,16 +2451,16 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		key:    reqCtx.clientLabel,
 		onRedact: func(ruleName string) {
 			s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
-			s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName)
-			s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName)
+			s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
+			s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		},
 		onBlock: func(ruleName string) {
 			s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
-			s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName)
-			s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName)
+			s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
+			s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		},
 		onDryRun: func(hits []rules.DryRunMatch) {
-			s.handleResponseDryRunHits(hits, reqCtx.method, reqCtx.url)
+			s.handleResponseDryRunHits(hits, reqCtx.method, reqCtx.url, reqCtx.requestID)
 		},
 	}
 	tee.onComplete = func(data []byte, cleanEOF bool) {
@@ -2637,20 +2737,20 @@ func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 		}
 		s.Stats.RecordTokensUsed(reqCtx.targetLabel, tokens)
 		s.Stats.RecordClientTokensUsed(reqCtx.clientLabel, tokens)
-		s.logUsage(reqCtx.method, reqCtx.url, tokens)
+		s.logUsage(reqCtx.method, reqCtx.url, reqCtx.requestID, tokens)
 		if cost, crossed := s.Stats.CrossedBudget(s.getCostRates(), s.getCostBudget()); crossed {
-			s.logBudgetExceeded(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
-			s.notifyBudgetWebhook(reqCtx.method, reqCtx.url, cost, s.getCostBudget())
+			s.logBudgetExceeded(reqCtx.method, reqCtx.url, reqCtx.requestID, cost, s.getCostBudget())
+			s.notifyBudgetWebhook(reqCtx.method, reqCtx.url, reqCtx.requestID, cost, s.getCostBudget())
 		}
 		if cost, crossed := s.Stats.CrossedClientBudget(reqCtx.clientLabel, s.getCostPer1KTokens(), reqCtx.clientCostBudget); crossed {
-			s.logClientBudgetExceeded(reqCtx.method, reqCtx.url, reqCtx.clientLabel, cost, reqCtx.clientCostBudget)
-			s.notifyClientBudgetWebhook(reqCtx.method, reqCtx.url, reqCtx.clientLabel, cost, reqCtx.clientCostBudget)
+			s.logClientBudgetExceeded(reqCtx.method, reqCtx.url, reqCtx.clientLabel, reqCtx.requestID, cost, reqCtx.clientCostBudget)
+			s.notifyClientBudgetWebhook(reqCtx.method, reqCtx.url, reqCtx.clientLabel, reqCtx.requestID, cost, reqCtx.clientCostBudget)
 		}
 	}
 }
 
-func (s *Server) logAllow(method, reqURL string) {
-	ev := s.recordLogEvent(logEvent{Level: "allow", Method: method, URL: reqURL})
+func (s *Server) logAllow(method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "allow", Method: method, URL: reqURL, RequestID: requestID})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2658,8 +2758,8 @@ func (s *Server) logAllow(method, reqURL string) {
 	s.logf("%s[ALLOW] %s %s%s", ansiGreen, method, reqURL, ansiReset)
 }
 
-func (s *Server) logBlock(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "block", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logBlock(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "block", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2667,8 +2767,8 @@ func (s *Server) logBlock(method, reqURL, ruleName string) {
 	s.logf("%s[BLOCK] %s %s - Triggered rule: %s%s", ansiBrightRed, method, reqURL, ruleName, ansiReset)
 }
 
-func (s *Server) logRateLimited(method, reqURL string) {
-	ev := s.recordLogEvent(logEvent{Level: "rate_limited", Method: method, URL: reqURL})
+func (s *Server) logRateLimited(method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "rate_limited", Method: method, URL: reqURL, RequestID: requestID})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2681,8 +2781,8 @@ func (s *Server) logRateLimited(method, reqURL string) {
 // ("token_rate_limited", not "rate_limited") so the two are
 // distinguishable in a JSON log stream or GET /_aiproxy/stats, the same
 // way ip_denied is kept separate from unauthorized.
-func (s *Server) logTokenRateLimited(method, reqURL string) {
-	ev := s.recordLogEvent(logEvent{Level: "token_rate_limited", Method: method, URL: reqURL})
+func (s *Server) logTokenRateLimited(method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "token_rate_limited", Method: method, URL: reqURL, RequestID: requestID})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2690,8 +2790,8 @@ func (s *Server) logTokenRateLimited(method, reqURL string) {
 	s.logf("%s[TOKEN LIMIT] %s %s - Token rate limit exceeded%s", ansiYellow, method, reqURL, ansiReset)
 }
 
-func (s *Server) logUnauthorized(method, reqURL string) {
-	ev := s.recordLogEvent(logEvent{Level: "unauthorized", Method: method, URL: reqURL})
+func (s *Server) logUnauthorized(method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "unauthorized", Method: method, URL: reqURL, RequestID: requestID})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2699,8 +2799,8 @@ func (s *Server) logUnauthorized(method, reqURL string) {
 	s.logf("%s[UNAUTHORIZED] %s %s - Missing or invalid Proxy-Authorization%s", ansiBrightRed, method, reqURL, ansiReset)
 }
 
-func (s *Server) logIPDenied(remoteIP, method, reqURL string) {
-	ev := s.recordLogEvent(logEvent{Level: "ip_denied", Method: method, URL: reqURL, RemoteIP: remoteIP})
+func (s *Server) logIPDenied(remoteIP, method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "ip_denied", Method: method, URL: reqURL, RequestID: requestID, RemoteIP: remoteIP})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2708,8 +2808,8 @@ func (s *Server) logIPDenied(remoteIP, method, reqURL string) {
 	s.logf("%s[IP DENIED] %s %s - %s not in ip_allow_list, or in ip_deny_list%s", ansiBrightRed, method, reqURL, remoteIP, ansiReset)
 }
 
-func (s *Server) logCountryDenied(remoteIP, country, method, reqURL string) {
-	ev := s.recordLogEvent(logEvent{Level: "country_denied", Method: method, URL: reqURL, RemoteIP: remoteIP, Country: country})
+func (s *Server) logCountryDenied(remoteIP, country, method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "country_denied", Method: method, URL: reqURL, RequestID: requestID, RemoteIP: remoteIP, Country: country})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2721,8 +2821,8 @@ func (s *Server) logCountryDenied(remoteIP, country, method, reqURL string) {
 	s.logf("%s[COUNTRY DENIED] %s %s - %s (%s) not in country_allow_list, or in country_deny_list%s", ansiBrightRed, method, reqURL, remoteIP, label, ansiReset)
 }
 
-func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) {
-	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Cost: cost, Budget: budget})
+func (s *Server) logBudgetExceeded(method, reqURL, requestID string, cost, budget float64) {
+	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, RequestID: requestID, Cost: cost, Budget: budget})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2735,8 +2835,8 @@ func (s *Server) logBudgetExceeded(method, reqURL string, cost, budget float64) 
 // client-aware branch inside logBudgetExceeded, since the two fire from
 // independent CrossedBudget/CrossedClientBudget checks and can both
 // fire for the very same request.
-func (s *Server) logClientBudgetExceeded(method, reqURL, client string, cost, budget float64) {
-	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, Client: client, Cost: cost, Budget: budget})
+func (s *Server) logClientBudgetExceeded(method, reqURL, client, requestID string, cost, budget float64) {
+	ev := s.recordLogEvent(logEvent{Level: "budget_exceeded", Method: method, URL: reqURL, RequestID: requestID, Client: client, Cost: cost, Budget: budget})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2748,8 +2848,8 @@ func (s *Server) logClientBudgetExceeded(method, reqURL, client string, cost, bu
 // baseline — see anomaly.Registry. currentCount/baseline are always
 // real, meaningful numbers here (Check only ever reports anomalous
 // alongside them), never zero-valued placeholders.
-func (s *Server) logAnomalyDetected(client, method, reqURL string, currentCount int, baseline float64) {
-	ev := s.recordLogEvent(logEvent{Level: "anomaly_detected", Method: method, URL: reqURL, Client: client, Rate: currentCount, Baseline: &baseline})
+func (s *Server) logAnomalyDetected(client, method, reqURL, requestID string, currentCount int, baseline float64) {
+	ev := s.recordLogEvent(logEvent{Level: "anomaly_detected", Method: method, URL: reqURL, RequestID: requestID, Client: client, Rate: currentCount, Baseline: &baseline})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2757,8 +2857,8 @@ func (s *Server) logAnomalyDetected(client, method, reqURL string, currentCount 
 	s.logf("%s[ANOMALY] %s %s - client %s: %d requests this minute vs. baseline %.1f%s", ansiYellow, method, reqURL, client, currentCount, baseline, ansiReset)
 }
 
-func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
-	ev := s.recordLogEvent(logEvent{Level: "failover", Method: method, URL: reqURL, FailedTarget: failedTarget, NextTarget: nextTarget})
+func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "failover", Method: method, URL: reqURL, RequestID: requestID, FailedTarget: failedTarget, NextTarget: nextTarget})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2802,9 +2902,9 @@ func (s *Server) logTargetRecovered(target string) {
 // regardless of whether that response then goes on to be blocked,
 // redacted, or forwarded as-is; latency measures how long upstream took
 // to answer, independent of what aiproxy decides to do with the answer.
-func (s *Server) logLatency(method, reqURL string, d time.Duration) {
+func (s *Server) logLatency(method, reqURL, requestID string, d time.Duration) {
 	ms := d.Milliseconds()
-	ev := s.recordLogEvent(logEvent{Level: "latency", Method: method, URL: reqURL, DurationMS: &ms})
+	ev := s.recordLogEvent(logEvent{Level: "latency", Method: method, URL: reqURL, RequestID: requestID, DurationMS: &ms})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2812,8 +2912,8 @@ func (s *Server) logLatency(method, reqURL string, d time.Duration) {
 	s.logf("%s[LATENCY] %s %s - %dms%s", ansiDim, method, reqURL, ms, ansiReset)
 }
 
-func (s *Server) logUsage(method, reqURL string, totalTokens int) {
-	ev := s.recordLogEvent(logEvent{Level: "usage", Method: method, URL: reqURL, Tokens: totalTokens})
+func (s *Server) logUsage(method, reqURL, requestID string, totalTokens int) {
+	ev := s.recordLogEvent(logEvent{Level: "usage", Method: method, URL: reqURL, RequestID: requestID, Tokens: totalTokens})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2827,9 +2927,9 @@ func (s *Server) logUsage(method, reqURL string, totalTokens int) {
 // rendered as a visually distinct log line (yellow instead of the usual
 // purple) so an operator watching the log stream notices a cache that's
 // due for a refresh without needing to poll /_aiproxy/stats.
-func (s *Server) logCacheHit(method, reqURL string, age time.Duration, stale bool) {
+func (s *Server) logCacheHit(method, reqURL, requestID string, age time.Duration, stale bool) {
 	ageSeconds := int(age.Seconds())
-	ev := s.recordLogEvent(logEvent{Level: "cache_hit", Method: method, URL: reqURL, AgeSeconds: &ageSeconds, Stale: stale})
+	ev := s.recordLogEvent(logEvent{Level: "cache_hit", Method: method, URL: reqURL, RequestID: requestID, AgeSeconds: &ageSeconds, Stale: stale})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2841,8 +2941,8 @@ func (s *Server) logCacheHit(method, reqURL string, age time.Duration, stale boo
 	s.logf("%s[CACHE HIT] %s %s - age %ds%s", ansiPurple, method, reqURL, ageSeconds, ansiReset)
 }
 
-func (s *Server) logRedact(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "redact", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logRedact(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "redact", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2850,8 +2950,8 @@ func (s *Server) logRedact(method, reqURL, ruleName string) {
 	s.logf("%s[REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
 }
 
-func (s *Server) logResponseBlock(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "response_block", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logResponseBlock(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_block", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2859,8 +2959,8 @@ func (s *Server) logResponseBlock(method, reqURL, ruleName string) {
 	s.logf("%s[RESPONSE BLOCK] %s %s - Triggered rule: %s%s", ansiBrightRed, method, reqURL, ruleName, ansiReset)
 }
 
-func (s *Server) logResponseRedact(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "response_redact", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logResponseRedact(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_redact", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2868,8 +2968,8 @@ func (s *Server) logResponseRedact(method, reqURL, ruleName string) {
 	s.logf("%s[RESPONSE REDACT] %s %s - Triggered rule: %s%s", ansiCyan, method, reqURL, ruleName, ansiReset)
 }
 
-func (s *Server) logDryRunBlock(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logDryRunBlock(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "dry_run_block", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2877,8 +2977,8 @@ func (s *Server) logDryRunBlock(method, reqURL, ruleName string) {
 	s.logf("%s[DRY-RUN BLOCK] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
 }
 
-func (s *Server) logDryRunRedact(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logDryRunRedact(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "dry_run_redact", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2886,8 +2986,8 @@ func (s *Server) logDryRunRedact(method, reqURL, ruleName string) {
 	s.logf("%s[DRY-RUN REDACT] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
 }
 
-func (s *Server) logResponseDryRunBlock(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "response_dry_run_block", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logResponseDryRunBlock(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_dry_run_block", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2895,8 +2995,8 @@ func (s *Server) logResponseDryRunBlock(method, reqURL, ruleName string) {
 	s.logf("%s[RESPONSE DRY-RUN BLOCK] %s %s - Would have triggered rule: %s%s", ansiGray, method, reqURL, ruleName, ansiReset)
 }
 
-func (s *Server) logResponseDryRunRedact(method, reqURL, ruleName string) {
-	ev := s.recordLogEvent(logEvent{Level: "response_dry_run_redact", Method: method, URL: reqURL, Rule: ruleName})
+func (s *Server) logResponseDryRunRedact(method, reqURL, ruleName, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "response_dry_run_redact", Method: method, URL: reqURL, RequestID: requestID, Rule: ruleName})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
@@ -2909,17 +3009,17 @@ func (s *Server) logResponseDryRunRedact(method, reqURL, ruleName string) {
 // happens if hits is empty. Called unconditionally, alongside whatever
 // the request's actual (non-dry-run) outcome turns out to be, since a
 // dry-run match never changes that outcome.
-func (s *Server) handleRequestDryRunHits(hits []rules.DryRunMatch, method, reqURL string) {
+func (s *Server) handleRequestDryRunHits(hits []rules.DryRunMatch, method, reqURL, requestID string) {
 	for _, h := range hits {
 		switch h.Action {
 		case rules.Block:
 			s.Stats.RecordDryRunBlock(h.RuleName)
-			s.logDryRunBlock(method, reqURL, h.RuleName)
-			s.notifyWebhook("dry_run_block", method, reqURL, h.RuleName)
+			s.logDryRunBlock(method, reqURL, h.RuleName, requestID)
+			s.notifyWebhook("dry_run_block", method, reqURL, h.RuleName, requestID)
 		case rules.Redact:
 			s.Stats.RecordDryRunRedact(h.RuleName)
-			s.logDryRunRedact(method, reqURL, h.RuleName)
-			s.notifyWebhook("dry_run_redact", method, reqURL, h.RuleName)
+			s.logDryRunRedact(method, reqURL, h.RuleName, requestID)
+			s.notifyWebhook("dry_run_redact", method, reqURL, h.RuleName, requestID)
 		}
 	}
 }
@@ -2928,17 +3028,17 @@ func (s *Server) handleRequestDryRunHits(hits []rules.DryRunMatch, method, reqUR
 // dry-run rule matching an upstream response instead of the client's
 // request — used by both the non-streaming (bufferResponse) and
 // streaming (streamTee) response paths.
-func (s *Server) handleResponseDryRunHits(hits []rules.DryRunMatch, method, reqURL string) {
+func (s *Server) handleResponseDryRunHits(hits []rules.DryRunMatch, method, reqURL, requestID string) {
 	for _, h := range hits {
 		switch h.Action {
 		case rules.Block:
 			s.Stats.RecordResponseDryRunBlock(h.RuleName)
-			s.logResponseDryRunBlock(method, reqURL, h.RuleName)
-			s.notifyWebhook("response_dry_run_block", method, reqURL, h.RuleName)
+			s.logResponseDryRunBlock(method, reqURL, h.RuleName, requestID)
+			s.notifyWebhook("response_dry_run_block", method, reqURL, h.RuleName, requestID)
 		case rules.Redact:
 			s.Stats.RecordResponseDryRunRedact(h.RuleName)
-			s.logResponseDryRunRedact(method, reqURL, h.RuleName)
-			s.notifyWebhook("response_dry_run_redact", method, reqURL, h.RuleName)
+			s.logResponseDryRunRedact(method, reqURL, h.RuleName, requestID)
+			s.notifyWebhook("response_dry_run_redact", method, reqURL, h.RuleName, requestID)
 		}
 	}
 }
@@ -2970,6 +3070,7 @@ type webhookAlert struct {
 	Event        string   `json:"event"`
 	Method       string   `json:"method"`
 	URL          string   `json:"url"`
+	RequestID    string   `json:"request_id,omitempty"` // see logEvent.RequestID
 	Rule         string   `json:"rule"`
 	Time         string   `json:"time"`
 	Cost         *float64 `json:"cost,omitempty"`
@@ -3091,7 +3192,7 @@ func (s *Server) postWebhook(label string, target *url.URL, data []byte) {
 // "" (neither is attributable to any one rule) — a dry-run event's Text
 // says "Would have triggered rule" instead of "Triggered rule", since
 // nothing was actually enforced.
-func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
+func (s *Server) notifyWebhook(event, method, reqURL, ruleName, requestID string) {
 	var text string
 	switch {
 	case event == "rate_limited":
@@ -3106,12 +3207,13 @@ func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
 		text = fmt.Sprintf("[%s] %s %s - Triggered rule: %s", strings.ToUpper(event), method, reqURL, ruleName)
 	}
 	s.deliverWebhookPayload(webhookAlert{
-		Text:   text,
-		Event:  event,
-		Method: method,
-		URL:    reqURL,
-		Rule:   ruleName,
-		Time:   time.Now().UTC().Format(time.RFC3339),
+		Text:      text,
+		Event:     event,
+		Method:    method,
+		URL:       reqURL,
+		RequestID: requestID,
+		Rule:      ruleName,
+		Time:      time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -3119,33 +3221,35 @@ func (s *Server) notifyWebhook(event, method, reqURL, ruleName string) {
 // budget_exceeded event — kept separate from notifyWebhook rather than
 // overloading its signature, since this is the only event carrying a
 // cost and a budget instead of a rule name.
-func (s *Server) notifyBudgetWebhook(method, reqURL string, cost, budget float64) {
+func (s *Server) notifyBudgetWebhook(method, reqURL, requestID string, cost, budget float64) {
 	text := fmt.Sprintf("[BUDGET_EXCEEDED] %s %s - Estimated cost %.4f exceeds budget %.4f", method, reqURL, cost, budget)
 	s.deliverWebhookPayload(webhookAlert{
-		Text:   text,
-		Event:  "budget_exceeded",
-		Method: method,
-		URL:    reqURL,
-		Time:   time.Now().UTC().Format(time.RFC3339),
-		Cost:   &cost,
-		Budget: &budget,
+		Text:      text,
+		Event:     "budget_exceeded",
+		Method:    method,
+		URL:       reqURL,
+		RequestID: requestID,
+		Time:      time.Now().UTC().Format(time.RFC3339),
+		Cost:      &cost,
+		Budget:    &budget,
 	})
 }
 
 // notifyClientBudgetWebhook is notifyBudgetWebhook's per-client
 // counterpart — see logClientBudgetExceeded for why this is a separate
 // method rather than a branch inside the existing one.
-func (s *Server) notifyClientBudgetWebhook(method, reqURL, client string, cost, budget float64) {
+func (s *Server) notifyClientBudgetWebhook(method, reqURL, client, requestID string, cost, budget float64) {
 	text := fmt.Sprintf("[BUDGET_EXCEEDED] %s %s - client %s: estimated cost %.4f exceeds budget %.4f", method, reqURL, client, cost, budget)
 	s.deliverWebhookPayload(webhookAlert{
-		Text:   text,
-		Event:  "budget_exceeded",
-		Method: method,
-		URL:    reqURL,
-		Client: client,
-		Time:   time.Now().UTC().Format(time.RFC3339),
-		Cost:   &cost,
-		Budget: &budget,
+		Text:      text,
+		Event:     "budget_exceeded",
+		Method:    method,
+		URL:       reqURL,
+		RequestID: requestID,
+		Client:    client,
+		Time:      time.Now().UTC().Format(time.RFC3339),
+		Cost:      &cost,
+		Budget:    &budget,
 	})
 }
 
@@ -3153,17 +3257,18 @@ func (s *Server) notifyClientBudgetWebhook(method, reqURL, client string, cost, 
 // anomaly_detected event — kept separate from notifyWebhook for the
 // same reason as notifyBudgetWebhook: this event carries a client, a
 // rate, and a baseline instead of a rule name.
-func (s *Server) notifyAnomalyWebhook(client, method, reqURL string, currentCount int, baseline float64) {
+func (s *Server) notifyAnomalyWebhook(client, method, reqURL, requestID string, currentCount int, baseline float64) {
 	text := fmt.Sprintf("[ANOMALY_DETECTED] %s %s - client %s: %d requests this minute vs. baseline %.1f", method, reqURL, client, currentCount, baseline)
 	s.deliverWebhookPayload(webhookAlert{
-		Text:     text,
-		Event:    "anomaly_detected",
-		Method:   method,
-		URL:      reqURL,
-		Client:   client,
-		Time:     time.Now().UTC().Format(time.RFC3339),
-		Rate:     currentCount,
-		Baseline: &baseline,
+		Text:      text,
+		Event:     "anomaly_detected",
+		Method:    method,
+		URL:       reqURL,
+		RequestID: requestID,
+		Client:    client,
+		Time:      time.Now().UTC().Format(time.RFC3339),
+		Rate:      currentCount,
+		Baseline:  &baseline,
 	})
 }
 
@@ -3171,13 +3276,14 @@ func (s *Server) notifyAnomalyWebhook(client, method, reqURL string, currentCoun
 // failover event — kept separate from notifyWebhook for the same reason
 // as notifyBudgetWebhook: this event carries a failed/next target pair
 // instead of a rule name.
-func (s *Server) notifyFailoverWebhook(method, reqURL, failedTarget, nextTarget string) {
+func (s *Server) notifyFailoverWebhook(method, reqURL, failedTarget, nextTarget, requestID string) {
 	text := fmt.Sprintf("[FAILOVER] %s %s - %s unreachable, trying %s", method, reqURL, failedTarget, nextTarget)
 	s.deliverWebhookPayload(webhookAlert{
 		Text:         text,
 		Event:        "failover",
 		Method:       method,
 		URL:          reqURL,
+		RequestID:    requestID,
 		Time:         time.Now().UTC().Format(time.RFC3339),
 		FailedTarget: failedTarget,
 		NextTarget:   nextTarget,
@@ -3212,15 +3318,16 @@ func (s *Server) notifyTargetRecoveredWebhook(target string) {
 // ip_denied event — kept separate from notifyWebhook for the same
 // reason as notifyBudgetWebhook/notifyFailoverWebhook: this event
 // carries a remote IP instead of a rule name.
-func (s *Server) notifyIPDeniedWebhook(remoteIP, method, reqURL string) {
+func (s *Server) notifyIPDeniedWebhook(remoteIP, method, reqURL, requestID string) {
 	text := fmt.Sprintf("[IP_DENIED] %s %s - %s not in ip_allow_list, or in ip_deny_list", method, reqURL, remoteIP)
 	s.deliverWebhookPayload(webhookAlert{
-		Text:     text,
-		Event:    "ip_denied",
-		Method:   method,
-		URL:      reqURL,
-		Time:     time.Now().UTC().Format(time.RFC3339),
-		RemoteIP: remoteIP,
+		Text:      text,
+		Event:     "ip_denied",
+		Method:    method,
+		URL:       reqURL,
+		RequestID: requestID,
+		Time:      time.Now().UTC().Format(time.RFC3339),
+		RemoteIP:  remoteIP,
 	})
 }
 
@@ -3228,20 +3335,21 @@ func (s *Server) notifyIPDeniedWebhook(remoteIP, method, reqURL string) {
 // country_denied event — kept separate from notifyWebhook for the same
 // reason as notifyIPDeniedWebhook: this event carries a remote IP (and
 // its resolved country) instead of a rule name.
-func (s *Server) notifyCountryDeniedWebhook(remoteIP, country, method, reqURL string) {
+func (s *Server) notifyCountryDeniedWebhook(remoteIP, country, method, reqURL, requestID string) {
 	label := country
 	if label == "" {
 		label = "unresolved"
 	}
 	text := fmt.Sprintf("[COUNTRY_DENIED] %s %s - %s (%s) not in country_allow_list, or in country_deny_list", method, reqURL, remoteIP, label)
 	s.deliverWebhookPayload(webhookAlert{
-		Text:     text,
-		Event:    "country_denied",
-		Method:   method,
-		URL:      reqURL,
-		Time:     time.Now().UTC().Format(time.RFC3339),
-		RemoteIP: remoteIP,
-		Country:  country,
+		Text:      text,
+		Event:     "country_denied",
+		Method:    method,
+		URL:       reqURL,
+		RequestID: requestID,
+		Time:      time.Now().UTC().Format(time.RFC3339),
+		RemoteIP:  remoteIP,
+		Country:   country,
 	})
 }
 

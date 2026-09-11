@@ -454,10 +454,10 @@ the shutdown summary (emitted as the same JSON shape `GET /_aiproxy/stats`
 serves, instead of the multi-line text block):
 
 ```
-{"time":"2026-01-01T12:00:00Z","level":"allow","method":"GET","url":"/get"}
-{"time":"2026-01-01T12:00:00Z","level":"latency","method":"GET","url":"/get","duration_ms":214}
-{"time":"2026-01-01T12:00:01Z","level":"block","method":"POST","url":"/x","rule":"aws-access-key"}
-{"time":"2026-01-01T12:00:02Z","level":"usage","method":"POST","url":"/chat","tokens":42}
+{"time":"2026-01-01T12:00:00Z","level":"allow","method":"GET","url":"/get","request_id":"a1b2c3d4-..."}
+{"time":"2026-01-01T12:00:00Z","level":"latency","method":"GET","url":"/get","request_id":"a1b2c3d4-...","duration_ms":214}
+{"time":"2026-01-01T12:00:01Z","level":"block","method":"POST","url":"/x","request_id":"e5f6a7b8-...","rule":"aws-access-key"}
+{"time":"2026-01-01T12:00:02Z","level":"usage","method":"POST","url":"/chat","request_id":"a1b2c3d4-...","tokens":42}
 {"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42,"per_target":{"default":{"allowed":2,"blocked":1,"rate_limited":0,"cache_hits":0,"total_tokens":42}}}
 ```
 
@@ -479,6 +479,10 @@ relevant, `duration_ms` only on `latency` (present even when it's
 genuinely `0` — a fast local response — since that's a real
 measurement, not the field being absent), `cost`/`budget` only on
 `budget_exceeded`, and `failed_target`/`next_target` only on `failover`.
+`request_id` appears on every event actually tied to one specific
+client request — see [Request correlation
+IDs](#request-correlation-ids) — and is absent on the handful of
+events that aren't (`target_ejected`/`target_recovered`, `error`).
 This only affects the ongoing per-request log stream on
 stderr; the one-time startup notices (`loaded N custom rule(s)`, `route:
 ...`, `aiproxy listening on ...`) still print as plain text on stdout,
@@ -539,6 +543,49 @@ already-started SSE response has no clean body to rewrite either way
 [Scanning responses too](#scanning-responses-too) for why that's an
 inherent limitation of streaming, not something content negotiation
 could fix.
+
+## Request correlation IDs
+
+Every request gets a unique ID — echoed back as `X-Request-Id` on
+every response aiproxy produces, whatever the outcome (forwarded,
+cached, blocked, rate-limited, any other rejection), and included as
+`request_id` on every log line and webhook payload that one request
+produces. No config needed — this is always on:
+
+```
+curl -i http://127.0.0.1:8080/v1/chat
+< X-Request-Id: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+```
+
+If the client already sent its own `X-Request-Id` (a gateway further
+upstream, say, that generates one per hop), aiproxy reuses it verbatim
+instead of generating a new one — so a single ID can trace a request
+across every hop it passed through, not just aiproxy's own. A
+client-supplied value is only trusted when it's safe to log and echo
+back as-is (letters, digits, and `-_.:`, up to 128 characters — the
+same shape a UUID, ULID, or W3C `traceparent`-style ID already fits
+inside); anything else is silently replaced with a freshly generated
+one rather than rejecting the request over what's ultimately a logging
+nicety. With no client-supplied ID, aiproxy generates its own — a
+random UUIDv4 — so there's always a real, unique ID to correlate on.
+
+This is the one piece of information that ties a client's own logs
+(they already have the ID, either because they sent it or because they
+read it off the response) to aiproxy's own — invaluable once you're
+trying to explain to a client "here's exactly what happened to *this*
+one request" out of a busy shared log stream. It's carried through to
+every [structured JSON log line](#structured-json-logging) as
+`request_id` and every [webhook alert](#webhook-alerts) the same way,
+so grepping one ID out of `--log-format json` output (or a durable
+[log file](#persistent-log-file), which always includes it regardless
+of `--log-format`) surfaces every line that one request produced. The
+handful of events with no single request to attribute
+(`target_ejected`/`target_recovered`, an internal `error`) simply omit
+it, same as `method`/`url` already do for those. The plain colored
+terminal text format doesn't repeat the ID inline on each line — it's
+meant for a human watching live output, where the ID would mostly be
+visual noise; for actual correlation, use `--log-format json` or the
+log file, both of which always carry it.
 
 ## Persistent log file
 
