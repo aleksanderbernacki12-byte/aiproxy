@@ -37,7 +37,7 @@ func TestCache_SetAndGet_RoundTrips(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	resp, hit, err := c.Get("key1")
+	resp, hit, _, err := c.Get("key1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestCache_SetAndGet_RoundTrips(t *testing.T) {
 func TestCache_Get_MissWhenKeyAbsent(t *testing.T) {
 	c := newTestCache(t)
 
-	_, hit, err := c.Get("never-set")
+	_, hit, _, err := c.Get("never-set")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestCache_TTL_ZeroMeansNoExpiry(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	_, hit, err := c.Get("key1")
+	_, hit, _, err := c.Get("key1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestCache_TTL_ExpiresOldEntry(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	_, hit, err := c.Get("key1")
+	_, hit, _, err := c.Get("key1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestCache_TTL_ExpiredEntryIsRemovedFromDisk(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	if _, hit, err := c.Get("key1"); err != nil || hit {
+	if _, hit, _, err := c.Get("key1"); err != nil || hit {
 		t.Fatalf("Get: hit=%v err=%v, want a miss", hit, err)
 	}
 
@@ -139,7 +139,7 @@ func TestCache_Set_ResetsAgeForTTL(t *testing.T) {
 	// 100ms since the first Set (which would have expired an 80ms TTL by
 	// now), but only 50ms since the second — must still be a hit.
 
-	_, hit, err := c.Get("key1")
+	_, hit, _, err := c.Get("key1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestCache_Clear_RemovesAllEntries(t *testing.T) {
 	}
 
 	for _, key := range []string{"key1", "key2"} {
-		if _, hit, err := c.Get(key); err != nil || hit {
+		if _, hit, _, err := c.Get(key); err != nil || hit {
 			t.Errorf("Get(%q) after Clear: hit=%v err=%v, want a miss", key, hit, err)
 		}
 	}
@@ -195,7 +195,7 @@ func TestCache_MaxSizeBytes_ZeroMeansUnbounded(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("key%d", i)
-		if _, hit, err := c.Get(key); err != nil || !hit {
+		if _, hit, _, err := c.Get(key); err != nil || !hit {
 			t.Errorf("Get(%s): hit=%v err=%v, want a hit — MaxSizeBytes=0 must never evict anything", key, hit, err)
 		}
 	}
@@ -227,10 +227,10 @@ func TestCache_MaxSizeBytes_EvictsOldestFirstOnceOverBudget(t *testing.T) {
 		t.Fatalf("Set key3: %v", err)
 	}
 
-	if _, hit, err := c.Get("key1"); err != nil || hit {
+	if _, hit, _, err := c.Get("key1"); err != nil || hit {
 		t.Errorf("Get(key1): hit=%v err=%v, want a miss — it should have been evicted as least-recently-used", hit, err)
 	}
-	if _, hit, err := c.Get("key3"); err != nil || !hit {
+	if _, hit, _, err := c.Get("key3"); err != nil || !hit {
 		t.Errorf("Get(key3): hit=%v err=%v, want a hit — the most recently written entry must survive", hit, err)
 	}
 
@@ -258,7 +258,7 @@ func TestCache_MaxSizeBytes_GetProtectsEntryFromEviction(t *testing.T) {
 	}
 	// Touch key1 — it's now more recently used than key2, even though
 	// key2 was written later.
-	if _, hit, err := c.Get("key1"); err != nil || !hit {
+	if _, hit, _, err := c.Get("key1"); err != nil || !hit {
 		t.Fatalf("Get key1 (priming): hit=%v err=%v, want a hit", hit, err)
 	}
 
@@ -266,10 +266,10 @@ func TestCache_MaxSizeBytes_GetProtectsEntryFromEviction(t *testing.T) {
 		t.Fatalf("Set key3: %v", err)
 	}
 
-	if _, hit, err := c.Get("key2"); err != nil || hit {
+	if _, hit, _, err := c.Get("key2"); err != nil || hit {
 		t.Errorf("Get(key2): hit=%v err=%v, want a miss — key2 was the least recently used, not key1", hit, err)
 	}
-	if _, hit, err := c.Get("key1"); err != nil || !hit {
+	if _, hit, _, err := c.Get("key1"); err != nil || !hit {
 		t.Errorf("Get(key1): hit=%v err=%v, want a hit — it was touched more recently than key2", hit, err)
 	}
 }
@@ -287,7 +287,7 @@ func TestCache_MaxSizeBytes_SingleOversizedEntrySurvives(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if _, hit, err := c.Get("key1"); err != nil || !hit {
+	if _, hit, _, err := c.Get("key1"); err != nil || !hit {
 		t.Errorf("Get(key1): hit=%v err=%v, want a hit — a single oversized entry must still be served", hit, err)
 	}
 }
@@ -321,10 +321,10 @@ func TestCache_MaxSizeBytes_ClearResetsAccounting(t *testing.T) {
 	if err := c.Set("key4", testResponse(body)); err != nil {
 		t.Fatalf("Set key4: %v", err)
 	}
-	if _, hit, err := c.Get("key3"); err != nil || !hit {
+	if _, hit, _, err := c.Get("key3"); err != nil || !hit {
 		t.Errorf("Get(key3): hit=%v err=%v, want a hit", hit, err)
 	}
-	if _, hit, err := c.Get("key4"); err != nil || !hit {
+	if _, hit, _, err := c.Get("key4"); err != nil || !hit {
 		t.Errorf("Get(key4): hit=%v err=%v, want a hit", hit, err)
 	}
 }
@@ -363,10 +363,10 @@ func TestCache_MaxSizeBytes_LoadsExistingEntriesOnNew(t *testing.T) {
 		t.Fatalf("Set key3: %v", err)
 	}
 
-	if _, hit, err := c2.Get("key1"); err != nil || hit {
+	if _, hit, _, err := c2.Get("key1"); err != nil || hit {
 		t.Errorf("Get(key1): hit=%v err=%v, want a miss — the oldest pre-existing entry should have been evicted", hit, err)
 	}
-	if _, hit, err := c2.Get("key3"); err != nil || !hit {
+	if _, hit, _, err := c2.Get("key3"); err != nil || !hit {
 		t.Errorf("Get(key3): hit=%v err=%v, want a hit", hit, err)
 	}
 }
@@ -386,5 +386,102 @@ func TestCache_Clear_OnMissingDirectoryIsNotAnError(t *testing.T) {
 
 	if err := c.Clear(); err != nil {
 		t.Fatalf("Clear on a missing directory = %v, want nil (already-empty is not an error)", err)
+	}
+}
+
+// TestCache_Get_ReportsAgeEvenWithoutTTL proves age is always computed
+// and returned on a hit, regardless of whether TTL is configured at all
+// — a cache with no expiry policy can still be asked "how old is this
+// entry."
+func TestCache_Get_ReportsAgeEvenWithoutTTL(t *testing.T) {
+	c := newTestCache(t)
+	if err := c.Set("key1", testResponse("v1")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	_, hit, age, err := c.Get("key1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !hit {
+		t.Fatal("hit = false, want true")
+	}
+	if age < 60*time.Millisecond {
+		t.Fatalf("age = %v, want at least 60ms", age)
+	}
+}
+
+// TestCache_Get_MissReportsZeroAge proves a miss always reports a zero
+// age — nothing to be old, so nothing to report.
+func TestCache_Get_MissReportsZeroAge(t *testing.T) {
+	c := newTestCache(t)
+	_, hit, age, err := c.Get("never-set")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if hit {
+		t.Fatal("hit = true, want false")
+	}
+	if age != 0 {
+		t.Fatalf("age = %v, want 0 on a miss", age)
+	}
+}
+
+// TestCache_IsStale_FalseWithoutTTL proves there is no "getting stale"
+// concept at all when TTL itself is unset — an entry that never
+// expires on its own has nothing to warn about, no matter how old it
+// actually is.
+func TestCache_IsStale_FalseWithoutTTL(t *testing.T) {
+	c := newTestCache(t)
+	if c.IsStale(365 * 24 * time.Hour) {
+		t.Fatal("IsStale = true with no TTL configured, want always false")
+	}
+}
+
+// TestCache_IsStale_FalseBeforeThresholdTrueAfter proves the threshold
+// is relative to TTL, not an absolute duration: comfortably fresh
+// (well under 80% of TTL) reports false, past it reports true, all
+// while still well short of TTL itself (which would make it a miss, not
+// a stale hit).
+func TestCache_IsStale_FalseBeforeThresholdTrueAfter(t *testing.T) {
+	c := newTestCache(t)
+	c.TTL = 100 * time.Second
+
+	if c.IsStale(50 * time.Second) {
+		t.Fatal("IsStale(50s) with TTL=100s = true, want false (well under the 80% threshold)")
+	}
+	if !c.IsStale(85 * time.Second) {
+		t.Fatal("IsStale(85s) with TTL=100s = false, want true (past the 80% threshold)")
+	}
+	if !c.IsStale(99 * time.Second) {
+		t.Fatal("IsStale(99s) with TTL=100s = false, want true (still under TTL itself, but well past the warning threshold)")
+	}
+}
+
+// TestCache_Get_StaleEntryStillServedAsAHit proves the staleness signal
+// is purely informational: an entry past the warning threshold but
+// still under its actual TTL is still returned as a real hit, not
+// treated as a miss.
+func TestCache_Get_StaleEntryStillServedAsAHit(t *testing.T) {
+	c := newTestCache(t)
+	c.TTL = 80 * time.Millisecond // threshold at 64ms
+	if err := c.Set("key1", testResponse("v1")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	time.Sleep(70 * time.Millisecond) // past the 64ms threshold, still under the 80ms TTL
+
+	resp, hit, age, err := c.Get("key1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !hit {
+		t.Fatal("hit = false, want true — a stale-but-not-expired entry must still be served")
+	}
+	if resp == nil {
+		t.Fatal("resp = nil on a reported hit")
+	}
+	if !c.IsStale(age) {
+		t.Fatalf("IsStale(%v) with TTL=80ms = false, want true", age)
 	}
 }

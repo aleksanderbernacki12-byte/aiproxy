@@ -908,6 +908,32 @@ their own, the same behavior as before this field existed.
 `aiproxy validate` rejects `cache_ttl_seconds` set without
 `cache_enabled` — a TTL for a cache that's off has nothing to expire.
 
+### Seeing how fresh a cache hit actually is
+
+Every cache hit carries a real `Age` header — the standard HTTP header
+(RFC 7234) for exactly this, in seconds — so a client can always tell
+how old the response it just got actually is, no config required:
+
+```
+< HTTP/1.1 200 OK
+< Age: 42
+```
+
+`Age` is present on every hit regardless of whether `cache_ttl_seconds`
+is even set — "how old is this" doesn't need an expiry policy to be a
+meaningful question. When `cache_ttl_seconds` *is* set, aiproxy also
+flags a hit as getting stale once its age crosses 80% of the TTL: a
+distinct `[CACHE HIT - STALE]` log line (yellow, instead of the usual
+purple) and its own `stale_cache_hits` count in `GET /_aiproxy/stats`
+and the Prometheus endpoint's `aiproxy_stale_cache_hits_total`,
+alongside the ordinary `cache_hits` every hit already gets. This is
+purely informational — a stale-flagged hit is still served exactly the
+same as any other; nothing about caching behavior itself changes, and
+an entry is only ever actually evicted once it's fully past
+`cache_ttl_seconds` (see above), not at this earlier warning point. The
+80% threshold isn't configurable — one reasonable default rather than
+another knob to tune per deployment.
+
 ### Capping the cache's disk usage
 
 `.aiproxy_cache/` has no size limit by default — left running long enough
@@ -1459,6 +1485,7 @@ can be monitored without waiting for Ctrl+C:
   "rate_limited": 0,
   "token_rate_limited": 0,
   "cache_hits": 5,
+  "stale_cache_hits": 1,
   "total_tokens": 3100,
   "response_blocked": 0,
   "response_redacted": 1,
@@ -1650,6 +1677,7 @@ aiproxy_requests_redacted_total{target="default"} 0
 aiproxy_requests_rate_limited_total{target="default"} 0
 aiproxy_requests_token_rate_limited_total{target="default"} 0
 aiproxy_cache_hits_total{target="default"} 5
+aiproxy_stale_cache_hits_total{target="default"} 1
 aiproxy_tokens_used_total{target="default"} 3100
 aiproxy_responses_blocked_total{target="default"} 0
 aiproxy_responses_redacted_total{target="default"} 1

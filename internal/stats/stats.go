@@ -34,6 +34,7 @@ type counters struct {
 	rateLimited      atomic.Int64
 	tokenRateLimited atomic.Int64
 	cacheHits        atomic.Int64
+	staleCacheHits   atomic.Int64
 	totalTokens      atomic.Int64
 	responseBlocked  atomic.Int64
 	responseRedacted atomic.Int64
@@ -52,6 +53,7 @@ func (c *counters) snapshot() Snapshot {
 		RateLimited:      c.rateLimited.Load(),
 		TokenRateLimited: c.tokenRateLimited.Load(),
 		CacheHits:        c.cacheHits.Load(),
+		StaleCacheHits:   c.staleCacheHits.Load(),
 		TotalTokens:      c.totalTokens.Load(),
 		ResponseBlocked:  c.responseBlocked.Load(),
 		ResponseRedacted: c.responseRedacted.Load(),
@@ -408,6 +410,15 @@ func (s *Stats) RecordCacheHit(target string) {
 	s.counterFor(target).cacheHits.Add(1)
 }
 
+// RecordStaleCacheHit records one cache hit whose age had already
+// crossed cache.Cache.IsStale's warning threshold — see RecordCacheHit,
+// which is always called alongside this for the same request; this
+// counts a subset of those, never a separate outcome of its own.
+func (s *Stats) RecordStaleCacheHit(target string) {
+	s.overall.staleCacheHits.Add(1)
+	s.counterFor(target).staleCacheHits.Add(1)
+}
+
 // RecordTokensUsed adds n to the running total of tokens used for
 // target, as reported by upstream responses.
 func (s *Stats) RecordTokensUsed(target string, n int) {
@@ -642,7 +653,15 @@ type Snapshot struct {
 	// specific target/route/key a request resolved to.
 	TokenRateLimited int64 `json:"token_rate_limited"`
 	CacheHits        int64 `json:"cache_hits"`
-	TotalTokens      int64 `json:"total_tokens"`
+
+	// StaleCacheHits counts how many of CacheHits were served past
+	// cache.Cache.IsStale's own warning threshold — still a genuine hit
+	// (never a miss; see cache.Cache.Get), just old enough relative to
+	// cache_ttl_seconds to be worth flagging. Always 0 when caching is
+	// disabled, or when cache_ttl_seconds itself is unset (nothing to be
+	// "relative to").
+	StaleCacheHits int64 `json:"stale_cache_hits"`
+	TotalTokens    int64 `json:"total_tokens"`
 
 	// ResponseBlocked and ResponseRedacted count the same two outcomes
 	// as Blocked and Redacted, but for a rule matching the upstream's
@@ -821,6 +840,12 @@ func (s Snapshot) String() string {
 	if s.TargetsRecovered > 0 {
 		out += fmt.Sprintf("\nTargets recovered:    %d", s.TargetsRecovered)
 	}
+	// Same reasoning again: 0 for every run that never configured
+	// cache_ttl_seconds, or that did but every cache hit was served
+	// comfortably fresh the whole run.
+	if s.StaleCacheHits > 0 {
+		out += fmt.Sprintf("\nStale cache hits:     %d", s.StaleCacheHits)
+	}
 	// Same reasoning again: 0 for every run that never configured a
 	// multi-URL target, or that did but never needed to actually use it.
 	if s.Failover > 0 {
@@ -868,6 +893,9 @@ func (s Snapshot) PerTargetString(costPer1KTokens float64) string {
 		}
 		if t.TokenRateLimited > 0 {
 			fmt.Fprintf(&b, " token-rate-limited=%d", t.TokenRateLimited)
+		}
+		if t.StaleCacheHits > 0 {
+			fmt.Fprintf(&b, " stale-cache-hits=%d", t.StaleCacheHits)
 		}
 		if t.Latency.Count > 0 {
 			fmt.Fprintf(&b, " avg-latency=%.1fms", t.Latency.AvgLatencyMillis())

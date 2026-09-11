@@ -148,46 +148,70 @@ func (c *Cache) path(key string) string {
 	return filepath.Join(c.dir, key+".bin")
 }
 
-// Get returns the cached response for key, if present and not expired.
-// The second return value reports whether a live cache entry existed; a
-// false with a nil error means a plain cache miss — including an entry
-// that existed but was older than TTL, which Get also removes from disk
-// on its way out, the same as if it had never been cached at all. A real
-// hit marks key most-recently-used in the LRU index, protecting it from
-// the next Set's size-based eviction.
-func (c *Cache) Get(key string) (*http.Response, bool, error) {
+// Get returns the cached response for key, if present and not expired,
+// along with its age — how long ago it was written (Set), regardless of
+// whether TTL is even configured — so a caller can report exactly how
+// fresh a cache hit actually is (see IsStale). The second return value
+// reports whether a live cache entry existed; a false with a nil error
+// means a plain cache miss — including an entry that existed but was
+// older than TTL, which Get also removes from disk on its way out, the
+// same as if it had never been cached at all (age is always zero
+// alongside a miss). A real hit marks key most-recently-used in the LRU
+// index, protecting it from the next Set's size-based eviction.
+func (c *Cache) Get(key string) (*http.Response, bool, time.Duration, error) {
 	path := c.path(key)
 
-	if c.TTL > 0 {
-		info, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil, false, nil
-			}
-			return nil, false, err
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, 0, nil
 		}
-		if time.Since(info.ModTime()) > c.TTL {
-			os.Remove(path) // best-effort: a failed cleanup just leaves a stale, inert file behind
-			c.forget(key)
-			return nil, false, nil
-		}
+		return nil, false, 0, err
+	}
+	age := time.Since(info.ModTime())
+	if c.TTL > 0 && age > c.TTL {
+		os.Remove(path) // best-effort: a failed cleanup just leaves a stale, inert file behind
+		c.forget(key)
+		return nil, false, 0, nil
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, false, nil
+			return nil, false, 0, nil
 		}
-		return nil, false, err
+		return nil, false, 0, err
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(data)), nil)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 
 	c.touch(key, int64(len(data)))
-	return resp, true, nil
+	return resp, true, age, nil
+}
+
+// staleThresholdRatio is the fraction of TTL past which IsStale flags a
+// cache hit as getting old — purely informational: an entry is only
+// ever actually evicted once it's fully past TTL (see Get above), not
+// at this earlier point. Not exposed as config — one universally
+// reasonable default rather than a knob every deployment needs to tune,
+// the same reasoning behind the anomaly package's own unexported
+// minRequestsFloor/emaAlpha constants.
+const staleThresholdRatio = 0.8
+
+// IsStale reports whether age — a cache hit's own age, as returned by
+// Get — has crossed staleThresholdRatio of c.TTL, a signal that this
+// entry will need refreshing soon. Always false when TTL itself is
+// unset (c.TTL <= 0): there is no "getting old relative to TTL" without
+// a TTL to be relative to, the same as an entry that never expires on
+// its own having nothing to warn about.
+func (c *Cache) IsStale(age time.Duration) bool {
+	if c.TTL <= 0 {
+		return false
+	}
+	return age >= time.Duration(float64(c.TTL)*staleThresholdRatio)
 }
 
 // Set dumps resp, including its body, and stores it under key. A

@@ -622,6 +622,18 @@ type logEvent struct {
 	// int64 would incorrectly drop it in exactly that case.
 	DurationMS *int64 `json:"duration_ms,omitempty"`
 
+	// AgeSeconds and Stale are only set on a cache_hit event: how many
+	// seconds old the served entry was (see cache.Cache.Get), and
+	// whether that age had already crossed cache.Cache.IsStale's warning
+	// threshold — never a reason to treat the hit as a miss, purely
+	// informational, the same "still genuinely served" semantics
+	// IsStale's own doc comment describes. AgeSeconds is a pointer, not
+	// a plain int, for the same reason DurationMS is: an entry served
+	// the instant after being cached has a real, meaningful age of
+	// exactly 0, not the same thing as the field being absent.
+	AgeSeconds *int `json:"age_seconds,omitempty"`
+	Stale      bool `json:"stale,omitempty"`
+
 	Message string `json:"message,omitempty"`
 }
 
@@ -1721,13 +1733,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if cch := s.getCache(); cch != nil {
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
 		cacheKey = cache.Key(r.Method, targets[0].ResolveReference(destURL).String(), body)
-		if cached, hit, err := cch.Get(cacheKey); err == nil && hit {
+		if cached, hit, age, err := cch.Get(cacheKey); err == nil && hit {
 			defer cached.Body.Close()
 			copyHeader(w.Header(), cached.Header)
+			// Set after copyHeader, so this always wins over whatever
+			// Age (if any) the original upstream response itself might
+			// have carried — that value described a different cache's
+			// own staleness, not aiproxy's.
+			w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
+			stale := cch.IsStale(age)
 			w.WriteHeader(cached.StatusCode)
 			io.Copy(w, cached.Body)
 			s.Stats.RecordCacheHit(targetLabel)
-			s.logCacheHit(r.Method, r.URL.String())
+			if stale {
+				s.Stats.RecordStaleCacheHit(targetLabel)
+			}
+			s.logCacheHit(r.Method, r.URL.String(), age, stale)
 			return
 		}
 	}
@@ -2431,13 +2452,24 @@ func (s *Server) logUsage(method, reqURL string, totalTokens int) {
 	s.logf("%s[USAGE] %s %s - Tokens used: %d%s", ansiBlue, method, reqURL, totalTokens, ansiReset)
 }
 
-func (s *Server) logCacheHit(method, reqURL string) {
-	ev := s.recordLogEvent(logEvent{Level: "cache_hit", Method: method, URL: reqURL})
+// logCacheHit logs a request served from cache — age is how old the
+// served entry was (see cache.Cache.Get), and stale reports whether
+// that age had already crossed cache.Cache.IsStale's warning threshold,
+// rendered as a visually distinct log line (yellow instead of the usual
+// purple) so an operator watching the log stream notices a cache that's
+// due for a refresh without needing to poll /_aiproxy/stats.
+func (s *Server) logCacheHit(method, reqURL string, age time.Duration, stale bool) {
+	ageSeconds := int(age.Seconds())
+	ev := s.recordLogEvent(logEvent{Level: "cache_hit", Method: method, URL: reqURL, AgeSeconds: &ageSeconds, Stale: stale})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
 		return
 	}
-	s.logf("%s[CACHE HIT] %s %s%s", ansiPurple, method, reqURL, ansiReset)
+	if stale {
+		s.logf("%s[CACHE HIT - STALE] %s %s - age %ds%s", ansiYellow, method, reqURL, ageSeconds, ansiReset)
+		return
+	}
+	s.logf("%s[CACHE HIT] %s %s - age %ds%s", ansiPurple, method, reqURL, ageSeconds, ansiReset)
 }
 
 func (s *Server) logRedact(method, reqURL, ruleName string) {
@@ -2960,6 +2992,9 @@ type statsSnapshotJSON struct {
 	// RateLimited, which is the plain request-count breaker.
 	TokenRateLimited int64 `json:"token_rate_limited"`
 	CacheHits        int64 `json:"cache_hits"`
+
+	// StaleCacheHits mirrors stats.Snapshot.StaleCacheHits — see there.
+	StaleCacheHits   int64 `json:"stale_cache_hits"`
 	TotalTokens      int64 `json:"total_tokens"`
 	ResponseBlocked  int64 `json:"response_blocked"`
 	ResponseRedacted int64 `json:"response_redacted"`
@@ -3039,6 +3074,7 @@ func toStatsSnapshotJSON(snap stats.Snapshot, costPer1KTokens float64) statsSnap
 		RateLimited:            snap.RateLimited,
 		TokenRateLimited:       snap.TokenRateLimited,
 		CacheHits:              snap.CacheHits,
+		StaleCacheHits:         snap.StaleCacheHits,
 		TotalTokens:            snap.TotalTokens,
 		ResponseBlocked:        snap.ResponseBlocked,
 		ResponseRedacted:       snap.ResponseRedacted,
@@ -3154,6 +3190,7 @@ var promCounters = []struct {
 	{"aiproxy_requests_rate_limited_total", "Total number of requests rejected by the rate limiter.", func(s stats.Snapshot) int64 { return s.RateLimited }},
 	{"aiproxy_requests_token_rate_limited_total", "Total number of requests rejected by the token-based rate limiter.", func(s stats.Snapshot) int64 { return s.TokenRateLimited }},
 	{"aiproxy_cache_hits_total", "Total number of requests served from the local response cache.", func(s stats.Snapshot) int64 { return s.CacheHits }},
+	{"aiproxy_stale_cache_hits_total", "Total number of cache hits served past their entry's own staleness warning threshold, relative to cache_ttl_seconds.", func(s stats.Snapshot) int64 { return s.StaleCacheHits }},
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
 	{"aiproxy_responses_redacted_total", "Total number of upstream responses forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.ResponseRedacted }},

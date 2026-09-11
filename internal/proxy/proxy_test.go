@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1405,6 +1406,191 @@ func TestServer_CacheTTL_ExpiredEntryForcesFreshUpstreamHit(t *testing.T) {
 	}
 }
 
+// TestServer_CacheHit_SetsAgeHeader proves every cache hit carries a
+// real, standard Age header (RFC 7234) reporting how long ago the
+// response was actually cached — present even with no TTL configured
+// at all, since "how old is this" doesn't depend on having an expiry
+// policy.
+func TestServer_CacheHit_SetsAgeHeader(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	post().Body.Close() // first request: populates the cache
+	time.Sleep(70 * time.Millisecond)
+	resp := post() // second: a real cache hit
+	defer resp.Body.Close()
+
+	age := resp.Header.Get("Age")
+	if age == "" {
+		t.Fatal("Age header missing on a cache hit")
+	}
+	ageSeconds, err := strconv.Atoi(age)
+	if err != nil {
+		t.Fatalf("Age header = %q, want an integer number of seconds: %v", age, err)
+	}
+	if ageSeconds < 0 {
+		t.Fatalf("Age header = %d, want a non-negative age", ageSeconds)
+	}
+}
+
+// TestServer_CacheHit_StaleAfterThreshold proves a cache hit whose age
+// has crossed the cache package's own staleness warning threshold
+// (80% of TTL) is still served as a genuine hit — the upstream is never
+// contacted again — while being flagged distinctly: a
+// [CACHE HIT - STALE] log line and a separate StaleCacheHits counter,
+// on top of the ordinary CacheHits count every hit already gets.
+func TestServer_CacheHit_StaleAfterThreshold(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	c.TTL = 100 * time.Millisecond // staleness threshold at 80ms
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	post().Body.Close()
+	time.Sleep(90 * time.Millisecond) // past the 80ms staleness threshold, still under the 100ms TTL
+	resp := post()
+	defer resp.Body.Close()
+
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream received %d requests, want 1 (a stale-but-not-expired entry must still be served as a hit)", got)
+	}
+	if !strings.Contains(logBuf.String(), "[CACHE HIT - STALE]") {
+		t.Fatalf("log missing [CACHE HIT - STALE]: %q", logBuf.String())
+	}
+	snap := srv.Stats.Snapshot()
+	if snap.CacheHits != 1 {
+		t.Errorf("CacheHits = %d, want 1 (the first request populates the cache; only the second is an actual hit)", snap.CacheHits)
+	}
+	if snap.StaleCacheHits != 1 {
+		t.Errorf("StaleCacheHits = %d, want 1 (that one hit was stale)", snap.StaleCacheHits)
+	}
+
+	// Checked against the real GET /_aiproxy/stats wire body too, not
+	// just the internal stats.Snapshot struct: those are two separate
+	// hand-maintained shapes (see statsSnapshotJSON/toStatsSnapshotJSON)
+	// that have drifted out of sync before (the v0.37 latency field gap)
+	// — a new Snapshot field is only actually live once it's threaded
+	// through both.
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var wire map[string]any
+	if err := json.NewDecoder(statsResp.Body).Decode(&wire); err != nil {
+		t.Fatalf("decode /_aiproxy/stats: %v", err)
+	}
+	if got, ok := wire["stale_cache_hits"].(float64); !ok || got != 1 {
+		t.Fatalf(`/_aiproxy/stats["stale_cache_hits"] = %v, want 1`, wire["stale_cache_hits"])
+	}
+}
+
+// TestServer_CacheHit_NotStaleBeforeThreshold proves a comfortably
+// fresh cache hit (well under the 80% threshold) is never flagged or
+// counted as stale.
+func TestServer_CacheHit_NotStaleBeforeThreshold(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	c.TTL = 500 * time.Millisecond // staleness threshold at 400ms
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	post().Body.Close()
+	time.Sleep(50 * time.Millisecond) // comfortably under the 400ms threshold
+	resp := post()
+	defer resp.Body.Close()
+
+	if strings.Contains(logBuf.String(), "STALE") {
+		t.Fatalf("log unexpectedly mentions staleness for a fresh hit: %q", logBuf.String())
+	}
+	if got := srv.Stats.Snapshot().StaleCacheHits; got != 0 {
+		t.Fatalf("StaleCacheHits = %d, want 0 for a comfortably fresh hit", got)
+	}
+}
+
 // TestServer_CacheMaxSizeBytes_EvictsLeastRecentlyUsedEndToEnd proves
 // Server.Cache.MaxSizeBytes is honored end-to-end through the proxy:
 // once enough distinct cached responses push the total over budget, the
@@ -1907,7 +2093,7 @@ func TestServer_StreamingResponse_AbortedStreamIsNeverCached(t *testing.T) {
 
 	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
 	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
-	if _, hit, err := c.Get(key); err != nil {
+	if _, hit, _, err := c.Get(key); err != nil {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {
 		t.Fatal("an aborted stream must never be cached, but a cache entry was found")
@@ -2083,7 +2269,7 @@ func TestServer_ResponseSecretScanning_BlocksStreamOnSecretAndNeverCaches(t *tes
 
 	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
 	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
-	if _, hit, err := c.Get(key); err != nil {
+	if _, hit, _, err := c.Get(key); err != nil {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {
 		t.Fatal("a stream cut short by a response Block rule must never be cached, but a cache entry was found")
