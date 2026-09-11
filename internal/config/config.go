@@ -605,6 +605,32 @@ type Config struct {
 	// CacheTTLSeconds.
 	CacheMaxSizeBytes int64 `json:"cache_max_size_bytes,omitempty"`
 
+	// IdempotencyEnabled turns on Idempotency-Key deduplication: a
+	// client that sends the same Idempotency-Key header on a retried
+	// request gets back the exact same response instead of triggering a
+	// second (and possibly separately billed) upstream call — including
+	// when the retry arrives while the first attempt is still in
+	// flight, in which case it waits for that attempt to finish rather
+	// than forwarding a duplicate. Deliberately independent of
+	// CacheEnabled: a cache hit is about content ("has this exact body
+	// been sent before, to anyone"), this is about intent ("is this the
+	// same caller retrying the same logical operation"). Records live
+	// only in memory and are lost on restart. false (the default) means
+	// an Idempotency-Key header, if sent, is simply ignored — unchanged
+	// from before this field existed.
+	IdempotencyEnabled bool `json:"idempotency_enabled,omitempty"`
+
+	// IdempotencyTTLSeconds is how long a completed record stays
+	// replayable after it was produced, in seconds — required whenever
+	// IdempotencyEnabled is true, unlike CacheTTLSeconds' own "zero
+	// means never expire" default: idempotency records live in memory
+	// with no separate size cap the way the on-disk cache has
+	// (CacheMaxSizeBytes), so leaving them to accumulate forever isn't
+	// a safe default here. Only meaningful alongside IdempotencyEnabled
+	// — setting this without it is a config error, same reasoning as
+	// CacheTTLSeconds requiring CacheEnabled.
+	IdempotencyTTLSeconds int `json:"idempotency_ttl_seconds,omitempty"`
+
 	// CostPer1KTokens prices the shutdown summary's total token count at
 	// this rate per 1,000 tokens, in whatever currency and rate the user
 	// knows applies to their own usage. Zero (the default when the field

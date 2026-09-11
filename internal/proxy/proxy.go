@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -37,6 +38,7 @@ import (
 	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/geoip"
+	"aiproxy/internal/idempotency"
 	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/rules"
@@ -134,6 +136,16 @@ type requestContextInfo struct {
 	// one from) — carried through to logUsageFromBody the same way
 	// clientLabel is, for stats.Stats.CrossedClientBudget.
 	clientCostBudget float64
+
+	// idempotencyClient/idempotencyKey identify this request's own
+	// Idempotency-Key claim (see Server.Idempotency) — both empty when
+	// idempotency isn't enabled, no header was sent, or the header
+	// value was invalid. Carried through to modifyResponse so
+	// bufferResponse/streamResponse can Store the real response once
+	// it's known, the same way cacheKey lets them write the on-disk
+	// cache entry.
+	idempotencyClient string
+	idempotencyKey    string
 
 	// tokenLimiter is the effective token-based rate limiter for this
 	// request (the authenticated key's own, else the resolved route's,
@@ -565,6 +577,18 @@ type Server struct {
 	// max_requests_per_minute_per_ip isn't configured) disables this
 	// entirely.
 	IPLimiter *iplimiter.Registry
+
+	// Idempotency, if non-nil, deduplicates a retried request that
+	// carries the same Idempotency-Key header — see the idempotency
+	// package's own doc comment for the full behavior. Checked in
+	// ServeHTTP right after the request body is read (so a retry's
+	// body can be hashed for conflict detection) and before route
+	// resolution or the cache check, deliberately independent of
+	// Cache/CacheEnabled: a cache hit is about content, this is about
+	// caller intent. nil (the default, whenever idempotency_enabled
+	// isn't configured) disables this entirely — an Idempotency-Key
+	// header, if sent, is simply ignored.
+	Idempotency *idempotency.Registry
 
 	// GeoIPTable resolves a client IP to its country code, for
 	// CountryAllowList/CountryDenyList — nil (the default, whenever
@@ -1206,6 +1230,33 @@ func (s *Server) runIPLimiterSweep(ctx context.Context) {
 	}
 }
 
+// idempotencySweepInterval is how often runIdempotencySweep asks
+// Idempotency to forget completed records past their own TTL — see
+// idempotency.Registry.Sweep. Fixed rather than configurable, the same
+// "one reasonable default" reasoning as ipLimiterSweepInterval.
+const idempotencySweepInterval = time.Minute
+
+// runIdempotencySweep runs until ctx is cancelled (see ListenAndServe),
+// periodically evicting Idempotency's completed-and-expired records so
+// a long-running process with a busy retry-heavy workload doesn't
+// remember every distinct idempotency key it has ever seen. A no-op
+// loop, at the same fixed cadence, whenever Idempotency is nil —
+// re-read fresh every iteration, so enabling idempotency_enabled via a
+// live SIGHUP reload starts actually sweeping on the very next tick, no
+// restart needed.
+func (s *Server) runIdempotencySweep(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(idempotencySweepInterval):
+		}
+		if idem := s.getIdempotency(); idem != nil {
+			idem.Sweep()
+		}
+	}
+}
+
 // allCandidateTargets returns every distinct candidate upstream URL
 // currently configured — Target plus every route's and model route's
 // own targets — deduplicated by URL string so a candidate reused
@@ -1628,6 +1679,12 @@ func (s *Server) getIPLimiter() *iplimiter.Registry {
 	return s.IPLimiter
 }
 
+func (s *Server) getIdempotency() *idempotency.Registry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Idempotency
+}
+
 // clientIP extracts and parses the remote TCP peer's IP address from
 // r.RemoteAddr — deliberately never a client-supplied header like
 // X-Forwarded-For, which any caller could set to whatever value they
@@ -1894,7 +1951,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1941,6 +1998,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.TargetShadowURL = targetShadowURL
 	s.TargetShadowSampleRate = targetShadowSampleRate
 	s.CostBudgetHardStop = costBudgetHardStop
+	s.Idempotency = idempotencyRegistry
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2393,6 +2451,54 @@ func generateRequestID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// idempotencyKeyHeader is the fixed header name a client sets to opt
+// one specific request into idempotency-key deduplication — the same
+// convention Stripe's and OpenAI's own APIs already use, so an existing
+// client retry implementation typically needs no changes at all to
+// benefit from this once idempotency_enabled is turned on.
+const idempotencyKeyHeader = "Idempotency-Key"
+
+// maxIdempotencyKeyLen caps how long a client-supplied Idempotency-Key
+// is still trusted at — same reasoning and same value as
+// maxRequestIDLen: generous for any real key scheme (a UUID is 36
+// characters) while never letting this header smuggle an outsized value
+// into the in-memory idempotency registry.
+const maxIdempotencyKeyLen = 128
+
+// resolveIdempotencyKey returns r's own Idempotency-Key header value
+// when it's present and safe to use as an in-memory map key, otherwise
+// "". Unlike resolveRequestID, there is deliberately no fallback to a
+// freshly generated value: an idempotency key only does anything useful
+// when the SAME caller sends the SAME value again on a retry, so a
+// server-generated one (never seen by the client, and different every
+// call) would be pointless busywork rather than a safe default — an
+// absent or invalid key simply means this one request gets no
+// idempotency protection, not that it's rejected or gets a substitute.
+func resolveIdempotencyKey(r *http.Request) string {
+	key := r.Header.Get(idempotencyKeyHeader)
+	if key == "" || !validIdempotencyKey(key) {
+		return ""
+	}
+	return key
+}
+
+// validIdempotencyKey applies the same conservative charset/length
+// shape as validRequestID — see its own doc comment for why.
+func validIdempotencyKey(key string) bool {
+	if len(key) > maxIdempotencyKeyLen {
+		return false
+	}
+	for _, c := range key {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.' || c == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // checkNetworkAndAuthAccess runs the three independent gates every
 // request — whether ordinary proxy traffic or a request for the admin
 // surface — must pass before anything else happens: the IP allow/deny
@@ -2611,6 +2717,52 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Idempotency-Key handling, checked before route resolution or the
+	// cache lookup below — a replay or conflict is resolved purely from
+	// (client, key, body), with no need to know which target this
+	// request would otherwise have gone to. See Server.Idempotency's
+	// own doc comment for the full behavior; idempotencyKey stays ""
+	// (a no-op everywhere else in this function) whenever idempotency
+	// isn't enabled, no header was sent, or the header value was
+	// invalid.
+	var idempotencyKey string
+	if idem := s.getIdempotency(); idem != nil {
+		if idempotencyKey = resolveIdempotencyKey(r); idempotencyKey != "" {
+			bodyHash := sha256.Sum256(body)
+			switch resp, outcome := idem.Claim(auth.label, idempotencyKey, bodyHash); outcome {
+			case idempotency.Replay:
+				copyHeader(w.Header(), resp.Header)
+				w.Header().Set("Idempotency-Replayed", "true")
+				w.WriteHeader(resp.StatusCode)
+				w.Write(resp.Body)
+				s.Stats.RecordIdempotencyReplay()
+				s.logIdempotencyReplay(r.Method, r.URL.String(), requestID, idempotencyKey)
+				return
+			case idempotency.Conflict:
+				s.Stats.RecordIdempotencyConflict()
+				s.logIdempotencyConflict(r.Method, r.URL.String(), requestID, idempotencyKey)
+				writeError(w, r, http.StatusConflict, "idempotency_key_conflict", "idempotency key already used for a request with a different body", "")
+				return
+			case idempotency.Timeout:
+				writeError(w, r, http.StatusServiceUnavailable, "idempotency_key_in_progress", "an earlier request with this idempotency key is still in progress", "")
+				return
+			case idempotency.Own:
+				// Own means this goroutine must eventually call either
+				// Store (a real response was produced — see
+				// bufferResponse/streamResponse/the cache-hit branch
+				// below, all of which do via reqCtx.idempotencyKey) or
+				// Release. A single deferred Release call, registered
+				// unconditionally right now, correctly covers every one
+				// of ServeHTTP's own early returns between here and
+				// forwarding (a rule block, rate limit, cost-budget
+				// hard-stop, anomaly detection) without needing to touch
+				// each of those individually: Release is a safe no-op
+				// once Store has already run, see its own doc comment.
+				defer idem.Release(auth.label, idempotencyKey)
+			}
+		}
+	}
+
 	// Resolved once so the cache key (below) and the actual forwarding
 	// (in Rewrite, via the request context set further down) can never
 	// disagree about which target and path this request maps to. targets
@@ -2664,7 +2816,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
 			stale := cch.IsStale(age, ttl)
 			w.WriteHeader(cached.StatusCode)
-			io.Copy(w, cached.Body)
+			// A cache hit never reaches bufferResponse/streamResponse —
+			// the only two places that otherwise call Idempotency.Store
+			// — so an owned idempotency claim (idempotencyKey != "")
+			// must be completed right here instead, or the deferred
+			// Release above would incorrectly abandon a claim that was
+			// actually served just fine. The body needs to be buffered
+			// (rather than the plain io.Copy the no-idempotency case
+			// still uses below) purely so Store has real bytes to keep.
+			if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
+				cachedBody, readErr := io.ReadAll(cached.Body)
+				w.Write(cachedBody)
+				if readErr == nil {
+					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: cachedBody})
+				}
+			} else {
+				io.Copy(w, cached.Body)
+			}
 			s.Stats.RecordCacheHit(targetLabel)
 			if stale {
 				s.Stats.RecordStaleCacheHit(targetLabel)
@@ -2817,17 +2985,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rewritten to the absolute upstream URL, and they need the exact
 	// same target/cache key ServeHTTP already resolved and checked.
 	reqCtx := requestContextInfo{
-		method:           r.Method,
-		url:              r.URL.String(),
-		requestID:        requestID,
-		cacheKey:         cacheKey,
-		targets:          targets,
-		forwardPath:      forwardPath,
-		targetLabel:      targetLabel,
-		clientLabel:      auth.label,
-		clientCostBudget: auth.costBudget,
-		tokenLimiter:     effectiveTokenLimiter,
-		latency:          new(time.Duration),
+		method:            r.Method,
+		url:               r.URL.String(),
+		requestID:         requestID,
+		cacheKey:          cacheKey,
+		targets:           targets,
+		forwardPath:       forwardPath,
+		targetLabel:       targetLabel,
+		clientLabel:       auth.label,
+		clientCostBudget:  auth.costBudget,
+		tokenLimiter:      effectiveTokenLimiter,
+		latency:           new(time.Duration),
+		idempotencyClient: auth.label,
+		idempotencyKey:    idempotencyKey,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -2933,6 +3103,21 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		}
 	}
 
+	// Unlike the cache write above, not restricted to a 200: a client
+	// retry with the same Idempotency-Key deserves the exact same real
+	// answer regardless of whether that answer was itself an upstream
+	// error — see Server.Idempotency's own doc comment. A response this
+	// function already blocked outright (the early return above) never
+	// reaches here, so it's never stored for replay either — a future
+	// retry gets evaluated fresh instead of being stuck on a stale
+	// block, the same reasoning a rate-limited/rejected REQUEST already
+	// gets via the deferred Release in ServeHTTP.
+	if reqCtx.idempotencyKey != "" {
+		if idem := s.getIdempotency(); idem != nil {
+			idem.Store(reqCtx.idempotencyClient, reqCtx.idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body})
+		}
+	}
+
 	s.logUsageFromBody(reqCtx, body)
 
 	return nil
@@ -2978,6 +3163,15 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// cleanEOF is false for it too (see streamTee.Read).
 		if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
 			s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data)
+		}
+		// Same "any status code, but only a clean, complete stream"
+		// reasoning as bufferResponse's own Store call — see there for
+		// why this isn't restricted to a 200 the way the cache write
+		// above is.
+		if cleanEOF && reqCtx.idempotencyKey != "" {
+			if idem := s.getIdempotency(); idem != nil {
+				idem.Store(reqCtx.idempotencyClient, reqCtx.idempotencyKey, &idempotency.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
+			}
 		}
 		s.logUsageFromBody(reqCtx, data)
 	}
@@ -3540,6 +3734,30 @@ func (s *Server) logCacheHit(method, reqURL, requestID string, age time.Duration
 		return
 	}
 	s.logf("%s[CACHE HIT] %s %s - age %ds%s", ansiPurple, method, reqURL, ageSeconds, ansiReset)
+}
+
+// logIdempotencyReplay logs a request served by replaying an earlier
+// response for the same Idempotency-Key — see
+// idempotency.Registry.Claim's Replay outcome.
+func (s *Server) logIdempotencyReplay(method, reqURL, requestID, idempotencyKey string) {
+	ev := s.recordLogEvent(logEvent{Level: "idempotency_replay", Method: method, URL: reqURL, RequestID: requestID, Message: fmt.Sprintf("idempotency key %q", idempotencyKey)})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[IDEMPOTENCY REPLAY] %s %s - key %q%s", ansiPurple, method, reqURL, idempotencyKey, ansiReset)
+}
+
+// logIdempotencyConflict logs a request rejected because its
+// Idempotency-Key was already in use for a request with a genuinely
+// different body — see idempotency.Registry.Claim's Conflict outcome.
+func (s *Server) logIdempotencyConflict(method, reqURL, requestID, idempotencyKey string) {
+	ev := s.recordLogEvent(logEvent{Level: "idempotency_conflict", Method: method, URL: reqURL, RequestID: requestID, Message: fmt.Sprintf("idempotency key %q", idempotencyKey)})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[IDEMPOTENCY CONFLICT] %s %s - key %q reused with a different request body%s", ansiBrightRed, method, reqURL, idempotencyKey, ansiReset)
 }
 
 func (s *Server) logRedact(method, reqURL, ruleName, requestID string) {
@@ -4167,6 +4385,12 @@ type statsSnapshotJSON struct {
 	// always 0 inside per_target — same reasoning as IPDenied.
 	BudgetRejected int64 `json:"budget_rejected"`
 
+	// IdempotencyReplayed/IdempotencyConflicts are likewise only
+	// meaningful at the top level, and always 0 inside per_target —
+	// same reasoning as IPDenied.
+	IdempotencyReplayed  int64 `json:"idempotency_replayed"`
+	IdempotencyConflicts int64 `json:"idempotency_conflicts"`
+
 	// CountryDenied is likewise only meaningful at the top level, and
 	// always 0 inside per_target — same reasoning as IPDenied.
 	CountryDenied int64 `json:"country_denied"`
@@ -4228,6 +4452,8 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		IPRateLimited:          snap.IPRateLimited,
 		DrainRejected:          snap.DrainRejected,
 		BudgetRejected:         snap.BudgetRejected,
+		IdempotencyReplayed:    snap.IdempotencyReplayed,
+		IdempotencyConflicts:   snap.IdempotencyConflicts,
 		CountryDenied:          snap.CountryDenied,
 		AnomalyDetected:        snap.AnomalyDetected,
 		TargetsEjected:         snap.TargetsEjected,
@@ -4638,6 +4864,15 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 	fmt.Fprintln(w, "# TYPE aiproxy_budget_rejected_total counter")
 	fmt.Fprintf(w, "aiproxy_budget_rejected_total %d\n", snap.BudgetRejected)
 
+	// Unlabeled: an idempotency replay/conflict is about a (client,
+	// key) pair, not about which target the request would have gone to.
+	fmt.Fprintln(w, "# HELP aiproxy_idempotency_replayed_total Total number of requests served by replaying an earlier response for the same Idempotency-Key.")
+	fmt.Fprintln(w, "# TYPE aiproxy_idempotency_replayed_total counter")
+	fmt.Fprintf(w, "aiproxy_idempotency_replayed_total %d\n", snap.IdempotencyReplayed)
+	fmt.Fprintln(w, "# HELP aiproxy_idempotency_conflicts_total Total number of requests rejected because their Idempotency-Key was already in use for a request with a different body.")
+	fmt.Fprintln(w, "# TYPE aiproxy_idempotency_conflicts_total counter")
+	fmt.Fprintf(w, "aiproxy_idempotency_conflicts_total %d\n", snap.IdempotencyConflicts)
+
 	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
 	// country-denied request never gets far enough to resolve a target.
 	fmt.Fprintln(w, "# HELP aiproxy_country_denied_total Total number of requests rejected by the GeoIP country allow/deny list.")
@@ -4847,6 +5082,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	go s.runHealthChecks(ctx)
 	go s.runIPLimiterSweep(ctx)
+	go s.runIdempotencySweep(ctx)
 
 	select {
 	case <-ctx.Done():

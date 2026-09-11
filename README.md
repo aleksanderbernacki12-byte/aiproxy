@@ -1218,6 +1218,56 @@ inherently a whole-cache-directory budget shared across every entry
 regardless of target, not something that makes sense to scope per
 target the way TTL/enabled do.
 
+### Idempotency-Key deduplication
+
+The cache above is about *content*: has this exact body been sent
+before, to anyone. `idempotency_enabled` is about *intent*: is this the
+same caller retrying the same logical operation. A client that sets the
+`Idempotency-Key` header — the same convention Stripe's and OpenAI's
+own APIs already use — gets back the exact same response on a retry
+instead of triggering a second (and possibly separately billed)
+upstream call, even if general caching is off entirely:
+
+```json
+{
+  "idempotency_enabled": true,
+  "idempotency_ttl_seconds": 300
+}
+```
+
+`idempotency_ttl_seconds` is required whenever `idempotency_enabled` is
+true — unlike `cache_ttl_seconds`'s own "zero means never expire"
+default, idempotency records live only in memory with no separate size
+cap the on-disk cache has (`cache_max_size_bytes`), so leaving them to
+accumulate forever isn't a safe default here.
+
+The interesting case isn't a retry that arrives after the first attempt
+already finished — that's a plain replay. It's a retry that arrives
+*while the first attempt is still in flight*, the most common real
+trigger for idempotency keys in practice (a client times out waiting on
+a slow completion and retries immediately, with the original call still
+running upstream). That retry waits for the first attempt to finish,
+then gets its exact response — it never triggers a second forward of
+its own. A retry that reuses the same key with a genuinely *different*
+body gets a `409 Conflict` instead of either replaying the wrong
+response or silently forwarding a second, different one. A replayed
+response carries `Idempotency-Replayed: true` so the client can tell.
+
+Keys are scoped per authenticated caller (the same [`proxy_api_key`
+identity](#authenticating-requests-to-the-proxy) stats/rate limits
+already use) — two different callers using the exact same key value
+never collide. A request that never reaches a real answer (blocked by a
+rule, rate-limited, or rejected by [cost-budget hard-stop](#cost-budget-hard-stop)
+before ever forwarding) never claims its key permanently either — a
+retry with the same key and body is evaluated fresh instead of being
+stuck replaying a stale rejection. Each replay/conflict is logged
+(`[IDEMPOTENCY REPLAY]`/`[IDEMPOTENCY CONFLICT]`) and counted in
+`stats.idempotency_replayed`/`idempotency_conflicts` and the Prometheus
+`aiproxy_idempotency_replayed_total`/`aiproxy_idempotency_conflicts_total`
+counters. Records are held only in memory and are lost on restart —
+the right tradeoff for a mechanism whose whole point is protecting a
+narrow, recent retry window, not long-term persistence.
+
 `cost_per_1k_tokens` is optional and off by default (no cost line at
 all). aiproxy has no built-in, inevitably-stale pricing table — you tell
 it what rate applies to your own usage (whatever your provider actually

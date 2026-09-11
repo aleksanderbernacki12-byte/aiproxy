@@ -2191,6 +2191,66 @@ func TestExecute_Validate_ValidConfig_WithProxyAPIKeyCostBudgetHardStop_ReturnsZ
 	}
 }
 
+func TestExecute_Validate_IdempotencyEnabledWithoutTTL_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"idempotency_enabled": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "idempotency_enabled requires idempotency_ttl_seconds") {
+		t.Errorf("stderr missing the requires-ttl problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_NegativeIdempotencyTTLSeconds_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"idempotency_ttl_seconds": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "idempotency_ttl_seconds") || !strings.Contains(stderr.String(), "must not be negative") {
+		t.Errorf("stderr missing the negative idempotency_ttl_seconds problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithIdempotencyEnabled_ReportsSummary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"idempotency_enabled": true, "idempotency_ttl_seconds": 300}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "idempotency enabled:     true") {
+		t.Fatalf("stdout missing idempotency enabled summary line: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "idempotency ttl:         300s") {
+		t.Fatalf("stdout missing idempotency ttl summary line: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithLogFile_ReportsPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

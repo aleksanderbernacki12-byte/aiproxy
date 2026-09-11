@@ -204,6 +204,16 @@ type Stats struct {
 	budgetAlerted    atomic.Bool
 	budgetRejected   atomic.Int64
 
+	// idempotencyReplayed/idempotencyConflicts count Idempotency-Key
+	// activity — see Stats.RecordIdempotencyReplay/RecordIdempotencyConflict
+	// and the proxy package's own idempotency handling. Never broken
+	// down per target or per client, same "not every counter needs a
+	// breakdown" reasoning as Unauthorized: an idempotency replay/
+	// conflict is about a (client, key) pair, not about which target
+	// the request would have gone to.
+	idempotencyReplayed  atomic.Int64
+	idempotencyConflicts atomic.Int64
+
 	mu        sync.Mutex
 	perTarget map[string]*counters
 	perRule   map[string]*ruleCounters
@@ -682,6 +692,22 @@ func (s *Stats) RecordBudgetRejected() {
 	s.budgetRejected.Add(1)
 }
 
+// RecordIdempotencyReplay records one request served by replaying an
+// earlier response for the same Idempotency-Key, instead of forwarding
+// a duplicate — see the idempotency package's Registry.Claim (Replay
+// outcome).
+func (s *Stats) RecordIdempotencyReplay() {
+	s.idempotencyReplayed.Add(1)
+}
+
+// RecordIdempotencyConflict records one request rejected because its
+// Idempotency-Key was already in use for a request with a genuinely
+// different body — see the idempotency package's Registry.Claim
+// (Conflict outcome).
+func (s *Stats) RecordIdempotencyConflict() {
+	s.idempotencyConflicts.Add(1)
+}
+
 // ClientOverBudget is CrossedClientBudget's non-latching counterpart —
 // see OverBudget for the same reasoning, scoped to one client the same
 // way CrossedClientBudget itself is. client == "" is never over
@@ -859,6 +885,14 @@ type Snapshot struct {
 	// rejected request never gets far enough to resolve one.
 	BudgetRejected int64 `json:"budget_rejected"`
 
+	// IdempotencyReplayed/IdempotencyConflicts count Idempotency-Key
+	// activity — see Stats.RecordIdempotencyReplay/RecordIdempotencyConflict.
+	// Never broken down per target: an idempotency record is about a
+	// (client, key) pair, not about which target the request would
+	// have gone to.
+	IdempotencyReplayed  int64 `json:"idempotency_replayed"`
+	IdempotencyConflicts int64 `json:"idempotency_conflicts"`
+
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
 	// IPDenied (a different rejection reason), never broken down per
@@ -944,6 +978,8 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.IPRateLimited = s.ipRateLimited.Load()
 	snap.DrainRejected = s.drainRejected.Load()
 	snap.BudgetRejected = s.budgetRejected.Load()
+	snap.IdempotencyReplayed = s.idempotencyReplayed.Load()
+	snap.IdempotencyConflicts = s.idempotencyConflicts.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()
@@ -1035,6 +1071,12 @@ func (s Snapshot) String() string {
 	// actually crossed.
 	if s.BudgetRejected > 0 {
 		out += fmt.Sprintf("\nBudget-rejected (402): %d", s.BudgetRejected)
+	}
+	// Same reasoning again: 0 for every run that never configured
+	// idempotency_enabled, or that did but no client ever actually
+	// retried a request with the same Idempotency-Key.
+	if s.IdempotencyReplayed > 0 || s.IdempotencyConflicts > 0 {
+		out += fmt.Sprintf("\nIdempotency replays:  %d (conflicts: %d)", s.IdempotencyReplayed, s.IdempotencyConflicts)
 	}
 	// Same reasoning again: 0 for every run that never configured
 	// country_allow_list/country_deny_list, or that did but never

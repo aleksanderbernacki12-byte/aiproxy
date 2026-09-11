@@ -27,6 +27,7 @@ import (
 	"aiproxy/internal/cache"
 	"aiproxy/internal/config"
 	"aiproxy/internal/geoip"
+	"aiproxy/internal/idempotency"
 	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
@@ -190,6 +191,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.CostPer1KTokens = lc.cost
 	server.CostBudget = lc.costBudget
 	server.CostBudgetHardStop = lc.costBudgetHardStop
+	server.Idempotency = lc.idempotency
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
 	server.Webhooks = lc.webhooks
@@ -272,6 +274,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				overriddenLabels[label] = true
 			}
 			fmt.Fprintf(stdout, "per-target cache overrides: %d\n", len(overriddenLabels))
+		}
+		if cfg.IdempotencyEnabled {
+			fmt.Fprintf(stdout, "idempotency-key deduplication: enabled (ttl %ds)\n", cfg.IdempotencyTTLSeconds)
 		}
 		if cfg.CostPer1KTokens > 0 {
 			fmt.Fprintf(stdout, "cost estimation: %g per 1K tokens\n", cfg.CostPer1KTokens)
@@ -490,7 +495,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency)
 
 	label := loadedFrom
 	if label == "" {
@@ -519,6 +524,7 @@ type liveConfig struct {
 	cost               float64
 	costBudget         float64
 	costBudgetHardStop bool
+	idempotency        *idempotency.Registry
 	maxBodyBytes       int64
 	webhookURL         *url.URL
 	webhooks           []proxy.WebhookTarget
@@ -593,6 +599,14 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 			c.MaxSizeBytes = cfg.CacheMaxSizeBytes
 			lc.cache = c
 			lc.cacheTTL = time.Duration(cfg.CacheTTLSeconds) * time.Second
+		}
+	}
+
+	if cfg.IdempotencyEnabled {
+		if cfg.IdempotencyTTLSeconds <= 0 {
+			errs = append(errs, fmt.Errorf("idempotency_enabled requires idempotency_ttl_seconds to be set (records would otherwise accumulate in memory forever)"))
+		} else {
+			lc.idempotency = idempotency.NewRegistry(time.Duration(cfg.IdempotencyTTLSeconds)*time.Second, idempotency.DefaultWaitTimeout)
 		}
 	}
 
@@ -1249,6 +1263,12 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.CacheMaxSizeBytes > 0 && !cfg.CacheEnabled {
 		problems = append(problems, "cache_max_size_bytes requires cache_enabled to be set (there's nothing to cap otherwise)")
 	}
+	if cfg.IdempotencyTTLSeconds < 0 {
+		problems = append(problems, fmt.Sprintf("idempotency_ttl_seconds: %d must not be negative", cfg.IdempotencyTTLSeconds))
+	}
+	if cfg.IdempotencyEnabled && cfg.IdempotencyTTLSeconds <= 0 {
+		problems = append(problems, "idempotency_enabled requires idempotency_ttl_seconds to be set (records would otherwise accumulate in memory forever)")
+	}
 	if cfg.WebhookURL != "" {
 		if _, err := parseWebhookURL(cfg.WebhookURL); err != nil {
 			problems = append(problems, fmt.Sprintf("webhook_url: %v", err))
@@ -1291,6 +1311,8 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  cache max size:          %s\n", cacheMaxSizeDisplay(cfg.CacheMaxSizeBytes))
 	fmt.Fprintf(stdout, "  per-target cache overrides: %d\n", countCacheOverrides(cfg))
 	fmt.Fprintf(stdout, "  shadow traffic targets:  %d\n", countShadowTargets(cfg))
+	fmt.Fprintf(stdout, "  idempotency enabled:     %v\n", cfg.IdempotencyEnabled)
+	fmt.Fprintf(stdout, "  idempotency ttl:         %s\n", idempotencyTTLDisplay(cfg.IdempotencyTTLSeconds))
 	fmt.Fprintf(stdout, "  cost per 1K tokens:      %g\n", cfg.CostPer1KTokens)
 	fmt.Fprintf(stdout, "  cost budget:             %g\n", cfg.CostBudget)
 	fmt.Fprintf(stdout, "  cost budget hard stop:   %v\n", cfg.CostBudgetHardStop)
@@ -1452,6 +1474,20 @@ func logFileDisplay(path string) string {
 func cacheTTLDisplay(seconds int) string {
 	if seconds <= 0 {
 		return "none (entries never expire on their own)"
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
+// idempotencyTTLDisplay renders idempotency_ttl_seconds for the
+// validate summary — unlike cacheTTLDisplay, zero/absent is never a
+// real "no TTL" case worth its own label here, since idempotency_enabled
+// requires a positive value; this only ever prints "disabled" (no
+// idempotency_ttl_seconds set at all, whether or not idempotency_enabled
+// is itself a config error already reported separately) or the real
+// configured duration.
+func idempotencyTTLDisplay(seconds int) string {
+	if seconds <= 0 {
+		return "disabled"
 	}
 	return fmt.Sprintf("%ds", seconds)
 }
