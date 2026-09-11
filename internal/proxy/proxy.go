@@ -1571,13 +1571,15 @@ type modelField struct {
 // messages[].content) plus the legacy single-string prompt/input
 // fields. A body that matches none of these simply never participates
 // in semantic caching — the existing exact-match cache is unaffected
-// either way.
+// either way. Every field is left as json.RawMessage and decoded again,
+// individually, by extractPromptText: on real client-controlled
+// traffic a malformed or unexpected shape in one field (Messages not
+// being an array, say) must not prevent Prompt/Input — or vice versa —
+// from still being picked up.
 type promptFields struct {
-	Prompt   string `json:"prompt"`
-	Input    string `json:"input"`
-	Messages []struct {
-		Content json.RawMessage `json:"content"`
-	} `json:"messages"`
+	Prompt   json.RawMessage `json:"prompt"`
+	Input    json.RawMessage `json:"input"`
+	Messages json.RawMessage `json:"messages"`
 }
 
 // contentBlock is one entry of a "content blocks" array, e.g.
@@ -1589,10 +1591,18 @@ type contentBlock struct {
 
 // extractPromptText returns the concatenated text aiproxy recognizes in
 // body for semantic caching, and whether any was found at all.
-// messages[].content is decoded permissively: a plain JSON string is
-// used directly, a JSON array of content blocks has every block's text
-// field concatenated in order. Extraction concatenates, in order: every
-// message's content, then Prompt, then Input.
+// Decoding is defensive at every level, because on live, heterogeneous,
+// fully client-controlled traffic one malformed field or array element
+// must never discard real text found elsewhere in the same body:
+// messages is decoded as a raw array and each message decoded on its
+// own, messages[].content accepts either a plain JSON string or a JSON
+// array of content blocks, and within that array each block is decoded
+// individually — an unrecognized or malformed block (a
+// tool_use/tool_result/thinking block mixed into content, say, or one
+// with the wrong JSON type for "text") is simply skipped rather than
+// aborting the whole array or the whole body. Extraction concatenates,
+// in order, every message's content, then Prompt, then Input, joining
+// non-empty chunks with a single space.
 func extractPromptText(body []byte) (string, bool) {
 	var pf promptFields
 	if err := json.Unmarshal(body, &pf); err != nil {
@@ -1600,33 +1610,55 @@ func extractPromptText(body []byte) (string, bool) {
 	}
 
 	var b strings.Builder
-	for _, m := range pf.Messages {
-		if len(m.Content) == 0 {
-			continue
+	writeChunk := func(s string) {
+		if s == "" {
+			return
 		}
-		var asString string
-		if err := json.Unmarshal(m.Content, &asString); err == nil {
-			b.WriteString(asString)
+		if b.Len() > 0 {
 			b.WriteByte(' ')
-			continue
 		}
-		var blocks []contentBlock
-		if err := json.Unmarshal(m.Content, &blocks); err == nil {
-			for _, blk := range blocks {
-				b.WriteString(blk.Text)
-				b.WriteByte(' ')
+		b.WriteString(s)
+	}
+
+	var rawMessages []json.RawMessage
+	if err := json.Unmarshal(pf.Messages, &rawMessages); err == nil {
+		for _, rawMsg := range rawMessages {
+			var m struct {
+				Content json.RawMessage `json:"content"`
+			}
+			if err := json.Unmarshal(rawMsg, &m); err != nil || len(m.Content) == 0 {
+				continue
+			}
+			var asString string
+			if err := json.Unmarshal(m.Content, &asString); err == nil {
+				writeChunk(asString)
+				continue
+			}
+			var rawBlocks []json.RawMessage
+			if err := json.Unmarshal(m.Content, &rawBlocks); err == nil {
+				for _, rawBlock := range rawBlocks {
+					var blk contentBlock
+					if err := json.Unmarshal(rawBlock, &blk); err == nil {
+						writeChunk(blk.Text)
+					}
+				}
 			}
 		}
 	}
-	b.WriteString(pf.Prompt)
-	b.WriteByte(' ')
-	b.WriteString(pf.Input)
 
-	text := strings.TrimSpace(b.String())
-	if text == "" {
+	var prompt string
+	if err := json.Unmarshal(pf.Prompt, &prompt); err == nil {
+		writeChunk(prompt)
+	}
+	var input string
+	if err := json.Unmarshal(pf.Input, &input); err == nil {
+		writeChunk(input)
+	}
+
+	if b.Len() == 0 {
 		return "", false
 	}
-	return text, true
+	return b.String(), true
 }
 
 // resolveModelRoute checks body's "model" field against every

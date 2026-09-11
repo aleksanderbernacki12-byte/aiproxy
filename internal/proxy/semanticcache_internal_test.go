@@ -76,3 +76,47 @@ func TestExtractPromptText_EmptyContentReturnsFalse(t *testing.T) {
 		t.Fatal("expected ok=false when every recognized field is empty")
 	}
 }
+
+func TestExtractPromptText_ContentBlocksArrayWithBareStringElementSkipsOnlyThatElement(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},"oops-a-bare-string",{"type":"text","text":"world"}]}]}`)
+	text, ok := extractPromptText(body)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if text != "hello world" {
+		t.Fatalf("text = %q, want %q", text, "hello world")
+	}
+}
+
+func TestExtractPromptText_ContentBlockWithWrongTypedTextFieldSkipsOnlyThatElement(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"tool_use","text":123},{"type":"text","text":"world"}]}]}`)
+	text, ok := extractPromptText(body)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if text != "hello world" {
+		t.Fatalf("text = %q, want %q", text, "hello world")
+	}
+}
+
+func TestExtractPromptText_MalformedMessagesFieldDoesNotDiscardPrompt(t *testing.T) {
+	body := []byte(`{"prompt":"legit text","messages":"not-an-array"}`)
+	text, ok := extractPromptText(body)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if text != "legit text" {
+		t.Fatalf("text = %q, want %q", text, "legit text")
+	}
+}
+
+func TestExtractPromptText_NoDoubleSpaceBetweenContentAndInput(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello world"}],"input":"some input"}`)
+	text, ok := extractPromptText(body)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if text != "hello world some input" {
+		t.Fatalf("text = %q, want %q (no double space)", text, "hello world some input")
+	}
+}
