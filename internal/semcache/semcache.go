@@ -82,10 +82,45 @@ func Similarity(a, b []uint64) float64 {
 	return float64(intersection) / float64(union)
 }
 
-// entry is one recorded fingerprint/cache-key pair inside an Index.
+// entry is one recorded fingerprint/cache-key pair inside a ring.
 type entry struct {
 	fingerprint []uint64
 	cacheKey    string
+}
+
+// ring is a fixed-capacity FIFO buffer of entries for one target. buf is
+// pre-allocated at its final length (cap(buf) never changes), so
+// add's overwrite-in-place is genuinely O(1) — unlike slicing off the
+// head of a growing []entry, which shrinks capacity in lockstep with
+// length and forces append to reallocate and copy the whole backing
+// array on nearly every call once the buffer is full.
+type ring struct {
+	buf   []entry
+	head  int // index of the oldest entry currently stored
+	count int // number of valid entries in buf (<= len(buf))
+}
+
+func newRing(size int) *ring {
+	return &ring{buf: make([]entry, size)}
+}
+
+// add writes e into the next free slot, or — once the ring is full —
+// overwrites the oldest entry and advances head to the new oldest one.
+func (r *ring) add(e entry) {
+	idx := (r.head + r.count) % len(r.buf)
+	r.buf[idx] = e
+	if r.count < len(r.buf) {
+		r.count++
+	} else {
+		r.head = (r.head + 1) % len(r.buf)
+	}
+}
+
+// forEach visits every valid entry, oldest first.
+func (r *ring) forEach(fn func(entry)) {
+	for i := 0; i < r.count; i++ {
+		fn(r.buf[(r.head+i)%len(r.buf)])
+	}
 }
 
 // Index holds, per target, the most recent fingerprints of requests
@@ -105,13 +140,19 @@ type entry struct {
 type Index struct {
 	mu      sync.Mutex
 	maxSize int
-	entries map[string][]entry
+	rings   map[string]*ring
 }
 
 // NewIndex creates an Index capping each target's own entries at
-// maxSize.
+// maxSize. A non-positive maxSize is clamped to 1 rather than left to
+// panic on the first Add (make([]entry, n) with n <= 0 is either a
+// no-op or invalid) — Add is on the hot request path (Task 7), so this
+// constructor must never be a landmine.
 func NewIndex(maxSize int) *Index {
-	return &Index{maxSize: maxSize, entries: make(map[string][]entry)}
+	if maxSize <= 0 {
+		maxSize = 1
+	}
+	return &Index{maxSize: maxSize, rings: make(map[string]*ring)}
 }
 
 // Add records fp/cacheKey under target, evicting that target's oldest
@@ -119,11 +160,12 @@ func NewIndex(maxSize int) *Index {
 func (ix *Index) Add(target string, fp []uint64, cacheKey string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	list := ix.entries[target]
-	if len(list) >= ix.maxSize {
-		list = list[1:]
+	r, ok := ix.rings[target]
+	if !ok {
+		r = newRing(ix.maxSize)
+		ix.rings[target] = r
 	}
-	ix.entries[target] = append(list, entry{fingerprint: fp, cacheKey: cacheKey})
+	r.add(entry{fingerprint: fp, cacheKey: cacheKey})
 }
 
 // FindBest returns the highest-similarity entry recorded under target
@@ -132,17 +174,21 @@ func (ix *Index) Add(target string, fp []uint64, cacheKey string) {
 func (ix *Index) FindBest(target string, fp []uint64, threshold float64) (cacheKey string, similarity float64, ok bool) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	r, exists := ix.rings[target]
+	if !exists {
+		return "", 0, false
+	}
 	var best float64
 	var bestKey string
 	found := false
-	for _, e := range ix.entries[target] {
+	r.forEach(func(e entry) {
 		sim := Similarity(fp, e.fingerprint)
 		if sim >= threshold && (!found || sim > best) {
 			best = sim
 			bestKey = e.cacheKey
 			found = true
 		}
-	}
+	})
 	return bestKey, best, found
 }
 
@@ -151,5 +197,8 @@ func (ix *Index) FindBest(target string, fp []uint64, threshold float64) (cacheK
 func (ix *Index) Len(target string) int {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	return len(ix.entries[target])
+	if r, ok := ix.rings[target]; ok {
+		return r.count
+	}
+	return 0
 }

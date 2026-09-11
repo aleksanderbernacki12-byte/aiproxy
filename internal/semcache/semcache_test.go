@@ -1,6 +1,7 @@
 package semcache_test
 
 import (
+	"fmt"
 	"testing"
 
 	"aiproxy/internal/semcache"
@@ -145,5 +146,68 @@ func TestIndex_Len(t *testing.T) {
 	ix.Add("targetA", semcache.Fingerprint("some text here today"), "cachekey-1")
 	if n := ix.Len("targetA"); n != 1 {
 		t.Fatalf("Len after one Add = %d, want 1", n)
+	}
+}
+
+// TestIndex_Add_RingBufferWrapsAcrossMultipleCycles adds more than twice
+// the capacity worth of entries (so the underlying ring buffer's head
+// wraps past index 0 more than once) and checks, via the public API
+// only, that the oldest entries are evicted in strict FIFO order and
+// exactly the newest maxSize entries survive.
+func TestIndex_Add_RingBufferWrapsAcrossMultipleCycles(t *testing.T) {
+	ix := semcache.NewIndex(3)
+	texts := []string{
+		"alpha bravo charlie delta",
+		"echo foxtrot golf hotel",
+		"india juliet kilo lima",
+		"mike november oscar papa",
+		"quebec romeo sierra tango",
+		"uniform victor whiskey xray",
+		"yankee zulu alpha bravo",
+	}
+	for i, text := range texts {
+		ix.Add("targetA", semcache.Fingerprint(text), fmt.Sprintf("k%d", i+1))
+	}
+
+	if n := ix.Len("targetA"); n != 3 {
+		t.Fatalf("Len = %d, want 3 after adding past capacity across multiple wraps", n)
+	}
+
+	// The oldest four (k1-k4) must have been evicted.
+	for i := 1; i <= 4; i++ {
+		fp := semcache.Fingerprint(texts[i-1])
+		if _, sim, ok := ix.FindBest("targetA", fp, 0.99); ok {
+			t.Fatalf("expected k%d to have been evicted, but it matched with similarity %v", i, sim)
+		}
+	}
+
+	// The newest three (k5-k7) must still be present.
+	for i := 5; i <= 7; i++ {
+		fp := semcache.Fingerprint(texts[i-1])
+		key, sim, ok := ix.FindBest("targetA", fp, 0.99)
+		if !ok || key != fmt.Sprintf("k%d", i) {
+			t.Fatalf("expected k%d still present with similarity ~1, got key=%q sim=%v ok=%v", i, key, sim, ok)
+		}
+	}
+}
+
+// TestNewIndex_NonPositiveMaxSizeClampsToOne confirms NewIndex's
+// documented guard: a non-positive maxSize no longer panics on the
+// first Add and instead behaves as a cap of 1.
+func TestNewIndex_NonPositiveMaxSizeClampsToOne(t *testing.T) {
+	for _, maxSize := range []int{0, -1, -100} {
+		ix := semcache.NewIndex(maxSize)
+		ix.Add("targetA", semcache.Fingerprint("some example text here"), "k1")
+		if n := ix.Len("targetA"); n != 1 {
+			t.Fatalf("NewIndex(%d): Len after first Add = %d, want 1", maxSize, n)
+		}
+
+		ix.Add("targetA", semcache.Fingerprint("another unrelated text now"), "k2")
+		if n := ix.Len("targetA"); n != 1 {
+			t.Fatalf("NewIndex(%d): Len after second Add = %d, want 1 (cap clamped to 1)", maxSize, n)
+		}
+		if _, _, ok := ix.FindBest("targetA", semcache.Fingerprint("some example text here"), 0.99); ok {
+			t.Fatalf("NewIndex(%d): expected first entry to be evicted once at capacity 1", maxSize)
+		}
 	}
 }
