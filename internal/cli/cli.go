@@ -80,7 +80,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", "127.0.0.1:8080", "address for the proxy to listen on")
-	adminAddr := fs.String("admin-addr", "", "address for a second listener serving only the admin surface (GET /_aiproxy/stats, /_aiproxy/metrics, /_aiproxy/dashboard, POST /_aiproxy/cache/clear), gated by the same proxy_api_key/IP/GeoIP checks as -addr; when set, -addr stops serving those paths entirely (404). /_aiproxy/healthz stays reachable on both. Empty (default) keeps everything on -addr")
+	adminAddr := fs.String("admin-addr", "", "address for a second listener serving only the admin surface (GET /_aiproxy/stats, /_aiproxy/metrics, /_aiproxy/dashboard, POST /_aiproxy/cache/clear, GET/POST/DELETE /_aiproxy/drain), gated by the same proxy_api_key/IP/GeoIP checks as -addr; when set, -addr stops serving those paths entirely (404). /_aiproxy/healthz stays reachable on both. Empty (default) keeps everything on -addr")
 	target := fs.String("target", "", "HTTPS URL to forward requests to (required)")
 	configPath := fs.String("config", "", "path to a JSON config file (custom rules, rate limit, cache, cost estimation, extra target routes; default: aiproxy.json in the working directory, if present)")
 	logFormat := fs.String("log-format", "text", `log output format: "text" (colored, human-readable) or "json" (one JSON object per line, safe to pipe into a log aggregator)`)

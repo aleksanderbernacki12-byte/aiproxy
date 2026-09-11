@@ -1827,6 +1827,484 @@ func TestServer_CacheClearEndpoint_GatedByProxyAuth(t *testing.T) {
 	}
 }
 
+// TestServer_Drain_RejectsNewRequestsAfterPost proves POST drainPath
+// actually stops ordinary proxy traffic: a request before the POST
+// succeeds normally, and one after it gets a 503 that never reaches the
+// upstream target at all.
+func TestServer_Drain_RejectsNewRequestsAfterPost(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get before drain: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status before drain = %d, want 200", resp.StatusCode)
+	}
+
+	drainResp, err := http.Post(frontend.URL+"/_aiproxy/drain", "", nil)
+	if err != nil {
+		t.Fatalf("post drain: %v", err)
+	}
+	drainResp.Body.Close()
+	if drainResp.StatusCode != http.StatusOK {
+		t.Fatalf("post drain status = %d, want 200", drainResp.StatusCode)
+	}
+
+	resp, err = http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get after drain: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status after drain = %d, want 503", resp.StatusCode)
+	}
+
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream received %d requests, want 1 (the rejected request must never reach it)", got)
+	}
+
+	snap := srv.Stats.Snapshot()
+	if snap.DrainRejected != 1 {
+		t.Fatalf("Stats.DrainRejected = %d, want 1", snap.DrainRejected)
+	}
+	if snap.Allowed != 1 {
+		t.Fatalf("Stats.Allowed = %d, want 1 (only the pre-drain request)", snap.Allowed)
+	}
+}
+
+// TestServer_Drain_LetsAlreadyInFlightRequestFinish is the feature's
+// central promise: a request that started before draining began must
+// run to completion normally, however long it takes, even though every
+// NEW request arriving after the drain started is rejected in the
+// meantime.
+func TestServer_Drain_LetsAlreadyInFlightRequestFinish(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	upstreamEntered := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(upstreamEntered)
+		<-releaseUpstream
+		w.Write([]byte("slow response"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	slowDone := make(chan *http.Response, 1)
+	slowErr := make(chan error, 1)
+	go func() {
+		resp, err := http.Get(frontend.URL + "/v1/chat")
+		if err != nil {
+			slowErr <- err
+			return
+		}
+		slowDone <- resp
+	}()
+
+	<-upstreamEntered // the slow request is now genuinely in flight
+
+	drainResp, err := http.Post(frontend.URL+"/_aiproxy/drain", "", nil)
+	if err != nil {
+		t.Fatalf("post drain: %v", err)
+	}
+	drainResp.Body.Close()
+
+	// A brand new request arriving while the first one is still blocked
+	// upstream must be rejected immediately, not queued behind it.
+	newResp, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get during drain: %v", err)
+	}
+	newResp.Body.Close()
+	if newResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("new request during drain status = %d, want 503", newResp.StatusCode)
+	}
+
+	close(releaseUpstream)
+
+	select {
+	case resp := <-slowDone:
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("in-flight request status = %d, want 200 (draining must never cut off a request already in progress)", resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read in-flight response body: %v", err)
+		}
+		if string(body) != "slow response" {
+			t.Fatalf("in-flight response body = %q, want %q", body, "slow response")
+		}
+	case err := <-slowErr:
+		t.Fatalf("in-flight request failed: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight request never completed after draining started")
+	}
+}
+
+// TestServer_Drain_StatusEndpointReportsInFlightCount proves GET
+// drainPath's in_flight field is a real, live count — the signal a
+// deploy script polls instead of guessing a fixed grace period.
+func TestServer_Drain_StatusEndpointReportsInFlightCount(t *testing.T) {
+	releaseUpstream := make(chan struct{})
+	upstreamEntered := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(upstreamEntered)
+		<-releaseUpstream
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	getDrainStatus := func() map[string]any {
+		resp, err := http.Get(frontend.URL + "/_aiproxy/drain")
+		if err != nil {
+			t.Fatalf("get drain status: %v", err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode drain status: %v", err)
+		}
+		return out
+	}
+
+	if status := getDrainStatus(); status["in_flight"].(float64) != 0 {
+		t.Fatalf("in_flight before any request = %v, want 0", status["in_flight"])
+	}
+
+	go func() {
+		resp, err := http.Get(frontend.URL + "/v1/chat")
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	<-upstreamEntered
+
+	if status := getDrainStatus(); status["in_flight"].(float64) != 1 {
+		t.Fatalf("in_flight while one request is blocked = %v, want 1", status["in_flight"])
+	}
+
+	close(releaseUpstream)
+
+	// The in-flight request completes asynchronously; poll briefly
+	// instead of assuming it's already back to 0 the instant Close
+	// unblocks the upstream handler.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if status := getDrainStatus(); status["in_flight"].(float64) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("in_flight never returned to 0 after the request completed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestServer_Drain_DeleteCancelsAnInProgressDrain proves DELETE
+// drainPath reverts to normal service — for aborting a deploy, or
+// undoing a drain triggered by mistake.
+func TestServer_Drain_DeleteCancelsAnInProgressDrain(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post, err := http.Post(frontend.URL+"/_aiproxy/drain", "", nil)
+	if err != nil {
+		t.Fatalf("post drain: %v", err)
+	}
+	post.Body.Close()
+
+	rejected, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get while draining: %v", err)
+	}
+	rejected.Body.Close()
+	if rejected.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status while draining = %d, want 503", rejected.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, frontend.URL+"/_aiproxy/drain", nil)
+	if err != nil {
+		t.Fatalf("build DELETE request: %v", err)
+	}
+	del, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("delete drain: %v", err)
+	}
+	del.Body.Close()
+	if del.StatusCode != http.StatusOK {
+		t.Fatalf("delete drain status = %d, want 200", del.StatusCode)
+	}
+
+	allowed, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get after undrain: %v", err)
+	}
+	allowed.Body.Close()
+	if allowed.StatusCode != http.StatusOK {
+		t.Fatalf("status after undrain = %d, want 200 (DELETE must revert to normal service)", allowed.StatusCode)
+	}
+}
+
+// TestServer_Drain_RejectsUnknownMethod proves drainPath only accepts
+// GET/POST/DELETE — the same "unsupported method" treatment as every
+// other reserved path.
+func TestServer_Drain_RejectsUnknownMethod(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	req, err := http.NewRequest(http.MethodPut, frontend.URL+"/_aiproxy/drain", nil)
+	if err != nil {
+		t.Fatalf("build PUT request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("put drain: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestServer_Drain_GatedByProxyAuth proves drainPath honors
+// ProxyAPIKey exactly like cacheClearPath — a mutating admin endpoint
+// deserves at least the same protection as the read-only ones.
+func TestServer_Drain_GatedByProxyAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.ProxyAPIKey = "s3cr3t"
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/_aiproxy/drain", "", nil)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d (missing Proxy-Authorization)", resp.StatusCode, http.StatusProxyAuthRequired)
+	}
+}
+
+// TestServer_Drain_HealthzStaysHealthyWhileDraining proves draining
+// never touches healthzPath — see healthzPath's own doc comment: it is
+// a pure liveness signal that must never flap based on any configured
+// dependency, draining included. An orchestrator polling drainPath
+// itself (or removing the instance from its own load-balancer pool
+// directly) is the intended way to learn about a drain — not healthz.
+func TestServer_Drain_HealthzStaysHealthyWhileDraining(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post, err := http.Post(frontend.URL+"/_aiproxy/drain", "", nil)
+	if err != nil {
+		t.Fatalf("post drain: %v", err)
+	}
+	post.Body.Close()
+
+	resp, err := http.Get(frontend.URL + "/_aiproxy/healthz")
+	if err != nil {
+		t.Fatalf("get healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status while draining = %d, want 200 (healthz must never flap)", resp.StatusCode)
+	}
+}
+
+// TestServer_Drain_SecondPostDoesNotFireASecondWebhook proves the
+// drain_started/drain_stopped webhooks are process-level events, fired
+// exactly once per real transition — not once per admin request, and
+// never at all for a rejected proxy request (that would make a busy
+// drain window spam a webhook destination once per rejected caller).
+func TestServer_Drain_SecondPostDoesNotFireASecondWebhook(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	received := make(chan map[string]any, 8)
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		json.NewDecoder(r.Body).Decode(&payload)
+		received <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+	webhookURL, err := url.Parse(webhook.URL)
+	if err != nil {
+		t.Fatalf("parse webhook url: %v", err)
+	}
+
+	var logBuf syncBuffer
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.WebhookURL = webhookURL
+	srv.Logger = log.New(&logBuf, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() {
+		resp, err := http.Post(frontend.URL+"/_aiproxy/drain", "", nil)
+		if err != nil {
+			t.Fatalf("post drain: %v", err)
+		}
+		resp.Body.Close()
+	}
+	post()
+	post() // second POST while already draining — must not re-fire
+
+	// A rejected request in between must not fire anything of its own.
+	rejected, err := http.Get(frontend.URL + "/v1/chat")
+	if err != nil {
+		t.Fatalf("get while draining: %v", err)
+	}
+	rejected.Body.Close()
+
+	select {
+	case payload := <-received:
+		if payload["event"] != "drain_started" {
+			t.Fatalf("event = %v, want drain_started", payload["event"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never received the drain_started event")
+	}
+
+	select {
+	case payload := <-received:
+		t.Fatalf("received an unexpected second webhook event: %v", payload)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: exactly one drain_started event total.
+	}
+
+	if !strings.Contains(logBuf.String(), "[DRAIN STARTED]") {
+		t.Fatalf("log missing [DRAIN STARTED] line: %q", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "[DRAIN REJECTED]") {
+		t.Fatalf("log missing [DRAIN REJECTED] line: %q", logBuf.String())
+	}
+}
+
+// TestServer_Drain_MovesToAdminAddrWhenConfigured proves drainPath
+// follows cacheClearPath's own precedent: once AdminAddr is set, it
+// moves entirely off the main listener (a plain 404, not forwarded)
+// and only works on AdminAddr instead.
+func TestServer_Drain_MovesToAdminAddrWhenConfigured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	addr := freeLoopbackAddr(t)
+	adminAddr := freeLoopbackAddr(t)
+
+	srv := proxy.New(addr, targetURL, rules.NewEngine(rules.Allow))
+	srv.AdminAddr = adminAddr
+	srv.Logger = log.New(io.Discard, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitForServerUp(t, addr, time.Second)
+	waitForServerUp(t, adminAddr, time.Second)
+
+	resp, err := http.Post("http://"+addr+"/_aiproxy/drain", "", nil)
+	if err != nil {
+		t.Fatalf("post drain on Addr: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("drain on Addr status = %d, want %d (must move entirely to AdminAddr)", resp.StatusCode, http.StatusNotFound)
+	}
+
+	resp, err = http.Post("http://"+adminAddr+"/_aiproxy/drain", "", nil)
+	if err != nil {
+		t.Fatalf("post drain on AdminAddr: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("drain on AdminAddr status = %d, want 200", resp.StatusCode)
+	}
+}
+
 // TestServer_StreamingResponse_DeliversChunksProgressively proves the
 // core streaming fix: chunks reach the client as they arrive, instead of
 // only after the full response has been read. If the proxy still

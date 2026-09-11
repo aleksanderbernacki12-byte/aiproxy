@@ -183,6 +183,7 @@ type Stats struct {
 	unauthorized     atomic.Int64
 	ipDenied         atomic.Int64
 	ipRateLimited    atomic.Int64
+	drainRejected    atomic.Int64
 	countryDenied    atomic.Int64
 	anomalyDetected  atomic.Int64
 	targetsEjected   atomic.Int64
@@ -378,6 +379,15 @@ func (s *Stats) RecordIPDenied() {
 // folded into the same counter.
 func (s *Stats) RecordIPRateLimited() {
 	s.ipRateLimited.Add(1)
+}
+
+// RecordDrainRejected records one request rejected because the proxy is
+// currently draining — see Server.serveDrain in the proxy package. No
+// target parameter, same reasoning as RecordIPDenied: this is checked
+// before any target is resolved, and applies uniformly regardless of
+// which route a request would otherwise have matched.
+func (s *Stats) RecordDrainRejected() {
+	s.drainRejected.Add(1)
 }
 
 // RecordCountryDenied records one request rejected by the GeoIP
@@ -745,6 +755,13 @@ type Snapshot struct {
 	// broken down per target, same reasoning as IPDenied.
 	IPRateLimited int64 `json:"ip_rate_limited"`
 
+	// DrainRejected counts requests rejected because the proxy was
+	// currently draining — see Stats.RecordDrainRejected/the proxy
+	// package's serveDrain. Never broken down per target, same
+	// reasoning as IPDenied: a draining proxy rejects everything
+	// uniformly, before any target is resolved.
+	DrainRejected int64 `json:"drain_rejected"`
+
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
 	// IPDenied (a different rejection reason), never broken down per
@@ -820,6 +837,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.Unauthorized = s.unauthorized.Load()
 	snap.IPDenied = s.ipDenied.Load()
 	snap.IPRateLimited = s.ipRateLimited.Load()
+	snap.DrainRejected = s.drainRejected.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()
@@ -900,6 +918,11 @@ func (s Snapshot) String() string {
 	// rate-limited anything.
 	if s.IPRateLimited > 0 {
 		out += fmt.Sprintf("\nIP rate-limited (429): %d", s.IPRateLimited)
+	}
+	// Same reasoning again: 0 for every run that never drained, or that
+	// did but no request happened to arrive during the drain window.
+	if s.DrainRejected > 0 {
+		out += fmt.Sprintf("\nDrain-rejected (503): %d", s.DrainRejected)
 	}
 	// Same reasoning again: 0 for every run that never configured
 	// country_allow_list/country_deny_list, or that did but never

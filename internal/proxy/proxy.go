@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aiproxy/internal/anomaly"
@@ -247,6 +248,23 @@ const dashboardPath = "/_aiproxy/dashboard"
 // them, deliberately silent even in that sense, since health probes
 // fire far more often than a human would ever want in a log stream.
 const healthzPath = "/_aiproxy/healthz"
+
+// drainPath is a sixth reserved, proxy-internal path: POST here begins
+// draining — every subsequent request to any other path is rejected
+// with 503 until either the process exits or DELETE here cancels it —
+// while a request already past this check keeps running for as long as
+// it needs to, however long that is (see the drain check near the top
+// of ServeHTTP's own forwarding path). GET reports the current status
+// (draining or not, since when, and how many requests are still
+// actually in flight), so a deploy script can poll it until draining is
+// actually safe to act on instead of guessing a fixed grace period the
+// way a plain SIGTERM/http.Server.Shutdown grace window would otherwise
+// have to. Gated by IP allow/deny lists and proxy authentication
+// exactly like cacheClearPath — draining a proxy is exactly as
+// sensitive an operation as clearing its cache, and reporting whether
+// it's draining is exactly as sensitive as reading its stats. See
+// serveDrain.
+const drainPath = "/_aiproxy/drain"
 
 // headerScanExcludes lists, in lowercase, the header names never handed
 // to the rule engine for scanning — see filterHeadersForScanning. These
@@ -613,6 +631,23 @@ type Server struct {
 	// and the write it produces must happen inside the same critical
 	// section.
 	AuditChain *auditlog.Chain
+
+	// drainMu guards draining/drainSince — separate from mu (which
+	// guards ReloadConfig's swaps) because draining is runtime
+	// operational state set by an admin request, not configuration
+	// that a SIGHUP reload ever touches; ReloadConfig leaves both
+	// fields alone entirely. See serveDrain.
+	drainMu    sync.Mutex
+	draining   bool
+	drainSince time.Time
+
+	// inFlight counts requests currently past the drain check in
+	// ServeHTTP — incremented right before, decremented via defer right
+	// after, regardless of how the request ultimately completes. GET
+	// drainPath reports its current value so a caller orchestrating a
+	// deploy can poll until it reaches 0 instead of guessing a fixed
+	// grace period.
+	inFlight atomic.Int64
 
 	reverseProxy    *httputil.ReverseProxy
 	httpServer      *http.Server
@@ -2002,7 +2037,7 @@ func writeResponseBlockedBody(resp *http.Response, message string) {
 // too regardless of AdminAddr (see AdminAddr's doc comment).
 func isReservedAdminPath(path string) bool {
 	switch path {
-	case statsPath, metricsPath, dashboardPath, cacheClearPath:
+	case statsPath, metricsPath, dashboardPath, cacheClearPath, drainPath:
 		return true
 	default:
 		return false
@@ -2319,6 +2354,8 @@ func (h adminMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveDashboard(w, r)
 	case cacheClearPath:
 		s.serveCacheClear(w, r)
+	case drainPath:
+		s.serveDrain(w, r)
 	default:
 		writeError(w, r, http.StatusNotFound, "not_found", "404 page not found", "")
 	}
@@ -2362,6 +2399,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveCacheClear(w, r)
 		return
 	}
+	if r.URL.Path == drainPath {
+		s.serveDrain(w, r)
+		return
+	}
+
+	if draining, _ := s.drainStatus(); draining {
+		// Checked after the admin surface's own dispatch above (so
+		// GET/DELETE drainPath itself, and statsPath/metricsPath/
+		// dashboardPath/cacheClearPath, stay reachable while draining —
+		// an operator still needs to be able to check status or cancel
+		// a mistaken drain) but before any real work — reading the
+		// body, resolving a route, checking the cache — starts for a
+		// request that's just going to be rejected anyway. A request
+		// that got this far in an earlier call, before draining began,
+		// is entirely unaffected: this only ever stops a NEW request
+		// from starting, see serveDrain's own doc comment.
+		s.Stats.RecordDrainRejected()
+		s.logDrainRejected(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+		writeError(w, r, http.StatusServiceUnavailable, "draining", "server is draining, try another instance", "")
+		return
+	}
+	s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
 
 	limitedBody := http.MaxBytesReader(w, r.Body, s.getMaxBodyBytes())
 	body, err := io.ReadAll(limitedBody)
@@ -3052,6 +3112,17 @@ func (s *Server) logIPRateLimited(remoteIP, method, reqURL, requestID string) {
 	s.logf("%s[IP RATE LIMITED] %s %s - %s exceeded max_requests_per_minute_per_ip%s", ansiYellow, method, reqURL, remoteIP, ansiReset)
 }
 
+// logDrainRejected is logIPRateLimited's counterpart for a request
+// rejected because the proxy was draining — see serveDrain.
+func (s *Server) logDrainRejected(remoteIP, method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "drain_rejected", Method: method, URL: reqURL, RequestID: requestID, RemoteIP: remoteIP})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[DRAIN REJECTED] %s %s - %s rejected while draining%s", ansiYellow, method, reqURL, remoteIP, ansiReset)
+}
+
 func (s *Server) logCountryDenied(remoteIP, country, method, reqURL, requestID string) {
 	ev := s.recordLogEvent(logEvent{Level: "country_denied", Method: method, URL: reqURL, RequestID: requestID, RemoteIP: remoteIP, Country: country})
 	if s.LogFormat == LogFormatJSON {
@@ -3135,6 +3206,31 @@ func (s *Server) logTargetRecovered(target string) {
 		return
 	}
 	s.logf("%s[TARGET RECOVERED] %s%s", ansiGreen, target, ansiReset)
+}
+
+// logDrainStarted logs a POST drainPath actually starting a new drain —
+// see Server.startDraining. Fires exactly once per drain, not on a
+// second POST while already draining. No method/URL/RequestID: unlike
+// logDrainRejected, this isn't tied to any one client request — see
+// logTargetEjected's own doc comment for the same reasoning.
+func (s *Server) logDrainStarted() {
+	ev := s.recordLogEvent(logEvent{Level: "drain_started"})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[DRAIN STARTED] no longer accepting new requests; requests already in flight continue normally%s", ansiBrightYellow, ansiReset)
+}
+
+// logDrainStopped logs a DELETE drainPath actually cancelling an
+// in-progress drain — see Server.stopDraining.
+func (s *Server) logDrainStopped() {
+	ev := s.recordLogEvent(logEvent{Level: "drain_stopped"})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[DRAIN STOPPED] accepting new requests again%s", ansiGreen, ansiReset)
 }
 
 // logLatency logs how long the upstream took to respond to one specific
@@ -3558,6 +3654,28 @@ func (s *Server) notifyTargetRecoveredWebhook(target string) {
 	})
 }
 
+// notifyDrainStartedWebhook builds and delivers a webhookAlert for the
+// drain_started event — no method/URL, same reasoning as
+// notifyTargetEjectedWebhook: the transition itself is the whole story,
+// independent of which admin request happened to trigger it.
+func (s *Server) notifyDrainStartedWebhook() {
+	s.deliverWebhookPayload(webhookAlert{
+		Text:  "[DRAIN STARTED] no longer accepting new requests; requests already in flight continue normally",
+		Event: "drain_started",
+		Time:  time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// notifyDrainStoppedWebhook builds and delivers a webhookAlert for the
+// drain_stopped event.
+func (s *Server) notifyDrainStoppedWebhook() {
+	s.deliverWebhookPayload(webhookAlert{
+		Text:  "[DRAIN STOPPED] accepting new requests again",
+		Event: "drain_stopped",
+		Time:  time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // notifyIPDeniedWebhook builds and delivers a webhookAlert for the
 // ip_denied event — kept separate from notifyWebhook for the same
 // reason as notifyBudgetWebhook/notifyFailoverWebhook: this event
@@ -3773,6 +3891,10 @@ type statsSnapshotJSON struct {
 	// always 0 inside per_target — same reasoning as IPDenied.
 	IPRateLimited int64 `json:"ip_rate_limited"`
 
+	// DrainRejected is likewise only meaningful at the top level, and
+	// always 0 inside per_target — same reasoning as IPDenied.
+	DrainRejected int64 `json:"drain_rejected"`
+
 	// CountryDenied is likewise only meaningful at the top level, and
 	// always 0 inside per_target — same reasoning as IPDenied.
 	CountryDenied int64 `json:"country_denied"`
@@ -3832,6 +3954,7 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		Unauthorized:           snap.Unauthorized,
 		IPDenied:               snap.IPDenied,
 		IPRateLimited:          snap.IPRateLimited,
+		DrainRejected:          snap.DrainRejected,
 		CountryDenied:          snap.CountryDenied,
 		AnomalyDetected:        snap.AnomalyDetected,
 		TargetsEjected:         snap.TargetsEjected,
@@ -3947,6 +4070,96 @@ func (s *Server) serveCacheClear(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"cleared": true})
+}
+
+// drainStatus reports whether the server is currently draining and, if
+// so, since when — see serveDrain.
+func (s *Server) drainStatus() (draining bool, since time.Time) {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	return s.draining, s.drainSince
+}
+
+// startDraining begins draining, unless it's already in progress (in
+// which case since is the original start time, not a reset one — a
+// second POST drainPath is idempotent, not a way to push the clock
+// back). Returns whether a drain was already in progress.
+func (s *Server) startDraining() (alreadyDraining bool, since time.Time) {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	if s.draining {
+		return true, s.drainSince
+	}
+	s.draining = true
+	s.drainSince = time.Now()
+	return false, s.drainSince
+}
+
+// stopDraining cancels an in-progress drain, reverting to normal
+// service. Returns whether a drain was actually in progress, so the
+// caller only logs/notifies a real transition.
+func (s *Server) stopDraining() (wasDraining bool) {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	wasDraining = s.draining
+	s.draining = false
+	s.drainSince = time.Time{}
+	return wasDraining
+}
+
+// serveDrain answers drainPath. GET reports the current status: whether
+// the server is draining, since when, and how many requests are still
+// in flight (see Server.inFlight) — the signal a deploy script polls
+// instead of guessing a fixed grace period. POST begins draining:
+// every subsequent request to any other path is rejected with 503
+// until either the process exits or DELETE here cancels it, while a
+// request already in flight when POST arrives is completely
+// unaffected and keeps running for as long as it needs to — draining
+// only ever stops a NEW request from starting (see the drain check
+// near the top of ServeHTTP's own forwarding path). DELETE cancels an
+// in-progress drain, reverting to normal service — for aborting a
+// deploy, or undoing a drain triggered by mistake. Idempotent in both
+// directions: POSTing while already draining, or DELETEing while not,
+// just reports the current status without logging a spurious
+// transition.
+func (s *Server) serveDrain(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		draining, since := s.drainStatus()
+		s.writeDrainStatus(w, draining, since)
+	case http.MethodPost:
+		alreadyDraining, since := s.startDraining()
+		if !alreadyDraining {
+			s.logDrainStarted()
+			s.notifyDrainStartedWebhook()
+		}
+		s.writeDrainStatus(w, true, since)
+	case http.MethodDelete:
+		wasDraining := s.stopDraining()
+		if wasDraining {
+			s.logDrainStopped()
+			s.notifyDrainStoppedWebhook()
+		}
+		s.writeDrainStatus(w, false, time.Time{})
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
+	}
+}
+
+// drainStatusJSON is GET/POST/DELETE drainPath's wire shape.
+type drainStatusJSON struct {
+	Draining   bool   `json:"draining"`
+	DrainSince string `json:"drain_since,omitempty"`
+	InFlight   int64  `json:"in_flight"`
+}
+
+func (s *Server) writeDrainStatus(w http.ResponseWriter, draining bool, since time.Time) {
+	out := drainStatusJSON{Draining: draining, InFlight: s.inFlight.Load()}
+	if draining {
+		out.DrainSince = since.UTC().Format(time.RFC3339)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 // promCounters lists the counters every metricsPath series is built
@@ -4133,6 +4346,13 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 	fmt.Fprintln(w, "# HELP aiproxy_ip_rate_limited_total Total number of requests rejected by the per-IP rate limiter.")
 	fmt.Fprintln(w, "# TYPE aiproxy_ip_rate_limited_total counter")
 	fmt.Fprintf(w, "aiproxy_ip_rate_limited_total %d\n", snap.IPRateLimited)
+
+	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
+	// drain-rejected request never gets far enough to resolve a target
+	// either.
+	fmt.Fprintln(w, "# HELP aiproxy_drain_rejected_total Total number of requests rejected because the proxy was draining.")
+	fmt.Fprintln(w, "# TYPE aiproxy_drain_rejected_total counter")
+	fmt.Fprintf(w, "aiproxy_drain_rejected_total %d\n", snap.DrainRejected)
 
 	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
 	// country-denied request never gets far enough to resolve a target.

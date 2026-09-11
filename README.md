@@ -34,7 +34,7 @@ aiproxy start --target https://api.example.com
   [Audit log signing](#audit-log-signing). Requires `log_file` to be
   configured; off by default.
 - `--admin-addr`: address for a second listener serving only
-  `/_aiproxy/stats`/`metrics`/`dashboard`/`cache/clear` — see
+  `/_aiproxy/stats`/`metrics`/`dashboard`/`cache/clear`/`drain` — see
   [Isolating the admin surface on its own port](#isolating-the-admin-surface-on-its-own-port).
   Must differ from `--addr`; everything stays on `--addr` by default.
 
@@ -2001,6 +2001,81 @@ if you need a container-internal check, either run an external monitor
 against the published port, or build your own image on a base with an
 HTTP client available.
 
+## Maintenance / drain mode
+
+`http.Server.Shutdown` (what a `SIGINT`/`SIGTERM` already triggers) stops
+accepting new connections and waits for in-flight ones to finish, but
+only up to a fixed grace period — long enough for an ordinary request,
+not necessarily for a long-running SSE stream or an agent loop mid-call.
+Draining decouples the two: tell aiproxy to stop accepting new work
+*before* you ever send the signal that actually stops the process, then
+wait until it's genuinely safe to do so instead of guessing a timeout.
+
+```
+curl -X POST http://127.0.0.1:8080/_aiproxy/drain
+```
+
+A sixth reserved, proxy-internal path (`GET`/`POST`/`DELETE
+/_aiproxy/drain`), gated by `proxy_api_key`/`ip_allow_list`/
+`ip_deny_list`/`country_allow_list`/`country_deny_list` exactly like
+`/_aiproxy/cache/clear` — draining a proxy is exactly as sensitive an
+operation as clearing its cache.
+
+- **`POST`** begins draining: every subsequent request to any other
+  path is rejected with `503` (`{"error":"draining", ...}`) until
+  either the process exits or a `DELETE` cancels it. A request already
+  in flight when the `POST` arrives is completely unaffected and runs
+  to completion normally, however long it takes — draining only ever
+  stops a *new* request from starting. A second `POST` while already
+  draining is a harmless no-op; it does not reset the start time or
+  fire a second `drain_started` event.
+- **`GET`** reports the current status:
+  ```json
+  {"draining": true, "drain_since": "2026-09-11T20:00:00Z", "in_flight": 2}
+  ```
+  `in_flight` is a live count of requests currently past the drain
+  check — poll this instead of a fixed sleep to learn exactly when it's
+  safe to stop the process (`in_flight` reaching `0`).
+- **`DELETE`** cancels an in-progress drain, reverting to normal
+  service — for aborting a deploy, or undoing a drain triggered by
+  mistake.
+
+A typical deploy script:
+
+```
+curl -X POST http://127.0.0.1:8080/_aiproxy/drain
+until [ "$(curl -s http://127.0.0.1:8080/_aiproxy/drain | jq .in_flight)" = "0" ]; do
+  sleep 1
+done
+# now safe to send SIGTERM / kill the container
+```
+
+[`/_aiproxy/healthz`](#health-check) is deliberately **not** affected by
+draining and keeps reporting healthy the whole time — see its own doc
+comment: it's a pure liveness signal that must never flap based on any
+configured dependency, draining included. If your orchestrator needs to
+stop routing traffic here automatically rather than through an explicit
+deploy-script step, wire draining into a lifecycle hook instead — a
+Kubernetes `preStop` hook, for example:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "wget -qO- --post-data='' http://127.0.0.1:8080/_aiproxy/drain; sleep 5"]
+```
+
+A rejected request is logged (`[DRAIN REJECTED]`) and counted in
+`stats.drain_rejected`/`aiproxy_drain_rejected_total`, same as every
+other rejection kind; the `drain_started`/`drain_stopped` transitions
+themselves are logged (`[DRAIN STARTED]`/`[DRAIN STOPPED]`) and fire a
+[webhook alert](#webhook-alerts) each, exactly once per real
+transition — never once per rejected request, which would turn a busy
+drain window into a webhook flood. Runtime-only state, not
+configuration: a SIGHUP reload never touches it, and it isn't
+persisted anywhere — a restarted process always starts back up not
+draining, regardless of what state it was in when it stopped.
+
 ## Prometheus metrics
 
 The same counters are also available at `GET /_aiproxy/metrics` in
@@ -2156,16 +2231,17 @@ stats it reports, and any method other than `GET` gets a 405.
 ## Isolating the admin surface on its own port
 
 By default, `GET /_aiproxy/stats`, `/_aiproxy/metrics`,
-`/_aiproxy/dashboard`, and `POST /_aiproxy/cache/clear` all live on the
-same listener as the actual proxy traffic (`--addr`). `--admin-addr`
-moves all four onto a second, independent listener instead:
+`/_aiproxy/dashboard`, `POST /_aiproxy/cache/clear`, and
+`GET`/`POST`/`DELETE /_aiproxy/drain` all live on the same listener as
+the actual proxy traffic (`--addr`). `--admin-addr` moves all five onto
+a second, independent listener instead:
 
 ```
 aiproxy start --target https://api.openai.com \
   --addr 0.0.0.0:8080 --admin-addr 127.0.0.1:9090
 ```
 
-Once set, `--addr` stops serving those four paths entirely — a request
+Once set, `--addr` stops serving those five paths entirely — a request
 for one of them there gets a plain 404, never silently forwarded
 upstream as if it were an ordinary route, since "reserved path" always
 meant exactly that. They're only reachable on `--admin-addr` now,
