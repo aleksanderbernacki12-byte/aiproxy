@@ -74,6 +74,34 @@ func (l *TokenLimiter) add(n int, now time.Time) {
 	l.entries = append(l.entries, tokenEntry{at: now, tokens: n})
 }
 
+// Info reports the configured maximum, how many tokens remain
+// available in the current rolling window, and how long until the
+// oldest recorded usage ages out of it — the values behind the
+// RateLimit-* response headers. Safe for concurrent use.
+func (l *TokenLimiter) Info() (max, remaining int, resetIn time.Duration) {
+	return l.info(time.Now())
+}
+
+// info is the deterministic core of Info — see allow.
+func (l *TokenLimiter) info(now time.Time) (max, remaining int, resetIn time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.evict(now)
+
+	remaining = l.maxTokens - l.sum()
+	if remaining < 0 {
+		remaining = 0
+	}
+	if len(l.entries) == 0 {
+		return l.maxTokens, remaining, 0
+	}
+	resetIn = l.window - now.Sub(l.entries[0].at)
+	if resetIn < 0 {
+		resetIn = 0
+	}
+	return l.maxTokens, remaining, resetIn
+}
+
 // evict drops every entry older than window, relative to now. Callers
 // must hold mu.
 func (l *TokenLimiter) evict(now time.Time) {

@@ -12047,3 +12047,221 @@ func TestServer_CORS_CacheHitFromDifferentAllowedOriginGetsItsOwnHeader(t *testi
 		t.Fatalf("cache-hit Access-Control-Allow-Origin = %q, want https://two.example.com (its own origin, not the first request's stale one)", got)
 	}
 }
+
+// TestServer_RateLimitHeaders_PresentOnAllowedRequestAndDecreasing
+// proves X-RateLimit-{Limit,Remaining,Reset}-Requests appear on a
+// genuinely successful response, not only on a 429 — the whole point
+// being a well-behaved client can see it's close to a limit before it
+// ever actually gets rejected — and that Remaining counts down request
+// by request.
+func TestServer_RateLimitHeaders_PresentOnAllowedRequestAndDecreasing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.Limiter = limiter.New(5, time.Minute)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	wantRemaining := []string{"4", "3", "2"}
+	for i, want := range wantRemaining {
+		resp, err := http.Get(frontend.URL + "/endpoint")
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d", i+1, resp.StatusCode, http.StatusOK)
+		}
+		if got := resp.Header.Get("X-Ratelimit-Limit-Requests"); got != "5" {
+			t.Fatalf("request %d: X-RateLimit-Limit-Requests = %q, want 5", i+1, got)
+		}
+		if got := resp.Header.Get("X-Ratelimit-Remaining-Requests"); got != want {
+			t.Fatalf("request %d: X-RateLimit-Remaining-Requests = %q, want %s", i+1, got, want)
+		}
+		if got := resp.Header.Get("X-Ratelimit-Reset-Requests"); got == "" {
+			t.Fatalf("request %d: X-RateLimit-Reset-Requests missing", i+1)
+		}
+		if resp.Header.Get("Retry-After") != "" {
+			t.Fatalf("request %d: Retry-After present on an allowed request, want absent", i+1)
+		}
+	}
+}
+
+// TestServer_RateLimitHeaders_RetryAfterPresentOnRejection proves a
+// genuine 429 carries Remaining=0 and a real Retry-After value a
+// well-behaved client can wait out — rounded up, never truncated down
+// to less than the actual remaining wait.
+func TestServer_RateLimitHeaders_RetryAfterPresentOnRejection(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.Limiter = limiter.New(1, time.Minute)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	first, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	first.Body.Close()
+
+	resp, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+	if got := resp.Header.Get("X-Ratelimit-Remaining-Requests"); got != "0" {
+		t.Fatalf("X-RateLimit-Remaining-Requests = %q, want 0", got)
+	}
+	retryAfter, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil {
+		t.Fatalf("Retry-After = %q, want an integer number of seconds: %v", resp.Header.Get("Retry-After"), err)
+	}
+	if retryAfter <= 0 || retryAfter > 60 {
+		t.Fatalf("Retry-After = %d, want a positive value up to the 60s window", retryAfter)
+	}
+}
+
+// TestServer_RateLimitHeaders_TokenLimiterUsesItsOwnHeaderPair proves
+// the token-based limiter reports through its own
+// X-RateLimit-*-Tokens header trio, independent of (and alongside) the
+// request-count limiter's own X-RateLimit-*-Requests trio when both
+// are configured.
+func TestServer_RateLimitHeaders_TokenLimiterUsesItsOwnHeaderPair(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"usage":{"total_tokens":40}}`))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.Limiter = limiter.New(100, time.Minute)
+	srv.TokenLimiter = limiter.NewTokenLimiter(100, time.Minute)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Post(frontend.URL+"/endpoint", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := resp.Header.Get("X-Ratelimit-Limit-Requests"); got != "100" {
+		t.Errorf("X-RateLimit-Limit-Requests = %q, want 100", got)
+	}
+	if got := resp.Header.Get("X-Ratelimit-Limit-Tokens"); got != "100" {
+		t.Errorf("X-RateLimit-Limit-Tokens = %q, want 100", got)
+	}
+	if got := resp.Header.Get("X-Ratelimit-Remaining-Tokens"); got != "100" {
+		// The 40-token usage this response reports is only recorded
+		// asynchronously once the response body is read — it can never
+		// be reflected in this same response's own headers, only a
+		// later request's.
+		t.Errorf("X-RateLimit-Remaining-Tokens = %q, want 100 (this response's own usage isn't known until after it's already been sent)", got)
+	}
+}
+
+// TestServer_RateLimitHeaders_AbsentWhenNoLimiterConfigured proves no
+// rate-limit headers appear at all when neither limiter is configured
+// — a request that never asks a limiter anything has no limiter state
+// to report.
+func TestServer_RateLimitHeaders_AbsentWhenNoLimiterConfigured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/endpoint")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	for _, h := range []string{"X-Ratelimit-Limit-Requests", "X-Ratelimit-Remaining-Requests", "X-Ratelimit-Reset-Requests"} {
+		if got := resp.Header.Get(h); got != "" {
+			t.Errorf("%s = %q, want absent when no limiter is configured", h, got)
+		}
+	}
+}
+
+// TestServer_RateLimitHeaders_AbsentOnCacheHit proves a cache hit —
+// which bypasses the rate limiter entirely, and always has — carries
+// no rate-limit headers either: there is no limiter state to report
+// for a request that never actually asked the limiter anything.
+func TestServer_RateLimitHeaders_AbsentOnCacheHit(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+	targetURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := cache.New()
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = c
+	srv.Logger = log.New(io.Discard, "", 0)
+	srv.Limiter = limiter.New(100, time.Minute)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const body = `{"model":"gpt-4"}`
+	post := func() *http.Response {
+		resp, err := http.Post(frontend.URL+"/v1/chat", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		return resp
+	}
+
+	first := post()
+	first.Body.Close()
+	if got := first.Header.Get("X-Ratelimit-Remaining-Requests"); got == "" {
+		t.Fatal("first (non-cached) request missing X-RateLimit-Remaining-Requests")
+	}
+
+	second := post() // a genuine cache hit
+	defer second.Body.Close()
+	if got := second.Header.Get("X-Ratelimit-Remaining-Requests"); got != "" {
+		t.Fatalf("cache-hit X-RateLimit-Remaining-Requests = %q, want absent (a cache hit never consults the limiter)", got)
+	}
+}

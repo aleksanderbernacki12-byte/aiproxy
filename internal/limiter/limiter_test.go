@@ -90,3 +90,81 @@ func TestLimiter_ConcurrentAccessNeverExceedsMax(t *testing.T) {
 		t.Fatalf("allowedCount = %d, want exactly %d", allowedCount, max)
 	}
 }
+
+// TestLimiter_Info_ReflectsRemainingAndResetAcrossAWindow proves Info
+// reports the configured maximum, decreasing remaining capacity, and a
+// resetIn that shrinks toward zero as the window's oldest entry ages —
+// the values behind the RateLimit-* response headers.
+func TestLimiter_Info_ReflectsRemainingAndResetAcrossAWindow(t *testing.T) {
+	base := time.Now()
+	l := New(5, time.Minute)
+
+	if max, remaining, resetIn := l.info(base); max != 5 || remaining != 5 || resetIn != 0 {
+		t.Fatalf("info on a fresh window = (%d, %d, %s), want (5, 5, 0)", max, remaining, resetIn)
+	}
+
+	for i := 1; i <= 3; i++ {
+		if !l.allow(base) {
+			t.Fatalf("request %d: want allowed", i)
+		}
+	}
+	max, remaining, resetIn := l.info(base)
+	if max != 5 || remaining != 2 {
+		t.Fatalf("info after 3 allowed = (%d, %d), want (5, 2)", max, remaining)
+	}
+	if resetIn <= 0 || resetIn > time.Minute {
+		t.Fatalf("resetIn = %s, want a positive value up to the full window", resetIn)
+	}
+
+	// A moment later, resetIn (time until the oldest of those 3 entries
+	// ages out) must have shrunk correspondingly.
+	later := base.Add(10 * time.Second)
+	_, _, resetInLater := l.info(later)
+	if resetInLater >= resetIn {
+		t.Fatalf("resetIn at t+10s = %s, want strictly less than at t+0s (%s)", resetInLater, resetIn)
+	}
+}
+
+// TestLimiter_Info_RemainingIsZeroOnceExhausted proves remaining never
+// goes negative once every slot in the window is used, and that Info
+// still reports a positive resetIn (there's still an oldest entry to
+// age out) even though the limiter itself is currently denying.
+func TestLimiter_Info_RemainingIsZeroOnceExhausted(t *testing.T) {
+	base := time.Now()
+	l := New(2, time.Minute)
+
+	l.allow(base)
+	l.allow(base)
+	if l.allow(base) {
+		t.Fatal("3rd request: want denied")
+	}
+
+	max, remaining, resetIn := l.info(base)
+	if max != 2 {
+		t.Fatalf("max = %d, want 2", max)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining = %d, want 0 once exhausted, never negative", remaining)
+	}
+	if resetIn <= 0 {
+		t.Fatal("resetIn = 0, want positive — the two live entries haven't aged out yet")
+	}
+}
+
+// TestLimiter_Info_ResetInZeroOnceWindowFullyElapsed proves resetIn
+// returns to 0 once every entry has aged out, exactly like a fresh,
+// never-used limiter.
+func TestLimiter_Info_ResetInZeroOnceWindowFullyElapsed(t *testing.T) {
+	base := time.Now()
+	l := New(2, time.Minute)
+	l.allow(base)
+
+	afterReset := base.Add(time.Minute + time.Millisecond)
+	max, remaining, resetIn := l.info(afterReset)
+	if max != 2 || remaining != 2 {
+		t.Fatalf("info once fully elapsed = (%d, %d), want (2, 2)", max, remaining)
+	}
+	if resetIn != 0 {
+		t.Fatalf("resetIn = %s, want 0 once every entry has aged out", resetIn)
+	}
+}

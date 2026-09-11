@@ -1674,6 +1674,41 @@ func acceptsJSON(r *http.Request) bool {
 	return false
 }
 
+// setRateLimitHeaders stamps the X-RateLimit-{Limit,Remaining,Reset}-<kind>
+// response headers for one consulted limiter (kind is "Requests" or
+// "Tokens") — set unconditionally right where effectiveLimiter/
+// effectiveTokenLimiter is actually checked in ServeHTTP, on both the
+// allowed and the rejected outcome, so a well-behaved client can see
+// it's close to a limit even on a request that still succeeded, not
+// only once it's already been rejected. Deliberately mirrors OpenAI's
+// own x-ratelimit-{limit,remaining,reset}-{requests,tokens} header
+// shape rather than inventing a new one from scratch, since that's
+// already the exact convention this project's own users — people
+// building against LLM APIs — are used to reading; Reset is rendered
+// via Duration.String() for the same reason (e.g. "12s", "1m30s"),
+// matching the exact format OpenAI's own API already sends. A request
+// whose response never reaches this check at all — a cache hit, or a
+// rejection from an earlier gate (IP/country/auth/rules) — never
+// consumes rate-limit budget in the first place, so it correctly never
+// carries these headers either: there's no limiter state to report for
+// a request that never asked the limiter anything.
+func setRateLimitHeaders(w http.ResponseWriter, kind string, max, remaining int, resetIn time.Duration) {
+	h := w.Header()
+	h.Set("X-RateLimit-Limit-"+kind, strconv.Itoa(max))
+	h.Set("X-RateLimit-Remaining-"+kind, strconv.Itoa(remaining))
+	h.Set("X-RateLimit-Reset-"+kind, resetIn.String())
+}
+
+// retryAfterSeconds rounds resetIn up to a whole number of seconds for
+// the standard Retry-After response header (RFC 9110) — always at
+// least as long as the real wait, never shorter, so a client that
+// waits exactly this long and retries is guaranteed the window has
+// actually reset rather than possibly retrying a fraction of a second
+// too early.
+func retryAfterSeconds(resetIn time.Duration) int {
+	return int((resetIn + time.Second - 1) / time.Second)
+}
+
 // writeError writes message as the body of an HTTP error response with
 // statusCode, in whichever format r's Accept header actually asked for
 // — see acceptsJSON. code and rule become errorResponse's Error/Rule
@@ -2075,13 +2110,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if effectiveLimiter != nil && !effectiveLimiter.Allow() {
-		s.Stats.RecordRateLimited(targetLabel)
-		s.Stats.RecordClientRateLimited(auth.label)
-		s.logRateLimited(r.Method, r.URL.String())
-		s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "")
-		writeError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded", "")
-		return
+	if effectiveLimiter != nil {
+		allowed := effectiveLimiter.Allow()
+		max, remaining, resetIn := effectiveLimiter.Info()
+		setRateLimitHeaders(w, "Requests", max, remaining, resetIn)
+		if !allowed {
+			s.Stats.RecordRateLimited(targetLabel)
+			s.Stats.RecordClientRateLimited(auth.label)
+			s.logRateLimited(r.Method, r.URL.String())
+			s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "")
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
+			writeError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded", "")
+			return
+		}
 	}
 
 	// A second, independent breaker: effectiveTokenLimiter.Allow() only
@@ -2091,13 +2132,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// checked against the budget before forwarding, only after, via
 	// logUsageFromBody's Add call once reqCtx carries this same limiter
 	// through to modifyResponse.
-	if effectiveTokenLimiter != nil && !effectiveTokenLimiter.Allow() {
-		s.Stats.RecordTokenRateLimited(targetLabel)
-		s.Stats.RecordClientTokenRateLimited(auth.label)
-		s.logTokenRateLimited(r.Method, r.URL.String())
-		s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "")
-		writeError(w, r, http.StatusTooManyRequests, "token_rate_limited", "token rate limit exceeded", "")
-		return
+	if effectiveTokenLimiter != nil {
+		allowed := effectiveTokenLimiter.Allow()
+		max, remaining, resetIn := effectiveTokenLimiter.Info()
+		setRateLimitHeaders(w, "Tokens", max, remaining, resetIn)
+		if !allowed {
+			s.Stats.RecordTokenRateLimited(targetLabel)
+			s.Stats.RecordClientTokenRateLimited(auth.label)
+			s.logTokenRateLimited(r.Method, r.URL.String())
+			s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "")
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
+			writeError(w, r, http.StatusTooManyRequests, "token_rate_limited", "token rate limit exceeded", "")
+			return
+		}
 	}
 
 	// A third, independent breaker, unlike Limiter/TokenLimiter keyed

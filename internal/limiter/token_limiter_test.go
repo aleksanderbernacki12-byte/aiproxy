@@ -106,6 +106,72 @@ func TestTokenLimiter_AddOfZeroOrNegativeIsNoOp(t *testing.T) {
 	}
 }
 
+// TestTokenLimiter_Info_ReflectsRemainingAndResetAsUsageAccrues proves
+// Info reports the configured maximum, decreasing remaining budget as
+// Add records usage, and a resetIn that shrinks as the oldest recorded
+// entry ages — the values behind the RateLimit-* response headers.
+func TestTokenLimiter_Info_ReflectsRemainingAndResetAsUsageAccrues(t *testing.T) {
+	base := time.Now()
+	l := NewTokenLimiter(100, time.Minute)
+
+	if max, remaining, resetIn := l.info(base); max != 100 || remaining != 100 || resetIn != 0 {
+		t.Fatalf("info on a fresh window = (%d, %d, %s), want (100, 100, 0)", max, remaining, resetIn)
+	}
+
+	l.add(40, base)
+	max, remaining, resetIn := l.info(base)
+	if max != 100 || remaining != 60 {
+		t.Fatalf("info after 40/100 used = (%d, %d), want (100, 60)", max, remaining)
+	}
+	if resetIn <= 0 || resetIn > time.Minute {
+		t.Fatalf("resetIn = %s, want a positive value up to the full window", resetIn)
+	}
+
+	later := base.Add(10 * time.Second)
+	_, _, resetInLater := l.info(later)
+	if resetInLater >= resetIn {
+		t.Fatalf("resetIn at t+10s = %s, want strictly less than at t+0s (%s)", resetInLater, resetIn)
+	}
+}
+
+// TestTokenLimiter_Info_RemainingNeverNegativeOnceOverBudget proves a
+// single large Add that overshoots the budget (see
+// TestTokenLimiter_SingleLargeAddCanExceedBudget) still reports
+// remaining as 0, never a negative number.
+func TestTokenLimiter_Info_RemainingNeverNegativeOnceOverBudget(t *testing.T) {
+	base := time.Now()
+	l := NewTokenLimiter(100, time.Minute)
+
+	l.add(10000, base)
+	max, remaining, resetIn := l.info(base)
+	if max != 100 {
+		t.Fatalf("max = %d, want 100", max)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining = %d, want 0, never negative", remaining)
+	}
+	if resetIn <= 0 {
+		t.Fatal("resetIn = 0, want positive — the overshooting entry hasn't aged out yet")
+	}
+}
+
+// TestTokenLimiter_Info_ResetInZeroOnceWindowFullyElapsed proves resetIn
+// returns to 0 once every recorded entry has aged out.
+func TestTokenLimiter_Info_ResetInZeroOnceWindowFullyElapsed(t *testing.T) {
+	base := time.Now()
+	l := NewTokenLimiter(100, time.Minute)
+	l.add(50, base)
+
+	afterReset := base.Add(time.Minute + time.Millisecond)
+	max, remaining, resetIn := l.info(afterReset)
+	if max != 100 || remaining != 100 {
+		t.Fatalf("info once fully elapsed = (%d, %d), want (100, 100)", max, remaining)
+	}
+	if resetIn != 0 {
+		t.Fatalf("resetIn = %s, want 0 once every entry has aged out", resetIn)
+	}
+}
+
 // TestTokenLimiter_ConcurrentAccessNeverRaces exercises Allow and Add
 // (the public, mutex-guarded entry points) from many goroutines at once.
 // Run with -race to prove there is no data race on the shared entries

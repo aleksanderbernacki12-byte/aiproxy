@@ -57,3 +57,42 @@ func (l *Limiter) allow(now time.Time) bool {
 	l.timestamps = append(l.timestamps, now)
 	return true
 }
+
+// Info reports the configured maximum, how many calls remain available
+// in the current rolling window, and how long until the oldest
+// currently-counted call ages out of it (freeing capacity) — the
+// values behind the RateLimit-* response headers. Safe for concurrent
+// use, and safe to call independently of Allow, though the proxy
+// package always calls it immediately after Allow to report the exact
+// state that call's decision just produced.
+func (l *Limiter) Info() (max, remaining int, resetIn time.Duration) {
+	return l.info(time.Now())
+}
+
+// info is the deterministic core of Info — see allow.
+func (l *Limiter) info(now time.Time) (max, remaining int, resetIn time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	cutoff := now.Add(-l.window)
+	live := l.timestamps[:0]
+	for _, ts := range l.timestamps {
+		if ts.After(cutoff) {
+			live = append(live, ts)
+		}
+	}
+	l.timestamps = live
+
+	remaining = l.maxRequests - len(l.timestamps)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if len(l.timestamps) == 0 {
+		return l.maxRequests, remaining, 0
+	}
+	resetIn = l.window - now.Sub(l.timestamps[0])
+	if resetIn < 0 {
+		resetIn = 0
+	}
+	return l.maxRequests, remaining, resetIn
+}

@@ -852,6 +852,45 @@ with their own `max_tokens_per_minute` — whichever is most specific for a
 given request takes precedence, with the exact same precedence order as
 the request-count breaker.
 
+### Rate-limit response headers
+
+Whenever `max_requests_per_minute` and/or `max_tokens_per_minute` is
+configured (server-wide, per-target, per-model-route, or per-named-key —
+whichever ends up effective for a given request), every response that
+actually reaches the limiter carries a matching pair of headers:
+
+```
+X-RateLimit-Limit-Requests: 60
+X-RateLimit-Remaining-Requests: 57
+X-RateLimit-Reset-Requests: 42s
+X-RateLimit-Limit-Tokens: 100000
+X-RateLimit-Remaining-Tokens: 88000
+X-RateLimit-Reset-Tokens: 12s
+```
+
+No config flag — this applies automatically the moment either limiter
+is configured, deliberately mirroring OpenAI's own
+`x-ratelimit-{limit,remaining}-{requests,tokens}` header shape rather
+than inventing a new one, since that's already the exact convention
+this proxy's own callers — people building against LLM APIs — are used
+to reading. They appear on a **successful** response too, not only a
+rejected one, so a well-behaved client can back off proactively once
+it sees `Remaining` getting low, before ever actually hitting a 429. A
+request that never reaches the limiter at all — an [IP/country
+deny](#restricting-access-by-ip), a failed
+[proxy auth](#authenticating-requests-to-the-proxy) check, a
+[blocked rule](#built-in-secret-patterns), or a [cache
+hit](#custom-rules-rate-limiting-caching-and-cost-estimation) — never
+carries these headers either, since there's no limiter state to report
+for a request that never actually asked the limiter anything.
+
+A rejected (429) response additionally carries the standard
+`Retry-After` header (an integer number of seconds, always rounded
+*up* — never a value a client could wait out and still retry too
+early) — the same header every real HTTP-aware client already knows
+how to honor, so a caller doesn't need to parse `X-RateLimit-Reset-*`
+itself just to know when to try again.
+
 ### Anomaly-based rate limiting
 
 `max_requests_per_minute`/`max_tokens_per_minute` are both fixed,
