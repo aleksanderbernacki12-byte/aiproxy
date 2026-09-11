@@ -25,6 +25,7 @@ import (
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
+	"aiproxy/internal/coalesce"
 	"aiproxy/internal/config"
 	"aiproxy/internal/geoip"
 	"aiproxy/internal/idempotency"
@@ -192,6 +193,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.CostBudget = lc.costBudget
 	server.CostBudgetHardStop = lc.costBudgetHardStop
 	server.Idempotency = lc.idempotency
+	server.Coalescer = lc.coalescer
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
 	server.Webhooks = lc.webhooks
@@ -263,6 +265,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			}
 			if cfg.CacheMaxSizeBytes > 0 {
 				fmt.Fprintf(stdout, "response cache: size-capped at %d bytes (LRU eviction)\n", cfg.CacheMaxSizeBytes)
+			}
+			if cfg.CacheRequestCoalescing {
+				fmt.Fprintln(stdout, "response cache: request coalescing enabled (concurrent identical misses share one upstream call)")
 			}
 		}
 		if len(lc.targetCacheTTL) > 0 || len(lc.targetCacheEnabled) > 0 {
@@ -495,7 +500,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency, lc.coalescer)
 
 	label := loadedFrom
 	if label == "" {
@@ -525,6 +530,7 @@ type liveConfig struct {
 	costBudget         float64
 	costBudgetHardStop bool
 	idempotency        *idempotency.Registry
+	coalescer          *coalesce.Group
 	maxBodyBytes       int64
 	webhookURL         *url.URL
 	webhooks           []proxy.WebhookTarget
@@ -599,7 +605,13 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 			c.MaxSizeBytes = cfg.CacheMaxSizeBytes
 			lc.cache = c
 			lc.cacheTTL = time.Duration(cfg.CacheTTLSeconds) * time.Second
+			if cfg.CacheRequestCoalescing {
+				lc.coalescer = coalesce.NewGroup(coalesce.DefaultWaitTimeout)
+			}
 		}
+	}
+	if cfg.CacheRequestCoalescing && !cfg.CacheEnabled {
+		errs = append(errs, fmt.Errorf("cache_request_coalescing requires cache_enabled to be set (there's no cache key for it to coalesce requests by otherwise)"))
 	}
 
 	if cfg.IdempotencyEnabled {
@@ -1263,6 +1275,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.CacheMaxSizeBytes > 0 && !cfg.CacheEnabled {
 		problems = append(problems, "cache_max_size_bytes requires cache_enabled to be set (there's nothing to cap otherwise)")
 	}
+	if cfg.CacheRequestCoalescing && !cfg.CacheEnabled {
+		problems = append(problems, "cache_request_coalescing requires cache_enabled to be set (there's no cache key for it to coalesce requests by otherwise)")
+	}
 	if cfg.IdempotencyTTLSeconds < 0 {
 		problems = append(problems, fmt.Sprintf("idempotency_ttl_seconds: %d must not be negative", cfg.IdempotencyTTLSeconds))
 	}
@@ -1309,6 +1324,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  cache enabled:           %v\n", cfg.CacheEnabled)
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
 	fmt.Fprintf(stdout, "  cache max size:          %s\n", cacheMaxSizeDisplay(cfg.CacheMaxSizeBytes))
+	fmt.Fprintf(stdout, "  cache request coalescing: %v\n", cfg.CacheRequestCoalescing)
 	fmt.Fprintf(stdout, "  per-target cache overrides: %d\n", countCacheOverrides(cfg))
 	fmt.Fprintf(stdout, "  shadow traffic targets:  %d\n", countShadowTargets(cfg))
 	fmt.Fprintf(stdout, "  idempotency enabled:     %v\n", cfg.IdempotencyEnabled)

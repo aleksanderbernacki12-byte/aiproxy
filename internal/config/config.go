@@ -605,6 +605,26 @@ type Config struct {
 	// CacheTTLSeconds.
 	CacheMaxSizeBytes int64 `json:"cache_max_size_bytes,omitempty"`
 
+	// CacheRequestCoalescing, if true, collapses concurrent requests
+	// that would otherwise all be simultaneous cache misses for the
+	// exact same content into one: the first one forwards normally,
+	// and every other one that arrives before it finishes waits for its
+	// response instead of independently forwarding an identical,
+	// redundant duplicate to the same upstream target — a "thundering
+	// herd" of otherwise-identical calls (many agents happening to ask
+	// the same question at once, say) collapsed into one real upstream
+	// call. Purely an optimization, invisible to the client: a
+	// coalesced response looks exactly like an ordinary forwarded one,
+	// with no marker header the way an idempotency replay has. Only
+	// meaningful alongside CacheEnabled — the "content-derived cache
+	// key" this collapses requests by is the same key the real response
+	// cache itself already computes, so setting this without
+	// CacheEnabled is a config error, same reasoning as
+	// CacheTTLSeconds. false (the default) means concurrent identical
+	// requests are all forwarded independently, unchanged from before
+	// this field existed.
+	CacheRequestCoalescing bool `json:"cache_request_coalescing,omitempty"`
+
 	// IdempotencyEnabled turns on Idempotency-Key deduplication: a
 	// client that sends the same Idempotency-Key header on a retried
 	// request gets back the exact same response instead of triggering a

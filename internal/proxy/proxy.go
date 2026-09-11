@@ -37,6 +37,7 @@ import (
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
+	"aiproxy/internal/coalesce"
 	"aiproxy/internal/geoip"
 	"aiproxy/internal/idempotency"
 	"aiproxy/internal/iplimiter"
@@ -146,6 +147,17 @@ type requestContextInfo struct {
 	// cache entry.
 	idempotencyClient string
 	idempotencyKey    string
+
+	// coalesceOwned is true when this request won ownership of
+	// cacheKey's own coalescing claim (see Server.Coalescer) — meaning
+	// bufferResponse/streamResponse must call Coalescer.Store once the
+	// real response is known, waking any concurrent identical request
+	// that's waiting on it. false whenever coalescing isn't configured,
+	// this request's own content wasn't a cache miss in the first
+	// place, or it gave up waiting for another owner instead (Bypass) —
+	// in every one of those cases there is no claim this request holds
+	// to complete.
+	coalesceOwned bool
 
 	// tokenLimiter is the effective token-based rate limiter for this
 	// request (the authenticated key's own, else the resolved route's,
@@ -440,6 +452,17 @@ type Server struct {
 	HealthCheckPath string
 
 	Cache *cache.Cache // nil disables the response cache
+
+	// Coalescer, if non-nil, collapses concurrent requests that would
+	// otherwise all be simultaneous cache misses for the exact same
+	// content into one — see the coalesce package's own doc comment.
+	// Checked in ServeHTTP right where a cache lookup would otherwise
+	// be a miss, reusing that exact same cache key; nil (the default,
+	// whenever cache_request_coalescing isn't configured) disables
+	// this entirely — every concurrent identical request is forwarded
+	// independently, unchanged from before this field existed. Only
+	// meaningful alongside Cache being non-nil.
+	Coalescer *coalesce.Group
 
 	// CacheTTL is the server-wide default TTL passed to Cache.Get/
 	// Cache.IsStale for a target with no override of its own — see
@@ -1685,6 +1708,12 @@ func (s *Server) getIdempotency() *idempotency.Registry {
 	return s.Idempotency
 }
 
+func (s *Server) getCoalescer() *coalesce.Group {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Coalescer
+}
+
 // clientIP extracts and parses the remote TCP peer's IP address from
 // r.RemoteAddr — deliberately never a client-supplied header like
 // X-Forwarded-For, which any caller could set to whatever value they
@@ -1951,7 +1980,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1999,6 +2028,7 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.TargetShadowSampleRate = targetShadowSampleRate
 	s.CostBudgetHardStop = costBudgetHardStop
 	s.Idempotency = idempotencyRegistry
+	s.Coalescer = coalescer
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2802,6 +2832,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// placeholder are still cached separately, which only ever costs an
 	// extra upstream call, never an incorrect one.
 	var cacheKey string
+	var coalesceOwnedForReqCtx bool
 	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
 		ttl := s.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
@@ -2839,6 +2870,38 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			s.logCacheHit(r.Method, r.URL.String(), requestID, age, stale)
 			return
+		}
+
+		// A genuine cache miss: if request coalescing is on, see
+		// whether another request is already in flight for this exact
+		// content before forwarding a possibly-redundant duplicate —
+		// see Server.Coalescer's own doc comment. Reuses cacheKey
+		// itself as the coalescing key, since it's already the same
+		// content-derived identity this section exists to deduplicate
+		// by.
+		if coalescer := s.getCoalescer(); coalescer != nil {
+			switch resp, outcome := coalescer.Claim(cacheKey); outcome {
+			case coalesce.Replay:
+				copyHeader(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				w.Write(resp.Body)
+				// A coalesced replay never reaches bufferResponse/
+				// streamResponse either — same reasoning as the cache-hit
+				// branch above needing its own Idempotency.Store call.
+				if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
+					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: resp.Body})
+				}
+				s.Stats.RecordCoalescedRequest(targetLabel)
+				s.logCoalescedRequest(r.Method, r.URL.String(), requestID)
+				return
+			case coalesce.Own:
+				coalesceOwnedForReqCtx = true
+				defer coalescer.Release(cacheKey)
+			case coalesce.Bypass:
+				// Gave up waiting for the current owner — proceed
+				// exactly as if coalescing weren't configured at all;
+				// this request holds no claim to ever complete.
+			}
 		}
 	}
 
@@ -2998,6 +3061,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		latency:           new(time.Duration),
 		idempotencyClient: auth.label,
 		idempotencyKey:    idempotencyKey,
+		coalesceOwned:     coalesceOwnedForReqCtx,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -3118,6 +3182,16 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		}
 	}
 
+	// Same "any status code, but never a response this function already
+	// blocked outright" reasoning as the Idempotency.Store call above —
+	// a concurrent identical request waiting on this exact content
+	// deserves the same real answer, whatever it turned out to be.
+	if reqCtx.coalesceOwned {
+		if coalescer := s.getCoalescer(); coalescer != nil {
+			coalescer.Store(reqCtx.cacheKey, &coalesce.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body})
+		}
+	}
+
 	s.logUsageFromBody(reqCtx, body)
 
 	return nil
@@ -3171,6 +3245,11 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		if cleanEOF && reqCtx.idempotencyKey != "" {
 			if idem := s.getIdempotency(); idem != nil {
 				idem.Store(reqCtx.idempotencyClient, reqCtx.idempotencyKey, &idempotency.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
+			}
+		}
+		if cleanEOF && reqCtx.coalesceOwned {
+			if coalescer := s.getCoalescer(); coalescer != nil {
+				coalescer.Store(reqCtx.cacheKey, &coalesce.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
 			}
 		}
 		s.logUsageFromBody(reqCtx, data)
@@ -3734,6 +3813,21 @@ func (s *Server) logCacheHit(method, reqURL, requestID string, age time.Duration
 		return
 	}
 	s.logf("%s[CACHE HIT] %s %s - age %ds%s", ansiPurple, method, reqURL, ageSeconds, ansiReset)
+}
+
+// logCoalescedRequest logs a request served by waiting for and
+// replaying a concurrent, still-in-flight identical request's own
+// response — see coalesce.Group.Claim's Replay outcome. Distinct from
+// logCacheHit: a cache hit is served from a completed, previously
+// cached response; this is served from another request that was, at
+// the time this one arrived, still in progress.
+func (s *Server) logCoalescedRequest(method, reqURL, requestID string) {
+	ev := s.recordLogEvent(logEvent{Level: "coalesced", Method: method, URL: reqURL, RequestID: requestID})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[COALESCED] %s %s - served from a concurrent in-flight request%s", ansiPurple, method, reqURL, ansiReset)
 }
 
 // logIdempotencyReplay logs a request served by replaying an earlier
@@ -4328,6 +4422,9 @@ type statsSnapshotJSON struct {
 	TokenRateLimited int64 `json:"token_rate_limited"`
 	CacheHits        int64 `json:"cache_hits"`
 
+	// CoalescedRequests mirrors stats.Snapshot.CoalescedRequests — see there.
+	CoalescedRequests int64 `json:"coalesced_requests"`
+
 	// StaleCacheHits mirrors stats.Snapshot.StaleCacheHits — see there.
 	StaleCacheHits   int64 `json:"stale_cache_hits"`
 	TotalTokens      int64 `json:"total_tokens"`
@@ -4439,6 +4536,7 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		RateLimited:            snap.RateLimited,
 		TokenRateLimited:       snap.TokenRateLimited,
 		CacheHits:              snap.CacheHits,
+		CoalescedRequests:      snap.CoalescedRequests,
 		StaleCacheHits:         snap.StaleCacheHits,
 		TotalTokens:            snap.TotalTokens,
 		ResponseBlocked:        snap.ResponseBlocked,
@@ -4677,6 +4775,7 @@ var promCounters = []struct {
 	{"aiproxy_requests_rate_limited_total", "Total number of requests rejected by the rate limiter.", func(s stats.Snapshot) int64 { return s.RateLimited }},
 	{"aiproxy_requests_token_rate_limited_total", "Total number of requests rejected by the token-based rate limiter.", func(s stats.Snapshot) int64 { return s.TokenRateLimited }},
 	{"aiproxy_cache_hits_total", "Total number of requests served from the local response cache.", func(s stats.Snapshot) int64 { return s.CacheHits }},
+	{"aiproxy_coalesced_requests_total", "Total number of requests served by waiting for and replaying a concurrent, still-in-flight identical request's own response.", func(s stats.Snapshot) int64 { return s.CoalescedRequests }},
 	{"aiproxy_stale_cache_hits_total", "Total number of cache hits served past their entry's own staleness warning threshold, relative to cache_ttl_seconds.", func(s stats.Snapshot) int64 { return s.StaleCacheHits }},
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},

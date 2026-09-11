@@ -28,19 +28,20 @@ var latencyBucketsSeconds = [...]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.
 // without a mutex. Stats keeps one for the overall total and one per
 // target.
 type counters struct {
-	allowed          atomic.Int64
-	blocked          atomic.Int64
-	redacted         atomic.Int64
-	rateLimited      atomic.Int64
-	tokenRateLimited atomic.Int64
-	cacheHits        atomic.Int64
-	staleCacheHits   atomic.Int64
-	totalTokens      atomic.Int64
-	responseBlocked  atomic.Int64
-	responseRedacted atomic.Int64
-	failover         atomic.Int64
-	shadowSent       atomic.Int64
-	shadowError      atomic.Int64
+	allowed           atomic.Int64
+	blocked           atomic.Int64
+	redacted          atomic.Int64
+	rateLimited       atomic.Int64
+	tokenRateLimited  atomic.Int64
+	cacheHits         atomic.Int64
+	coalescedRequests atomic.Int64
+	staleCacheHits    atomic.Int64
+	totalTokens       atomic.Int64
+	responseBlocked   atomic.Int64
+	responseRedacted  atomic.Int64
+	failover          atomic.Int64
+	shadowSent        atomic.Int64
+	shadowError       atomic.Int64
 
 	latencyBuckets  [len(latencyBucketsSeconds)]atomic.Int64
 	latencyCount    atomic.Int64
@@ -49,20 +50,21 @@ type counters struct {
 
 func (c *counters) snapshot() Snapshot {
 	return Snapshot{
-		Allowed:          c.allowed.Load(),
-		Blocked:          c.blocked.Load(),
-		Redacted:         c.redacted.Load(),
-		RateLimited:      c.rateLimited.Load(),
-		TokenRateLimited: c.tokenRateLimited.Load(),
-		CacheHits:        c.cacheHits.Load(),
-		StaleCacheHits:   c.staleCacheHits.Load(),
-		TotalTokens:      c.totalTokens.Load(),
-		ResponseBlocked:  c.responseBlocked.Load(),
-		ResponseRedacted: c.responseRedacted.Load(),
-		Failover:         c.failover.Load(),
-		ShadowSent:       c.shadowSent.Load(),
-		ShadowError:      c.shadowError.Load(),
-		Latency:          c.latencySnapshot(),
+		Allowed:           c.allowed.Load(),
+		Blocked:           c.blocked.Load(),
+		Redacted:          c.redacted.Load(),
+		RateLimited:       c.rateLimited.Load(),
+		TokenRateLimited:  c.tokenRateLimited.Load(),
+		CacheHits:         c.cacheHits.Load(),
+		CoalescedRequests: c.coalescedRequests.Load(),
+		StaleCacheHits:    c.staleCacheHits.Load(),
+		TotalTokens:       c.totalTokens.Load(),
+		ResponseBlocked:   c.responseBlocked.Load(),
+		ResponseRedacted:  c.responseRedacted.Load(),
+		Failover:          c.failover.Load(),
+		ShadowSent:        c.shadowSent.Load(),
+		ShadowError:       c.shadowError.Load(),
+		Latency:           c.latencySnapshot(),
 	}
 }
 
@@ -470,6 +472,18 @@ func (s *Stats) RecordCacheHit(target string) {
 	s.counterFor(target).cacheHits.Add(1)
 }
 
+// RecordCoalescedRequest records one request served by waiting for and
+// replaying a concurrent, still-in-flight identical request's own
+// response instead of independently forwarding a redundant duplicate —
+// see the coalesce package's Group.Claim (Replay outcome). Attributed
+// to target the same way RecordCacheHit is: this only ever fires
+// alongside cache_enabled, for a target whose own cache key this
+// request's would otherwise have collided with.
+func (s *Stats) RecordCoalescedRequest(target string) {
+	s.overall.coalescedRequests.Add(1)
+	s.counterFor(target).coalescedRequests.Add(1)
+}
+
 // RecordStaleCacheHit records one cache hit whose age had already
 // crossed cache.Cache.IsStale's warning threshold — see RecordCacheHit,
 // which is always called alongside this for the same request; this
@@ -832,6 +846,16 @@ type Snapshot struct {
 	TokenRateLimited int64 `json:"token_rate_limited"`
 	CacheHits        int64 `json:"cache_hits"`
 
+	// CoalescedRequests counts requests served by waiting for and
+	// replaying a concurrent, still-in-flight identical request's own
+	// response — see Stats.RecordCoalescedRequest and the coalesce
+	// package. Distinct from CacheHits: a cache hit is served from a
+	// completed, previously-cached response; a coalesced request is
+	// served from another request that was, at the time this one
+	// arrived, still in progress. Always 0 when cache_request_coalescing
+	// isn't configured.
+	CoalescedRequests int64 `json:"coalesced_requests"`
+
 	// StaleCacheHits counts how many of CacheHits were served past
 	// cache.Cache.IsStale's own warning threshold — still a genuine hit
 	// (never a miss; see cache.Cache.Get), just old enough relative to
@@ -1105,6 +1129,12 @@ func (s Snapshot) String() string {
 	if s.StaleCacheHits > 0 {
 		out += fmt.Sprintf("\nStale cache hits:     %d", s.StaleCacheHits)
 	}
+	// Same reasoning again: 0 for every run that never configured
+	// cache_request_coalescing, or that did but no two identical
+	// requests ever actually overlapped in flight.
+	if s.CoalescedRequests > 0 {
+		out += fmt.Sprintf("\nCoalesced requests:   %d", s.CoalescedRequests)
+	}
 	// Same reasoning again: 0 for every run that never configured a
 	// multi-URL target, or that did but never needed to actually use it.
 	if s.Failover > 0 {
@@ -1164,6 +1194,9 @@ func (s Snapshot) PerTargetString(rates CostRates) string {
 		}
 		if t.StaleCacheHits > 0 {
 			fmt.Fprintf(&b, " stale-cache-hits=%d", t.StaleCacheHits)
+		}
+		if t.CoalescedRequests > 0 {
+			fmt.Fprintf(&b, " coalesced=%d", t.CoalescedRequests)
 		}
 		if t.Latency.Count > 0 {
 			fmt.Fprintf(&b, " avg-latency=%.1fms", t.Latency.AvgLatencyMillis())

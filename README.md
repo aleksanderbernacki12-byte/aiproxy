@@ -1218,6 +1218,49 @@ inherently a whole-cache-directory budget shared across every entry
 regardless of target, not something that makes sense to scope per
 target the way TTL/enabled do.
 
+### Request coalescing
+
+Without this, several concurrent requests for the exact same content
+that all happen to be cache misses at once — many agents asking the
+same question in the same moment, say — each forward independently to
+the upstream target, a "thundering herd" of redundant, separately
+billed calls, even though caching would have served every one of them
+from a single response if only they hadn't all arrived at once.
+`cache_request_coalescing` collapses them into one real upstream call:
+the first request forwards normally, and every other one that arrives
+before it finishes waits for its response instead of forwarding its
+own duplicate:
+
+```json
+{
+  "cache_enabled": true,
+  "cache_request_coalescing": true
+}
+```
+
+Only meaningful alongside `cache_enabled` — the identity requests are
+collapsed by is the same content-derived cache key the real cache
+already computes, so `aiproxy validate` rejects
+`cache_request_coalescing` set without it. Completely transparent to
+the client: a coalesced response carries no marker header the way an
+[idempotency replay](#idempotency-key-deduplication) deliberately does
+— the client never opted into this, so it should never be able to tell
+the difference from an ordinary forward. Once the owning request
+actually completes, its response is written to the real on-disk cache
+exactly as normal, and the coalescing record itself is immediately
+forgotten — there's nothing left to keep around once the cache can
+serve that content to every future, non-overlapping request on its
+own. A request that never reaches a real answer (blocked by a rule,
+rate-limited, or otherwise rejected before forwarding) never strands
+the requests waiting on it either — they get a fair shot at their own
+attempt instead of waiting forever. Each coalesced request is logged
+(`[COALESCED]`, purple; `"coalesced"` under `--log-format json`) and
+counted in `stats.coalesced_requests` and the Prometheus
+`aiproxy_coalesced_requests_total` counter, broken down per target like
+`cache_hits` — distinct from a cache hit itself, which is served from a
+*completed*, previously cached response rather than one still in
+progress.
+
 ### Idempotency-Key deduplication
 
 The cache above is about *content*: has this exact body been sent

@@ -2229,6 +2229,44 @@ func TestExecute_Validate_NegativeIdempotencyTTLSeconds_ReportsProblem(t *testin
 	}
 }
 
+func TestExecute_Validate_CacheRequestCoalescingWithoutCacheEnabled_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_request_coalescing": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "cache_request_coalescing requires cache_enabled") {
+		t.Errorf("stderr missing the requires-cache_enabled problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithCacheRequestCoalescing_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "cache_request_coalescing": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cache request coalescing: true") {
+		t.Fatalf("stdout missing cache request coalescing summary line: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithIdempotencyEnabled_ReportsSummary(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
