@@ -465,11 +465,16 @@ func TestCache_IsStale_FalseBeforeThresholdTrueAfter(t *testing.T) {
 // treated as a miss.
 func TestCache_Get_StaleEntryStillServedAsAHit(t *testing.T) {
 	c := newTestCache(t)
-	c.TTL = 80 * time.Millisecond // threshold at 64ms
+	c.TTL = 2 * time.Second // threshold at 1.6s
 	if err := c.Set("key1", testResponse("v1")); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	time.Sleep(70 * time.Millisecond) // past the 64ms threshold, still under the 80ms TTL
+	// 1.8s: comfortably past the 1.6s threshold, with a 200ms margin on
+	// both sides before the 2s TTL itself — a tighter margin (previously
+	// 80ms/70ms, only 10ms before expiry) proved flaky under real CI
+	// scheduling jitter on the equivalent proxy-level test, so this one
+	// uses the same wider margin proactively.
+	time.Sleep(1800 * time.Millisecond)
 
 	resp, hit, age, err := c.Get("key1")
 	if err != nil {

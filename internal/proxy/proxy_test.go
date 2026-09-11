@@ -1484,7 +1484,7 @@ func TestServer_CacheHit_StaleAfterThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache.New: %v", err)
 	}
-	c.TTL = 100 * time.Millisecond // staleness threshold at 80ms
+	c.TTL = 2 * time.Second // staleness threshold at 1.6s
 
 	var logBuf syncBuffer
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
@@ -1503,7 +1503,15 @@ func TestServer_CacheHit_StaleAfterThreshold(t *testing.T) {
 	}
 
 	post().Body.Close()
-	time.Sleep(90 * time.Millisecond) // past the 80ms staleness threshold, still under the 100ms TTL
+	// 1.8s: comfortably past the 1.6s staleness threshold, with a wide
+	// 200ms margin on both sides before the 2s TTL itself — the previous
+	// version of this test used 100ms/90ms (only a 10ms margin before
+	// full expiry), which proved flaky on a slower/busier CI runner
+	// (observed failing on macOS specifically): real wall-clock
+	// scheduling jitter pushed the second request's age past the full
+	// TTL, turning the intended "stale but still valid" hit into a
+	// genuine miss and a second real upstream call.
+	time.Sleep(1800 * time.Millisecond)
 	resp := post()
 	defer resp.Body.Close()
 
