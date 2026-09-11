@@ -384,6 +384,23 @@ type Server struct {
 	// existed.
 	CORS *CORSConfig
 
+	// HealthCheckInterval, if greater than zero, makes ListenAndServe
+	// run a background goroutine (runHealthChecks) that proactively
+	// probes every currently configured candidate target on this
+	// interval, feeding the result into TargetBreaker exactly like a
+	// real request's own success/failure already does — see
+	// TargetHealthCheckIntervalSeconds's doc comment in the config
+	// package for the full rationale. Only takes effect when
+	// TargetBreaker is also non-nil (there's nothing for a probe to
+	// report into otherwise); zero (the default) disables this
+	// entirely.
+	HealthCheckInterval time.Duration
+
+	// HealthCheckPath, if set, replaces the path probed on every
+	// candidate; empty probes each candidate's own configured URL
+	// unchanged. Only meaningful alongside HealthCheckInterval.
+	HealthCheckPath string
+
 	Cache           *cache.Cache // nil disables the response cache
 	CostPer1KTokens float64      // zero omits the shutdown summary's cost line
 	routes          []route
@@ -754,12 +771,12 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 				cancel()
 			}
 			if tb != nil && len(candidates) == 1 {
-				t.recordBreakerFailure(tb, candidates[0].String())
+				t.server.recordBreakerFailure(tb, candidates[0].String())
 			}
 			return nil, err
 		}
 		if tb != nil && len(candidates) == 1 {
-			t.recordBreakerSuccess(tb, candidates[0].String())
+			t.server.recordBreakerSuccess(tb, candidates[0].String())
 		}
 		t.recordLatency(reqCtx, time.Since(start))
 		return wrapBody(resp), nil
@@ -803,7 +820,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		resp, err := base.RoundTrip(attempt)
 		if err == nil {
 			if tb != nil {
-				t.recordBreakerSuccess(tb, candidate.String())
+				t.server.recordBreakerSuccess(tb, candidate.String())
 			}
 			// Deliberately timed from the very first attempt, not just
 			// this successful one: retry time spent on an earlier
@@ -814,7 +831,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			return wrapBody(resp), nil
 		}
 		if tb != nil {
-			t.recordBreakerFailure(tb, candidate.String())
+			t.server.recordBreakerFailure(tb, candidate.String())
 		}
 		lastErr = err
 
@@ -856,26 +873,150 @@ func healthOrdered(candidates []*url.URL, tb *breaker.Registry) []*url.URL {
 	return append(healthy, ejected...)
 }
 
+// healthCheckIdlePollInterval is how often runHealthChecks rechecks
+// whether health checking has since been turned on (or its interval
+// changed) via a live SIGHUP reload, while it's currently disabled —
+// deliberately short and fixed rather than itself configurable, the
+// same "one universally reasonable default, not a knob every
+// deployment needs" reasoning behind the cache package's own
+// staleThresholdRatio.
+const healthCheckIdlePollInterval = 5 * time.Second
+
+// healthCheckProbeTimeout bounds how long a single candidate's probe
+// may take. Fixed rather than derived from HealthCheckInterval: a slow
+// candidate should time out and count as a failure well before it
+// could ever block an entire probe cycle, regardless of how frequently
+// probes are scheduled.
+const healthCheckProbeTimeout = 10 * time.Second
+
+// runHealthChecks runs until ctx is cancelled (see ListenAndServe),
+// probing every currently configured candidate target once per
+// HealthCheckInterval and feeding the result into TargetBreaker
+// exactly like a real request's own success/failure already does —
+// see recordBreakerFailure's doc comment for why proactive and
+// reactive signals deliberately share one Registry rather than two
+// independent ones. Re-reads its own configuration fresh on every
+// iteration, so a live SIGHUP reload that changes the interval, the
+// probe path, or turns health checking on/off entirely takes effect
+// starting with the very next cycle, no restart needed.
+func (s *Server) runHealthChecks(ctx context.Context) {
+	for {
+		interval, path, tb := s.getHealthCheckConfig()
+		wait := interval
+		if interval > 0 && tb != nil {
+			s.probeAllTargets(path, tb)
+		} else {
+			wait = healthCheckIdlePollInterval
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+// allCandidateTargets returns every distinct candidate upstream URL
+// currently configured — Target plus every route's and model route's
+// own targets — deduplicated by URL string so a candidate reused
+// across more than one route is only ever probed once per cycle.
+func (s *Server) allCandidateTargets() []*url.URL {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	seen := make(map[string]bool)
+	var out []*url.URL
+	add := func(u *url.URL) {
+		if u == nil {
+			return
+		}
+		key := u.String()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, u)
+	}
+	add(s.Target)
+	for _, r := range s.routes {
+		for _, u := range r.targets {
+			add(u)
+		}
+	}
+	for _, r := range s.modelRoutes {
+		for _, u := range r.targets {
+			add(u)
+		}
+	}
+	return out
+}
+
+// probeAllTargets probes every currently configured candidate
+// concurrently — so one slow or hung candidate can never delay
+// discovering that an unrelated candidate is perfectly healthy —
+// waiting for every probe to finish before this cycle is considered
+// complete.
+func (s *Server) probeAllTargets(path string, tb *breaker.Registry) {
+	transport, _ := s.getUpstreamConfig()
+	client := &http.Client{Transport: transport, Timeout: healthCheckProbeTimeout}
+	var wg sync.WaitGroup
+	for _, target := range s.allCandidateTargets() {
+		wg.Add(1)
+		go func(target *url.URL) {
+			defer wg.Done()
+			s.probeTarget(client, path, target, tb)
+		}(target)
+	}
+	wg.Wait()
+}
+
+// probeTarget makes one HTTP GET against target (or, if path is set,
+// against target with its path replaced) and reports the outcome into
+// tb. Any completed HTTP exchange counts as healthy regardless of its
+// status code — the same "only a genuine transport-level failure
+// counts" rule failoverTransport itself already applies — since an
+// arbitrary upstream LLM API has no universal unauthenticated
+// health-check convention to match a specific status against.
+func (s *Server) probeTarget(client *http.Client, path string, target *url.URL, tb *breaker.Registry) {
+	probeURL := *target
+	if path != "" {
+		probeURL.Path = path
+		probeURL.RawPath = ""
+	}
+	resp, err := client.Get(probeURL.String())
+	if err != nil {
+		s.recordBreakerFailure(tb, target.String())
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	s.recordBreakerSuccess(tb, target.String())
+}
+
 // recordBreakerFailure records a transport-level failure against
 // target in tb and, exactly on the transition into ejected, reports it
 // — a log line, a stats counter, and a webhook alert — the same
 // single-fire-on-transition treatment every other breaker-like event in
-// this package gets (see e.g. logAnomalyDetected).
-func (t *failoverTransport) recordBreakerFailure(tb *breaker.Registry, target string) {
+// this package gets (see e.g. logAnomalyDetected). Shared by
+// failoverTransport.RoundTrip (a real request's own failure) and
+// runHealthChecks (a background probe's failure) — both report into
+// the exact same breaker.Registry, so a target ejected by one is
+// reflected identically to the other, with no separate signal or
+// observability path for "how we found out."
+func (s *Server) recordBreakerFailure(tb *breaker.Registry, target string) {
 	if tb.RecordFailure(target) {
-		t.server.Stats.RecordTargetEjected()
-		t.server.logTargetEjected(target)
-		t.server.notifyTargetEjectedWebhook(target)
+		s.Stats.RecordTargetEjected()
+		s.logTargetEjected(target)
+		s.notifyTargetEjectedWebhook(target)
 	}
 }
 
 // recordBreakerSuccess records a success against target in tb and,
 // exactly on the transition out of ejected, reports its recovery.
-func (t *failoverTransport) recordBreakerSuccess(tb *breaker.Registry, target string) {
+func (s *Server) recordBreakerSuccess(tb *breaker.Registry, target string) {
 	if tb.RecordSuccess(target) {
-		t.server.Stats.RecordTargetRecovered()
-		t.server.logTargetRecovered(target)
-		t.server.notifyTargetRecoveredWebhook(target)
+		s.Stats.RecordTargetRecovered()
+		s.logTargetRecovered(target)
+		s.notifyTargetRecoveredWebhook(target)
 	}
 }
 
@@ -1161,6 +1302,14 @@ func (s *Server) getCORSConfig() *CORSConfig {
 	return s.CORS
 }
 
+// getHealthCheckConfig returns HealthCheckInterval, HealthCheckPath,
+// and TargetBreaker under one lock, for runHealthChecks.
+func (s *Server) getHealthCheckConfig() (time.Duration, string, *breaker.Registry) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.HealthCheckInterval, s.HealthCheckPath, s.TargetBreaker
+}
+
 // NewUpstreamTransport builds the *http.Transport used for every
 // forwarded request: a clone of http.DefaultTransport — preserving its
 // connection pooling, dialer, and TLS defaults — with
@@ -1316,7 +1465,7 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig) {
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -1353,6 +1502,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.UpstreamTotalTimeout = upstreamTotalTimeout
 	s.TargetBreaker = targetBreaker
 	s.CORS = cors
+	s.HealthCheckInterval = healthCheckInterval
+	s.HealthCheckPath = healthCheckPath
 	s.mu.Unlock()
 
 	if oldLogFile != nil {
@@ -2547,7 +2698,7 @@ func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget string) {
 // logTargetEjected logs one candidate upstream URL crossing its
 // consecutive-failure threshold — see breaker.Registry.RecordFailure.
 // Fires exactly once per ejection, not on every subsequent failure
-// while still in cooldown — see failoverTransport.recordBreakerFailure.
+// while still in cooldown — see Server.recordBreakerFailure.
 // No method/URL: unlike failover, this isn't tied to any one client
 // request — a target can be ejected by any request that happened to hit
 // it, and the target itself is the whole story.
@@ -3683,6 +3834,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		}
 		go serve(s.adminHTTPServer)
 	}
+
+	go s.runHealthChecks(ctx)
 
 	select {
 	case <-ctx.Done():

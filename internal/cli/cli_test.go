@@ -1540,6 +1540,115 @@ func TestRunStart_CORSAllowCredentialsWithoutOrigins_FatalsWithClearMessage(t *t
 	}
 }
 
+func TestExecute_Validate_NegativeTargetHealthCheckInterval_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": 3, "target_ejection_cooldown_seconds": 30, "target_health_check_interval_seconds": -5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "target_health_check_interval_seconds") {
+		t.Errorf("stderr missing negative target_health_check_interval_seconds problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_TargetHealthCheckIntervalWithoutEjectionThreshold_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_health_check_interval_seconds": 10}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "target_health_check_interval_seconds requires target_ejection_threshold") {
+		t.Errorf("stderr missing interval-requires-ejection-threshold problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_TargetHealthCheckPathWithoutInterval_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": 3, "target_ejection_cooldown_seconds": 30, "target_health_check_path": "/health"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "target_health_check_path requires target_health_check_interval_seconds") {
+		t.Errorf("stderr missing path-requires-interval problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithTargetHealthCheck_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_ejection_threshold": 3, "target_ejection_cooldown_seconds": 30, "target_health_check_interval_seconds": 15, "target_health_check_path": "/health"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "target health checks:    every 15s (probing /health)") {
+		t.Fatalf("stdout missing target health check summary: %q", stdout.String())
+	}
+}
+
+// TestRunStart_TargetHealthCheckIntervalWithoutEjectionThreshold_FatalsWithClearMessage
+// proves a cold start rejects the same pairing problem runValidate
+// reports, not just at `aiproxy validate` time.
+func TestRunStart_TargetHealthCheckIntervalWithoutEjectionThreshold_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"target_health_check_interval_seconds": 10}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_TargetHealthCheckIntervalWithoutEjectionThreshold_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+	if !strings.Contains(stderr.String(), "target_health_check_interval_seconds requires target_ejection_threshold") {
+		t.Fatalf("stderr missing expected fatal message: %q", stderr.String())
+	}
+}
+
 func TestExecute_Validate_NegativeCostBudget_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

@@ -353,6 +353,41 @@ type Config struct {
 	// AnomalyDryRun requiring AnomalyMultiplier.
 	TargetEjectionCooldownSeconds int `json:"target_ejection_cooldown_seconds,omitempty"`
 
+	// TargetHealthCheckIntervalSeconds, if greater than zero, makes
+	// aiproxy proactively probe every currently configured candidate
+	// upstream URL (--target plus every targets[]/model_routes[]
+	// candidate, deduplicated) on this interval, in the background,
+	// independent of real client traffic — so a dead target is
+	// discovered and deprioritized before a real request has to fail
+	// against it first, rather than only reactively after one does.
+	// Feeds the exact same breaker.Registry TargetEjectionThreshold
+	// already configures: a probe that fails is recorded exactly like a
+	// real request's own transport-level failure, and a probe that
+	// succeeds clears it exactly like a real request's own success —
+	// one shared notion of "unhealthy," with no separate threshold,
+	// cooldown, log line, or webhook event of its own. Requires
+	// TargetEjectionThreshold/TargetEjectionCooldownSeconds to already
+	// be set — there's no breaker for a health check to report into
+	// otherwise. Zero (the default when the field is absent) disables
+	// this entirely; aiproxy only ever finds out about a dead target
+	// reactively, the exact behavior it always had before this feature
+	// existed.
+	TargetHealthCheckIntervalSeconds int `json:"target_health_check_interval_seconds,omitempty"`
+
+	// TargetHealthCheckPath, if set, is the path probed on each
+	// candidate instead of its own configured path — e.g. probing
+	// "/health" on every candidate rather than each target's own base
+	// URL. A probe counts as healthy the moment it receives ANY HTTP
+	// response at all, regardless of status code — the same "only a
+	// genuine transport-level failure counts" rule failover itself
+	// already applies — since an arbitrary upstream LLM API has no
+	// universal unauthenticated health-check convention, but completing
+	// the HTTP exchange at all still proves the candidate is genuinely
+	// reachable. Only meaningful alongside
+	// TargetHealthCheckIntervalSeconds; empty (the default) probes each
+	// candidate's own configured URL unchanged.
+	TargetHealthCheckPath string `json:"target_health_check_path,omitempty"`
+
 	// AnomalyMultiplier, if greater than zero, flags — and, unless
 	// AnomalyDryRun is set, rejects with a 429 — a request from a
 	// named proxy client (see ProxyAPIKeys) whose current minute's

@@ -1278,6 +1278,54 @@ endpoint's `aiproxy_targets_ejected_total`/`aiproxy_targets_recovered_total`
 payload, since which specific candidate tripped isn't a route-label-shaped
 dimension the way most other counters are.
 
+### Proactive target health checks
+
+Ejection above is purely *reactive* — a candidate only gets
+deprioritized after a real client request happens to hit it and fail.
+`target_health_check_interval_seconds` adds a proactive check on top:
+
+```json
+{
+  "target_ejection_threshold": 3,
+  "target_ejection_cooldown_seconds": 30,
+  "target_health_check_interval_seconds": 15,
+  "target_health_check_path": "/health"
+}
+```
+
+Once set, aiproxy probes every currently configured candidate URL
+(`--target` plus every `targets[]`/`model_routes[]` candidate,
+deduplicated) in the background on this interval, independent of real
+traffic — so a dead target is discovered and deprioritized *before* a
+real request ever has to fail against it first. A probe counts as
+healthy the moment it gets back **any** HTTP response at all, whatever
+the status code — the same "only a genuine transport-level failure
+counts" rule [ejection](#automatically-deprioritizing-a-failing-candidate)
+itself already applies — since an arbitrary upstream LLM API has no
+universal unauthenticated health-check convention to match a specific
+status against, but completing the HTTP exchange at all still proves
+the candidate is genuinely reachable. `target_health_check_path`, if
+set, probes that path on every candidate instead of each one's own
+configured URL — useful for probing a dedicated lightweight endpoint
+rather than hitting a heavier default route on every cycle.
+
+A health check's result feeds directly into the exact same breaker
+`target_ejection_threshold` already configures — a failed probe is
+recorded exactly like a real request's own transport-level failure, a
+successful one clears it exactly like a real request's own success — so
+`target_health_check_interval_seconds` **requires**
+`target_ejection_threshold`/`target_ejection_cooldown_seconds` to
+already be set: there's no breaker for a health check to report into
+otherwise. There's no separate threshold, cooldown, log line, stats
+counter, or webhook event for a health check specifically — a target
+crossing the threshold from a failed probe logs `[TARGET EJECTED]` and
+alerts exactly the same way a target crossing it from a real request's
+own failure already does, since from that point on it's the exact same
+breaker state either way. Both settings are ordinary, optional,
+hot-reloadable-via-SIGHUP `aiproxy.json` fields; zero/absent (the
+default) disables proactive checking entirely, leaving aiproxy exactly
+as reactive as it's always been.
+
 ### Configurable upstream timeouts
 
 By default, forwarding a request to an upstream uses Go's own

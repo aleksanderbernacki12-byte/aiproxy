@@ -253,6 +253,45 @@ func TestLoad_TargetEjectionSettingsDefaultToZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesTargetHealthCheckSettings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"target_health_check_interval_seconds": 15, "target_health_check_path": "/health"}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.TargetHealthCheckIntervalSeconds != 15 {
+		t.Fatalf("TargetHealthCheckIntervalSeconds = %d, want 15", cfg.TargetHealthCheckIntervalSeconds)
+	}
+	if cfg.TargetHealthCheckPath != "/health" {
+		t.Fatalf("TargetHealthCheckPath = %q, want /health", cfg.TargetHealthCheckPath)
+	}
+}
+
+func TestLoad_TargetHealthCheckSettingsDefaultToZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.TargetHealthCheckIntervalSeconds != 0 {
+		t.Fatalf("TargetHealthCheckIntervalSeconds = %d, want 0 when absent", cfg.TargetHealthCheckIntervalSeconds)
+	}
+	if cfg.TargetHealthCheckPath != "" {
+		t.Fatalf("TargetHealthCheckPath = %q, want empty when absent", cfg.TargetHealthCheckPath)
+	}
+}
+
 func TestLoad_ParsesCORSSettings(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")
