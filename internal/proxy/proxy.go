@@ -2985,6 +2985,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// extra upstream call, never an incorrect one.
 	var cacheKey string
 	var coalesceOwnedForReqCtx bool
+	var semanticFingerprintForReqCtx []uint64
 	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
 		ttl := s.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
@@ -3022,6 +3023,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			s.logCacheHit(r.Method, r.URL.String(), requestID, age, stale)
 			return
+		}
+
+		// A genuine exact-cache miss: if a prompt can be extracted from
+		// the body, compute its fingerprint once — used both to search
+		// for an existing similar answer right below and, regardless of
+		// whether one is found, to index this request's own eventual
+		// response for future lookups (see the Index.Add call sites in
+		// bufferResponse/streamResponse). See Server.SemanticIndex's own
+		// doc comment for why this is a second, approximate layer
+		// checked only after the exact-match cache already missed.
+		if threshold := s.getSemanticCacheThreshold(); threshold > 0 {
+			if text, extracted := extractPromptText(body); extracted {
+				semanticFingerprintForReqCtx = semcache.Fingerprint(text)
+				if idx := s.getSemanticIndex(); idx != nil {
+					if candidateKey, similarity, found := idx.FindBest(targetLabel, semanticFingerprintForReqCtx, threshold); found {
+						if cached, hit, _, err := cch.Get(candidateKey, ttl); err == nil && hit {
+							defer cached.Body.Close()
+							copyHeader(w.Header(), cached.Header)
+							w.Header().Set("X-Semantic-Cache-Hit", "true")
+							w.Header().Set("X-Semantic-Cache-Similarity", strconv.FormatFloat(similarity, 'f', 2, 64))
+							w.WriteHeader(cached.StatusCode)
+							// Same reasoning as the exact-cache-hit branch
+							// above: a semantic hit never reaches
+							// bufferResponse/streamResponse either, so an
+							// owned idempotency claim must be completed
+							// right here.
+							if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
+								cachedBody, readErr := io.ReadAll(cached.Body)
+								w.Write(cachedBody)
+								if readErr == nil {
+									idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: cachedBody})
+								}
+							} else {
+								io.Copy(w, cached.Body)
+							}
+							s.Stats.RecordSemanticCacheHit(targetLabel)
+							s.logSemanticCacheHit(r.Method, r.URL.String(), requestID, similarity)
+							return
+						}
+					}
+				}
+			}
 		}
 
 		// A genuine cache miss: if request coalescing is on, see
@@ -3200,20 +3243,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rewritten to the absolute upstream URL, and they need the exact
 	// same target/cache key ServeHTTP already resolved and checked.
 	reqCtx := requestContextInfo{
-		method:            r.Method,
-		url:               r.URL.String(),
-		requestID:         requestID,
-		cacheKey:          cacheKey,
-		targets:           targets,
-		forwardPath:       forwardPath,
-		targetLabel:       targetLabel,
-		clientLabel:       auth.label,
-		clientCostBudget:  auth.costBudget,
-		tokenLimiter:      effectiveTokenLimiter,
-		latency:           new(time.Duration),
-		idempotencyClient: auth.label,
-		idempotencyKey:    idempotencyKey,
-		coalesceOwned:     coalesceOwnedForReqCtx,
+		method:              r.Method,
+		url:                 r.URL.String(),
+		requestID:           requestID,
+		cacheKey:            cacheKey,
+		targets:             targets,
+		forwardPath:         forwardPath,
+		targetLabel:         targetLabel,
+		clientLabel:         auth.label,
+		clientCostBudget:    auth.costBudget,
+		tokenLimiter:        effectiveTokenLimiter,
+		latency:             new(time.Duration),
+		idempotencyClient:   auth.label,
+		idempotencyKey:      idempotencyKey,
+		coalesceOwned:       coalesceOwnedForReqCtx,
+		semanticFingerprint: semanticFingerprintForReqCtx,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -3316,6 +3360,8 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// never left pending behind an already-visible log line.
 		if err := cch.Set(reqCtx.cacheKey, resp); err != nil {
 			s.logError("aiproxy: cache: failed to store response: %v", err)
+		} else if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
+			idx.Add(reqCtx.targetLabel, reqCtx.semanticFingerprint, reqCtx.cacheKey)
 		}
 	}
 
@@ -3388,7 +3434,11 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// short is never cached, same as any other incomplete stream:
 		// cleanEOF is false for it too (see streamTee.Read).
 		if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
-			s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data)
+			if s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data) {
+				if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
+					idx.Add(reqCtx.targetLabel, reqCtx.semanticFingerprint, reqCtx.cacheKey)
+				}
+			}
 		}
 		// Same "any status code, but only a clean, complete stream"
 		// reasoning as bufferResponse's own Store call — see there for
@@ -3410,10 +3460,11 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 }
 
 // writeStreamToCache stores a completed stream's accumulated bytes under
-// key in cch. A stream that was cut short (client disconnect, upstream
-// error) must never reach here: a future "hit" would silently replay a
-// truncated response as if it were complete.
-func (s *Server) writeStreamToCache(cch *cache.Cache, key string, statusCode int, header http.Header, data []byte) {
+// key in cch, reporting whether the write succeeded. A stream that was
+// cut short (client disconnect, upstream error) must never reach here:
+// a future "hit" would silently replay a truncated response as if it
+// were complete.
+func (s *Server) writeStreamToCache(cch *cache.Cache, key string, statusCode int, header http.Header, data []byte) bool {
 	cached := &http.Response{
 		StatusCode: statusCode,
 		Header:     header,
@@ -3421,7 +3472,9 @@ func (s *Server) writeStreamToCache(cch *cache.Cache, key string, statusCode int
 	}
 	if err := cch.Set(key, cached); err != nil {
 		s.logError("aiproxy: cache: failed to store response: %v", err)
+		return false
 	}
+	return true
 }
 
 // errResponseBlocked is returned by streamTee.Read once a Block-actioned
