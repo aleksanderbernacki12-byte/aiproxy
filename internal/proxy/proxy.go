@@ -4650,6 +4650,9 @@ type statsSnapshotJSON struct {
 	// CoalescedRequests mirrors stats.Snapshot.CoalescedRequests — see there.
 	CoalescedRequests int64 `json:"coalesced_requests"`
 
+	// SemanticCacheHits mirrors stats.Snapshot.SemanticCacheHits — see there.
+	SemanticCacheHits int64 `json:"semantic_cache_hits"`
+
 	// StaleCacheHits mirrors stats.Snapshot.StaleCacheHits — see there.
 	StaleCacheHits   int64 `json:"stale_cache_hits"`
 	TotalTokens      int64 `json:"total_tokens"`
@@ -4762,6 +4765,7 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		TokenRateLimited:       snap.TokenRateLimited,
 		CacheHits:              snap.CacheHits,
 		CoalescedRequests:      snap.CoalescedRequests,
+		SemanticCacheHits:      snap.SemanticCacheHits,
 		StaleCacheHits:         snap.StaleCacheHits,
 		TotalTokens:            snap.TotalTokens,
 		ResponseBlocked:        snap.ResponseBlocked,

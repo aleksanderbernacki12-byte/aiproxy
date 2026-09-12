@@ -3521,6 +3521,7 @@ type statsJSONResponse struct {
 	Redacted               int64                         `json:"redacted"`
 	RateLimited            int64                         `json:"rate_limited"`
 	CacheHits              int64                         `json:"cache_hits"`
+	SemanticCacheHits      int64                         `json:"semantic_cache_hits"`
 	TotalTokens            int64                         `json:"total_tokens"`
 	ResponseBlocked        int64                         `json:"response_blocked"`
 	ResponseRedacted       int64                         `json:"response_redacted"`

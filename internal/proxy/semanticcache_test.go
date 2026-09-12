@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -264,6 +265,39 @@ func TestServer_SemanticCache_StatsAndLog(t *testing.T) {
 
 	if n := srv.Stats.Snapshot().SemanticCacheHits; n != 1 {
 		t.Fatalf("stats SemanticCacheHits = %d, want 1", n)
+	}
+}
+
+// TestServer_SemanticCache_StatsJSONEndpointIncludesSemanticCacheHits
+// checks the real GET /_aiproxy/stats wire body, not just the internal
+// stats.Snapshot struct: those are two separate hand-maintained shapes
+// (see statsSnapshotJSON/toStatsSnapshotJSON) that have drifted out of
+// sync before (the v0.37 latency field gap) — a new Snapshot field is
+// only actually live once it's threaded through both.
+func TestServer_SemanticCache_StatsJSONEndpointIncludesSemanticCacheHits(t *testing.T) {
+	t.Chdir(t.TempDir())
+	var hits atomic.Int32
+	upstream := countingUpstream(&hits, "a real answer")
+	_, frontend := newSemanticCacheTestServer(t, upstream, 0.5)
+
+	http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"messages":[{"role":"user","content":"Can you tell me what the capital of Sweden is"}]}`))
+	http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"messages":[{"role":"user","content":"Could you tell me what the capital of Sweden is"}]}`))
+
+	statsResp, err := http.Get(frontend.URL + "/_aiproxy/stats")
+	if err != nil {
+		t.Fatalf("GET /_aiproxy/stats: %v", err)
+	}
+	defer statsResp.Body.Close()
+	var wire map[string]any
+	if err := json.NewDecoder(statsResp.Body).Decode(&wire); err != nil {
+		t.Fatalf("decode /_aiproxy/stats: %v", err)
+	}
+	got, ok := wire["semantic_cache_hits"]
+	if !ok {
+		t.Fatalf("semantic_cache_hits key missing from /_aiproxy/stats JSON response entirely: %v", wire)
+	}
+	if got != float64(1) {
+		t.Fatalf(`/_aiproxy/stats["semantic_cache_hits"] = %v, want 1`, got)
 	}
 }
 
