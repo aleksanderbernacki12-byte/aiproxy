@@ -535,7 +535,7 @@ Also on by default, no config needed, in the same
 | `prompt-injection-ignore-instructions`  | "ignore/disregard/forget previous/prior/above instructions"     |
 | `prompt-injection-system-exfiltration`  | "reveal/print/show your system prompt"                          |
 | `prompt-injection-role-override`        | "you are now in developer mode / DAN / an unrestricted AI"      |
-| `prompt-injection-fake-system-turn`     | injected fake `[SYSTEM]:`/`ADMIN:` delimiters                   |
+| `prompt-injection-fake-system-turn`     | fake all-caps `[SYSTEM]:`/`ADMIN:`/`ROOT:` delimiters followed by "override"/"new instructions" |
 | `prompt-injection-restriction-bypass`   | "bypass/override/disable your safety/content guidelines"        |
 
 Unlike the secret patterns above, none of these can be made
