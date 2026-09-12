@@ -3038,9 +3038,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				semanticFingerprintForReqCtx = semcache.Fingerprint(text)
 				if idx := s.getSemanticIndex(); idx != nil {
 					if candidateKey, similarity, found := idx.FindBest(targetLabel, semanticFingerprintForReqCtx, threshold); found {
-						if cached, hit, _, err := cch.Get(candidateKey, ttl); err == nil && hit {
+						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit {
 							defer cached.Body.Close()
 							copyHeader(w.Header(), cached.Header)
+							// Set after copyHeader, same reasoning as the
+							// exact-cache-hit branch above: this always
+							// wins over whatever Age the original response
+							// itself might have carried.
+							w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
 							w.Header().Set("X-Semantic-Cache-Hit", "true")
 							w.Header().Set("X-Semantic-Cache-Similarity", strconv.FormatFloat(similarity, 'f', 2, 64))
 							w.WriteHeader(cached.StatusCode)

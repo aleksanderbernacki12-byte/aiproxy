@@ -1308,6 +1308,14 @@ is always marked with `X-Semantic-Cache-Hit: true` and
 answer to a *materially different* request than the one the client
 actually sent, and the client should be able to detect that.
 
+Like the exact-match cache, this is scoped per target, not per caller:
+two different `proxy_api_keys` entries hitting the same target can
+share both an exact and a semantic cache hit. The similarity threshold
+makes an accidental cross-caller match easier to trigger than the
+exact cache's byte-for-byte requirement, so pick a conservative
+threshold if different callers' traffic on the same target could
+plausibly contain similar-but-sensitive content.
+
 Each semantic cache hit is logged (`[SEMANTIC CACHE HIT]`, purple;
 `"semantic_cache_hit"` under `--log-format json`) and counted in
 `stats.semantic_cache_hits` and the Prometheus

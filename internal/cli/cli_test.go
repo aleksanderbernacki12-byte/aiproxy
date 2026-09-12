@@ -2362,6 +2362,43 @@ func TestExecute_Validate_SemanticCacheThresholdAboveOne_ReportsProblem(t *testi
 	}
 }
 
+// TestRunStart_SemanticCacheThresholdAboveOne_FatalsWithClearMessage
+// proves buildLiveConfig itself rejects an out-of-range
+// semantic_cache_threshold, not just `aiproxy validate` — a threshold
+// above 1 makes the Jaccard-similarity check in internal/semcache
+// never fire, silently turning the feature into a permanent no-op
+// (while still paying its fingerprinting/indexing cost) if only
+// runValidate caught this and the actual start/reload path didn't.
+func TestRunStart_SemanticCacheThresholdAboveOne_FatalsWithClearMessage(t *testing.T) {
+	if os.Getenv("AIPROXY_TEST_CRASHER") == "1" {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "aiproxy.json")
+		invalidConfig := `{"cache_enabled": true, "semantic_cache_enabled": true, "semantic_cache_threshold": 5.0}`
+		if err := os.WriteFile(configPath, []byte(invalidConfig), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		cli.Execute([]string{"start", "-target", "https://example.com", "-config", configPath}, os.Stdout, os.Stderr)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunStart_SemanticCacheThresholdAboveOne_FatalsWithClearMessage")
+	cmd.Env = append(os.Environ(), "AIPROXY_TEST_CRASHER=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected the subprocess to exit with an error, got %v (stderr: %s)", err, stderr.String())
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (log.Fatalf's os.Exit(1))", exitErr.ExitCode())
+	}
+	if !strings.Contains(stderr.String(), "semantic_cache_threshold") || !strings.Contains(stderr.String(), "must not be greater than 1") {
+		t.Fatalf("stderr missing expected fatal message: %q", stderr.String())
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithSemanticCache_ReturnsZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

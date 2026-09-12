@@ -634,6 +634,9 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	if cfg.SemanticCacheThreshold > 0 && !cfg.SemanticCacheEnabled {
 		errs = append(errs, fmt.Errorf("semantic_cache_threshold requires semantic_cache_enabled to be set"))
 	}
+	if cfg.SemanticCacheThreshold > 1 {
+		errs = append(errs, fmt.Errorf("semantic_cache_threshold: %g must not be greater than 1", cfg.SemanticCacheThreshold))
+	}
 
 	if cfg.IdempotencyEnabled {
 		if cfg.IdempotencyTTLSeconds <= 0 {

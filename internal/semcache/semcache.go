@@ -39,8 +39,9 @@ const shingleSize = 3
 func Fingerprint(text string) []uint64 {
 	words := strings.Fields(strings.ToLower(text))
 	seen := make(map[uint64]struct{})
+	h := fnv.New64a()
 	for i := 0; i+shingleSize <= len(words); i++ {
-		h := fnv.New64a()
+		h.Reset()
 		for j := i; j < i+shingleSize; j++ {
 			h.Write([]byte(words[j]))
 			h.Write([]byte{0})
@@ -48,8 +49,8 @@ func Fingerprint(text string) []uint64 {
 		seen[h.Sum64()] = struct{}{}
 	}
 	hashes := make([]uint64, 0, len(seen))
-	for h := range seen {
-		hashes = append(hashes, h)
+	for hash := range seen {
+		hashes = append(hashes, hash)
 	}
 	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
 	return hashes
