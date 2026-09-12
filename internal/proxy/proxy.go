@@ -906,6 +906,15 @@ type logEvent struct {
 	AgeSeconds *int `json:"age_seconds,omitempty"`
 	Stale      bool `json:"stale,omitempty"`
 
+	// Similarity is only set on a semantic_cache_hit event: the Jaccard
+	// similarity (see semcache.Similarity) between this request's own
+	// extracted prompt text and the matched prior request's — always
+	// greater than 0 in practice, since it can only be set once it
+	// crossed semantic_cache_threshold, so a plain float64 with
+	// omitempty is safe here (unlike AgeSeconds/DurationMS, which can
+	// legitimately be a real, meaningful zero).
+	Similarity float64 `json:"similarity,omitempty"`
+
 	Message string `json:"message,omitempty"`
 }
 
@@ -3971,6 +3980,21 @@ func (s *Server) logCoalescedRequest(method, reqURL, requestID string) {
 		return
 	}
 	s.logf("%s[COALESCED] %s %s - served from a concurrent in-flight request%s", ansiPurple, method, reqURL, ansiReset)
+}
+
+// logSemanticCacheHit logs a request served by an approximate match
+// against a recent, sufficiently similar prior request — see
+// semcache.Index.FindBest and Server.SemanticCacheThreshold. Distinct
+// from logCacheHit: the served response belongs to a different (if
+// similar) request, so there's no meaningful "this request's own age"
+// to report the way a genuine cache hit has.
+func (s *Server) logSemanticCacheHit(method, reqURL, requestID string, similarity float64) {
+	ev := s.recordLogEvent(logEvent{Level: "semantic_cache_hit", Method: method, URL: reqURL, RequestID: requestID, Similarity: similarity})
+	if s.LogFormat == LogFormatJSON {
+		s.logEventJSON(ev)
+		return
+	}
+	s.logf("%s[SEMANTIC CACHE HIT] %s %s - similarity %.2f%s", ansiPurple, method, reqURL, similarity, ansiReset)
 }
 
 // logIdempotencyReplay logs a request served by replaying an earlier
