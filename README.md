@@ -1261,6 +1261,56 @@ counted in `stats.coalesced_requests` and the Prometheus
 *completed*, previously cached response rather than one still in
 progress.
 
+### Semantic cache
+
+The exact-match cache above only serves a hit for a byte-for-byte
+identical request. `semantic_cache_enabled` adds a second, approximate
+lookup layer on top of it: when the exact cache misses, aiproxy checks
+whether a recent, sufficiently similar request already has a cached
+answer for this target — a rephrased prompt, reordered whitespace, a
+client that appends a timestamp to its system message — and serves that
+instead of forwarding upstream:
+
+```json
+{
+  "cache_enabled": true,
+  "semantic_cache_enabled": true,
+  "semantic_cache_threshold": 0.9
+}
+```
+
+Only meaningful alongside `cache_enabled`, same reasoning as
+`cache_request_coalescing`; `aiproxy validate` rejects
+`semantic_cache_enabled` set without it, or without an explicit
+`semantic_cache_threshold` — there is no universally safe default
+similarity threshold the way "never expire" is a safe default TTL, so
+one must always be set (in `(0, 1]`) when this is turned on. The
+reverse is validated too: setting `semantic_cache_threshold` without
+`semantic_cache_enabled` is also rejected, since the value would
+otherwise silently do nothing.
+
+Similarity is computed entirely locally: aiproxy extracts the prompt
+text it recognizes from the request body (the `content` of each entry
+in a `messages` array — OpenAI/Anthropic style, plain string or a
+content-block array — plus the legacy top-level `prompt`/`input`
+fields), splits it into overlapping 3-word shingles, and compares two
+requests' shingle sets by exact Jaccard similarity (no external
+embeddings API, no added latency or cost on a miss). This catches
+near-duplicate *phrasings* — the same request restated with minor edits
+or additions — but not a true paraphrase with substantially different
+wording, which would require real, meaning-based embeddings; a request
+whose body doesn't match any recognized shape simply never participates
+in semantic caching, with no effect on the exact-match cache. Unlike a
+coalesced request, a semantic cache hit is always marked with
+`X-Semantic-Cache-Hit: true` and `X-Semantic-Cache-Similarity: 0.93`
+response headers: it can serve the answer to a *materially different*
+request than the one the client actually sent, and the client should be
+able to detect that. Each semantic cache hit is logged (`[SEMANTIC
+CACHE HIT]`, purple; `"semantic_cache_hit"` under `--log-format json`)
+and counted in `stats.semantic_cache_hits` and the Prometheus
+`aiproxy_semantic_cache_hits_total` counter, broken down per target like
+`cache_hits`.
+
 ### Idempotency-Key deduplication
 
 The cache above is about *content*: has this exact body been sent
