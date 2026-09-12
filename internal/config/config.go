@@ -654,9 +654,12 @@ type Config struct {
 	// threshold (too low risks serving a mismatched answer, too high
 	// makes the feature a no-op, and the right value is inherently
 	// workload-specific), the same reasoning IdempotencyTTLSeconds
-	// already requires an explicit value for — including that same
-	// field's asymmetry: a threshold set without SemanticCacheEnabled is
-	// not itself flagged as an error, only the reverse.
+	// already requires an explicit value for. Unlike
+	// IdempotencyTTLSeconds, though, this validates in both directions —
+	// same as CacheTTLSeconds/CacheMaxSizeBytes under CacheEnabled: a
+	// threshold set without SemanticCacheEnabled is also flagged as an
+	// error, since a forgotten flag would otherwise leave the threshold
+	// silently inert.
 	SemanticCacheThreshold float64 `json:"semantic_cache_threshold,omitempty"`
 
 	// IdempotencyEnabled turns on Idempotency-Key deduplication: a

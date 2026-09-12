@@ -2305,6 +2305,25 @@ func TestExecute_Validate_SemanticCacheEnabledWithoutThreshold_ReportsProblem(t 
 	}
 }
 
+func TestExecute_Validate_SemanticCacheThresholdWithoutEnabled_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "semantic_cache_threshold": 0.9}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "semantic_cache_threshold requires semantic_cache_enabled") {
+		t.Errorf("stderr missing the requires-enabled problem: %q", stderr.String())
+	}
+}
+
 func TestExecute_Validate_SemanticCacheThresholdNegative_ReportsProblem(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

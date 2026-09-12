@@ -631,6 +631,9 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	if cfg.SemanticCacheEnabled && cfg.SemanticCacheThreshold <= 0 {
 		errs = append(errs, fmt.Errorf("semantic_cache_enabled requires semantic_cache_threshold to be set (there is no safe default similarity threshold)"))
 	}
+	if cfg.SemanticCacheThreshold > 0 && !cfg.SemanticCacheEnabled {
+		errs = append(errs, fmt.Errorf("semantic_cache_threshold requires semantic_cache_enabled to be set"))
+	}
 
 	if cfg.IdempotencyEnabled {
 		if cfg.IdempotencyTTLSeconds <= 0 {
@@ -1307,6 +1310,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	}
 	if cfg.SemanticCacheEnabled && !cfg.CacheEnabled {
 		problems = append(problems, "semantic_cache_enabled requires cache_enabled to be set (there's no cache key for a semantic match to point at otherwise)")
+	}
+	if cfg.SemanticCacheThreshold > 0 && !cfg.SemanticCacheEnabled {
+		problems = append(problems, "semantic_cache_threshold requires semantic_cache_enabled to be set")
 	}
 	if cfg.IdempotencyTTLSeconds < 0 {
 		problems = append(problems, fmt.Sprintf("idempotency_ttl_seconds: %d must not be negative", cfg.IdempotencyTTLSeconds))
