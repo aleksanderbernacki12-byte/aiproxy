@@ -131,16 +131,26 @@ func (c *Cache) loadExisting() error {
 }
 
 // Key computes the cache key for a request: the hex-encoded SHA256 hash
-// of the HTTP method, the fully-resolved target URL, and the entire
-// request body. NUL bytes separate the fields so that, for example,
-// method "GETX" + url "Y" cannot collide with method "GET" + url "XY".
-func Key(method, targetURL string, body []byte) string {
+// of the HTTP method, the fully-resolved target URL, the entire request
+// body, and partitionID — an opaque, caller-computed identity string
+// that must differ between two callers whenever their responses could
+// legitimately differ (different proxy client, different upstream
+// credential; see proxy.partitionIdentity, this cache's only caller).
+// Without partitionID, two different callers requesting the exact same
+// method/URL/body would share one cache entry regardless of who they
+// are or what credential they authenticate to the upstream with — see
+// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #1. NUL bytes
+// separate every field so that, for example, method "GETX" + url "Y"
+// cannot collide with method "GET" + url "XY".
+func Key(method, targetURL string, body []byte, partitionID string) string {
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte{0})
 	h.Write([]byte(targetURL))
 	h.Write([]byte{0})
 	h.Write(body)
+	h.Write([]byte{0})
+	h.Write([]byte(partitionID))
 	return hex.EncodeToString(h.Sum(nil))
 }
 

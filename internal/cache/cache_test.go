@@ -490,3 +490,19 @@ func TestCache_Get_StaleEntryStillServedAsAHit(t *testing.T) {
 		t.Fatalf("IsStale(%v) with TTL=80ms = false, want true", age)
 	}
 }
+
+func TestKey_DifferentPartitionsProduceDifferentKeys(t *testing.T) {
+	a := cache.Key("GET", "https://api.example.com/v1/chat", []byte(`{"x":1}`), "partition-alice")
+	b := cache.Key("GET", "https://api.example.com/v1/chat", []byte(`{"x":1}`), "partition-bob")
+	if a == b {
+		t.Fatalf("same method/url/body but different partitionID produced identical keys: %q", a)
+	}
+}
+
+func TestKey_SamePartitionAndInputsProduceSameKey(t *testing.T) {
+	a := cache.Key("GET", "https://api.example.com/v1/chat", []byte(`{"x":1}`), "partition-alice")
+	b := cache.Key("GET", "https://api.example.com/v1/chat", []byte(`{"x":1}`), "partition-alice")
+	if a != b {
+		t.Fatalf("identical inputs produced different keys: %q vs %q", a, b)
+	}
+}
