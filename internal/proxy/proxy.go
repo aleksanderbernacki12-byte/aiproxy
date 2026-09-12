@@ -1587,28 +1587,44 @@ type contentBlock struct {
 // with just that free text blanked out to JSON null, leaving every
 // other field — model, stream, message roles, tools, response_format,
 // generation parameters, and anything else aiproxy doesn't specifically
-// recognize — byte-for-byte reproducible from the original (map key
-// order is Go's own deterministic sorted-key json.Marshal output, so
-// two requests that differ only in field order still produce identical
-// remainders). remainder is the mandatory *exact*-match requirement
-// semantic caching checks before it ever consults approximate text
-// similarity — see docs/reviews/2026-09-12-v0.74.1-system-review.md
-// finding #3: without it, a request to a different model, or with
-// streaming toggled, could receive a cached answer generated under
-// completely different parameters just because its prompt text was
-// similar. ok is false, and both other return values are zero, exactly
-// when body isn't a JSON object at all; a body that IS a JSON object
-// but has no recognizable prompt text still returns a real remainder
-// (there is nothing to blank, so it's just body's own canonicalized
-// bytes) — the semantic cache's own caller only ever consults remainder
-// when text was actually found, so this asymmetry is harmless.
+// recognize — canonicalized from the original (map key order is Go's
+// own deterministic sorted-key json.Marshal output, so two requests
+// that differ only in field order still produce identical remainders;
+// values are also compacted and HTML-escaped by json.Marshal, so two
+// differently-formatted-but-equivalent bodies canonicalize to the same
+// remainder rather than being preserved byte-for-byte). remainder is
+// intended to become a mandatory *exact*-match requirement semantic
+// caching checks before it ever consults approximate text similarity —
+// see docs/reviews/2026-09-12-v0.74.1-system-review.md finding #3:
+// without it, a request to a different model, or with streaming
+// toggled, could receive a cached answer generated under completely
+// different parameters just because its prompt text was similar (see
+// Task 5, which wires remainder into that check). ok is false, and
+// both other return values are zero, exactly when body isn't a JSON
+// object at all; a body that IS a JSON object but has no recognizable
+// prompt text still returns a real remainder (there is nothing to
+// blank, so it's just body's own canonicalized bytes) — the semantic
+// cache's own caller only ever consults remainder when text was
+// actually found, so this asymmetry is harmless.
 //
 // Decoding stays defensive at every level, same discipline as before:
 // messages is decoded as a raw array and each message decoded on its
 // own, content accepts either a plain JSON string or a JSON array of
 // content blocks, and one malformed message or block is skipped (left
 // out of the extracted text, left unblanked in the remainder) rather
-// than aborting the whole body.
+// than aborting the whole body. Blanking only ever happens where text
+// was actually extracted — never merely because a field or key is
+// present — so a content-block array blanks only each block's own
+// "text" field (an image_url/tool_use/tool_result block with no "text"
+// key survives completely untouched, preserving whatever distinguishes
+// it, e.g. a different image), and a "prompt"/"input"/"content" value
+// with a shape this function doesn't recognize (not a string, not a
+// parseable block array) is left as its raw original value in
+// remainder rather than blanked. That raw-value case is fail-closed
+// from a matching-strictness standpoint — it can only make two
+// requests LESS likely to be treated as identical, never more — but it
+// does mean remainder must always be treated as potentially containing
+// raw user content: hash it, never log or persist it raw.
 func extractPromptText(body []byte) (text string, remainder []byte, ok bool) {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(body, &top); err != nil {
@@ -1642,19 +1658,57 @@ func extractPromptText(body []byte) (text string, remainder []byte, ok bool) {
 				}
 				var asString string
 				if err := json.Unmarshal(rawContent, &asString); err == nil {
+					// Plain string content: unambiguous, blank the whole thing.
 					writeChunk(asString)
+					msg["content"] = json.RawMessage("null")
 				} else {
 					var blocks []json.RawMessage
 					if err := json.Unmarshal(rawContent, &blocks); err == nil {
-						for _, rawBlock := range blocks {
-							var blk contentBlock
-							if err := json.Unmarshal(rawBlock, &blk); err == nil {
-								writeChunk(blk.Text)
+						// Content-block array: blank only each block's own
+						// "text" field, when the block actually has one —
+						// an image_url/tool_use/tool_result/cache_control
+						// block (no "text" key) is left completely
+						// untouched, since blanking it would erase real
+						// distinguishing content (a different image, a
+						// different tool result) without capturing
+						// anything in the extracted text to compensate.
+						// This is what keeps the exact-match gate honest
+						// for multimodal/tool traffic instead of treating
+						// two different images as interchangeable.
+						blankedBlocks := make([]json.RawMessage, len(blocks))
+						copy(blankedBlocks, blocks)
+						for j, rawBlock := range blocks {
+							var blockMap map[string]json.RawMessage
+							if err := json.Unmarshal(rawBlock, &blockMap); err != nil {
+								continue
+							}
+							rawText, hasText := blockMap["text"]
+							if !hasText {
+								continue
+							}
+							var blockText string
+							if err := json.Unmarshal(rawText, &blockText); err != nil {
+								continue
+							}
+							writeChunk(blockText)
+							blockMap["text"] = json.RawMessage("null")
+							if reMarshaledBlock, err := json.Marshal(blockMap); err == nil {
+								blankedBlocks[j] = reMarshaledBlock
 							}
 						}
+						if reMarshaledBlocks, err := json.Marshal(blankedBlocks); err == nil {
+							msg["content"] = reMarshaledBlocks
+						}
 					}
+					// Content is neither a string nor a block array (an
+					// unrecognized shape): no text was extracted from it,
+					// so it's left completely untouched in msg["content"]
+					// (still holding rawContent from the initial decode)
+					// rather than blanked — an unrecognized shape must
+					// stay distinguishable from every other unrecognized
+					// shape, or the exact-match gate would silently treat
+					// genuinely different requests as identical.
 				}
-				msg["content"] = json.RawMessage("null")
 				if reMarshaled, err := json.Marshal(msg); err == nil {
 					blanked[i] = reMarshaled
 				}
@@ -1669,15 +1723,20 @@ func extractPromptText(body []byte) (text string, remainder []byte, ok bool) {
 		var prompt string
 		if err := json.Unmarshal(rawPrompt, &prompt); err == nil {
 			writeChunk(prompt)
+			top["prompt"] = json.RawMessage("null")
 		}
-		top["prompt"] = json.RawMessage("null")
+		// A non-string prompt (e.g. OpenAI's legacy token-array form) is
+		// left untouched — same "only blank what you actually extracted"
+		// discipline as content above.
 	}
 	if rawInput, hasInput := top["input"]; hasInput {
 		var input string
 		if err := json.Unmarshal(rawInput, &input); err == nil {
 			writeChunk(input)
+			top["input"] = json.RawMessage("null")
 		}
-		top["input"] = json.RawMessage("null")
+		// A non-string input (e.g. an array-shaped batch input) is left
+		// untouched — same discipline as prompt and content above.
 	}
 
 	remainder, err := json.Marshal(top)

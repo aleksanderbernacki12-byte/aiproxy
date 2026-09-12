@@ -206,3 +206,52 @@ func TestExtractPromptText_DifferentResponseFormatProducesDifferentRemainder(t *
 		t.Fatalf("different response_format produced identical remainders: %q", remainderA)
 	}
 }
+
+func TestExtractPromptText_DifferentImagesInContentBlocksProduceDifferentRemainder(t *testing.T) {
+	a := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}}]}]}`)
+	b := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"https://example.com/dog.jpg"}}]}]}`)
+	textA, remainderA, okA := extractPromptText(a)
+	textB, remainderB, okB := extractPromptText(b)
+	if !okA || !okB {
+		t.Fatal("expected text to be found in both")
+	}
+	if textA != textB {
+		t.Fatalf("expected identical extracted text (only the image differs), got %q vs %q", textA, textB)
+	}
+	if string(remainderA) == string(remainderB) {
+		t.Fatalf("different images produced identical remainders despite identical text: %q", remainderA)
+	}
+}
+
+func TestExtractPromptText_UnrecognizedContentShapesStayDistinguishable(t *testing.T) {
+	a := []byte(`{"messages":[{"role":"user","content":{"weird":"AAA"}}]}`)
+	b := []byte(`{"messages":[{"role":"user","content":{"weird":"BBB"}}]}`)
+	_, remainderA, _ := extractPromptText(a)
+	_, remainderB, _ := extractPromptText(b)
+	if string(remainderA) == string(remainderB) {
+		t.Fatalf("two different unrecognized content shapes produced identical remainders: %q", remainderA)
+	}
+}
+
+func TestExtractPromptText_NonStringPromptAndInputStayDistinguishable(t *testing.T) {
+	a := []byte(`{"model":"m","prompt":["what is 2+2"],"input":"hi"}`)
+	b := []byte(`{"model":"m","prompt":["what is 3+3"],"input":"hi"}`)
+	_, remainderA, _ := extractPromptText(a)
+	_, remainderB, _ := extractPromptText(b)
+	if string(remainderA) == string(remainderB) {
+		t.Fatalf("two different non-string prompt values produced identical remainders: %q", remainderA)
+	}
+}
+
+func TestExtractPromptText_FieldOrderIndependence(t *testing.T) {
+	a := []byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	b := []byte(`{"stream":true,"messages":[{"role":"user","content":"hi"}],"model":"m"}`)
+	_, remainderA, okA := extractPromptText(a)
+	_, remainderB, okB := extractPromptText(b)
+	if !okA || !okB {
+		t.Fatal("expected text to be found in both")
+	}
+	if string(remainderA) != string(remainderB) {
+		t.Fatalf("field order affected the remainder: %q vs %q", remainderA, remainderB)
+	}
+}
