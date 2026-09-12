@@ -534,7 +534,7 @@ Also on by default, no config needed, in the same
 | --------------------------------------- | ---------------------------------------------------------------- |
 | `prompt-injection-ignore-instructions`  | "ignore/disregard/forget previous/prior/above instructions"     |
 | `prompt-injection-system-exfiltration`  | "reveal/print/show your system prompt"                          |
-| `prompt-injection-role-override`        | "you are now in developer mode / DAN / an unrestricted AI"      |
+| `prompt-injection-role-override`        | "you are now in developer mode / DAN / an unrestricted AI / jailbroken" |
 | `prompt-injection-fake-system-turn`     | fake all-caps `[SYSTEM]:`/`ADMIN:`/`ROOT:` delimiters followed by "override"/"new instructions" |
 | `prompt-injection-restriction-bypass`   | "bypass/override/disable your safety/content guidelines"        |
 
@@ -547,6 +547,12 @@ prompt injection) can trip one of these. Use
 performs against real traffic before trusting it enough to actually
 block on, the same way you would for a new `custom_rules` entry — see
 [Dry-run mode for rules](#dry-run-mode-for-rules).
+
+Like every other rule in this proxy, these are only evaluated on a
+genuine cache miss — a response already served from the on-disk or
+semantic cache is not re-scanned, so a rule change (including turning
+one of these on) only affects new, not-yet-cached content going
+forward.
 
 Every pattern here is checked in both directions — the request and the
 upstream's own response — for free: it's the same `bodyRules` mechanism

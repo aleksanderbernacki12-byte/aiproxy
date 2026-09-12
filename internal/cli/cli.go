@@ -1103,14 +1103,16 @@ func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]
 }
 
 // buildEngine constructs the rule engine used to evaluate every request:
-// every built-in secret-blocking rule in builtinRules not turned off
-// (each block or redact otherwise, depending on cfg.BuiltinRuleActions),
-// plus any path_rules and custom_rules from cfg. Engine.Evaluate always
-// checks path rules before any body rule regardless of the order they
-// were added in, so a path_rules "allow" entry exempts a matching
-// request from custom_rules too, not just the built-ins. cfg may be
-// nil (no config file at all), in which case only the built-ins apply,
-// all blocking.
+// every built-in rule from both catalogs returned by allBuiltinRules
+// (secret-blocking and prompt-injection) not turned off, each set to
+// the Action and DryRun resolveBuiltinRuleActions resolved for it from
+// cfg.BuiltinRuleActions (block or redact, optionally previewed via
+// dry_run instead of enforced), plus any path_rules and custom_rules
+// from cfg. Engine.Evaluate always checks path rules before any body
+// rule regardless of the order they were added in, so a path_rules
+// "allow" entry exempts a matching request from custom_rules too, not
+// just the built-ins. cfg may be nil (no config file at all), in which
+// case only the built-ins apply, all blocking.
 func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	engine := rules.NewEngine(rules.Allow)
 
@@ -1226,7 +1228,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if cfg == nil {
-		fmt.Fprintln(stdout, "no config file found — aiproxy would run with just the built-in secret-blocking rules. Nothing to validate.")
+		fmt.Fprintln(stdout, "no config file found — aiproxy would run with just the built-in secret-blocking and prompt-injection rules. Nothing to validate.")
 		return 0
 	}
 

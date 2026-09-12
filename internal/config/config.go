@@ -712,15 +712,20 @@ type Config struct {
 	ModelRoutes []ModelRoute `json:"model_routes,omitempty"`
 
 	// BuiltinRuleActions overrides the action of one or more of aiproxy's
-	// built-in secret-blocking rules, keyed by rule name (see the CLI's
-	// builtinRules for the current list). Values are "block" (every
-	// built-in rule's long-standing default, still applied to any
+	// built-in rules from either catalog — secret-detection and
+	// prompt-injection — keyed by rule name (see the CLI's
+	// allBuiltinRules for the current combined list). Values are "block"
+	// (every built-in rule's long-standing default, still applied to any
 	// built-in rule not mentioned here), "redact" (same meaning as
-	// CustomRule.Action), or "off" (skip the rule entirely — the one
-	// value CustomRule.Action has no equivalent for, since leaving a
-	// custom rule out of the list already does that). A key that isn't a
-	// real built-in rule name, or a value that isn't one of those three,
-	// is a config error.
+	// CustomRule.Action), "off" (skip the rule entirely — the one value
+	// CustomRule.Action has no equivalent for, since leaving a custom
+	// rule out of the list already does that), or "dry_run" (evaluate
+	// the rule and record what it would have done without actually
+	// blocking or redacting the request; for a built-in rule this always
+	// previews as "would block", unlike custom_rules[].dry_run, which
+	// can pair with either "block" or "redact"). A key that isn't a real
+	// built-in rule name, or a value that isn't one of those four, is a
+	// config error.
 	BuiltinRuleActions map[string]string `json:"builtin_rule_actions,omitempty"`
 
 	// MaxBodyBytes caps how large a single request body aiproxy will

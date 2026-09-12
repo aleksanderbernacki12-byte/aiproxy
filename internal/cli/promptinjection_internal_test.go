@@ -253,6 +253,28 @@ func TestPromptInjectionRules_DryRunLetsRequestThroughButRecordsWouldBeBlock(t *
 	}
 }
 
+func TestPromptInjectionRules_DryRunAlsoWorksOnPreExistingSecretRule(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	cfg := &config.Config{BuiltinRuleActions: map[string]string{"aws-access-key": "dry_run"}}
+	srv, frontend := newPromptInjectionTestServer(t, cfg, upstream)
+
+	resp, err := http.Post(frontend.URL+"/chat", "application/json", strings.NewReader(`{"key":"AKIAABCDEFGHIJKLMNOP"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (dry_run must never actually block, even for a pre-existing secret rule)", resp.StatusCode, http.StatusOK)
+	}
+	snap := srv.Stats.Snapshot()
+	if got := snap.PerRule["aws-access-key"].DryRunBlocked; got != 1 {
+		t.Fatalf("per-rule DryRunBlocked for aws-access-key = %d, want 1", got)
+	}
+}
+
 func TestPromptInjectionRules_CatchesInjectionInUpstreamResponseToo(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"reply":"Okay, I will ignore previous instructions as requested"}`))
