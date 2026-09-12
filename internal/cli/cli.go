@@ -53,6 +53,20 @@ var (
 	googleAPIKeyPattern    = regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`)
 	npmAccessTokenPattern  = regexp.MustCompile(`npm_[A-Za-z0-9]{36}`)
 	jwtPattern             = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`)
+
+	// The five prompt-injection/jailbreak patterns below are a
+	// deliberately different kind of pattern than every one above:
+	// natural-language phrasing is inherently ambiguous in a way a
+	// secret key's fixed format isn't, so none of these can be made
+	// false-positive-proof. See builtinPromptInjectionRules' own doc
+	// comment for the two deliberate case-sensitivity choices made to
+	// control that risk, and resolveBuiltinRuleActions for the
+	// "dry_run" builtin_rule_actions value this risk motivated adding.
+	ignorePreviousInstructionsPattern = regexp.MustCompile(`(?i)(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above|preceding)\s+(instructions?|prompts?|rules?|guidelines?)`)
+	systemPromptExfiltrationPattern   = regexp.MustCompile(`(?i)(repeat|reveal|print|show|output)\s+(your\s+)?(system\s+prompt|initial\s+instructions?|the\s+instructions?\s+above)`)
+	roleOverridePattern               = regexp.MustCompile(`(?i:you\s+are\s+now\s+(in\s+)?(developer\s+mode|an?\s+unrestricted\s+AI|jailbroken))|you\s+are\s+now\s+DAN\b`)
+	fakeSystemTurnPattern             = regexp.MustCompile(`\[?(SYSTEM|ADMIN|ROOT)\]?\s*:\s*(override|new\s+instructions?)`)
+	restrictionBypassPattern          = regexp.MustCompile(`(?i)(bypass|override|disable)\s+(your\s+)?(safety|content)\s+(guidelines?|filters?|restrictions?)`)
 )
 
 // Execute parses args and runs the requested subcommand, writing output
