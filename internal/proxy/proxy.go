@@ -2307,23 +2307,36 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 }
 
 // partitionIdentity returns a SHA256 hash identifying which "identity"
-// auth/r represents, for use as part of the cache/coalescing/semantic-
-// cache key — see docs/reviews/2026-09-12-v0.74.1-system-review.md
-// finding #1. Two dimensions make two callers genuinely different: this
-// proxy's own notion of who's calling (auth.label, from
+// auth/r represents, for use as part of the cache/coalescing key (see
+// the exact-match cache-key call site in ServeHTTP) — a later task
+// wires the semantic cache to this same identity too; see
+// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #1. Two
+// dimensions make two callers genuinely different: this proxy's own
+// notion of who's calling (auth.label, from
 // Server.ProxyAPIKey/ProxyAPIKeys) and the actual credential the caller
-// presents to authenticate to the *upstream* API (Authorization/
-// X-Api-Key) — since Rewrite never touches headers (see its own doc
-// comment), aiproxy is a bring-your-own-key passthrough, so two callers
-// can share one proxy key configuration yet carry two different
-// personal upstream credentials and still must never share a cached
-// response. Proxy-Authorization is folded in too even though
-// checkProxyAuth already consumed it into auth.label, purely so this
-// function needs no special-casing for the "auth disabled entirely"
-// case (auth.label == "") — the raw header value still differs per
-// caller in the disabled-auth case only if the caller happens to send
-// one anyway, which is harmless either way. Hashed, never stored or
-// logged in plaintext, exactly like idempotency's own bodyHash. The
+// presents to authenticate to the *upstream* API — since Rewrite never
+// touches headers (see its own doc comment), aiproxy is a
+// bring-your-own-key passthrough, so two callers can share one proxy
+// key configuration yet carry two different personal upstream
+// credentials and still must never share a cached response.
+// Proxy-Authorization is folded in too even though checkProxyAuth
+// already consumed it into auth.label, purely so this function needs
+// no special-casing for the "auth disabled entirely" case (auth.label
+// == "") — the raw header value still differs per caller in the
+// disabled-auth case only if the caller happens to send one anyway,
+// which is harmless either way. The five headers hashed —
+// Authorization, X-Api-Key, Proxy-Authorization, Api-Key (Azure
+// OpenAI), and X-Goog-Api-Key (Google Vertex/Gemini) — are a curated
+// list of known upstream-auth conventions (OpenAI/Anthropic/generic
+// bearer, Azure OpenAI, Google Vertex/Gemini), not an exhaustive one: a
+// provider using some other header convention aiproxy doesn't yet know
+// about would still share a partition across callers using only that
+// unrecognized header. None of these header reads can carry a NUL
+// byte in the first place — Go's HTTP/1.1 server itself rejects any
+// header value containing one with a 400 before ServeHTTP ever runs —
+// so, unlike cache.Key's method/targetURL/body inputs, no boundary
+// reasoning is needed here for these five reads. Hashed, never stored
+// or logged in plaintext, exactly like idempotency's own bodyHash. The
 // result is always a 64-character lowercase hex digest — fixed-width
 // and structurally NUL-free — which matters because cache.Key hashes
 // this value adjacent to other fields with no length prefix of its own;
@@ -2333,7 +2346,12 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 // a composite identity string that embeds this function's own output
 // alongside a NUL byte or other untrusted content and pass THAT to
 // cache.Key's partitionID parameter — that trades this problem for the
-// same one at a different layer.
+// same one at a different layer. (A later task, Task 5, does safely
+// compose targetLabel + "\x00" + partitionIdentity(auth, r) — but
+// passes that composite to semcache.Index's own target parameter,
+// never to cache.Key; semcache.Index and cache.Key are different
+// functions with different contracts, so that composition does not
+// contradict this warning.)
 func partitionIdentity(auth clientAuth, r *http.Request) string {
 	h := sha256.New()
 	h.Write([]byte(auth.label))
@@ -2343,6 +2361,10 @@ func partitionIdentity(auth clientAuth, r *http.Request) string {
 	h.Write([]byte(r.Header.Get("X-Api-Key")))
 	h.Write([]byte{0})
 	h.Write([]byte(r.Header.Get("Proxy-Authorization")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("Api-Key")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("X-Goog-Api-Key")))
 	return hex.EncodeToString(h.Sum(nil))
 }
 

@@ -2578,12 +2578,18 @@ func TestServer_StreamingResponse_AbortedStreamIsNeverCached(t *testing.T) {
 	// checking too early to know either way.
 	time.Sleep(200 * time.Millisecond)
 
-	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
-	key := cache.Key(http.MethodPost, resolved.String(), "", []byte(requestBody))
-	if _, hit, _, err := c.Get(key, 0); err != nil {
-		t.Fatalf("cache.Get: %v", err)
-	} else if hit {
-		t.Fatal("an aborted stream must never be cached, but a cache entry was found")
+	// A recomputed cache.Key lookup would be vacuous here: the key now
+	// depends on partitionIdentity(auth, r), not just method/URL/body, so
+	// asserting a miss on a guessed key proves nothing about whether the
+	// real request (whatever its actual partition) got cached. Assert
+	// the cache directory itself is empty instead — key-agnostic and
+	// still fails if anything at all got written.
+	entries, err := os.ReadDir(cache.DirName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("an aborted stream must never be cached, but %d cache entries exist", len(entries))
 	}
 }
 
@@ -2754,12 +2760,18 @@ func TestServer_ResponseSecretScanning_BlocksStreamOnSecretAndNeverCaches(t *tes
 		t.Fatalf("Stats.ResponseBlocked = %d, want 1", snap.ResponseBlocked)
 	}
 
-	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
-	key := cache.Key(http.MethodPost, resolved.String(), "", []byte(requestBody))
-	if _, hit, _, err := c.Get(key, 0); err != nil {
-		t.Fatalf("cache.Get: %v", err)
-	} else if hit {
-		t.Fatal("a stream cut short by a response Block rule must never be cached, but a cache entry was found")
+	// A recomputed cache.Key lookup would be vacuous here: the key now
+	// depends on partitionIdentity(auth, r), not just method/URL/body, so
+	// asserting a miss on a guessed key proves nothing about whether the
+	// real request (whatever its actual partition) got cached. Assert
+	// the cache directory itself is empty instead — key-agnostic and
+	// still fails if anything at all got written.
+	entries, err := os.ReadDir(cache.DirName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("a stream cut short by a response Block rule must never be cached, but %d cache entries exist", len(entries))
 	}
 }
 
