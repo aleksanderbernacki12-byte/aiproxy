@@ -525,6 +525,36 @@ credential is deliberately shaped exactly like what those patterns
 detect. A `redact` rule matched in a header masks only that header's
 value, the same way it masks a match in the body.
 
+## Built-in prompt-injection patterns
+
+Also on by default, no config needed, in the same
+`builtin_rule_actions` name-space as the secret patterns above:
+
+| Rule name                              | Detects                                                        |
+| --------------------------------------- | ---------------------------------------------------------------- |
+| `prompt-injection-ignore-instructions`  | "ignore/disregard/forget previous/prior/above instructions"     |
+| `prompt-injection-system-exfiltration`  | "reveal/print/show your system prompt"                          |
+| `prompt-injection-role-override`        | "you are now in developer mode / DAN / an unrestricted AI"      |
+| `prompt-injection-fake-system-turn`     | injected fake `[SYSTEM]:`/`ADMIN:` delimiters                   |
+| `prompt-injection-restriction-bypass`   | "bypass/override/disable your safety/content guidelines"        |
+
+Unlike the secret patterns above, none of these can be made
+false-positive-proof — natural language is inherently ambiguous in a way
+a secret key's fixed format isn't. A legitimate message discussing these
+exact topics (e.g. someone testing their own chatbot's robustness to
+prompt injection) can trip one of these. Use
+[`"dry_run"`](#redacting-instead-of-blocking) to see how a pattern
+performs against real traffic before trusting it enough to actually
+block on, the same way you would for a new `custom_rules` entry — see
+[Dry-run mode for rules](#dry-run-mode-for-rules).
+
+Every pattern here is checked in both directions — the request and the
+upstream's own response — for free: it's the same `bodyRules` mechanism
+the secret patterns above already use, which is evaluated on both sides
+of the conversation. A model reply that starts complying with an
+injected instruction ("Sure, ignoring my previous instructions...") is
+caught exactly the same way the request that provoked it would be.
+
 ## Structured JSON logging
 
 ```
@@ -1514,8 +1544,16 @@ to leave it out of):
 Any built-in rule not listed keeps blocking. `builtin_rule_actions` keys
 must be one of the built-in rule names listed above (`aiproxy validate`
 catches a typo here the same way it catches a bad regex), and values are
-`"block"`, `"redact"`, or `"off"` — the first two are the same pair as
-`custom_rules[].action`, which has no `"off"` value of its own.
+`"block"`, `"redact"`, `"off"`, or `"dry_run"` — the first two are the
+same pair as `custom_rules[].action`, which has no `"off"`/`"dry_run"`
+value of its own. `"dry_run"` works exactly like
+[`custom_rules[].dry_run`](#dry-run-mode-for-rules): the rule is
+evaluated normally but never actually blocks or redacts, only logs and
+counts what it *would* have done — the one difference is that a
+built-in rule always previews as "would block" regardless of what its
+live action is set to elsewhere, since `builtin_rule_actions` holds one
+flat value per rule rather than a separate action and dry-run flag the
+way `custom_rules`/`path_rules` do.
 
 ## Scanning responses too
 
