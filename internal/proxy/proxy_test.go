@@ -2579,7 +2579,7 @@ func TestServer_StreamingResponse_AbortedStreamIsNeverCached(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
-	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
+	key := cache.Key(http.MethodPost, resolved.String(), "", []byte(requestBody))
 	if _, hit, _, err := c.Get(key, 0); err != nil {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {
@@ -2755,7 +2755,7 @@ func TestServer_ResponseSecretScanning_BlocksStreamOnSecretAndNeverCaches(t *tes
 	}
 
 	resolved := targetURL.ResolveReference(&url.URL{Path: requestPath})
-	key := cache.Key(http.MethodPost, resolved.String(), []byte(requestBody))
+	key := cache.Key(http.MethodPost, resolved.String(), "", []byte(requestBody))
 	if _, hit, _, err := c.Get(key, 0); err != nil {
 		t.Fatalf("cache.Get: %v", err)
 	} else if hit {

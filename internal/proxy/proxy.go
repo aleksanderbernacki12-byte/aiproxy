@@ -13,6 +13,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2305,6 +2306,46 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 	return clientAuth{}, false
 }
 
+// partitionIdentity returns a SHA256 hash identifying which "identity"
+// auth/r represents, for use as part of the cache/coalescing/semantic-
+// cache key — see docs/reviews/2026-09-12-v0.74.1-system-review.md
+// finding #1. Two dimensions make two callers genuinely different: this
+// proxy's own notion of who's calling (auth.label, from
+// Server.ProxyAPIKey/ProxyAPIKeys) and the actual credential the caller
+// presents to authenticate to the *upstream* API (Authorization/
+// X-Api-Key) — since Rewrite never touches headers (see its own doc
+// comment), aiproxy is a bring-your-own-key passthrough, so two callers
+// can share one proxy key configuration yet carry two different
+// personal upstream credentials and still must never share a cached
+// response. Proxy-Authorization is folded in too even though
+// checkProxyAuth already consumed it into auth.label, purely so this
+// function needs no special-casing for the "auth disabled entirely"
+// case (auth.label == "") — the raw header value still differs per
+// caller in the disabled-auth case only if the caller happens to send
+// one anyway, which is harmless either way. Hashed, never stored or
+// logged in plaintext, exactly like idempotency's own bodyHash. The
+// result is always a 64-character lowercase hex digest — fixed-width
+// and structurally NUL-free — which matters because cache.Key hashes
+// this value adjacent to other fields with no length prefix of its own;
+// a NUL-bearing or unbounded partitionID would reopen exactly the kind
+// of cross-identity collision this function exists to prevent (see
+// cache.Key's own doc comment for the boundary reasoning). Never build
+// a composite identity string that embeds this function's own output
+// alongside a NUL byte or other untrusted content and pass THAT to
+// cache.Key's partitionID parameter — that trades this problem for the
+// same one at a different layer.
+func partitionIdentity(auth clientAuth, r *http.Request) string {
+	h := sha256.New()
+	h.Write([]byte(auth.label))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("Authorization")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("X-Api-Key")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("Proxy-Authorization")))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // errorResponse is the JSON body writeError sends when the client's
 // Accept header explicitly asks for it — see acceptsJSON. Error is a
 // stable, machine-readable identifier using the exact same vocabulary
@@ -2989,7 +3030,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
 		ttl := s.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
-		cacheKey = cache.Key(r.Method, targets[0].ResolveReference(destURL).String(), body)
+		cacheKey = cache.Key(r.Method, targets[0].ResolveReference(destURL).String(), partitionIdentity(auth, r), body)
 		if cached, hit, age, err := cch.Get(cacheKey, ttl); err == nil && hit {
 			defer cached.Body.Close()
 			copyHeader(w.Header(), cached.Header)
