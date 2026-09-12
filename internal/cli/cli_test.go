@@ -771,6 +771,31 @@ func TestExecute_Validate_ValidConfig_WithEveryBuiltinRuleOverride_ReturnsZero(t
 	}
 }
 
+func TestExecute_Validate_ValidConfig_WithEveryPromptInjectionRuleOverride_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {
+		"prompt-injection-ignore-instructions": "redact",
+		"prompt-injection-system-exfiltration": "redact",
+		"prompt-injection-role-override": "redact",
+		"prompt-injection-fake-system-turn": "redact",
+		"prompt-injection-restriction-bypass": "redact"
+	}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "built-in rule overrides: 5") {
+		t.Fatalf("stdout missing built-in rule override count: %q", stdout.String())
+	}
+}
+
 // TestExecute_Validate_ValidConfig_WithBuiltinRuleOff_ReturnsZero proves
 // "off" is accepted for builtin_rule_actions — the only way to fully
 // disable a built-in rule, unlike "block"/"redact" which both keep it

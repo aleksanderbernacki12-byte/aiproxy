@@ -965,13 +965,20 @@ func loadClientCAPool(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// builtinRuleDef is one built-in rule's name and compiled pattern —
+// shared by builtinRules (secret detection) and
+// builtinPromptInjectionRules (prompt injection/jailbreak detection) so
+// both catalogs can be combined into one name-space for
+// builtin_rule_actions validation via allBuiltinRules.
+type builtinRuleDef struct {
+	name    string
+	pattern *regexp.Regexp
+}
+
 // builtinRules lists the name and pattern of each of aiproxy's built-in
 // secret-blocking rules, in the order buildEngine adds them to the
 // engine.
-var builtinRules = []struct {
-	name    string
-	pattern *regexp.Regexp
-}{
+var builtinRules = []builtinRuleDef{
 	{"aws-access-key", awsAccessKeyPattern},
 	{"openai-api-key", openAIAPIKeyPattern},
 	{"github-token", githubTokenPattern},
@@ -984,13 +991,52 @@ var builtinRules = []struct {
 	{"jwt", jwtPattern},
 }
 
+// builtinPromptInjectionRules is a second, deliberately separate catalog
+// of built-in rules from builtinRules: known prompt-injection/jailbreak
+// phrasings rather than leaked-secret formats. Kept as its own list
+// (not appended to builtinRules) since the two are conceptually
+// distinct catalogs — the README documents them as two separate
+// tables — even though both are merged into one combined name-space for
+// builtin_rule_actions validation (see allBuiltinRules), since that
+// config knob already covers "any built-in rule," not "any built-in
+// secret rule."
+//
+// Two deliberate case-sensitivity choices control false positives on
+// ordinary text: roleOverridePattern's "DAN" alternative is
+// case-sensitive (scoped via Go regexp's (?i:...) flag-scoped group)
+// so it doesn't also fire on the ordinary given name "Dan"; and
+// fakeSystemTurnPattern is entirely case-sensitive, since a forged
+// system-level delimiter is typically written in a visually distinct
+// (all-caps/bracketed) way specifically to look authoritative to the
+// model, unlike the extremely common lowercase "system:" in ordinary
+// text or JSON keys.
+var builtinPromptInjectionRules = []builtinRuleDef{
+	{"prompt-injection-ignore-instructions", ignorePreviousInstructionsPattern},
+	{"prompt-injection-system-exfiltration", systemPromptExfiltrationPattern},
+	{"prompt-injection-role-override", roleOverridePattern},
+	{"prompt-injection-fake-system-turn", fakeSystemTurnPattern},
+	{"prompt-injection-restriction-bypass", restrictionBypassPattern},
+}
+
+// allBuiltinRules returns every built-in rule from both catalogs above,
+// secrets first then prompt-injection patterns, as the single combined
+// name-space builtin_rule_actions validates against and buildEngine
+// registers into the live rules.Engine.
+func allBuiltinRules() []builtinRuleDef {
+	all := make([]builtinRuleDef, 0, len(builtinRules)+len(builtinPromptInjectionRules))
+	all = append(all, builtinRules...)
+	all = append(all, builtinPromptInjectionRules...)
+	return all
+}
+
 // builtinRuleNames returns every built-in rule's name, in the same
 // order as builtinRules — used to list valid names in a config error
 // message without that list drifting out of sync with builtinRules
 // itself.
 func builtinRuleNames() []string {
-	names := make([]string, len(builtinRules))
-	for i, b := range builtinRules {
+	all := allBuiltinRules()
+	names := make([]string, len(all))
+	for i, b := range all {
 		names[i] = b.name
 	}
 	return names
@@ -1010,9 +1056,10 @@ func builtinRuleNames() []string {
 // that doesn't match any real built-in rule name (almost always a
 // typo).
 func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]rules.Action, off map[string]bool, errs []error) {
-	actions = make(map[string]rules.Action, len(builtinRules))
-	names := make(map[string]bool, len(builtinRules))
-	for _, b := range builtinRules {
+	all := allBuiltinRules()
+	actions = make(map[string]rules.Action, len(all))
+	names := make(map[string]bool, len(all))
+	for _, b := range all {
 		actions[b.name] = rules.Block
 		names[b.name] = true
 	}
@@ -1057,7 +1104,7 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 		overrides = cfg.BuiltinRuleActions
 	}
 	actions, off, errs := resolveBuiltinRuleActions(overrides)
-	for _, b := range builtinRules {
+	for _, b := range allBuiltinRules() {
 		if off[b.name] {
 			continue
 		}
