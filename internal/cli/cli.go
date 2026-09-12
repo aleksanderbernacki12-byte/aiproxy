@@ -1029,10 +1029,11 @@ func allBuiltinRules() []builtinRuleDef {
 	return all
 }
 
-// builtinRuleNames returns every built-in rule's name, in the same
-// order as builtinRules — used to list valid names in a config error
-// message without that list drifting out of sync with builtinRules
-// itself.
+// builtinRuleNames returns every built-in rule's name from both
+// catalogs (secrets and prompt-injection patterns), in allBuiltinRules'
+// order — used to list valid names in a config error message without
+// that list drifting out of sync with builtinRules and
+// builtinPromptInjectionRules themselves.
 func builtinRuleNames() []string {
 	all := allBuiltinRules()
 	names := make([]string, len(all))

@@ -116,3 +116,20 @@ func TestPromptInjectionPatterns_RestrictionBypass(t *testing.T) {
 		}
 	}
 }
+
+// TestBuiltinRuleNames_AllUniqueAcrossBothCatalogs guards against an
+// accidental name collision between builtinRules and
+// builtinPromptInjectionRules: allBuiltinRules concatenates the two
+// lists with no dedup check, and rules.Engine.AddBodyRegexRule has no
+// dedup either, so a duplicate name across the two independently
+// edited catalogs would otherwise silently double-register a rule
+// instead of failing loudly.
+func TestBuiltinRuleNames_AllUniqueAcrossBothCatalogs(t *testing.T) {
+	seen := make(map[string]bool)
+	for _, name := range builtinRuleNames() {
+		if seen[name] {
+			t.Fatalf("duplicate built-in rule name: %q", name)
+		}
+		seen[name] = true
+	}
+}
