@@ -3755,3 +3755,63 @@ func TestExecute_Validate_CustomRuleValidTargetsAndKeys_ReturnsZero(t *testing.T
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 	}
 }
+
+func TestExecute_Validate_ValidConfig_WithBuiltinRuleDryRun_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"prompt-injection-ignore-instructions": "dry_run"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "built-in rule overrides: 1") {
+		t.Fatalf("stdout missing built-in rule override count: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "rules in dry-run:        1") {
+		t.Fatalf("stdout missing dry-run rule count: %q", stdout.String())
+	}
+}
+
+func TestExecute_Validate_BuiltinRuleDryRun_WorksOnPreExistingSecretRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"aws-access-key": "dry_run"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "rules in dry-run:        1") {
+		t.Fatalf("stdout missing dry-run rule count: %q", stdout.String())
+	}
+}
+
+func TestExecute_Validate_InvalidBuiltinRuleAction_MentionsDryRunInMessage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"builtin_rule_actions": {"jwt": "delete"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `must be "block", "redact", "off", or "dry_run"`) {
+		t.Fatalf("stderr missing updated four-option message: %q", stderr.String())
+	}
+}

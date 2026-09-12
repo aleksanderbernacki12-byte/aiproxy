@@ -1044,19 +1044,27 @@ func builtinRuleNames() []string {
 }
 
 // resolveBuiltinRuleActions turns a config file's builtin_rule_actions
-// map into a rule name -> Action lookup plus a set of rule names turned
-// off entirely, defaulting every built-in rule not mentioned to its
-// long-standing rules.Block behavior. "off" is accepted here and only
-// here — never by parseRuleAction, so a custom_rules entry can't be set
-// to "off" (there's no need: omitting a custom rule from the list
-// already does that) — since it's the only way to fully disable a
-// built-in rule, which can't otherwise be removed from the list the way
-// a custom rule can. It reports three kinds of config mistakes as
-// errors, collecting all of them rather than stopping at the first: an
-// action string that is neither "block", "redact", nor "off"; and a key
-// that doesn't match any real built-in rule name (almost always a
-// typo).
-func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]rules.Action, off map[string]bool, errs []error) {
+// map into a rule name -> Action lookup, a set of rule names turned off
+// entirely, and a set of rule names running in dry-run mode, defaulting
+// every built-in rule not mentioned to its long-standing rules.Block
+// behavior. "off" and "dry_run" are both accepted here and only here —
+// never by parseRuleAction, so a custom_rules entry can't be set to
+// either (there's no need: omitting a custom rule from the list already
+// disables it, and custom_rules/path_rules already have their own
+// separate boolean dry_run field) — builtin_rule_actions is the only
+// way to fully disable, or dry-run, a built-in rule, which can't
+// otherwise be removed from the list or given a second field the way a
+// custom rule can. A built-in rule set to "dry_run" is always reported
+// as if its action were rules.Block (the built-in default) — there is
+// no way to preview "would redact" for a built-in the way
+// custom_rules[].dry_run can pair with "action": "redact", since
+// builtin_rule_actions holds one flat string per rule rather than a
+// separate action/dry_run pair. It reports two kinds of config
+// mistakes as errors, collecting all of them rather than stopping at
+// the first: a key that doesn't match any real built-in rule name
+// (almost always a typo), and an action string that is neither
+// "block", "redact", "off", nor "dry_run".
+func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]rules.Action, off map[string]bool, dryRun map[string]bool, errs []error) {
 	all := allBuiltinRules()
 	actions = make(map[string]rules.Action, len(all))
 	names := make(map[string]bool, len(all))
@@ -1066,6 +1074,7 @@ func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]
 	}
 
 	off = make(map[string]bool)
+	dryRun = make(map[string]bool)
 	for name, raw := range overrides {
 		if !names[name] {
 			errs = append(errs, fmt.Errorf("Fatal error: builtin_rule_actions: %q is not a built-in rule (valid names: %s)", name, strings.Join(builtinRuleNames(), ", ")))
@@ -1075,17 +1084,22 @@ func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]
 			off[name] = true
 			continue
 		}
+		if raw == "dry_run" {
+			dryRun[name] = true
+			continue
+		}
 		action, err := parseRuleAction(raw)
 		if err != nil {
-			// Not parseRuleAction's own error message: "off" is valid
-			// here but not for parseRuleAction's other caller
-			// (custom_rules[].action), so its message can't mention it.
-			errs = append(errs, fmt.Errorf("Fatal error: Invalid action for built-in rule %s: must be \"block\", \"redact\", or \"off\", got %q", name, raw))
+			// Not parseRuleAction's own error message: "off"/"dry_run"
+			// are valid here but not for parseRuleAction's other
+			// caller (custom_rules[].action), so its message can't
+			// mention them.
+			errs = append(errs, fmt.Errorf("Fatal error: Invalid action for built-in rule %s: must be \"block\", \"redact\", \"off\", or \"dry_run\", got %q", name, raw))
 			continue
 		}
 		actions[name] = action
 	}
-	return actions, off, errs
+	return actions, off, dryRun, errs
 }
 
 // buildEngine constructs the rule engine used to evaluate every request:
@@ -1104,7 +1118,7 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	if cfg != nil {
 		overrides = cfg.BuiltinRuleActions
 	}
-	actions, off, errs := resolveBuiltinRuleActions(overrides)
+	actions, off, dryRun, errs := resolveBuiltinRuleActions(overrides)
 	for _, b := range allBuiltinRules() {
 		if off[b.name] {
 			continue
@@ -1113,6 +1127,7 @@ func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 			Name:    b.name,
 			Pattern: b.pattern,
 			Action:  actions[b.name],
+			DryRun:  dryRun[b.name],
 		})
 	}
 
@@ -1320,7 +1335,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
 	}
 
-	_, _, builtinErrs := resolveBuiltinRuleActions(cfg.BuiltinRuleActions)
+	_, _, _, builtinErrs := resolveBuiltinRuleActions(cfg.BuiltinRuleActions)
 	for _, e := range builtinErrs {
 		problems = append(problems, strings.TrimPrefix(e.Error(), "Fatal error: "))
 	}
@@ -1684,6 +1699,8 @@ func countDryRunRules(cfg *config.Config) int {
 			n++
 		}
 	}
+	_, _, builtinDryRun, _ := resolveBuiltinRuleActions(cfg.BuiltinRuleActions)
+	n += len(builtinDryRun)
 	return n
 }
 
