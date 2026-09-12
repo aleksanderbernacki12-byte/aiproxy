@@ -1573,13 +1573,6 @@ type modelField struct {
 	Model string `json:"model"`
 }
 
-// contentBlock is one entry of a "content blocks" array, e.g.
-// [{"type":"text","text":"..."}] — the shape both OpenAI and Anthropic
-// use for multi-part (text + image, etc.) message content.
-type contentBlock struct {
-	Text string `json:"text"`
-}
-
 // extractPromptText returns the concatenated text aiproxy recognizes in
 // body for semantic caching's approximate similarity check (messages[].
 // content, then prompt, then input, exactly as before this function
