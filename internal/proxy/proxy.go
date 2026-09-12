@@ -4919,6 +4919,7 @@ var promCounters = []struct {
 	{"aiproxy_requests_token_rate_limited_total", "Total number of requests rejected by the token-based rate limiter.", func(s stats.Snapshot) int64 { return s.TokenRateLimited }},
 	{"aiproxy_cache_hits_total", "Total number of requests served from the local response cache.", func(s stats.Snapshot) int64 { return s.CacheHits }},
 	{"aiproxy_coalesced_requests_total", "Total number of requests served by waiting for and replaying a concurrent, still-in-flight identical request's own response.", func(s stats.Snapshot) int64 { return s.CoalescedRequests }},
+	{"aiproxy_semantic_cache_hits_total", "Total number of requests served by an approximate match against a recent, sufficiently similar prior request's own cached answer.", func(s stats.Snapshot) int64 { return s.SemanticCacheHits }},
 	{"aiproxy_stale_cache_hits_total", "Total number of cache hits served past their entry's own staleness warning threshold, relative to cache_ttl_seconds.", func(s stats.Snapshot) int64 { return s.StaleCacheHits }},
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},

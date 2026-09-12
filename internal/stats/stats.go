@@ -35,6 +35,7 @@ type counters struct {
 	tokenRateLimited  atomic.Int64
 	cacheHits         atomic.Int64
 	coalescedRequests atomic.Int64
+	semanticCacheHits atomic.Int64
 	staleCacheHits    atomic.Int64
 	totalTokens       atomic.Int64
 	responseBlocked   atomic.Int64
@@ -57,6 +58,7 @@ func (c *counters) snapshot() Snapshot {
 		TokenRateLimited:  c.tokenRateLimited.Load(),
 		CacheHits:         c.cacheHits.Load(),
 		CoalescedRequests: c.coalescedRequests.Load(),
+		SemanticCacheHits: c.semanticCacheHits.Load(),
 		StaleCacheHits:    c.staleCacheHits.Load(),
 		TotalTokens:       c.totalTokens.Load(),
 		ResponseBlocked:   c.responseBlocked.Load(),
@@ -484,6 +486,18 @@ func (s *Stats) RecordCoalescedRequest(target string) {
 	s.counterFor(target).coalescedRequests.Add(1)
 }
 
+// RecordSemanticCacheHit records one request served by an approximate
+// match against a recent, sufficiently similar prior request's own
+// cached answer — see the semcache package and Server.SemanticIndex.
+// Attributed to target the same way RecordCacheHit is. Distinct from
+// CacheHits: a cache hit's response belongs to this exact request's own
+// prior occurrence; a semantic cache hit's response belongs to a
+// different (if similar) request.
+func (s *Stats) RecordSemanticCacheHit(target string) {
+	s.overall.semanticCacheHits.Add(1)
+	s.counterFor(target).semanticCacheHits.Add(1)
+}
+
 // RecordStaleCacheHit records one cache hit whose age had already
 // crossed cache.Cache.IsStale's warning threshold — see RecordCacheHit,
 // which is always called alongside this for the same request; this
@@ -856,6 +870,14 @@ type Snapshot struct {
 	// isn't configured.
 	CoalescedRequests int64 `json:"coalesced_requests"`
 
+	// SemanticCacheHits counts requests served by an approximate match
+	// against a recent, sufficiently similar prior request's own cached
+	// answer — see Stats.RecordSemanticCacheHit and the semcache
+	// package. Distinct from CacheHits: the served response belongs to
+	// a different (if similar) request, not this exact one's own prior
+	// occurrence. Always 0 when semantic_cache_enabled isn't configured.
+	SemanticCacheHits int64 `json:"semantic_cache_hits"`
+
 	// StaleCacheHits counts how many of CacheHits were served past
 	// cache.Cache.IsStale's own warning threshold — still a genuine hit
 	// (never a miss; see cache.Cache.Get), just old enough relative to
@@ -1135,6 +1157,12 @@ func (s Snapshot) String() string {
 	if s.CoalescedRequests > 0 {
 		out += fmt.Sprintf("\nCoalesced requests:   %d", s.CoalescedRequests)
 	}
+	// Same reasoning again: 0 for every run that never configured
+	// semantic_cache_enabled, or that did but no request ever came in
+	// similar enough to an earlier one to cross semantic_cache_threshold.
+	if s.SemanticCacheHits > 0 {
+		out += fmt.Sprintf("\nSemantic cache hits:  %d", s.SemanticCacheHits)
+	}
 	// Same reasoning again: 0 for every run that never configured a
 	// multi-URL target, or that did but never needed to actually use it.
 	if s.Failover > 0 {
@@ -1197,6 +1225,9 @@ func (s Snapshot) PerTargetString(rates CostRates) string {
 		}
 		if t.CoalescedRequests > 0 {
 			fmt.Fprintf(&b, " coalesced=%d", t.CoalescedRequests)
+		}
+		if t.SemanticCacheHits > 0 {
+			fmt.Fprintf(&b, " semantic-cache-hits=%d", t.SemanticCacheHits)
 		}
 		if t.Latency.Count > 0 {
 			fmt.Fprintf(&b, " avg-latency=%.1fms", t.Latency.AvgLatencyMillis())
