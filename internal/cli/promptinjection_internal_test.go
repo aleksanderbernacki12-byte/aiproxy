@@ -166,8 +166,8 @@ func newPromptInjectionTestServer(t *testing.T, cfg *config.Config, upstream *ht
 	srv := proxy.New("unused", targetURL, engine)
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
-	t.Cleanup(frontend.Close)
 	t.Cleanup(upstream.Close)
+	t.Cleanup(frontend.Close)
 	return srv, frontend
 }
 
@@ -269,7 +269,7 @@ func TestPromptInjectionRules_CatchesInjectionInUpstreamResponseToo(t *testing.T
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d (a response containing a matching phrase must be blocked)", resp.StatusCode, http.StatusForbidden)
 	}
-	if strings.Contains(string(body), "I will ignore previous instructions") {
-		t.Fatalf("blocked response body leaked the upstream's real content: %q", body)
+	if string(body) != "response blocked by aiproxy rules" {
+		t.Fatalf("blocked response body = %q, want the standard response-block message (no leak of upstream content)", body)
 	}
 }
