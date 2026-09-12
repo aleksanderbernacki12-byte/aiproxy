@@ -64,8 +64,8 @@ var (
 	// "dry_run" builtin_rule_actions value this risk motivated adding.
 	ignorePreviousInstructionsPattern = regexp.MustCompile(`(?i)(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above|preceding)\s+(instructions?|prompts?|rules?|guidelines?)`)
 	systemPromptExfiltrationPattern   = regexp.MustCompile(`(?i)(repeat|reveal|print|show|output)\s+(your\s+)?(system\s+prompt|initial\s+instructions?|the\s+instructions?\s+above)`)
-	roleOverridePattern               = regexp.MustCompile(`(?i:you\s+are\s+now\s+(in\s+)?(developer\s+mode|an?\s+unrestricted\s+AI|jailbroken))|you\s+are\s+now\s+DAN\b`)
-	fakeSystemTurnPattern             = regexp.MustCompile(`\[?(SYSTEM|ADMIN|ROOT)\]?\s*:\s*(override|new\s+instructions?)`)
+	roleOverridePattern               = regexp.MustCompile(`(?i:you\s+are\s+now\s+(in\s+)?(developer\s+mode|an?\s+unrestricted\s+AI|jailbroken))|(?i:you\s+are\s+now\s+)DAN\b`)
+	fakeSystemTurnPattern             = regexp.MustCompile(`\[?\b(SYSTEM|ADMIN|ROOT)\b\]?\s*:\s*(override|new\s+instructions?)`)
 	restrictionBypassPattern          = regexp.MustCompile(`(?i)(bypass|override|disable)\s+(your\s+)?(safety|content)\s+(guidelines?|filters?|restrictions?)`)
 )
 
