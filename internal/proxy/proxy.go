@@ -1573,25 +1573,6 @@ type modelField struct {
 	Model string `json:"model"`
 }
 
-// promptFields is a shallow, best-effort decode of the request body
-// looking for text meaningful to semantic caching — the same
-// "recognize the common shape, don't guess at the rest" discipline
-// modelField already uses for the "model" field. Covers the two
-// dominant chat-message conventions (OpenAI/Anthropic-shaped
-// messages[].content) plus the legacy single-string prompt/input
-// fields. A body that matches none of these simply never participates
-// in semantic caching — the existing exact-match cache is unaffected
-// either way. Every field is left as json.RawMessage and decoded again,
-// individually, by extractPromptText: on real client-controlled
-// traffic a malformed or unexpected shape in one field (Messages not
-// being an array, say) must not prevent Prompt/Input — or vice versa —
-// from still being picked up.
-type promptFields struct {
-	Prompt   json.RawMessage `json:"prompt"`
-	Input    json.RawMessage `json:"input"`
-	Messages json.RawMessage `json:"messages"`
-}
-
 // contentBlock is one entry of a "content blocks" array, e.g.
 // [{"type":"text","text":"..."}] — the shape both OpenAI and Anthropic
 // use for multi-part (text + image, etc.) message content.
@@ -1600,23 +1581,38 @@ type contentBlock struct {
 }
 
 // extractPromptText returns the concatenated text aiproxy recognizes in
-// body for semantic caching, and whether any was found at all.
-// Decoding is defensive at every level, because on live, heterogeneous,
-// fully client-controlled traffic one malformed field or array element
-// must never discard real text found elsewhere in the same body:
+// body for semantic caching's approximate similarity check (messages[].
+// content, then prompt, then input, exactly as before this function
+// gained a third return value), and the "structural remainder": body
+// with just that free text blanked out to JSON null, leaving every
+// other field — model, stream, message roles, tools, response_format,
+// generation parameters, and anything else aiproxy doesn't specifically
+// recognize — byte-for-byte reproducible from the original (map key
+// order is Go's own deterministic sorted-key json.Marshal output, so
+// two requests that differ only in field order still produce identical
+// remainders). remainder is the mandatory *exact*-match requirement
+// semantic caching checks before it ever consults approximate text
+// similarity — see docs/reviews/2026-09-12-v0.74.1-system-review.md
+// finding #3: without it, a request to a different model, or with
+// streaming toggled, could receive a cached answer generated under
+// completely different parameters just because its prompt text was
+// similar. ok is false, and both other return values are zero, exactly
+// when body isn't a JSON object at all; a body that IS a JSON object
+// but has no recognizable prompt text still returns a real remainder
+// (there is nothing to blank, so it's just body's own canonicalized
+// bytes) — the semantic cache's own caller only ever consults remainder
+// when text was actually found, so this asymmetry is harmless.
+//
+// Decoding stays defensive at every level, same discipline as before:
 // messages is decoded as a raw array and each message decoded on its
-// own, messages[].content accepts either a plain JSON string or a JSON
-// array of content blocks, and within that array each block is decoded
-// individually — an unrecognized or malformed block (a
-// tool_use/tool_result/thinking block mixed into content, say, or one
-// with the wrong JSON type for "text") is simply skipped rather than
-// aborting the whole array or the whole body. Extraction concatenates,
-// in order, every message's content, then Prompt, then Input, joining
-// non-empty chunks with a single space.
-func extractPromptText(body []byte) (string, bool) {
-	var pf promptFields
-	if err := json.Unmarshal(body, &pf); err != nil {
-		return "", false
+// own, content accepts either a plain JSON string or a JSON array of
+// content blocks, and one malformed message or block is skipped (left
+// out of the extracted text, left unblanked in the remainder) rather
+// than aborting the whole body.
+func extractPromptText(body []byte) (text string, remainder []byte, ok bool) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return "", nil, false
 	}
 
 	var b strings.Builder
@@ -1630,45 +1626,68 @@ func extractPromptText(body []byte) (string, bool) {
 		b.WriteString(s)
 	}
 
-	var rawMessages []json.RawMessage
-	if err := json.Unmarshal(pf.Messages, &rawMessages); err == nil {
-		for _, rawMsg := range rawMessages {
-			var m struct {
-				Content json.RawMessage `json:"content"`
-			}
-			if err := json.Unmarshal(rawMsg, &m); err != nil || len(m.Content) == 0 {
-				continue
-			}
-			var asString string
-			if err := json.Unmarshal(m.Content, &asString); err == nil {
-				writeChunk(asString)
-				continue
-			}
-			var rawBlocks []json.RawMessage
-			if err := json.Unmarshal(m.Content, &rawBlocks); err == nil {
-				for _, rawBlock := range rawBlocks {
-					var blk contentBlock
-					if err := json.Unmarshal(rawBlock, &blk); err == nil {
-						writeChunk(blk.Text)
+	if rawMessages, hasMessages := top["messages"]; hasMessages {
+		var messages []json.RawMessage
+		if err := json.Unmarshal(rawMessages, &messages); err == nil {
+			blanked := make([]json.RawMessage, len(messages))
+			copy(blanked, messages)
+			for i, rawMsg := range messages {
+				var msg map[string]json.RawMessage
+				if err := json.Unmarshal(rawMsg, &msg); err != nil {
+					continue
+				}
+				rawContent, hasContent := msg["content"]
+				if !hasContent {
+					continue
+				}
+				var asString string
+				if err := json.Unmarshal(rawContent, &asString); err == nil {
+					writeChunk(asString)
+				} else {
+					var blocks []json.RawMessage
+					if err := json.Unmarshal(rawContent, &blocks); err == nil {
+						for _, rawBlock := range blocks {
+							var blk contentBlock
+							if err := json.Unmarshal(rawBlock, &blk); err == nil {
+								writeChunk(blk.Text)
+							}
+						}
 					}
 				}
+				msg["content"] = json.RawMessage("null")
+				if reMarshaled, err := json.Marshal(msg); err == nil {
+					blanked[i] = reMarshaled
+				}
+			}
+			if reMarshaled, err := json.Marshal(blanked); err == nil {
+				top["messages"] = reMarshaled
 			}
 		}
 	}
 
-	var prompt string
-	if err := json.Unmarshal(pf.Prompt, &prompt); err == nil {
-		writeChunk(prompt)
+	if rawPrompt, hasPrompt := top["prompt"]; hasPrompt {
+		var prompt string
+		if err := json.Unmarshal(rawPrompt, &prompt); err == nil {
+			writeChunk(prompt)
+		}
+		top["prompt"] = json.RawMessage("null")
 	}
-	var input string
-	if err := json.Unmarshal(pf.Input, &input); err == nil {
-		writeChunk(input)
+	if rawInput, hasInput := top["input"]; hasInput {
+		var input string
+		if err := json.Unmarshal(rawInput, &input); err == nil {
+			writeChunk(input)
+		}
+		top["input"] = json.RawMessage("null")
 	}
 
-	if b.Len() == 0 {
-		return "", false
+	remainder, err := json.Marshal(top)
+	if err != nil {
+		return "", nil, false
 	}
-	return b.String(), true
+	if b.Len() == 0 {
+		return "", remainder, false
+	}
+	return b.String(), remainder, true
 }
 
 // resolveModelRoute checks body's "model" field against every

@@ -1,10 +1,14 @@
 package proxy
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestExtractPromptText_PlainStringContent(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"hello world"}]}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -15,7 +19,7 @@ func TestExtractPromptText_PlainStringContent(t *testing.T) {
 
 func TestExtractPromptText_ContentBlocksArray(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -26,7 +30,7 @@ func TestExtractPromptText_ContentBlocksArray(t *testing.T) {
 
 func TestExtractPromptText_MultipleMessagesConcatenated(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hello world"}]}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -37,7 +41,7 @@ func TestExtractPromptText_MultipleMessagesConcatenated(t *testing.T) {
 
 func TestExtractPromptText_TopLevelPromptField(t *testing.T) {
 	body := []byte(`{"prompt":"legacy completion prompt"}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -48,7 +52,7 @@ func TestExtractPromptText_TopLevelPromptField(t *testing.T) {
 
 func TestExtractPromptText_TopLevelInputField(t *testing.T) {
 	body := []byte(`{"input":"some input text"}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -59,27 +63,27 @@ func TestExtractPromptText_TopLevelInputField(t *testing.T) {
 
 func TestExtractPromptText_UnrecognizedShapeReturnsFalse(t *testing.T) {
 	body := []byte(`{"foo":"bar"}`)
-	if _, ok := extractPromptText(body); ok {
+	if _, _, ok := extractPromptText(body); ok {
 		t.Fatal("expected ok=false for a body with no recognized prompt field")
 	}
 }
 
 func TestExtractPromptText_InvalidJSONReturnsFalse(t *testing.T) {
-	if _, ok := extractPromptText([]byte("not json")); ok {
+	if _, _, ok := extractPromptText([]byte("not json")); ok {
 		t.Fatal("expected ok=false for invalid JSON")
 	}
 }
 
 func TestExtractPromptText_EmptyContentReturnsFalse(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":""}]}`)
-	if _, ok := extractPromptText(body); ok {
+	if _, _, ok := extractPromptText(body); ok {
 		t.Fatal("expected ok=false when every recognized field is empty")
 	}
 }
 
 func TestExtractPromptText_ContentBlocksArrayWithBareStringElementSkipsOnlyThatElement(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},"oops-a-bare-string",{"type":"text","text":"world"}]}]}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -90,7 +94,7 @@ func TestExtractPromptText_ContentBlocksArrayWithBareStringElementSkipsOnlyThatE
 
 func TestExtractPromptText_ContentBlockWithWrongTypedTextFieldSkipsOnlyThatElement(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"tool_use","text":123},{"type":"text","text":"world"}]}]}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -101,7 +105,7 @@ func TestExtractPromptText_ContentBlockWithWrongTypedTextFieldSkipsOnlyThatEleme
 
 func TestExtractPromptText_MalformedMessagesFieldDoesNotDiscardPrompt(t *testing.T) {
 	body := []byte(`{"prompt":"legit text","messages":"not-an-array"}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -112,11 +116,93 @@ func TestExtractPromptText_MalformedMessagesFieldDoesNotDiscardPrompt(t *testing
 
 func TestExtractPromptText_NoDoubleSpaceBetweenContentAndInput(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"hello world"}],"input":"some input"}`)
-	text, ok := extractPromptText(body)
+	text, _, ok := extractPromptText(body)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
 	if text != "hello world some input" {
 		t.Fatalf("text = %q, want %q (no double space)", text, "hello world some input")
+	}
+}
+
+func TestExtractPromptText_RemainderPreservesNonTextFields(t *testing.T) {
+	body := []byte(`{"model":"gpt-4","stream":true,"temperature":0.7,"messages":[{"role":"user","content":"hello"}]}`)
+	_, remainder, ok := extractPromptText(body)
+	if !ok {
+		t.Fatal("expected text to be found")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(remainder, &decoded); err != nil {
+		t.Fatalf("remainder is not valid JSON: %v, %q", err, remainder)
+	}
+	if decoded["model"] != "gpt-4" {
+		t.Fatalf("remainder lost model field: %q", remainder)
+	}
+	if decoded["stream"] != true {
+		t.Fatalf("remainder lost stream field: %q", remainder)
+	}
+	if decoded["temperature"] != 0.7 {
+		t.Fatalf("remainder lost temperature field: %q", remainder)
+	}
+}
+
+func TestExtractPromptText_RemainderBlanksMessageContentButKeepsRole(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"secret system prompt"}]}`)
+	_, remainder, ok := extractPromptText(body)
+	if !ok {
+		t.Fatal("expected text to be found")
+	}
+	if strings.Contains(string(remainder), "secret system prompt") {
+		t.Fatalf("remainder leaked message content verbatim: %q", remainder)
+	}
+	var decoded struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(remainder, &decoded); err != nil {
+		t.Fatalf("remainder is not valid JSON: %v", err)
+	}
+	if len(decoded.Messages) != 1 || decoded.Messages[0].Role != "system" {
+		t.Fatalf("remainder lost message role: %q", remainder)
+	}
+}
+
+func TestExtractPromptText_DifferentModelProducesDifferentRemainder(t *testing.T) {
+	a := []byte(`{"model":"model-a","stream":false,"messages":[{"role":"user","content":"same text"}]}`)
+	b := []byte(`{"model":"model-b","stream":true,"messages":[{"role":"user","content":"same text"}]}`)
+	_, remainderA, okA := extractPromptText(a)
+	_, remainderB, okB := extractPromptText(b)
+	if !okA || !okB {
+		t.Fatal("expected text to be found in both")
+	}
+	if string(remainderA) == string(remainderB) {
+		t.Fatalf("different model/stream produced identical remainders: %q", remainderA)
+	}
+}
+
+func TestExtractPromptText_DifferentToolsProduceDifferentRemainder(t *testing.T) {
+	a := []byte(`{"tools":[{"name":"get_weather"}],"messages":[{"role":"user","content":"same text"}]}`)
+	b := []byte(`{"tools":[{"name":"get_stock_price"}],"messages":[{"role":"user","content":"same text"}]}`)
+	_, remainderA, okA := extractPromptText(a)
+	_, remainderB, okB := extractPromptText(b)
+	if !okA || !okB {
+		t.Fatal("expected text to be found in both")
+	}
+	if string(remainderA) == string(remainderB) {
+		t.Fatalf("different tool definitions produced identical remainders: %q", remainderA)
+	}
+}
+
+func TestExtractPromptText_DifferentResponseFormatProducesDifferentRemainder(t *testing.T) {
+	a := []byte(`{"response_format":{"type":"text"},"messages":[{"role":"user","content":"same text"}]}`)
+	b := []byte(`{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"same text"}]}`)
+	_, remainderA, okA := extractPromptText(a)
+	_, remainderB, okB := extractPromptText(b)
+	if !okA || !okB {
+		t.Fatal("expected text to be found in both")
+	}
+	if string(remainderA) == string(remainderB) {
+		t.Fatalf("different response_format produced identical remainders: %q", remainderA)
 	}
 }
