@@ -228,14 +228,25 @@ deliberate breaking change to close finding #6 in every deployment shape,
 including the common single-listener one where `AdminAddr` was never set.
 
 `aiproxy validate` gains a new warning (not a hard error — an operator may
-have a legitimate reason to run without any admin surface reachable at all,
-e.g. `AdminAddr` bound to loopback behind its own separate access control):
-if any admin path is reachable at all (always true on `Addr` when `AdminAddr`
-is unset; also true whenever `AdminAddr` is set to a non-loopback address)
-and neither `AdminAPIKey` nor `AdminAPIKeys` is configured, print a clear
-warning naming the exposed capability (drain, cache-clear, stats) so an
-upgrading operator sees an actionable message instead of silently discovering
-a 401 on their next `drain` call.
+have a legitimate reason to run without any admin key at all, e.g. a
+single-user local setup): if `admin_api_key`/`admin_api_keys` are both unset
+in the config file, print a clear warning naming the exposed capability
+(drain, cache-clear, stats) so an upgrading operator sees an actionable
+message instead of silently discovering a 401 on their next `drain` call.
+
+**Correction found during plan-writing:** the design originally described this
+warning as conditional on whether `-admin-addr` is set and, if so, whether
+it's bound to loopback. `AdminAddr` turns out to be a `start`-time-only CLI
+flag (`-admin-addr`) with no config-file equivalent at all — `runValidate`
+parses only `-config` and has no way to know what `-admin-addr` value (if
+any) a later `aiproxy start` invocation will use. The warning is therefore
+unconditional on admin-key absence alone, regardless of `AdminAddr`: even a
+deployment that will bind the admin surface to loopback still benefits from
+being told its admin paths accept any configured proxy key today, since IP
+binding and key-based authorization are additive protections, not
+substitutes for each other. Introducing a config-file-visible admin bind
+address purely to make this warning AdminAddr-aware would be unrelated scope
+creep for this phase.
 
 ## Config surface
 
@@ -338,14 +349,10 @@ Additional cases beyond the four inherited ones:
   `temperature`) must fail to match, one negative test per field, so a
   future regression narrowing the remainder hash's coverage is caught
   per-field rather than only in aggregate.
-- Admin keys: `aiproxy validate` emits the new warning when
-  `admin_api_key`/`admin_api_keys` are both unset and admin paths are
-  reachable (both the `AdminAddr`-unset and `AdminAddr`-set-to-non-loopback
-  cases); no warning when an admin key is configured, and no warning when
-  `AdminAddr` is loopback-bound (still reachable in principle from the same
-  host, but not the "any network client" exposure the warning exists to
-  flag — matches how the review frames loopback binding as the network-
-  isolation half of this fix).
+- Admin keys: `aiproxy validate` emits the new warning whenever
+  `admin_api_key`/`admin_api_keys` are both unset in the config file (see
+  the Section 4 correction above — this is unconditional on `AdminAddr`,
+  which validate cannot see); no warning when either is configured.
 - `ReloadConfig` correctly swaps live `AdminAPIKey`/`AdminAPIKeys` without a
   restart, matching every other reloadable field's existing test coverage
   pattern.
