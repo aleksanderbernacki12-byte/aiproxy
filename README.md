@@ -1267,9 +1267,9 @@ The exact-match cache above only serves a hit for a byte-for-byte
 identical request. `semantic_cache_enabled` adds a second, approximate
 lookup layer on top of it: when the exact cache misses, aiproxy checks
 whether a recent, sufficiently similar request already has a cached
-answer for this target — a rephrased prompt, reordered whitespace, a
-client that appends a timestamp to its system message — and serves that
-instead of forwarding upstream:
+answer for this target — a prompt with minor wording tweaks, reordered
+whitespace, a client that appends a timestamp to its system message —
+and serves that instead of forwarding upstream:
 
 ```json
 {
@@ -1300,14 +1300,17 @@ near-duplicate *phrasings* — the same request restated with minor edits
 or additions — but not a true paraphrase with substantially different
 wording, which would require real, meaning-based embeddings; a request
 whose body doesn't match any recognized shape simply never participates
-in semantic caching, with no effect on the exact-match cache. Unlike a
-coalesced request, a semantic cache hit is always marked with
-`X-Semantic-Cache-Hit: true` and `X-Semantic-Cache-Similarity: 0.93`
-response headers: it can serve the answer to a *materially different*
-request than the one the client actually sent, and the client should be
-able to detect that. Each semantic cache hit is logged (`[SEMANTIC
-CACHE HIT]`, purple; `"semantic_cache_hit"` under `--log-format json`)
-and counted in `stats.semantic_cache_hits` and the Prometheus
+in semantic caching, with no effect on the exact-match cache.
+
+Unlike a [coalesced request](#request-coalescing), a semantic cache hit
+is always marked with `X-Semantic-Cache-Hit: true` and
+`X-Semantic-Cache-Similarity: 0.93` response headers: it can serve the
+answer to a *materially different* request than the one the client
+actually sent, and the client should be able to detect that.
+
+Each semantic cache hit is logged (`[SEMANTIC CACHE HIT]`, purple;
+`"semantic_cache_hit"` under `--log-format json`) and counted in
+`stats.semantic_cache_hits` and the Prometheus
 `aiproxy_semantic_cache_hits_total` counter, broken down per target like
 `cache_hits`.
 
