@@ -2267,6 +2267,104 @@ func TestExecute_Validate_ValidConfig_WithCacheRequestCoalescing_ReturnsZero(t *
 	}
 }
 
+func TestExecute_Validate_SemanticCacheEnabledWithoutCacheEnabled_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"semantic_cache_enabled": true, "semantic_cache_threshold": 0.9}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "semantic_cache_enabled requires cache_enabled") {
+		t.Errorf("stderr missing the requires-cache_enabled problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_SemanticCacheEnabledWithoutThreshold_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "semantic_cache_enabled": true}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "semantic_cache_enabled requires semantic_cache_threshold") {
+		t.Errorf("stderr missing the requires-threshold problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_SemanticCacheThresholdNegative_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "semantic_cache_enabled": true, "semantic_cache_threshold": -0.1}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "must not be negative") {
+		t.Errorf("stderr missing the negative-threshold problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_SemanticCacheThresholdAboveOne_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "semantic_cache_enabled": true, "semantic_cache_threshold": 1.5}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "must not be greater than 1") {
+		t.Errorf("stderr missing the out-of-range problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_ValidConfig_WithSemanticCache_ReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	raw := `{"cache_enabled": true, "semantic_cache_enabled": true, "semantic_cache_threshold": 0.9}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "semantic cache enabled:  true") {
+		t.Fatalf("stdout missing semantic cache enabled summary line: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "semantic cache threshold: 0.9") {
+		t.Fatalf("stdout missing semantic cache threshold summary line: %q", stdout.String())
+	}
+}
+
 func TestExecute_Validate_ValidConfig_WithIdempotencyEnabled_ReportsSummary(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aiproxy.json")

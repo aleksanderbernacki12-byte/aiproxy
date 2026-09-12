@@ -33,6 +33,7 @@ import (
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
+	"aiproxy/internal/semcache"
 )
 
 // defaultConfigPath is where aiproxy looks for custom rules when --config
@@ -194,6 +195,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.CostBudgetHardStop = lc.costBudgetHardStop
 	server.Idempotency = lc.idempotency
 	server.Coalescer = lc.coalescer
+	server.SemanticIndex = lc.semanticIndex
+	server.SemanticCacheThreshold = lc.semanticCacheThreshold
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.WebhookURL = lc.webhookURL
 	server.Webhooks = lc.webhooks
@@ -268,6 +271,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			}
 			if cfg.CacheRequestCoalescing {
 				fmt.Fprintln(stdout, "response cache: request coalescing enabled (concurrent identical misses share one upstream call)")
+			}
+			if cfg.SemanticCacheEnabled {
+				fmt.Fprintf(stdout, "response cache: semantic matching enabled (threshold %g)\n", cfg.SemanticCacheThreshold)
 			}
 		}
 		if len(lc.targetCacheTTL) > 0 || len(lc.targetCacheEnabled) > 0 {
@@ -500,7 +506,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency, lc.coalescer, nil, 0)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency, lc.coalescer, lc.semanticIndex, lc.semanticCacheThreshold)
 
 	label := loadedFrom
 	if label == "" {
@@ -522,30 +528,32 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 // rebuilt from an aiproxy.json: everything runStart wires in at startup,
 // and everything a SIGHUP reload replaces via Server.ReloadConfig.
 type liveConfig struct {
-	engine             *rules.Engine
-	limiter            *limiter.Limiter
-	tokenLimiter       *limiter.TokenLimiter
-	cache              *cache.Cache
-	cost               float64
-	costBudget         float64
-	costBudgetHardStop bool
-	idempotency        *idempotency.Registry
-	coalescer          *coalesce.Group
-	maxBodyBytes       int64
-	webhookURL         *url.URL
-	webhooks           []proxy.WebhookTarget
-	proxyAPIKey        string
-	proxyAPIKeys       []proxy.ProxyKey
-	logFile            *os.File
-	routes             []targetRoute
-	modelRoutes        []modelRoute
-	ipAllowList        []*net.IPNet
-	ipDenyList         []*net.IPNet
-	geoIPTable         *geoip.Table
-	countryAllowList   []string
-	countryDenyList    []string
-	anomalyDetector    *anomaly.Registry
-	anomalyDryRun      bool
+	engine                 *rules.Engine
+	limiter                *limiter.Limiter
+	tokenLimiter           *limiter.TokenLimiter
+	cache                  *cache.Cache
+	cost                   float64
+	costBudget             float64
+	costBudgetHardStop     bool
+	idempotency            *idempotency.Registry
+	coalescer              *coalesce.Group
+	semanticIndex          *semcache.Index
+	semanticCacheThreshold float64
+	maxBodyBytes           int64
+	webhookURL             *url.URL
+	webhooks               []proxy.WebhookTarget
+	proxyAPIKey            string
+	proxyAPIKeys           []proxy.ProxyKey
+	logFile                *os.File
+	routes                 []targetRoute
+	modelRoutes            []modelRoute
+	ipAllowList            []*net.IPNet
+	ipDenyList             []*net.IPNet
+	geoIPTable             *geoip.Table
+	countryAllowList       []string
+	countryDenyList        []string
+	anomalyDetector        *anomaly.Registry
+	anomalyDryRun          bool
 
 	upstreamTransport    *http.Transport
 	upstreamTotalTimeout time.Duration
@@ -608,10 +616,20 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 			if cfg.CacheRequestCoalescing {
 				lc.coalescer = coalesce.NewGroup(coalesce.DefaultWaitTimeout)
 			}
+			if cfg.SemanticCacheEnabled && cfg.SemanticCacheThreshold > 0 {
+				lc.semanticIndex = semcache.NewIndex(semcache.DefaultIndexSize)
+				lc.semanticCacheThreshold = cfg.SemanticCacheThreshold
+			}
 		}
 	}
 	if cfg.CacheRequestCoalescing && !cfg.CacheEnabled {
 		errs = append(errs, fmt.Errorf("cache_request_coalescing requires cache_enabled to be set (there's no cache key for it to coalesce requests by otherwise)"))
+	}
+	if cfg.SemanticCacheEnabled && !cfg.CacheEnabled {
+		errs = append(errs, fmt.Errorf("semantic_cache_enabled requires cache_enabled to be set (there's no cache key for a semantic match to point at otherwise)"))
+	}
+	if cfg.SemanticCacheEnabled && cfg.SemanticCacheThreshold <= 0 {
+		errs = append(errs, fmt.Errorf("semantic_cache_enabled requires semantic_cache_threshold to be set (there is no safe default similarity threshold)"))
 	}
 
 	if cfg.IdempotencyEnabled {
@@ -1278,6 +1296,18 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.CacheRequestCoalescing && !cfg.CacheEnabled {
 		problems = append(problems, "cache_request_coalescing requires cache_enabled to be set (there's no cache key for it to coalesce requests by otherwise)")
 	}
+	if cfg.SemanticCacheThreshold < 0 {
+		problems = append(problems, fmt.Sprintf("semantic_cache_threshold: %g must not be negative", cfg.SemanticCacheThreshold))
+	}
+	if cfg.SemanticCacheThreshold > 1 {
+		problems = append(problems, fmt.Sprintf("semantic_cache_threshold: %g must not be greater than 1", cfg.SemanticCacheThreshold))
+	}
+	if cfg.SemanticCacheEnabled && cfg.SemanticCacheThreshold <= 0 {
+		problems = append(problems, "semantic_cache_enabled requires semantic_cache_threshold to be set (there is no safe default similarity threshold)")
+	}
+	if cfg.SemanticCacheEnabled && !cfg.CacheEnabled {
+		problems = append(problems, "semantic_cache_enabled requires cache_enabled to be set (there's no cache key for a semantic match to point at otherwise)")
+	}
 	if cfg.IdempotencyTTLSeconds < 0 {
 		problems = append(problems, fmt.Sprintf("idempotency_ttl_seconds: %d must not be negative", cfg.IdempotencyTTLSeconds))
 	}
@@ -1325,6 +1355,8 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  cache ttl:               %s\n", cacheTTLDisplay(cfg.CacheTTLSeconds))
 	fmt.Fprintf(stdout, "  cache max size:          %s\n", cacheMaxSizeDisplay(cfg.CacheMaxSizeBytes))
 	fmt.Fprintf(stdout, "  cache request coalescing: %v\n", cfg.CacheRequestCoalescing)
+	fmt.Fprintf(stdout, "  semantic cache enabled:  %v\n", cfg.SemanticCacheEnabled)
+	fmt.Fprintf(stdout, "  semantic cache threshold: %g\n", cfg.SemanticCacheThreshold)
 	fmt.Fprintf(stdout, "  per-target cache overrides: %d\n", countCacheOverrides(cfg))
 	fmt.Fprintf(stdout, "  shadow traffic targets:  %d\n", countShadowTargets(cfg))
 	fmt.Fprintf(stdout, "  idempotency enabled:     %v\n", cfg.IdempotencyEnabled)
