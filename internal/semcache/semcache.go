@@ -83,7 +83,8 @@ func Similarity(a, b []uint64) float64 {
 	return float64(intersection) / float64(union)
 }
 
-// entry is one recorded fingerprint/cache-key pair inside a ring.
+// entry is one recorded fingerprint/remainderHash/cache-key triple
+// inside a ring.
 type entry struct {
 	fingerprint   []uint64
 	remainderHash string
@@ -136,9 +137,10 @@ func (r *ring) forEach(fn func(entry)) {
 // a timer-driven sweep and bounds memory unconditionally, regardless of
 // how the real cache's own TTL is configured (including "never
 // expire"). An Index never stores response bytes itself, only
-// fingerprints and the real cache's own key — the caller must always
-// re-verify a candidate against the real cache before serving it, since
-// the underlying entry may have since expired or been evicted there.
+// fingerprints, remainderHash, and the real cache's own key — the
+// caller must always re-verify a candidate against the real cache
+// before serving it, since the underlying entry may have since expired
+// or been evicted there.
 type Index struct {
 	mu      sync.Mutex
 	maxSize int
@@ -161,6 +163,10 @@ func NewIndex(maxSize int) *Index {
 // target's oldest entry first if it's already at maxSize. remainderHash
 // is an exact-match requirement FindBest checks before it ever
 // considers fingerprint similarity — see FindBest's own doc comment.
+// remainderHash must be a hash of the structural remainder (see
+// proxy.extractPromptText), never the raw remainder bytes themselves —
+// Add has no way to enforce this, so getting it wrong here would mean
+// raw request content ends up held in memory in this index.
 func (ix *Index) Add(target string, fp []uint64, remainderHash, cacheKey string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()

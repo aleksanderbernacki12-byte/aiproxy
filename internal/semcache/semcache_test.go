@@ -209,6 +209,54 @@ func TestIndex_FindBest_RequiresExactRemainderHashMatch(t *testing.T) {
 	}
 }
 
+// TestIndex_FindBest_CrossoverWithMultipleEntries guards against
+// implementations that compute similarity across every entry and only
+// use remainderHash to gate the overall "found" result (e.g. via
+// found = found || e.remainderHash == remainderHash) while still
+// letting a mismatched-remainder-hash entry's higher similarity win the
+// returned cache key. A single-entry test can't catch that: it takes at
+// least one mismatched and one matching entry, with the mismatched one
+// MORE similar to the query, to prove the remainder-hash gate is
+// applied before similarity is ever compared, not just OR'd into the
+// final "found" bool.
+//
+// Empirically verified against the real Fingerprint/Similarity
+// implementation: "explain the capital of Sweden" is identical to the
+// query (similarity 1.0), while "the capital of sweden is stockholm"
+// only partially overlaps it (similarity 0.4) — so the mismatched entry
+// is deliberately the more-similar one here.
+func TestIndex_FindBest_CrossoverWithMultipleEntries(t *testing.T) {
+	ix := semcache.NewIndex(10)
+	query := semcache.Fingerprint("explain the capital of Sweden")
+	// Mismatched remainder hash, but identical text to the query ->
+	// similarity 1.0, the highest possible.
+	ix.Add("targetA", semcache.Fingerprint("explain the capital of Sweden"), "hash-other-model", "cache-key-wrong")
+	// Matching remainder hash, but only partially overlapping text ->
+	// similarity 0.4, lower than the mismatched entry's.
+	ix.Add("targetA", semcache.Fingerprint("the capital of sweden is stockholm"), "hash-this-model", "cache-key-right")
+
+	key, similarity, ok := ix.FindBest("targetA", query, "hash-this-model", 0.3)
+	if !ok {
+		t.Fatal("expected a match")
+	}
+	if key != "cache-key-right" {
+		t.Fatalf("returned the wrong entry's cache key: got %q, want %q (a mismatched-remainder-hash entry with higher similarity must never win)", key, "cache-key-right")
+	}
+	if similarity >= 0.99 {
+		t.Fatalf("similarity %v looks like it came from the mismatched entry, not the matching one", similarity)
+	}
+
+	// Same check with insertion order reversed, in case ordering matters
+	// to the implementation.
+	ix2 := semcache.NewIndex(10)
+	ix2.Add("targetA", semcache.Fingerprint("the capital of sweden is stockholm"), "hash-this-model", "cache-key-right")
+	ix2.Add("targetA", semcache.Fingerprint("explain the capital of Sweden"), "hash-other-model", "cache-key-wrong")
+	key2, _, ok2 := ix2.FindBest("targetA", query, "hash-this-model", 0.3)
+	if !ok2 || key2 != "cache-key-right" {
+		t.Fatalf("reversed insertion order: got key=%q ok=%v, want cache-key-right", key2, ok2)
+	}
+}
+
 // TestNewIndex_NonPositiveMaxSizeClampsToOne confirms NewIndex's
 // documented guard: a non-positive maxSize no longer panics on the
 // first Add and instead behaves as a cap of 1.
