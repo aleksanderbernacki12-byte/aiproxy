@@ -295,3 +295,20 @@ func TestPromptInjectionRules_CatchesInjectionInUpstreamResponseToo(t *testing.T
 		t.Fatalf("blocked response body = %q, want the standard response-block message (no leak of upstream content)", body)
 	}
 }
+
+func TestBuildLiveConfig_AdminAPIKeysCompileSeparatelyFromProxyKeys(t *testing.T) {
+	cfg := &config.Config{
+		AdminAPIKey:  "admin-secret",
+		AdminAPIKeys: []config.ProxyAPIKeyEntry{{Name: "ops", Key: "ops-secret"}},
+	}
+	lc, errs := buildLiveConfig(cfg)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if lc.adminAPIKey != "admin-secret" {
+		t.Fatalf("adminAPIKey = %q, want %q", lc.adminAPIKey, "admin-secret")
+	}
+	if len(lc.adminAPIKeys) != 1 || lc.adminAPIKeys[0].Name != "ops" {
+		t.Fatalf("adminAPIKeys = %+v, want one entry named 'ops'", lc.adminAPIKeys)
+	}
+}

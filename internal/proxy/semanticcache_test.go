@@ -333,7 +333,7 @@ func TestServer_SemanticCache_ReloadConfigHotSwapsThresholdAndEnablement(t *test
 	}
 
 	idx := semcache.NewIndex(semcache.DefaultIndexSize)
-	srv.ReloadConfig(srv.Engine, nil, c, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, idx, 0.5)
+	srv.ReloadConfig(srv.Engine, nil, c, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, idx, 0.5, "", nil)
 
 	// Deliberately a different prompt pair from the pre-reload requests
 	// above (Norway, not Sweden): the exact-match cache (srv.Cache) is

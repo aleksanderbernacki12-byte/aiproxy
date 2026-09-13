@@ -216,6 +216,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.Webhooks = lc.webhooks
 	server.ProxyAPIKey = lc.proxyAPIKey
 	server.ProxyAPIKeys = lc.proxyAPIKeys
+	server.AdminAPIKey = lc.adminAPIKey
+	server.AdminAPIKeys = lc.adminAPIKeys
 	server.LogFile = lc.logFile
 	server.IPAllowList = lc.ipAllowList
 	server.IPDenyList = lc.ipDenyList
@@ -520,7 +522,7 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency, lc.coalescer, lc.semanticIndex, lc.semanticCacheThreshold)
+	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency, lc.coalescer, lc.semanticIndex, lc.semanticCacheThreshold, lc.adminAPIKey, lc.adminAPIKeys)
 
 	label := loadedFrom
 	if label == "" {
@@ -558,6 +560,8 @@ type liveConfig struct {
 	webhooks               []proxy.WebhookTarget
 	proxyAPIKey            string
 	proxyAPIKeys           []proxy.ProxyKey
+	adminAPIKey            string
+	adminAPIKeys           []proxy.ProxyKey
 	logFile                *os.File
 	routes                 []targetRoute
 	modelRoutes            []modelRoute
@@ -680,9 +684,14 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 
 	lc.proxyAPIKey = cfg.ProxyAPIKey
 
-	proxyAPIKeys, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
+	proxyAPIKeys, proxyKeyErrs := compileAPIKeys("proxy_api_keys", cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
 	errs = append(errs, proxyKeyErrs...)
 	lc.proxyAPIKeys = proxyAPIKeys
+
+	adminAPIKeys, adminKeyErrs := compileAPIKeys("admin_api_keys", cfg.AdminAPIKeys, 0)
+	errs = append(errs, adminKeyErrs...)
+	lc.adminAPIKey = cfg.AdminAPIKey
+	lc.adminAPIKeys = adminAPIKeys
 
 	if cfg.LogFile != "" {
 		logFile, err := openLogFile(cfg.LogFile)
@@ -1411,8 +1420,12 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	for _, e := range webhookErrs {
 		problems = append(problems, e.Error())
 	}
-	_, proxyKeyErrs := compileProxyAPIKeys(cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
+	_, proxyKeyErrs := compileAPIKeys("proxy_api_keys", cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
 	for _, e := range proxyKeyErrs {
+		problems = append(problems, e.Error())
+	}
+	_, adminKeyErrs := compileAPIKeys("admin_api_keys", cfg.AdminAPIKeys, 0)
+	for _, e := range adminKeyErrs {
 		problems = append(problems, e.Error())
 	}
 	if cfg.LogFile != "" {
@@ -2349,65 +2362,68 @@ type modelRoute struct {
 	shadowSampleRate     float64
 }
 
-// compileProxyAPIKeys validates and resolves the config file's
-// proxy_api_keys list into proxy.ProxyKey values, ready for
-// Server.ProxyAPIKeys — same shape and rigor as compileTargetRoutes:
-// every entry needs a non-empty, unique name (it's the stats/log
-// attribution label, so a collision would silently merge two different
-// callers' numbers together — "default" is reserved for the anonymous
-// top-level proxy_api_key, so it's rejected here too) and a non-empty,
-// unique key; max_requests_per_minute, if set, must not be negative and
-// compiles into that key's own dedicated limiter, checked instead of
-// whatever route/global limiter would otherwise apply for that caller.
-func compileProxyAPIKeys(entries []config.ProxyAPIKeyEntry, costPer1KTokens float64) ([]proxy.ProxyKey, []error) {
+// compileAPIKeys validates and resolves a config file's proxy_api_keys
+// or admin_api_keys list into proxy.ProxyKey values, ready for
+// Server.ProxyAPIKeys/Server.AdminAPIKeys — same shape and rigor as
+// compileTargetRoutes: every entry needs a non-empty, unique name (it's
+// the stats/log attribution label, so a collision would silently merge
+// two different callers' numbers together — "default" is reserved for
+// the anonymous top-level proxy_api_key, so it's rejected here too) and
+// a non-empty, unique key; max_requests_per_minute, if set, must not be
+// negative and compiles into that key's own dedicated limiter, checked
+// instead of whatever route/global limiter would otherwise apply for
+// that caller. fieldName ("proxy_api_keys" or "admin_api_keys") names
+// the actual field being validated in every error message, since both
+// callers share this same validation logic.
+func compileAPIKeys(fieldName string, entries []config.ProxyAPIKeyEntry, costPer1KTokens float64) ([]proxy.ProxyKey, []error) {
 	compiled := make([]proxy.ProxyKey, 0, len(entries))
 	var errs []error
 	seenNames := make(map[string]bool, len(entries))
 	seenKeys := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		if e.Name == "" {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: name must not be empty"))
+			errs = append(errs, fmt.Errorf("%s: name must not be empty", fieldName))
 			continue
 		}
 		if e.Name == "default" {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: name %q is reserved for the anonymous top-level proxy_api_key", e.Name))
+			errs = append(errs, fmt.Errorf("%s: name %q is reserved for the anonymous top-level proxy_api_key", fieldName, e.Name))
 			continue
 		}
 		if seenNames[e.Name] {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: duplicate name %q (stats would merge under one label)", e.Name))
+			errs = append(errs, fmt.Errorf("%s: duplicate name %q (stats would merge under one label)", fieldName, e.Name))
 			continue
 		}
 		seenNames[e.Name] = true
 
 		if e.Key == "" {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: key must not be empty", e.Name))
+			errs = append(errs, fmt.Errorf("%s: %q: key must not be empty", fieldName, e.Name))
 			continue
 		}
 		if seenKeys[e.Key] {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: key duplicates an earlier entry's (whichever is checked first would silently claim every request)", e.Name))
+			errs = append(errs, fmt.Errorf("%s: %q: key duplicates an earlier entry's (whichever is checked first would silently claim every request)", fieldName, e.Name))
 			continue
 		}
 		seenKeys[e.Key] = true
 
 		if e.MaxRequestsPerMinute < 0 {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: max_requests_per_minute %d must not be negative", e.Name, e.MaxRequestsPerMinute))
+			errs = append(errs, fmt.Errorf("%s: %q: max_requests_per_minute %d must not be negative", fieldName, e.Name, e.MaxRequestsPerMinute))
 			continue
 		}
 		if e.MaxTokensPerMinute < 0 {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: max_tokens_per_minute %d must not be negative", e.Name, e.MaxTokensPerMinute))
+			errs = append(errs, fmt.Errorf("%s: %q: max_tokens_per_minute %d must not be negative", fieldName, e.Name, e.MaxTokensPerMinute))
 			continue
 		}
 
 		if e.CostBudget < 0 {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget %g must not be negative", e.Name, e.CostBudget))
+			errs = append(errs, fmt.Errorf("%s: %q: cost_budget %g must not be negative", fieldName, e.Name, e.CostBudget))
 			continue
 		}
 		if e.CostBudget > 0 && costPer1KTokens <= 0 {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget requires the top-level cost_per_1k_tokens to be set (there's no rate to price tokens at otherwise)", e.Name))
+			errs = append(errs, fmt.Errorf("%s: %q: cost_budget requires the top-level cost_per_1k_tokens to be set (there's no rate to price tokens at otherwise)", fieldName, e.Name))
 			continue
 		}
 		if e.CostBudgetHardStop && e.CostBudget <= 0 {
-			errs = append(errs, fmt.Errorf("proxy_api_keys: %q: cost_budget_hard_stop requires this key's own cost_budget to be set (there's no budget to enforce otherwise)", e.Name))
+			errs = append(errs, fmt.Errorf("%s: %q: cost_budget_hard_stop requires this key's own cost_budget to be set (there's no budget to enforce otherwise)", fieldName, e.Name))
 			continue
 		}
 

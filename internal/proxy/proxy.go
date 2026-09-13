@@ -692,6 +692,20 @@ type Server struct {
 	// default) means ProxyAPIKey alone (if set) is the only key.
 	ProxyAPIKeys []ProxyKey
 
+	// AdminAPIKey, if set, is required to reach any of the five admin
+	// paths (stats, metrics, dashboard, cache-clear, drain) — checked by
+	// a later task's checkAdminAuth instead of checkProxyAuth,
+	// completely independent of ProxyAPIKey/ProxyAPIKeys. See
+	// config.Config.AdminAPIKey's own doc comment for the fail-closed
+	// behavior once this (or AdminAPIKeys) is set at all.
+	AdminAPIKey string
+
+	// AdminAPIKeys lists additional named admin keys beyond AdminAPIKey,
+	// the same relationship ProxyAPIKeys has to ProxyAPIKey. Reuses
+	// ProxyKey's shape as-is — see config.Config.AdminAPIKeys' own doc
+	// comment for why.
+	AdminAPIKeys []ProxyKey
+
 	// TLSCertFile and TLSKeyFile, if both set, make ListenAndServe
 	// terminate TLS itself — a PEM certificate and private key file,
 	// loaded once at startup — instead of listening on plain HTTP.
@@ -2217,7 +2231,12 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group, semanticIndex *semcache.Index, semanticCacheThreshold float64) {
+//
+// adminAPIKey/adminAPIKeys replace AdminAPIKey/AdminAPIKeys wholesale,
+// the same way proxyAPIKey/proxyAPIKeys replace ProxyAPIKey/
+// ProxyAPIKeys. Appended at the very end since they were added after
+// every other parameter above.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group, semanticIndex *semcache.Index, semanticCacheThreshold float64, adminAPIKey string, adminAPIKeys []ProxyKey) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -2240,6 +2259,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.Webhooks = webhooks
 	s.ProxyAPIKey = proxyAPIKey
 	s.ProxyAPIKeys = proxyAPIKeys
+	s.AdminAPIKey = adminAPIKey
+	s.AdminAPIKeys = adminAPIKeys
 	s.LogFile = logFile
 	s.routes = newRoutes
 	s.modelRoutes = newModelRoutes
