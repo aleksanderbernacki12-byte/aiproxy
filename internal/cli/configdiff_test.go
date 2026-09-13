@@ -83,6 +83,30 @@ func TestDiffConfig_RedactsProxyAPIKey(t *testing.T) {
 	}
 }
 
+// TestDiffConfig_RedactsAdminAPIKey proves AdminAPIKey is redacted the
+// same way ProxyAPIKey is — a changed admin key must never appear in a
+// reload diff summary (which gets written to the log file and, if
+// configured, shipped via webhook).
+func TestDiffConfig_RedactsAdminAPIKey(t *testing.T) {
+	old := &config.Config{AdminAPIKey: "old-admin-secret"}
+	newCfg := &config.Config{AdminAPIKey: "new-admin-secret"}
+
+	changes := diffConfig(old, newCfg)
+	if len(changes) != 1 {
+		t.Fatalf("len(changes) = %d, want 1: %+v", len(changes), changes)
+	}
+	c := changes[0]
+	if c.JSONName != "admin_api_key" {
+		t.Fatalf("JSONName = %q, want admin_api_key", c.JSONName)
+	}
+	if c.Old != "(hidden)" || c.New != "(hidden)" {
+		t.Fatalf("Old/New = %q/%q, want both (hidden) — a secret must never appear in a diff", c.Old, c.New)
+	}
+	if strings.Contains(c.Old, "secret") || strings.Contains(c.New, "secret") {
+		t.Fatalf("diff leaked the actual secret value: %+v", c)
+	}
+}
+
 func TestDiffConfig_RedactsWebhookURL(t *testing.T) {
 	old := &config.Config{WebhookURL: "https://hooks.slack.com/services/OLD/TOKEN"}
 	newCfg := &config.Config{WebhookURL: "https://hooks.slack.com/services/NEW/TOKEN"}

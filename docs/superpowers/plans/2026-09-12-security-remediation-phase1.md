@@ -1272,21 +1272,22 @@ Expected: FAIL to compile — `config.Config` has no field `AdminAPIKey`/`AdminA
 In `internal/config/config.go`, immediately after the `ProxyAPIKeys` field (after line 828):
 
 ```go
-	// AdminAPIKey, if set, is required — via the same "Proxy-Authorization:
+	// AdminAPIKey configures the key that, once wired up by a later
+	// task, will be required — via the same "Proxy-Authorization:
 	// Bearer <key>" header and constant-time comparison as ProxyAPIKey —
 	// to reach any of the five admin paths (GET /_aiproxy/stats,
 	// /_aiproxy/metrics, /_aiproxy/dashboard, POST /_aiproxy/cache/clear,
-	// GET/POST/DELETE /_aiproxy/drain). Once AdminAPIKey or AdminAPIKeys
-	// is set, ProxyAPIKey/ProxyAPIKeys stop working against these paths
-	// entirely — there is no fallback to accepting an ordinary client
-	// key, regardless of whether -admin-addr is also set. Empty (the
-	// default when the field is absent) means every admin path still
-	// accepts ProxyAPIKey/ProxyAPIKeys instead, unchanged from before
-	// this field existed — see
+	// GET/POST/DELETE /_aiproxy/drain), at which point ProxyAPIKey/
+	// ProxyAPIKeys will stop working against those paths entirely —
+	// there will be no fallback to accepting an ordinary client key,
+	// regardless of whether -admin-addr is also set. Not yet enforced
+	// as of this commit: this field is currently parsed, validated, and
+	// threaded through to Server.AdminAPIKey, but nothing checks it —
+	// every admin path still accepts ProxyAPIKey/ProxyAPIKeys exactly as
+	// before this field existed, and `aiproxy validate` does not yet
+	// warn when both this and AdminAPIKeys are unset. See
 	// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6 for
-	// why this is a real gap in a shared/multi-tenant deployment, and
-	// `aiproxy validate`'s own warning when both this and AdminAPIKeys
-	// are unset.
+	// why closing this gap matters in a shared/multi-tenant deployment.
 	AdminAPIKey string `json:"admin_api_key,omitempty"`
 
 	// AdminAPIKeys lists additional named admin keys beyond AdminAPIKey,

@@ -684,14 +684,18 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 
 	lc.proxyAPIKey = cfg.ProxyAPIKey
 
-	proxyAPIKeys, proxyKeyErrs := compileAPIKeys("proxy_api_keys", cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
+	proxyAPIKeys, proxyKeyErrs := compileAPIKeys("proxy_api_keys", "proxy_api_key", cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
 	errs = append(errs, proxyKeyErrs...)
 	lc.proxyAPIKeys = proxyAPIKeys
 
-	adminAPIKeys, adminKeyErrs := compileAPIKeys("admin_api_keys", cfg.AdminAPIKeys, 0)
+	adminAPIKeys, adminKeyErrs := compileAPIKeys("admin_api_keys", "admin_api_key", cfg.AdminAPIKeys, cfg.CostPer1KTokens)
 	errs = append(errs, adminKeyErrs...)
 	lc.adminAPIKey = cfg.AdminAPIKey
 	lc.adminAPIKeys = adminAPIKeys
+
+	if err := checkNoSharedAPIKeys(cfg.ProxyAPIKey, cfg.ProxyAPIKeys, cfg.AdminAPIKey, cfg.AdminAPIKeys); err != nil {
+		errs = append(errs, err)
+	}
 
 	if cfg.LogFile != "" {
 		logFile, err := openLogFile(cfg.LogFile)
@@ -1420,13 +1424,16 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	for _, e := range webhookErrs {
 		problems = append(problems, e.Error())
 	}
-	_, proxyKeyErrs := compileAPIKeys("proxy_api_keys", cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
+	_, proxyKeyErrs := compileAPIKeys("proxy_api_keys", "proxy_api_key", cfg.ProxyAPIKeys, cfg.CostPer1KTokens)
 	for _, e := range proxyKeyErrs {
 		problems = append(problems, e.Error())
 	}
-	_, adminKeyErrs := compileAPIKeys("admin_api_keys", cfg.AdminAPIKeys, 0)
+	_, adminKeyErrs := compileAPIKeys("admin_api_keys", "admin_api_key", cfg.AdminAPIKeys, cfg.CostPer1KTokens)
 	for _, e := range adminKeyErrs {
 		problems = append(problems, e.Error())
+	}
+	if err := checkNoSharedAPIKeys(cfg.ProxyAPIKey, cfg.ProxyAPIKeys, cfg.AdminAPIKey, cfg.AdminAPIKeys); err != nil {
+		problems = append(problems, err.Error())
 	}
 	if cfg.LogFile != "" {
 		if f, err := openLogFile(cfg.LogFile); err != nil {
@@ -2368,14 +2375,16 @@ type modelRoute struct {
 // compileTargetRoutes: every entry needs a non-empty, unique name (it's
 // the stats/log attribution label, so a collision would silently merge
 // two different callers' numbers together — "default" is reserved for
-// the anonymous top-level proxy_api_key, so it's rejected here too) and
-// a non-empty, unique key; max_requests_per_minute, if set, must not be
+// the anonymous top-level key, so it's rejected here too) and a
+// non-empty, unique key; max_requests_per_minute, if set, must not be
 // negative and compiles into that key's own dedicated limiter, checked
 // instead of whatever route/global limiter would otherwise apply for
 // that caller. fieldName ("proxy_api_keys" or "admin_api_keys") names
-// the actual field being validated in every error message, since both
-// callers share this same validation logic.
-func compileAPIKeys(fieldName string, entries []config.ProxyAPIKeyEntry, costPer1KTokens float64) ([]proxy.ProxyKey, []error) {
+// the actual field being validated in every error message, and
+// topLevelFieldName ("proxy_api_key" or "admin_api_key") names the
+// corresponding singular top-level field that "default" is reserved
+// for — since both callers share this same validation logic.
+func compileAPIKeys(fieldName, topLevelFieldName string, entries []config.ProxyAPIKeyEntry, costPer1KTokens float64) ([]proxy.ProxyKey, []error) {
 	compiled := make([]proxy.ProxyKey, 0, len(entries))
 	var errs []error
 	seenNames := make(map[string]bool, len(entries))
@@ -2386,7 +2395,7 @@ func compileAPIKeys(fieldName string, entries []config.ProxyAPIKeyEntry, costPer
 			continue
 		}
 		if e.Name == "default" {
-			errs = append(errs, fmt.Errorf("%s: name %q is reserved for the anonymous top-level proxy_api_key", fieldName, e.Name))
+			errs = append(errs, fmt.Errorf("%s: name %q is reserved for the anonymous top-level %s", fieldName, e.Name, topLevelFieldName))
 			continue
 		}
 		if seenNames[e.Name] {
@@ -2437,6 +2446,39 @@ func compileAPIKeys(fieldName string, entries []config.ProxyAPIKeyEntry, costPer
 		compiled = append(compiled, pk)
 	}
 	return compiled, errs
+}
+
+// checkNoSharedAPIKeys verifies that no single key value is configured
+// as both an ordinary client key (proxy_api_key/proxy_api_keys) and an
+// admin key (admin_api_key/admin_api_keys). compileAPIKeys validates
+// each of those two lists independently, so without this check the
+// same secret could pass validation on both sides — meaning once a
+// later task wires up real admin-auth checking, any client holding
+// that key would also reach the admin surface, silently reopening the
+// exact gap review finding #6 describes. Empty key values are never
+// compared: an unset proxy_api_key and an unset admin_api_key are not
+// "the same key" just because they're both "".
+func checkNoSharedAPIKeys(proxyKey string, proxyKeys []config.ProxyAPIKeyEntry, adminKey string, adminKeys []config.ProxyAPIKeyEntry) error {
+	proxyKeySet := make(map[string]bool, len(proxyKeys)+1)
+	if proxyKey != "" {
+		proxyKeySet[proxyKey] = true
+	}
+	for _, e := range proxyKeys {
+		if e.Key != "" {
+			proxyKeySet[e.Key] = true
+		}
+	}
+
+	sharesProxyKey := func(key string) bool { return key != "" && proxyKeySet[key] }
+	if sharesProxyKey(adminKey) {
+		return fmt.Errorf("admin_api_key/admin_api_keys must not share a key value with proxy_api_key/proxy_api_keys (found a duplicate) — an admin key must never also work as an ordinary client key")
+	}
+	for _, e := range adminKeys {
+		if sharesProxyKey(e.Key) {
+			return fmt.Errorf("admin_api_key/admin_api_keys must not share a key value with proxy_api_key/proxy_api_keys (found a duplicate) — an admin key must never also work as an ordinary client key")
+		}
+	}
+	return nil
 }
 
 func printUsage(w io.Writer) {
