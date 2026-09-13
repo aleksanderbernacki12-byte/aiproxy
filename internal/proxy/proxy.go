@@ -3099,9 +3099,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// path out of this case; there is no code after it that
 				// could still reach the forwarding logic further down in
 				// ServeHTTP.
-				allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, "", auth.label, resp.Body)
+				servedBody, allowed := s.checkReplayPolicy(w, r, requestID, "", auth.label, r.Header, body, resp.Body)
 				if !allowed {
-					writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
 					return
 				}
 				copyHeader(w.Header(), resp.Header)
@@ -3197,9 +3196,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// it — checkReplayPolicy re-runs that same check now, against
 			// the CURRENT rules, before this stored response is ever
 			// written to the client. See its own doc comment.
-			allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, targetLabel, auth.label, cachedBody)
+			servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
 			if !allowed {
-				writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
 				return
 			}
 			copyHeader(w.Header(), cached.Header)
@@ -3257,9 +3255,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							// bufferResponse/streamResponse either, so its
 							// stored body must be re-checked against the
 							// CURRENT rules before being served.
-							allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, targetLabel, auth.label, cachedBody)
+							servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
 							if !allowed {
-								writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
 								return
 							}
 							copyHeader(w.Header(), cached.Header)
@@ -3304,9 +3301,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// streamResponse either, so its stored body must be
 				// re-checked against the CURRENT rules before being
 				// served — see checkReplayPolicy's own doc comment.
-				allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, targetLabel, auth.label, resp.Body)
+				servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, resp.Body)
 				if !allowed {
-					writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
 					return
 				}
 				copyHeader(w.Header(), resp.Header)
@@ -3571,22 +3567,74 @@ func isEventStream(resp *http.Response) bool {
 // different angle). When allowed is true, resultBody is what the
 // caller should actually serve — unchanged from body for an Allow
 // result, redacted for a Redact result.
-func (s *Server) checkReplayPolicy(method, reqURL, requestID, targetLabel, clientLabel string, body []byte) (allowed bool, resultBody []byte, ruleName string) {
-	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, targetLabel, clientLabel)
-	s.handleResponseDryRunHits(dryRunHits, method, reqURL, requestID)
+// checkReplayPolicy re-evaluates a previously-produced response — about
+// to be served from the exact-match cache, request coalescing, the
+// semantic cache, or an idempotency replay — against the CURRENT rules
+// engine, on BOTH sides: the current incoming request (requestBody,
+// requestHeaders — exactly as a live, non-cached request would be
+// checked) and the stored response content itself (responseBody).
+// Every one of ServeHTTP's replay paths must call this before writing
+// stored bytes to a client: a response that was fine to store under an
+// older policy — or before a rule existed at all — must never bypass a
+// rule that would block or redact it today, and neither must a client
+// whose CURRENT permission to make this request at all has since been
+// revoked by a request-side rule (e.g. a Keys-scoped access-control
+// rule) added after the response was cached. See
+// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #2, whose
+// own remediation text asks for exactly this: "kontrollera aktuell
+// klientbehörighet och requestpolicy före återanvändning" (check
+// current client authorization and request policy before reuse), not
+// just the response content.
+//
+// This function writes the block response itself (via writeError) when
+// either side blocks, using the same message/code a LIVE request would
+// get for whichever side actually matched — "blocked by aiproxy rules"
+// for a request-side match, "response blocked by aiproxy rules" for a
+// response-side match — so a caller only needs to check the returned
+// allowed bool and, if true, use resultBody. A request-side Redact
+// match is deliberately NOT applied to anything here: redaction exists
+// to keep sensitive request content from reaching the upstream target,
+// and a replay never forwards anything upstream, so there is nothing
+// left to protect by modifying the served response bytes over a
+// request-side-only redact match — only a request-side Block carries
+// forward to a replay.
+func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, requestID, targetLabel, clientLabel string, requestHeaders http.Header, requestBody, responseBody []byte) (resultBody []byte, allowed bool) {
+	reqAction, reqRuleName, _, _, reqDryRunHits, err := s.getEngine().Evaluate(rules.Request{
+		Method:  r.Method,
+		URL:     r.URL.String(),
+		Body:    requestBody,
+		Headers: filterHeadersForScanning(requestHeaders),
+		Target:  targetLabel,
+		Key:     clientLabel,
+	})
+	if err == nil {
+		s.handleRequestDryRunHits(reqDryRunHits, r.Method, r.URL.String(), requestID)
+		if reqAction == rules.Block {
+			s.Stats.RecordBlock(targetLabel, reqRuleName)
+			s.Stats.RecordClientBlock(clientLabel)
+			s.logBlock(r.Method, r.URL.String(), reqRuleName, requestID)
+			s.notifyWebhook("block", r.Method, r.URL.String(), reqRuleName, requestID)
+			writeError(w, r, http.StatusForbidden, "block", "blocked by aiproxy rules", reqRuleName)
+			return nil, false
+		}
+	}
+
+	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(responseBody, targetLabel, clientLabel)
+	s.handleResponseDryRunHits(dryRunHits, r.Method, r.URL.String(), requestID)
 	switch action {
 	case rules.Block:
 		s.Stats.RecordResponseBlock(targetLabel, ruleName)
-		s.logResponseBlock(method, reqURL, ruleName, requestID)
-		s.notifyWebhook("response_block", method, reqURL, ruleName, requestID)
-		return false, nil, ruleName
+		s.logResponseBlock(r.Method, r.URL.String(), ruleName, requestID)
+		s.notifyWebhook("response_block", r.Method, r.URL.String(), ruleName, requestID)
+		writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
+		return nil, false
 	case rules.Redact:
 		s.Stats.RecordResponseRedact(targetLabel, ruleName)
-		s.logResponseRedact(method, reqURL, ruleName, requestID)
-		s.notifyWebhook("response_redact", method, reqURL, ruleName, requestID)
-		return true, scannedBody, ruleName
+		s.logResponseRedact(r.Method, r.URL.String(), ruleName, requestID)
+		s.notifyWebhook("response_redact", r.Method, r.URL.String(), ruleName, requestID)
+		return scannedBody, true
 	default:
-		return true, body, ""
+		return responseBody, true
 	}
 }
 

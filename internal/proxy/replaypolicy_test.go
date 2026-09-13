@@ -56,32 +56,47 @@ func TestReplayPolicy_Coalescing_BlockedByCurrentRules(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-release
 		served.Add(1)
-		fmt.Fprint(w, "contains COALESCE_SECRET")
+		fmt.Fprint(w, "shared answer")
 	}))
 	t.Cleanup(upstream.Close)
 	u, _ := url.Parse(upstream.URL)
 	engine := rules.NewEngine(rules.Allow)
-	// The block rule for the response body exists from the start here —
-	// this specifically proves coalesced replay (not just exact cache)
-	// re-checks current rules, since a coalesced Replay branch never
-	// even calls bufferResponse's own live check.
-	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "coalesce-secret", Pattern: regexp.MustCompile("COALESCE_SECRET"), Action: rules.Block})
+	// Scoped to "/beta" only — the owner's own request lands on the
+	// default target ("default"), out of this rule's scope, and
+	// succeeds; only the coalesced waiter's request (routed to
+	// "/beta", the SAME upstream, sharing the same coalescing key
+	// since cache.Key hashes the resolved destination, not the route
+	// label) is in scope. Only checkReplayPolicy's own re-check can
+	// catch that — the owner's live check was for a different scope
+	// entirely and would never have blocked this.
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "beta-secret", Pattern: regexp.MustCompile("SHARED"), Action: rules.Block, Targets: []string{"/beta"}})
 	s := proxy.New("unused", u, engine)
 	s.Logger = log.New(io.Discard, "", 0)
+	t.Chdir(t.TempDir())
+	c, err := cache.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Cache = c
 	s.Coalescer = coalesce.NewGroup(5 * time.Second)
+	s.AddRoute("/beta", []*url.URL{u}, nil, nil, nil)
 
 	done := make(chan *httptest.ResponseRecorder, 2)
-	go func() { done <- partitionCall(s, "GET", "/chat", "", nil) }()
-	time.Sleep(50 * time.Millisecond) // let the first request claim Own before the second arrives
-	go func() { done <- partitionCall(s, "GET", "/chat", "", nil) }()
-	time.Sleep(50 * time.Millisecond) // let the second request start waiting (coalesce.Claim) before releasing upstream
+	go func() { done <- partitionCall(s, "GET", "/", "SHARED content", nil) }()
+	time.Sleep(50 * time.Millisecond)
+	go func() { done <- partitionCall(s, "GET", "/beta", "SHARED content", nil) }()
+	time.Sleep(50 * time.Millisecond)
 	close(release)
 
-	r1, r2 := <-done, <-done
-	for _, r := range []*httptest.ResponseRecorder{r1, r2} {
-		if r.Code == 200 {
-			t.Fatalf("a request (owner or coalesced replay) received a blocked body: status=%d body=%q", r.Code, r.Body.String())
-		}
+	owner, waiter := <-done, <-done
+	if owner.Code != 200 {
+		t.Fatalf("owner (out of the rule's scope) should have succeeded, got %d: %s", owner.Code, owner.Body.String())
+	}
+	if waiter.Code == 200 {
+		t.Fatalf("coalesced waiter received a response its own route-scoped rule should have blocked: status=%d body=%q", waiter.Code, waiter.Body.String())
+	}
+	if served.Load() != 1 {
+		t.Fatalf("expected exactly 1 upstream call (real coalescing), got %d — the two requests may not share a coalescing key", served.Load())
 	}
 }
 
@@ -114,5 +129,37 @@ func TestReplayPolicy_IdempotencyReplay_BlockedWithoutReForwardingUpstream(t *te
 	}
 	if executions.Load() != 1 {
 		t.Fatalf("a policy-rejected idempotency replay re-forwarded the request upstream: %d total executions (a real charge operation must never run twice)", executions.Load())
+	}
+}
+
+func TestReplayPolicy_ExactCacheHit_BlockedByRequestSideRuleAddedAfterCaching(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "allowed answer")
+	}))
+	t.Cleanup(upstream.Close)
+	u, _ := url.Parse(upstream.URL)
+	s := proxy.New("unused", u, rules.NewEngine(rules.Allow))
+	s.Logger = log.New(io.Discard, "", 0)
+	t.Chdir(t.TempDir())
+	c, err := cache.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Cache = c
+
+	// First call: no request-side rule yet, gets cached normally. The
+	// upstream response itself is completely benign — this proves the
+	// re-check is catching the REQUEST content, not the response.
+	first := partitionCall(s, "POST", "/chat", "restricted content", nil)
+	if first.Code != 200 {
+		t.Fatalf("expected first call to succeed, got %d: %s", first.Code, first.Body.String())
+	}
+
+	// A request-side block rule is added AFTER the response was cached.
+	s.Engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "restricted-request", Pattern: regexp.MustCompile("restricted"), Action: rules.Block})
+
+	second := partitionCall(s, "POST", "/chat", "restricted content", nil)
+	if second.Code == 200 {
+		t.Fatalf("cached response bypassed a REQUEST-side rule added after it was cached: status=%d body=%q", second.Code, second.Body.String())
 	}
 }
