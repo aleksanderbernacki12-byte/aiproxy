@@ -3083,10 +3083,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			bodyHash := sha256.Sum256(body)
 			switch resp, outcome := idem.Claim(auth.label, idempotencyKey, bodyHash); outcome {
 			case idempotency.Replay:
+				// targetLabel is "" here (idempotency is checked before
+				// route resolution) — a rule scoped to a specific target
+				// via Targets won't fire against an idempotency replay
+				// specifically. A rule with no Targets set (the common
+				// case, including every built-in secret/prompt-injection
+				// rule) is unaffected, since inScope treats an empty
+				// Targets list as matching every target.
+				//
+				// CRITICAL: an idempotency replay must never fall through
+				// to forwarding the request upstream on a block — that
+				// would re-execute a possibly side-effecting operation a
+				// second time, exactly what idempotency exists to
+				// prevent. The early return below on !allowed is the only
+				// path out of this case; there is no code after it that
+				// could still reach the forwarding logic further down in
+				// ServeHTTP.
+				allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, "", auth.label, resp.Body)
+				if !allowed {
+					writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
+					return
+				}
 				copyHeader(w.Header(), resp.Header)
+				w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
 				w.Header().Set("Idempotency-Replayed", "true")
 				w.WriteHeader(resp.StatusCode)
-				w.Write(resp.Body)
+				w.Write(servedBody)
 				s.Stats.RecordIdempotencyReplay()
 				s.logIdempotencyReplay(r.Method, r.URL.String(), requestID, idempotencyKey)
 				return
@@ -3165,30 +3187,39 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cacheKey = cache.Key(r.Method, resolvedDestination, partitionIdentity(auth, r), body)
 		if cached, hit, age, err := cch.Get(cacheKey, ttl); err == nil && hit {
 			defer cached.Body.Close()
+			cachedBody, readErr := io.ReadAll(cached.Body)
+			if readErr != nil {
+				writeError(w, r, http.StatusBadGateway, "cache_read_failed", "failed to read cached response", "")
+				return
+			}
+			// A cache hit never reaches bufferResponse/streamResponse, so
+			// the rule engine's own live check there never runs against
+			// it — checkReplayPolicy re-runs that same check now, against
+			// the CURRENT rules, before this stored response is ever
+			// written to the client. See its own doc comment.
+			allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, targetLabel, auth.label, cachedBody)
+			if !allowed {
+				writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
+				return
+			}
 			copyHeader(w.Header(), cached.Header)
 			// Set after copyHeader, so this always wins over whatever
 			// Age (if any) the original upstream response itself might
 			// have carried — that value described a different cache's
 			// own staleness, not aiproxy's.
 			w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
+			w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
 			stale := cch.IsStale(age, ttl)
 			w.WriteHeader(cached.StatusCode)
+			w.Write(servedBody)
 			// A cache hit never reaches bufferResponse/streamResponse —
 			// the only two places that otherwise call Idempotency.Store
 			// — so an owned idempotency claim (idempotencyKey != "")
 			// must be completed right here instead, or the deferred
 			// Release above would incorrectly abandon a claim that was
-			// actually served just fine. The body needs to be buffered
-			// (rather than the plain io.Copy the no-idempotency case
-			// still uses below) purely so Store has real bytes to keep.
+			// actually served just fine.
 			if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-				cachedBody, readErr := io.ReadAll(cached.Body)
-				w.Write(cachedBody)
-				if readErr == nil {
-					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: cachedBody})
-				}
-			} else {
-				io.Copy(w, cached.Body)
+				idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 			}
 			s.Stats.RecordCacheHit(targetLabel)
 			if stale {
@@ -3216,28 +3247,39 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					if candidateKey, similarity, found := idx.FindBest(semanticTargetPartitionForReqCtx, semanticFingerprintForReqCtx, semanticRemainderHashForReqCtx, threshold); found {
 						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit {
 							defer cached.Body.Close()
+							cachedBody, readErr := io.ReadAll(cached.Body)
+							if readErr != nil {
+								writeError(w, r, http.StatusBadGateway, "cache_read_failed", "failed to read cached response", "")
+								return
+							}
+							// Same reasoning as the exact-cache-hit branch
+							// above: a semantic hit never reaches
+							// bufferResponse/streamResponse either, so its
+							// stored body must be re-checked against the
+							// CURRENT rules before being served.
+							allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, targetLabel, auth.label, cachedBody)
+							if !allowed {
+								writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
+								return
+							}
 							copyHeader(w.Header(), cached.Header)
 							// Set after copyHeader, same reasoning as the
 							// exact-cache-hit branch above: this always
 							// wins over whatever Age the original response
 							// itself might have carried.
 							w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
+							w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
 							w.Header().Set("X-Semantic-Cache-Hit", "true")
 							w.Header().Set("X-Semantic-Cache-Similarity", strconv.FormatFloat(similarity, 'f', 2, 64))
 							w.WriteHeader(cached.StatusCode)
+							w.Write(servedBody)
 							// Same reasoning as the exact-cache-hit branch
 							// above: a semantic hit never reaches
 							// bufferResponse/streamResponse either, so an
 							// owned idempotency claim must be completed
 							// right here.
 							if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-								cachedBody, readErr := io.ReadAll(cached.Body)
-								w.Write(cachedBody)
-								if readErr == nil {
-									idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: cachedBody})
-								}
-							} else {
-								io.Copy(w, cached.Body)
+								idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 							}
 							s.Stats.RecordSemanticCacheHit(targetLabel)
 							s.logSemanticCacheHit(r.Method, r.URL.String(), requestID, similarity)
@@ -3258,14 +3300,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if coalescer := s.getCoalescer(); coalescer != nil {
 			switch resp, outcome := coalescer.Claim(cacheKey); outcome {
 			case coalesce.Replay:
-				copyHeader(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				w.Write(resp.Body)
 				// A coalesced replay never reaches bufferResponse/
-				// streamResponse either — same reasoning as the cache-hit
-				// branch above needing its own Idempotency.Store call.
+				// streamResponse either, so its stored body must be
+				// re-checked against the CURRENT rules before being
+				// served — see checkReplayPolicy's own doc comment.
+				allowed, servedBody, ruleName := s.checkReplayPolicy(r.Method, r.URL.String(), requestID, targetLabel, auth.label, resp.Body)
+				if !allowed {
+					writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
+					return
+				}
+				copyHeader(w.Header(), resp.Header)
+				w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
+				w.WriteHeader(resp.StatusCode)
+				w.Write(servedBody)
+				// Same reasoning as the cache-hit branch above needing
+				// its own Idempotency.Store call.
 				if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: resp.Body})
+					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: servedBody})
 				}
 				s.Stats.RecordCoalescedRequest(targetLabel)
 				s.logCoalescedRequest(r.Method, r.URL.String(), requestID)
@@ -3497,6 +3548,46 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 func isEventStream(resp *http.Response) bool {
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	return mediaType == "text/event-stream"
+}
+
+// checkReplayPolicy re-evaluates body — a previously-produced response
+// about to be served from the exact-match cache, request coalescing,
+// the semantic cache, or an idempotency replay — against the CURRENT
+// rules engine, exactly as bufferResponse does for a response that just
+// arrived live from upstream. Every one of ServeHTTP's replay paths
+// must call this before writing stored bytes to a client: a response
+// that was fine to store under an older policy — or before a rule
+// existed at all — must never bypass a rule that would block or redact
+// it today. See docs/reviews/2026-09-12-v0.74.1-system-review.md
+// finding #2.
+//
+// allowed is false exactly when action is rules.Block — the caller must
+// write the standard block response (see writeError's use at every call
+// site below) and must NOT fall through to forwarding the request
+// upstream: for idempotency replay specifically, a policy rejection on
+// replay must never re-execute an operation that may have side effects
+// (see finding #2's own idempotency-specific note, and finding #8's
+// related concern about failover risking a duplicate execution from a
+// different angle). When allowed is true, resultBody is what the
+// caller should actually serve — unchanged from body for an Allow
+// result, redacted for a Redact result.
+func (s *Server) checkReplayPolicy(method, reqURL, requestID, targetLabel, clientLabel string, body []byte) (allowed bool, resultBody []byte, ruleName string) {
+	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, targetLabel, clientLabel)
+	s.handleResponseDryRunHits(dryRunHits, method, reqURL, requestID)
+	switch action {
+	case rules.Block:
+		s.Stats.RecordResponseBlock(targetLabel, ruleName)
+		s.logResponseBlock(method, reqURL, ruleName, requestID)
+		s.notifyWebhook("response_block", method, reqURL, ruleName, requestID)
+		return false, nil, ruleName
+	case rules.Redact:
+		s.Stats.RecordResponseRedact(targetLabel, ruleName)
+		s.logResponseRedact(method, reqURL, ruleName, requestID)
+		s.notifyWebhook("response_redact", method, reqURL, ruleName, requestID)
+		return true, scannedBody, ruleName
+	default:
+		return true, body, ""
+	}
 }
 
 // bufferResponse reads the full response body into memory, scans it for
