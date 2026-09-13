@@ -85,8 +85,9 @@ func Similarity(a, b []uint64) float64 {
 
 // entry is one recorded fingerprint/cache-key pair inside a ring.
 type entry struct {
-	fingerprint []uint64
-	cacheKey    string
+	fingerprint   []uint64
+	remainderHash string
+	cacheKey      string
 }
 
 // ring is a fixed-capacity FIFO buffer of entries for one target. buf is
@@ -156,9 +157,11 @@ func NewIndex(maxSize int) *Index {
 	return &Index{maxSize: maxSize, rings: make(map[string]*ring)}
 }
 
-// Add records fp/cacheKey under target, evicting that target's oldest
-// entry first if it's already at maxSize.
-func (ix *Index) Add(target string, fp []uint64, cacheKey string) {
+// Add records fp/remainderHash/cacheKey under target, evicting that
+// target's oldest entry first if it's already at maxSize. remainderHash
+// is an exact-match requirement FindBest checks before it ever
+// considers fingerprint similarity — see FindBest's own doc comment.
+func (ix *Index) Add(target string, fp []uint64, remainderHash, cacheKey string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	r, ok := ix.rings[target]
@@ -166,13 +169,19 @@ func (ix *Index) Add(target string, fp []uint64, cacheKey string) {
 		r = newRing(ix.maxSize)
 		ix.rings[target] = r
 	}
-	r.add(entry{fingerprint: fp, cacheKey: cacheKey})
+	r.add(entry{fingerprint: fp, remainderHash: remainderHash, cacheKey: cacheKey})
 }
 
 // FindBest returns the highest-similarity entry recorded under target
-// that's at or above threshold, or ok=false if none qualifies (either
-// because target has no entries, or none reach threshold).
-func (ix *Index) FindBest(target string, fp []uint64, threshold float64) (cacheKey string, similarity float64, ok bool) {
+// that has an EXACTLY matching remainderHash and is at or above
+// threshold, or ok=false if none qualifies (target has no entries, none
+// share remainderHash, or none reach threshold among those that do).
+// remainderHash is checked first, before Similarity is even computed —
+// see docs/reviews/2026-09-12-v0.74.1-system-review.md finding #3: two
+// requests with similar prompt text but a different model, streaming
+// mode, tool set, or generation parameters must never be treated as
+// interchangeable just because their extracted text happens to match.
+func (ix *Index) FindBest(target string, fp []uint64, remainderHash string, threshold float64) (cacheKey string, similarity float64, ok bool) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	r, exists := ix.rings[target]
@@ -183,6 +192,9 @@ func (ix *Index) FindBest(target string, fp []uint64, threshold float64) (cacheK
 	var bestKey string
 	found := false
 	r.forEach(func(e entry) {
+		if e.remainderHash != remainderHash {
+			return
+		}
 		sim := Similarity(fp, e.fingerprint)
 		if sim >= threshold && (!found || sim > best) {
 			best = sim

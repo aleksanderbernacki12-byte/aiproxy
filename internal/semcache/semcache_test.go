@@ -63,9 +63,9 @@ func TestSimilarity_OneEmptyIsZero(t *testing.T) {
 func TestIndex_AddAndFindBest_ExactMatch(t *testing.T) {
 	ix := semcache.NewIndex(10)
 	fp := semcache.Fingerprint("what is the capital of Sweden")
-	ix.Add("targetA", fp, "cachekey-1")
+	ix.Add("targetA", fp, "rh", "cachekey-1")
 
-	key, sim, ok := ix.FindBest("targetA", fp, 0.5)
+	key, sim, ok := ix.FindBest("targetA", fp, "rh", 0.5)
 	if !ok {
 		t.Fatal("expected a match")
 	}
@@ -79,9 +79,9 @@ func TestIndex_AddAndFindBest_ExactMatch(t *testing.T) {
 
 func TestIndex_FindBest_BelowThresholdNotFound(t *testing.T) {
 	ix := semcache.NewIndex(10)
-	ix.Add("targetA", semcache.Fingerprint("what is the capital of Sweden"), "cachekey-1")
+	ix.Add("targetA", semcache.Fingerprint("what is the capital of Sweden"), "rh", "cachekey-1")
 
-	_, _, ok := ix.FindBest("targetA", semcache.Fingerprint("explain how photosynthesis works in plants"), 0.5)
+	_, _, ok := ix.FindBest("targetA", semcache.Fingerprint("explain how photosynthesis works in plants"), "rh", 0.5)
 	if ok {
 		t.Fatal("expected no match for unrelated text")
 	}
@@ -91,10 +91,10 @@ func TestIndex_FindBest_AtExactlyThresholdCountsAsMatch(t *testing.T) {
 	ix := semcache.NewIndex(10)
 	a := []uint64{1, 2, 3, 4}
 	b := []uint64{3, 4, 5, 6} // similarity exactly 2/6
-	ix.Add("targetA", a, "cachekey-1")
+	ix.Add("targetA", a, "rh", "cachekey-1")
 
 	threshold := float64(2) / float64(6)
-	_, sim, ok := ix.FindBest("targetA", b, threshold)
+	_, sim, ok := ix.FindBest("targetA", b, "rh", threshold)
 	if !ok {
 		t.Fatalf("expected a match when similarity (%v) exactly equals threshold", sim)
 	}
@@ -103,11 +103,11 @@ func TestIndex_FindBest_AtExactlyThresholdCountsAsMatch(t *testing.T) {
 func TestIndex_FindBest_ReturnsHighestSimilarityAmongMultiple(t *testing.T) {
 	ix := semcache.NewIndex(10)
 	query := []uint64{1, 2, 3, 4, 5}
-	ix.Add("targetA", []uint64{1, 2, 3}, "low-overlap")    // 3/5 = 0.6
-	ix.Add("targetA", []uint64{1, 2, 3, 4, 5}, "exact")    // 5/5 = 1.0
-	ix.Add("targetA", []uint64{1, 2, 3, 4}, "mid-overlap") // 4/5 = 0.8
+	ix.Add("targetA", []uint64{1, 2, 3}, "rh", "low-overlap")    // 3/5 = 0.6
+	ix.Add("targetA", []uint64{1, 2, 3, 4, 5}, "rh", "exact")    // 5/5 = 1.0
+	ix.Add("targetA", []uint64{1, 2, 3, 4}, "rh", "mid-overlap") // 4/5 = 0.8
 
-	key, sim, ok := ix.FindBest("targetA", query, 0.5)
+	key, sim, ok := ix.FindBest("targetA", query, "rh", 0.5)
 	if !ok || key != "exact" {
 		t.Fatalf("FindBest = (%q, %v, %v), want (\"exact\", 1, true)", key, sim, ok)
 	}
@@ -116,14 +116,14 @@ func TestIndex_FindBest_ReturnsHighestSimilarityAmongMultiple(t *testing.T) {
 func TestIndex_Add_EvictsOldestWhenAtCapacity(t *testing.T) {
 	ix := semcache.NewIndex(2)
 	first := semcache.Fingerprint("what is the capital of Sweden")
-	ix.Add("targetA", first, "cachekey-1")
-	ix.Add("targetA", semcache.Fingerprint("explain how photosynthesis works"), "cachekey-2")
-	ix.Add("targetA", semcache.Fingerprint("describe the water cycle in nature"), "cachekey-3")
+	ix.Add("targetA", first, "rh", "cachekey-1")
+	ix.Add("targetA", semcache.Fingerprint("explain how photosynthesis works"), "rh", "cachekey-2")
+	ix.Add("targetA", semcache.Fingerprint("describe the water cycle in nature"), "rh", "cachekey-3")
 
 	if n := ix.Len("targetA"); n != 2 {
 		t.Fatalf("Len = %d, want 2 (capacity 2, oldest evicted)", n)
 	}
-	if _, _, ok := ix.FindBest("targetA", first, 0.99); ok {
+	if _, _, ok := ix.FindBest("targetA", first, "rh", 0.99); ok {
 		t.Fatal("expected the oldest entry to have been evicted, but it was still found")
 	}
 }
@@ -131,9 +131,9 @@ func TestIndex_Add_EvictsOldestWhenAtCapacity(t *testing.T) {
 func TestIndex_MultiTargetIsolation(t *testing.T) {
 	ix := semcache.NewIndex(10)
 	fp := semcache.Fingerprint("what is the capital of Sweden")
-	ix.Add("targetA", fp, "cachekey-1")
+	ix.Add("targetA", fp, "rh", "cachekey-1")
 
-	if _, _, ok := ix.FindBest("targetB", fp, 0.5); ok {
+	if _, _, ok := ix.FindBest("targetB", fp, "rh", 0.5); ok {
 		t.Fatal("expected an entry added under targetA to never match a lookup under targetB")
 	}
 }
@@ -143,7 +143,7 @@ func TestIndex_Len(t *testing.T) {
 	if n := ix.Len("targetA"); n != 0 {
 		t.Fatalf("Len on empty index = %d, want 0", n)
 	}
-	ix.Add("targetA", semcache.Fingerprint("some text here today"), "cachekey-1")
+	ix.Add("targetA", semcache.Fingerprint("some text here today"), "rh", "cachekey-1")
 	if n := ix.Len("targetA"); n != 1 {
 		t.Fatalf("Len after one Add = %d, want 1", n)
 	}
@@ -166,7 +166,7 @@ func TestIndex_Add_RingBufferWrapsAcrossMultipleCycles(t *testing.T) {
 		"yankee zulu alpha bravo",
 	}
 	for i, text := range texts {
-		ix.Add("targetA", semcache.Fingerprint(text), fmt.Sprintf("k%d", i+1))
+		ix.Add("targetA", semcache.Fingerprint(text), "rh", fmt.Sprintf("k%d", i+1))
 	}
 
 	if n := ix.Len("targetA"); n != 3 {
@@ -176,7 +176,7 @@ func TestIndex_Add_RingBufferWrapsAcrossMultipleCycles(t *testing.T) {
 	// The oldest four (k1-k4) must have been evicted.
 	for i := 1; i <= 4; i++ {
 		fp := semcache.Fingerprint(texts[i-1])
-		if _, sim, ok := ix.FindBest("targetA", fp, 0.99); ok {
+		if _, sim, ok := ix.FindBest("targetA", fp, "rh", 0.99); ok {
 			t.Fatalf("expected k%d to have been evicted, but it matched with similarity %v", i, sim)
 		}
 	}
@@ -184,10 +184,28 @@ func TestIndex_Add_RingBufferWrapsAcrossMultipleCycles(t *testing.T) {
 	// The newest three (k5-k7) must still be present.
 	for i := 5; i <= 7; i++ {
 		fp := semcache.Fingerprint(texts[i-1])
-		key, sim, ok := ix.FindBest("targetA", fp, 0.99)
+		key, sim, ok := ix.FindBest("targetA", fp, "rh", 0.99)
 		if !ok || key != fmt.Sprintf("k%d", i) {
 			t.Fatalf("expected k%d still present with similarity ~1, got key=%q sim=%v ok=%v", i, key, sim, ok)
 		}
+	}
+}
+
+func TestIndex_FindBest_RequiresExactRemainderHashMatch(t *testing.T) {
+	ix := semcache.NewIndex(10)
+	fp := semcache.Fingerprint("explain the capital of Sweden")
+	ix.Add("target-a", fp, "remainder-hash-x", "cache-key-1")
+
+	// Same target, same (near-)identical fingerprint, but a DIFFERENT
+	// remainder hash (e.g. a different model or streaming flag) must
+	// never be treated as a match, however high the text similarity is.
+	if _, _, ok := ix.FindBest("target-a", fp, "remainder-hash-y", 0.5); ok {
+		t.Fatal("FindBest matched despite a different remainder hash")
+	}
+
+	// The exact same remainder hash must still match.
+	if key, _, ok := ix.FindBest("target-a", fp, "remainder-hash-x", 0.5); !ok || key != "cache-key-1" {
+		t.Fatalf("FindBest failed to match identical remainder hash: key=%q ok=%v", key, ok)
 	}
 }
 
@@ -197,16 +215,16 @@ func TestIndex_Add_RingBufferWrapsAcrossMultipleCycles(t *testing.T) {
 func TestNewIndex_NonPositiveMaxSizeClampsToOne(t *testing.T) {
 	for _, maxSize := range []int{0, -1, -100} {
 		ix := semcache.NewIndex(maxSize)
-		ix.Add("targetA", semcache.Fingerprint("some example text here"), "k1")
+		ix.Add("targetA", semcache.Fingerprint("some example text here"), "rh", "k1")
 		if n := ix.Len("targetA"); n != 1 {
 			t.Fatalf("NewIndex(%d): Len after first Add = %d, want 1", maxSize, n)
 		}
 
-		ix.Add("targetA", semcache.Fingerprint("another unrelated text now"), "k2")
+		ix.Add("targetA", semcache.Fingerprint("another unrelated text now"), "rh", "k2")
 		if n := ix.Len("targetA"); n != 1 {
 			t.Fatalf("NewIndex(%d): Len after second Add = %d, want 1 (cap clamped to 1)", maxSize, n)
 		}
-		if _, _, ok := ix.FindBest("targetA", semcache.Fingerprint("some example text here"), 0.99); ok {
+		if _, _, ok := ix.FindBest("targetA", semcache.Fingerprint("some example text here"), "rh", 0.99); ok {
 			t.Fatalf("NewIndex(%d): expected first entry to be evicted once at capacity 1", maxSize)
 		}
 	}
