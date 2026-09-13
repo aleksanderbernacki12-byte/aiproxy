@@ -2453,6 +2453,27 @@ func partitionIdentity(auth clientAuth, r *http.Request) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// semanticPartitionTarget composes the opaque "target" string
+// semcache.Index partitions by: targetLabel, this caller's identity
+// (see partitionIdentity), and resolvedDestination — the exact
+// method-resolved destination URL cache.Key itself hashes (path and
+// query included). Folding in the destination, not just targetLabel,
+// matters because a single target/route can front multiple logically
+// distinct destinations that the body alone doesn't distinguish — the
+// clearest real case being Azure OpenAI, which selects the model by
+// deployment name in the URL path rather than in a body field, so two
+// different deployments behind one target would otherwise share a
+// remainder hash and a fingerprint despite being genuinely different
+// models. See docs/reviews/2026-09-12-v0.74.1-system-review.md finding
+// #3's own remediation text, which explicitly calls for exact
+// agreement on "route and endpoint" alongside model/streaming/etc.
+// Used for semcache.Index's target only, never for cache.Key's
+// partitionID — see partitionIdentity's own doc comment for why those
+// two contracts must not be conflated.
+func semanticPartitionTarget(targetLabel, resolvedDestination string, auth clientAuth, r *http.Request) string {
+	return targetLabel + "\x00" + partitionIdentity(auth, r) + "\x00" + resolvedDestination
+}
+
 // errorResponse is the JSON body writeError sends when the client's
 // Accept header explicitly asks for it — see acceptsJSON. Error is a
 // stable, machine-readable identifier using the exact same vocabulary
@@ -3135,11 +3156,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var coalesceOwnedForReqCtx bool
 	var semanticFingerprintForReqCtx []uint64
 	var semanticRemainderHashForReqCtx string
-	var semanticTargetForReqCtx string
+	var semanticTargetPartitionForReqCtx string
 	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
 		ttl := s.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
-		cacheKey = cache.Key(r.Method, targets[0].ResolveReference(destURL).String(), partitionIdentity(auth, r), body)
+		resolvedDestination := targets[0].ResolveReference(destURL).String()
+		cacheKey = cache.Key(r.Method, resolvedDestination, partitionIdentity(auth, r), body)
 		if cached, hit, age, err := cch.Get(cacheKey, ttl); err == nil && hit {
 			defer cached.Body.Close()
 			copyHeader(w.Header(), cached.Header)
@@ -3188,9 +3210,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				semanticFingerprintForReqCtx = semcache.Fingerprint(text)
 				remainderSum := sha256.Sum256(remainder)
 				semanticRemainderHashForReqCtx = hex.EncodeToString(remainderSum[:])
+				semanticTargetPartitionForReqCtx = semanticPartitionTarget(targetLabel, resolvedDestination, auth, r)
 				if idx := s.getSemanticIndex(); idx != nil {
-					semanticTargetForReqCtx = targetLabel + "\x00" + partitionIdentity(auth, r)
-					if candidateKey, similarity, found := idx.FindBest(semanticTargetForReqCtx, semanticFingerprintForReqCtx, semanticRemainderHashForReqCtx, threshold); found {
+					if candidateKey, similarity, found := idx.FindBest(semanticTargetPartitionForReqCtx, semanticFingerprintForReqCtx, semanticRemainderHashForReqCtx, threshold); found {
 						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit {
 							defer cached.Body.Close()
 							copyHeader(w.Header(), cached.Header)
@@ -3417,7 +3439,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		coalesceOwned:           coalesceOwnedForReqCtx,
 		semanticFingerprint:     semanticFingerprintForReqCtx,
 		semanticRemainderHash:   semanticRemainderHashForReqCtx,
-		semanticTargetPartition: semanticTargetForReqCtx,
+		semanticTargetPartition: semanticTargetPartitionForReqCtx,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 

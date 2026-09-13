@@ -149,19 +149,44 @@ func TestCache_IsolatesByProxyKeyLabel_SameUpstreamCredential(t *testing.T) {
 
 func TestSemanticCache_IsolatesByUpstreamCredential(t *testing.T) {
 	// Regression for review finding #1 applied to the semantic cache
-	// specifically: same prompt text, same target, but two different
-	// upstream credentials must never produce a semantic-cache hit
-	// across them.
+	// specifically: a REPHRASED prompt (so the exact-match cache can't
+	// contribute — only a real semantic-similarity hit could serve it)
+	// from a different upstream credential must never receive the
+	// first caller's cached response, and must get its own real answer
+	// from upstream instead.
 	s := partitionTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		fmt.Fprint(w, "answer to: "+string(b)+" for "+r.Header.Get("Authorization"))
 	})
 	s.SemanticIndex = semcache.NewIndex(100)
 	s.SemanticCacheThreshold = 0.5
-	body := `{"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`
-	partitionCall(s, "POST", "/chat", body, map[string]string{"Authorization": "Bearer alice-upstream"})
-	got := partitionCall(s, "POST", "/chat", body, map[string]string{"Authorization": "Bearer bob-upstream"})
+	first := `{"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`
+	second := `{"messages":[{"role":"user","content":"What is the capital city of Sweden"}]}`
+	partitionCall(s, "POST", "/chat", first, map[string]string{"Authorization": "Bearer alice-upstream"})
+	got := partitionCall(s, "POST", "/chat", second, map[string]string{"Authorization": "Bearer bob-upstream"})
 	if got.Header().Get("X-Semantic-Cache-Hit") == "true" {
 		t.Fatalf("different upstream credential received a semantic cache hit meant for another caller: %s", got.Body.String())
+	}
+	if !strings.Contains(got.Body.String(), "bob-upstream") {
+		t.Fatalf("expected bob to receive his own real answer, got: %s", got.Body.String())
+	}
+}
+
+func TestSemanticCache_IsolatesByDestinationPath(t *testing.T) {
+	// Regression for the endpoint/path dimension of review finding #3:
+	// two different destination paths behind the same target (e.g. two
+	// Azure OpenAI deployments, which put the model name in the URL
+	// path rather than the request body) must never share a semantic
+	// cache hit, even with byte-identical bodies and the same caller.
+	s := partitionTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "answer from "+r.URL.Path)
+	})
+	s.SemanticIndex = semcache.NewIndex(100)
+	s.SemanticCacheThreshold = 0.5
+	body := `{"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`
+	partitionCall(s, "POST", "/openai/deployments/gpt-4o-prod/chat/completions", body, nil)
+	got := partitionCall(s, "POST", "/openai/deployments/gpt-35-cheap/chat/completions", body, nil)
+	if got.Header().Get("X-Semantic-Cache-Hit") == "true" {
+		t.Fatalf("different destination path received a semantic cache hit meant for a different deployment: %s", got.Body.String())
 	}
 }
