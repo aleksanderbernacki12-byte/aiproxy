@@ -1926,6 +1926,16 @@ func (s *Server) getProxyAPIKeys() (string, []ProxyKey) {
 	return s.ProxyAPIKey, s.ProxyAPIKeys
 }
 
+// getAdminAPIKeys returns Server.AdminAPIKey/AdminAPIKeys under the
+// same lock discipline getProxyAPIKeys already uses for their
+// proxy-key equivalents, since both are hot-reloadable via
+// ReloadConfig.
+func (s *Server) getAdminAPIKeys() (string, []ProxyKey) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.AdminAPIKey, s.AdminAPIKeys
+}
+
 // getIPLists returns both IPAllowList and IPDenyList under one lock,
 // for checkIPAccess.
 func (s *Server) getIPLists() ([]*net.IPNet, []*net.IPNet) {
@@ -2413,6 +2423,43 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 	return clientAuth{}, false
 }
 
+// checkAdminAuth reports whether r is allowed to reach the admin
+// surface, mirroring checkProxyAuth's constant-time comparison logic
+// exactly but against Server.AdminAPIKey/AdminAPIKeys instead of
+// ProxyAPIKey/ProxyAPIKeys — entirely independent credential sets, so
+// an ordinary client key never authenticates here and an admin key
+// never authenticates against checkProxyAuth. Backward compatible by
+// design: when neither AdminAPIKey nor AdminAPIKeys is configured, this
+// falls back to checkProxyAuth's own result unchanged — a deployment
+// that hasn't adopted admin_api_key/admin_api_keys yet keeps today's
+// behavior (any valid proxy key still reaches the admin surface) rather
+// than being locked out by a config it never opted into. Once either is
+// configured, that fallback stops: see config.Config.AdminAPIKey's own
+// doc comment for the fail-closed reasoning.
+func (s *Server) checkAdminAuth(r *http.Request) (clientAuth, bool) {
+	adminAPIKey, adminAPIKeys := s.getAdminAPIKeys()
+	if adminAPIKey == "" && len(adminAPIKeys) == 0 {
+		return s.checkProxyAuth(r)
+	}
+
+	got := r.Header.Get("Proxy-Authorization")
+	if !strings.HasPrefix(got, proxyAuthScheme) {
+		return clientAuth{}, false
+	}
+	got = strings.TrimPrefix(got, proxyAuthScheme)
+	gotBytes := []byte(got)
+
+	if adminAPIKey != "" && subtle.ConstantTimeCompare(gotBytes, []byte(adminAPIKey)) == 1 {
+		return clientAuth{label: "default"}, true
+	}
+	for _, k := range adminAPIKeys {
+		if subtle.ConstantTimeCompare(gotBytes, []byte(k.Key)) == 1 {
+			return clientAuth{label: k.Name}, true
+		}
+	}
+	return clientAuth{}, false
+}
+
 // partitionIdentity returns a SHA256 hash identifying which "identity"
 // auth/r represents, for use as part of the cache/coalescing key (see
 // the exact-match cache-key call site in ServeHTTP) — a later task
@@ -2872,16 +2919,15 @@ func validIdempotencyKey(key string) bool {
 	return true
 }
 
-// checkNetworkAndAuthAccess runs the three independent gates every
-// request — whether ordinary proxy traffic or a request for the admin
-// surface — must pass before anything else happens: the IP allow/deny
-// list, the GeoIP country allow/deny list, and proxy_api_key
-// authentication, in that order, responding and returning ok=false at
-// the first one that rejects the request. Shared by ServeHTTP and
-// adminMux.ServeHTTP so a request for the admin surface is gated
-// identically whether it arrives on Addr (AdminAddr unset) or on
-// AdminAddr's own listener — moving where the admin surface is
-// reachable from was never meant to change what's required to reach it.
+// checkNetworkAccess runs the three independent network-level gates
+// every request — whether ordinary proxy traffic or a request for the
+// admin surface — must pass before any credential is even checked: the
+// IP allow/deny list, the GeoIP country allow/deny list, and the
+// per-IP rate limiter, in that order, responding and returning false at
+// the first one that rejects the request. No opinion on which
+// credential (if any) the caller must present — see
+// checkNetworkAndAuthAccess and checkNetworkAndAdminAuthAccess, its
+// only two callers, for that.
 //
 // CORS handling — applying Access-Control-Allow-Origin and friends,
 // and short-circuiting a preflight entirely — runs first, before any
@@ -2891,7 +2937,7 @@ func validIdempotencyKey(key string) bool {
 // resolveRequestID — already resolved and already stamped as the
 // X-Request-Id response header by the caller before this runs, so it's
 // available for every rejection this function can produce too.
-func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request, requestID string) (clientAuth, bool) {
+func (s *Server) checkNetworkAccess(w http.ResponseWriter, r *http.Request, requestID string) bool {
 	// Stamped first, unconditionally, exactly like applyCORSHeaders'
 	// own top-of-function stamp just below — a plain Set (not Add) on
 	// the ResponseWriter's own header map, so it's never touched by
@@ -2904,7 +2950,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		applyCORSHeaders(cors, w.Header(), r)
 		if corsPreflightRequest(r) {
 			handleCORSPreflight(cors, w, r)
-			return clientAuth{}, false
+			return false
 		}
 	}
 	if !s.checkIPAccess(r) {
@@ -2916,7 +2962,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 		writeError(w, r, http.StatusForbidden, "ip_denied", "access denied", "")
-		return clientAuth{}, false
+		return false
 	}
 	if allowed, country := s.checkCountryAccess(r); !allowed {
 		// Checked right after checkIPAccess, for the same reason — a
@@ -2928,15 +2974,15 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
 		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
 		writeError(w, r, http.StatusForbidden, "country_denied", "access denied", "")
-		return clientAuth{}, false
+		return false
 	}
 
 	if ipLimiter := s.getIPLimiter(); ipLimiter != nil {
 		// A third, independent network-layer gate, checked after
 		// checkIPAccess/checkCountryAccess (same "before any
 		// application-level credential check" reasoning) but still
-		// before checkProxyAuth: a caller's own IP-level budget applies
-		// whether or not it ever presents a valid proxy_api_key — the
+		// before any auth check: a caller's own IP-level budget applies
+		// whether or not it ever presents a valid credential — the
 		// whole point is protection for a caller with no identity of
 		// its own to be rate-limited by otherwise.
 		ip := clientIP(r)
@@ -2949,7 +2995,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 			s.logIPRateLimited(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
-			return clientAuth{}, false
+			return false
 		}
 		ipStr := ip.String()
 		allowed := ipLimiter.Allow(ipStr)
@@ -2961,10 +3007,20 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
 			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
-			return clientAuth{}, false
+			return false
 		}
 	}
+	return true
+}
 
+// checkNetworkAndAuthAccess runs checkNetworkAccess, then ordinary
+// proxy_api_key/proxy_api_keys authentication (checkProxyAuth) — used
+// for every request except the five admin paths; see
+// checkNetworkAndAdminAuthAccess for those.
+func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request, requestID string) (clientAuth, bool) {
+	if !s.checkNetworkAccess(w, r, requestID) {
+		return clientAuth{}, false
+	}
 	auth, ok := s.checkProxyAuth(r)
 	if !ok {
 		// Checked before statsPath/metricsPath too — an API key, once
@@ -2980,10 +3036,33 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 	return auth, true
 }
 
+// checkNetworkAndAdminAuthAccess runs checkNetworkAccess, then
+// checkAdminAuth instead of checkProxyAuth — used for exactly the five
+// admin paths (statsPath, metricsPath, dashboardPath, cacheClearPath,
+// drainPath), in both ServeHTTP and adminMux.ServeHTTP, so the two
+// dispatch paths keep sharing identical network-level gating while
+// diverging only on which credential they require. See
+// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6.
+func (s *Server) checkNetworkAndAdminAuthAccess(w http.ResponseWriter, r *http.Request, requestID string) (clientAuth, bool) {
+	if !s.checkNetworkAccess(w, r, requestID) {
+		return clientAuth{}, false
+	}
+	auth, ok := s.checkAdminAuth(r)
+	if !ok {
+		s.Stats.RecordUnauthorized()
+		s.logUnauthorized(r.Method, r.URL.String(), requestID)
+		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "", requestID)
+		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
+		writeError(w, r, http.StatusProxyAuthRequired, "unauthorized", "proxy authentication required", "")
+		return clientAuth{}, false
+	}
+	return auth, true
+}
+
 // adminMux is AdminAddr's own http.Handler, when configured: it serves
 // nothing but healthzPath and the admin surface (statsPath, metricsPath,
 // dashboardPath, cacheClearPath), gated by exactly the same checks as
-// Addr applies to them (see checkNetworkAndAuthAccess) — it never
+// Addr applies to them (see checkNetworkAndAdminAuthAccess) — it never
 // forwards to the upstream target, since that was never this listener's
 // job to begin with.
 type adminMux struct {
@@ -2996,7 +3075,7 @@ func (h adminMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveHealthz(w, r)
 		return
 	}
-	if _, ok := s.checkNetworkAndAuthAccess(w, r, resolveRequestID(r)); !ok {
+	if _, ok := s.checkNetworkAndAdminAuthAccess(w, r, resolveRequestID(r)); !ok {
 		return
 	}
 	switch r.URL.Path {
@@ -3033,28 +3112,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestID := resolveRequestID(r)
+
+	if isReservedAdminPath(r.URL.Path) {
+		// Gated by checkAdminAuth (via checkNetworkAndAdminAuthAccess),
+		// not ordinary proxy_api_key/proxy_api_keys authentication —
+		// see checkAdminAuth's own doc comment. Dispatched before the
+		// checkNetworkAndAuthAccess call below runs at all, so an
+		// ordinary proxy key is never even consulted for one of these
+		// five paths once an admin key is configured. See
+		// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6.
+		if _, ok := s.checkNetworkAndAdminAuthAccess(w, r, requestID); !ok {
+			return
+		}
+		switch r.URL.Path {
+		case statsPath:
+			s.serveStats(w, r)
+		case metricsPath:
+			s.serveMetrics(w, r)
+		case dashboardPath:
+			s.serveDashboard(w, r)
+		case cacheClearPath:
+			s.serveCacheClear(w, r)
+		case drainPath:
+			s.serveDrain(w, r)
+		}
+		return
+	}
+
 	auth, ok := s.checkNetworkAndAuthAccess(w, r, requestID)
 	if !ok {
-		return
-	}
-	if r.URL.Path == statsPath {
-		s.serveStats(w, r)
-		return
-	}
-	if r.URL.Path == metricsPath {
-		s.serveMetrics(w, r)
-		return
-	}
-	if r.URL.Path == dashboardPath {
-		s.serveDashboard(w, r)
-		return
-	}
-	if r.URL.Path == cacheClearPath {
-		s.serveCacheClear(w, r)
-		return
-	}
-	if r.URL.Path == drainPath {
-		s.serveDrain(w, r)
 		return
 	}
 
