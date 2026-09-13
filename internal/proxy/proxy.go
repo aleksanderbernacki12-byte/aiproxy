@@ -3168,12 +3168,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		effectiveTokenLimiter = auth.tokenLimiter
 	}
 
-	// The cache is checked before rules and the rate limiter: a cache hit
-	// never touches either, and never reaches the upstream target. The
-	// key is computed from the body as received, before any redaction —
-	// two different secrets that happen to redact to the same
-	// placeholder are still cached separately, which only ever costs an
-	// extra upstream call, never an incorrect one.
+	// The cache is checked before the rate limiter: a cache hit never
+	// reaches it, and never reaches the upstream target. It is still
+	// re-checked against the current rules engine before being served —
+	// see checkReplayPolicy. The key is computed from the body as
+	// received, before any redaction — two different secrets that
+	// happen to redact to the same placeholder are still cached
+	// separately, which only ever costs an extra upstream call, never
+	// an incorrect one.
 	var cacheKey string
 	var coalesceOwnedForReqCtx bool
 	var semanticFingerprintForReqCtx []uint64
@@ -3546,36 +3548,19 @@ func isEventStream(resp *http.Response) bool {
 	return mediaType == "text/event-stream"
 }
 
-// checkReplayPolicy re-evaluates body — a previously-produced response
-// about to be served from the exact-match cache, request coalescing,
-// the semantic cache, or an idempotency replay — against the CURRENT
-// rules engine, exactly as bufferResponse does for a response that just
-// arrived live from upstream. Every one of ServeHTTP's replay paths
-// must call this before writing stored bytes to a client: a response
-// that was fine to store under an older policy — or before a rule
-// existed at all — must never bypass a rule that would block or redact
-// it today. See docs/reviews/2026-09-12-v0.74.1-system-review.md
-// finding #2.
-//
-// allowed is false exactly when action is rules.Block — the caller must
-// write the standard block response (see writeError's use at every call
-// site below) and must NOT fall through to forwarding the request
-// upstream: for idempotency replay specifically, a policy rejection on
-// replay must never re-execute an operation that may have side effects
-// (see finding #2's own idempotency-specific note, and finding #8's
-// related concern about failover risking a duplicate execution from a
-// different angle). When allowed is true, resultBody is what the
-// caller should actually serve — unchanged from body for an Allow
-// result, redacted for a Redact result.
 // checkReplayPolicy re-evaluates a previously-produced response — about
 // to be served from the exact-match cache, request coalescing, the
 // semantic cache, or an idempotency replay — against the CURRENT rules
 // engine, on BOTH sides: the current incoming request (requestBody,
 // requestHeaders — exactly as a live, non-cached request would be
-// checked) and the stored response content itself (responseBody).
-// Every one of ServeHTTP's replay paths must call this before writing
-// stored bytes to a client: a response that was fine to store under an
-// older policy — or before a rule existed at all — must never bypass a
+// checked — except at the idempotency-replay site, where targetLabel
+// is "" (idempotency runs before route resolution), so a Targets-
+// scoped rule won't fire there the way it would on a live request; an
+// unscoped or Keys-scoped rule is unaffected) and the stored response
+// content itself (responseBody). Every one of ServeHTTP's replay paths
+// must call this before writing stored bytes to a client: a response
+// that was fine to store under an older policy — or before a rule
+// existed at all — must never bypass a
 // rule that would block or redact it today, and neither must a client
 // whose CURRENT permission to make this request at all has since been
 // revoked by a request-side rule (e.g. a Keys-scoped access-control
@@ -3610,7 +3595,9 @@ func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, reque
 	if err == nil {
 		s.handleRequestDryRunHits(reqDryRunHits, r.Method, r.URL.String(), requestID)
 		if reqAction == rules.Block {
-			s.Stats.RecordBlock(targetLabel, reqRuleName)
+			if targetLabel != "" {
+				s.Stats.RecordBlock(targetLabel, reqRuleName)
+			}
 			s.Stats.RecordClientBlock(clientLabel)
 			s.logBlock(r.Method, r.URL.String(), reqRuleName, requestID)
 			s.notifyWebhook("block", r.Method, r.URL.String(), reqRuleName, requestID)
@@ -3623,7 +3610,9 @@ func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, reque
 	s.handleResponseDryRunHits(dryRunHits, r.Method, r.URL.String(), requestID)
 	switch action {
 	case rules.Block:
-		s.Stats.RecordResponseBlock(targetLabel, ruleName)
+		if targetLabel != "" {
+			s.Stats.RecordResponseBlock(targetLabel, ruleName)
+		}
 		s.logResponseBlock(r.Method, r.URL.String(), ruleName, requestID)
 		s.notifyWebhook("response_block", r.Method, r.URL.String(), ruleName, requestID)
 		writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)

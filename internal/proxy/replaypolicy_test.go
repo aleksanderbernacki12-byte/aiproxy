@@ -88,15 +88,73 @@ func TestReplayPolicy_Coalescing_BlockedByCurrentRules(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(release)
 
-	owner, waiter := <-done, <-done
-	if owner.Code != 200 {
-		t.Fatalf("owner (out of the rule's scope) should have succeeded, got %d: %s", owner.Code, owner.Body.String())
+	first, second := <-done, <-done
+	var ownerResp, waiterResp *httptest.ResponseRecorder
+	for _, r := range []*httptest.ResponseRecorder{first, second} {
+		if r.Code == 200 {
+			ownerResp = r
+		} else {
+			waiterResp = r
+		}
 	}
-	if waiter.Code == 200 {
-		t.Fatalf("coalesced waiter received a response its own route-scoped rule should have blocked: status=%d body=%q", waiter.Code, waiter.Body.String())
+	if ownerResp == nil {
+		t.Fatalf("expected exactly one 200 response (the owner, out of the rule's scope), got codes %d and %d", first.Code, second.Code)
+	}
+	if waiterResp == nil {
+		t.Fatalf("expected exactly one blocked response (the coalesced waiter), got codes %d and %d", first.Code, second.Code)
 	}
 	if served.Load() != 1 {
 		t.Fatalf("expected exactly 1 upstream call (real coalescing), got %d — the two requests may not share a coalescing key", served.Load())
+	}
+}
+
+func TestReplayPolicy_Coalescing_BlockedByResponseSideRule(t *testing.T) {
+	release := make(chan struct{})
+	var served atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		served.Add(1)
+		fmt.Fprint(w, "SHARED_RESPONSE_SECRET")
+	}))
+	t.Cleanup(upstream.Close)
+	u, _ := url.Parse(upstream.URL)
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "beta-response-secret", Pattern: regexp.MustCompile("SHARED_RESPONSE_SECRET"), Action: rules.Block, Targets: []string{"/beta"}})
+	s := proxy.New("unused", u, engine)
+	s.Logger = log.New(io.Discard, "", 0)
+	t.Chdir(t.TempDir())
+	c, err := cache.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Cache = c
+	s.Coalescer = coalesce.NewGroup(5 * time.Second)
+	s.AddRoute("/beta", []*url.URL{u}, nil, nil, nil)
+
+	done := make(chan *httptest.ResponseRecorder, 2)
+	go func() { done <- partitionCall(s, "GET", "/", "", nil) }()
+	time.Sleep(50 * time.Millisecond)
+	go func() { done <- partitionCall(s, "GET", "/beta", "", nil) }()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	first, second := <-done, <-done
+	var ownerResp, waiterResp *httptest.ResponseRecorder
+	for _, r := range []*httptest.ResponseRecorder{first, second} {
+		if r.Code == 200 {
+			ownerResp = r
+		} else {
+			waiterResp = r
+		}
+	}
+	if ownerResp == nil {
+		t.Fatalf("expected exactly one 200 response (the owner, out of the rule's scope), got codes %d and %d", first.Code, second.Code)
+	}
+	if waiterResp == nil {
+		t.Fatalf("expected exactly one blocked response (the coalesced waiter, blocked on the RESPONSE side), got codes %d and %d", first.Code, second.Code)
+	}
+	if served.Load() != 1 {
+		t.Fatalf("expected exactly 1 upstream call (real coalescing), got %d", served.Load())
 	}
 }
 
