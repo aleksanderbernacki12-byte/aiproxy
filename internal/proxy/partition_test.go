@@ -189,4 +189,7 @@ func TestSemanticCache_IsolatesByDestinationPath(t *testing.T) {
 	if got.Header().Get("X-Semantic-Cache-Hit") == "true" {
 		t.Fatalf("different destination path received a semantic cache hit meant for a different deployment: %s", got.Body.String())
 	}
+	if !strings.Contains(got.Body.String(), "gpt-35-cheap") {
+		t.Fatalf("expected the second deployment to receive its own real answer, got: %s", got.Body.String())
+	}
 }

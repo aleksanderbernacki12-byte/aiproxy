@@ -178,9 +178,10 @@ type requestContextInfo struct {
 	// semanticFingerprint is nil.
 	semanticRemainderHash string
 
-	// semanticTargetPartition is targetLabel + "\x00" + partitionIdentity
-	// (see partitionIdentity), precomputed once in ServeHTTP where r is
-	// still available, since bufferResponse/streamResponse only ever see
+	// semanticTargetPartition is semanticPartitionTarget's output —
+	// targetLabel, partitionIdentity, and the resolved destination URL,
+	// NUL-separated — precomputed once in ServeHTTP where r is still
+	// available, since bufferResponse/streamResponse only ever see
 	// reqCtx, not the original request. Empty exactly when
 	// semanticFingerprint is nil.
 	semanticTargetPartition string
@@ -2431,12 +2432,12 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 // a composite identity string that embeds this function's own output
 // alongside a NUL byte or other untrusted content and pass THAT to
 // cache.Key's partitionID parameter — that trades this problem for the
-// same one at a different layer. (A later task, Task 5, does safely
-// compose targetLabel + "\x00" + partitionIdentity(auth, r) — but
-// passes that composite to semcache.Index's own target parameter,
-// never to cache.Key; semcache.Index and cache.Key are different
-// functions with different contracts, so that composition does not
-// contradict this warning.)
+// same one at a different layer. (semanticPartitionTarget does safely
+// compose targetLabel, this function's output, and a resolved
+// destination URL — but passes that composite to semcache.Index's own
+// target parameter, never to cache.Key; semcache.Index and cache.Key
+// are different functions with different contracts, so that
+// composition does not contradict this warning.)
 func partitionIdentity(auth clientAuth, r *http.Request) string {
 	h := sha256.New()
 	h.Write([]byte(auth.label))
