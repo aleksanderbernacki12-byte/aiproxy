@@ -171,6 +171,20 @@ type requestContextInfo struct {
 	// on-disk cache entry.
 	semanticFingerprint []uint64
 
+	// semanticRemainderHash is the SHA256 hash of this request's own
+	// "structural remainder" (see extractPromptText) — the exact-match
+	// requirement Index.Add/FindBest both key on alongside
+	// semanticFingerprint's approximate similarity. Empty exactly when
+	// semanticFingerprint is nil.
+	semanticRemainderHash string
+
+	// semanticTargetPartition is targetLabel + "\x00" + partitionIdentity
+	// (see partitionIdentity), precomputed once in ServeHTTP where r is
+	// still available, since bufferResponse/streamResponse only ever see
+	// reqCtx, not the original request. Empty exactly when
+	// semanticFingerprint is nil.
+	semanticTargetPartition string
+
 	// tokenLimiter is the effective token-based rate limiter for this
 	// request (the authenticated key's own, else the resolved route's,
 	// else the server-wide one — see ServeHTTP), carried through to
@@ -3120,6 +3134,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var cacheKey string
 	var coalesceOwnedForReqCtx bool
 	var semanticFingerprintForReqCtx []uint64
+	var semanticRemainderHashForReqCtx string
+	var semanticTargetForReqCtx string
 	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
 		ttl := s.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
@@ -3168,10 +3184,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// doc comment for why this is a second, approximate layer
 		// checked only after the exact-match cache already missed.
 		if threshold := s.getSemanticCacheThreshold(); threshold > 0 {
-			if text, extracted := extractPromptText(body); extracted {
+			if text, remainder, extracted := extractPromptText(body); extracted {
 				semanticFingerprintForReqCtx = semcache.Fingerprint(text)
+				remainderSum := sha256.Sum256(remainder)
+				semanticRemainderHashForReqCtx = hex.EncodeToString(remainderSum[:])
 				if idx := s.getSemanticIndex(); idx != nil {
-					if candidateKey, similarity, found := idx.FindBest(targetLabel, semanticFingerprintForReqCtx, threshold); found {
+					semanticTargetForReqCtx = targetLabel + "\x00" + partitionIdentity(auth, r)
+					if candidateKey, similarity, found := idx.FindBest(semanticTargetForReqCtx, semanticFingerprintForReqCtx, semanticRemainderHashForReqCtx, threshold); found {
 						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit {
 							defer cached.Body.Close()
 							copyHeader(w.Header(), cached.Header)
@@ -3382,21 +3401,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rewritten to the absolute upstream URL, and they need the exact
 	// same target/cache key ServeHTTP already resolved and checked.
 	reqCtx := requestContextInfo{
-		method:              r.Method,
-		url:                 r.URL.String(),
-		requestID:           requestID,
-		cacheKey:            cacheKey,
-		targets:             targets,
-		forwardPath:         forwardPath,
-		targetLabel:         targetLabel,
-		clientLabel:         auth.label,
-		clientCostBudget:    auth.costBudget,
-		tokenLimiter:        effectiveTokenLimiter,
-		latency:             new(time.Duration),
-		idempotencyClient:   auth.label,
-		idempotencyKey:      idempotencyKey,
-		coalesceOwned:       coalesceOwnedForReqCtx,
-		semanticFingerprint: semanticFingerprintForReqCtx,
+		method:                  r.Method,
+		url:                     r.URL.String(),
+		requestID:               requestID,
+		cacheKey:                cacheKey,
+		targets:                 targets,
+		forwardPath:             forwardPath,
+		targetLabel:             targetLabel,
+		clientLabel:             auth.label,
+		clientCostBudget:        auth.costBudget,
+		tokenLimiter:            effectiveTokenLimiter,
+		latency:                 new(time.Duration),
+		idempotencyClient:       auth.label,
+		idempotencyKey:          idempotencyKey,
+		coalesceOwned:           coalesceOwnedForReqCtx,
+		semanticFingerprint:     semanticFingerprintForReqCtx,
+		semanticRemainderHash:   semanticRemainderHashForReqCtx,
+		semanticTargetPartition: semanticTargetForReqCtx,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -3500,7 +3521,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		if err := cch.Set(reqCtx.cacheKey, resp); err != nil {
 			s.logError("aiproxy: cache: failed to store response: %v", err)
 		} else if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
-			idx.Add(reqCtx.targetLabel, reqCtx.semanticFingerprint, reqCtx.cacheKey)
+			idx.Add(reqCtx.semanticTargetPartition, reqCtx.semanticFingerprint, reqCtx.semanticRemainderHash, reqCtx.cacheKey)
 		}
 	}
 
@@ -3575,7 +3596,7 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
 			if s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data) {
 				if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
-					idx.Add(reqCtx.targetLabel, reqCtx.semanticFingerprint, reqCtx.cacheKey)
+					idx.Add(reqCtx.semanticTargetPartition, reqCtx.semanticFingerprint, reqCtx.semanticRemainderHash, reqCtx.cacheKey)
 				}
 			}
 		}

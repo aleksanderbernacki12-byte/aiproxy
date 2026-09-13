@@ -14,6 +14,7 @@ import (
 	"aiproxy/internal/cache"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
+	"aiproxy/internal/semcache"
 )
 
 func partitionTestServer(t *testing.T, handler http.HandlerFunc) *proxy.Server {
@@ -143,5 +144,24 @@ func TestCache_IsolatesByProxyKeyLabel_SameUpstreamCredential(t *testing.T) {
 	}
 	if a.Body.String() == b.Body.String() {
 		t.Fatalf("callers with different proxy-key labels received the same cached response: %q", a.Body.String())
+	}
+}
+
+func TestSemanticCache_IsolatesByUpstreamCredential(t *testing.T) {
+	// Regression for review finding #1 applied to the semantic cache
+	// specifically: same prompt text, same target, but two different
+	// upstream credentials must never produce a semantic-cache hit
+	// across them.
+	s := partitionTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		fmt.Fprint(w, "answer to: "+string(b)+" for "+r.Header.Get("Authorization"))
+	})
+	s.SemanticIndex = semcache.NewIndex(100)
+	s.SemanticCacheThreshold = 0.5
+	body := `{"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`
+	partitionCall(s, "POST", "/chat", body, map[string]string{"Authorization": "Bearer alice-upstream"})
+	got := partitionCall(s, "POST", "/chat", body, map[string]string{"Authorization": "Bearer bob-upstream"})
+	if got.Header().Get("X-Semantic-Cache-Hit") == "true" {
+		t.Fatalf("different upstream credential received a semantic cache hit meant for another caller: %s", got.Body.String())
 	}
 }
