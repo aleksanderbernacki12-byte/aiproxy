@@ -14,8 +14,14 @@ const (
 // bytes used to create the private commitment. Request and Response are never
 // serialized into Payload or stored in the telemetry database.
 type Submission struct {
-	EventID         string
-	Timestamp       time.Time
+	EventID   string
+	Timestamp time.Time
+	// ClientID is a data-plane-local identifier. SubmitAsync replaces it with
+	// a rotating HMAC-SHA256 pseudonym before the event enters the queue.
+	ClientID string
+	// ClientIDHash is retained for source compatibility. Its value is treated
+	// as an identifier and HMAC-hashed again; it is never sent directly.
+	// Deprecated: use ClientID.
 	ClientIDHash    string
 	ApplicationID   string
 	Routing         map[string]any
@@ -23,6 +29,7 @@ type Submission struct {
 	Metrics         map[string]any
 	Request         []byte
 	Response        []byte
+	clientIDHash    string
 }
 
 // Payload is the exact top-level event object sent to the control plane.

@@ -89,7 +89,7 @@ func (c *Client) persist(ctx context.Context, submission Submission) error {
 	payload := Payload{
 		EventID:         strings.ToLower(submission.EventID),
 		Timestamp:       submission.Timestamp.UTC(),
-		ClientIDHash:    strings.ToLower(submission.ClientIDHash),
+		ClientIDHash:    submission.clientIDHash,
 		ApplicationID:   submission.ApplicationID,
 		Routing:         submission.Routing,
 		ComplianceFlags: submission.ComplianceFlags,

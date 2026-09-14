@@ -151,7 +151,7 @@ func testSubmission(eventID string, timestamp time.Time) Submission {
 	return Submission{
 		EventID:       eventID,
 		Timestamp:     timestamp,
-		ClientIDHash:  strings.Repeat("a", 64),
+		ClientID:      "customer-user-42",
 		ApplicationID: "legal-assistant",
 		Routing: map[string]any{
 			"provider": "customer-azure",
@@ -227,8 +227,8 @@ func TestSubmitAsync_ExactSignedPayloadAndOrderedHashChain(t *testing.T) {
 	if calls[0].header.Get("Authorization") != "Bearer tenant-secret" {
 		t.Fatal("tenant authorization was not sent")
 	}
-	if bytes.Contains(calls[0].body, []byte("Alice@example.com")) || bytes.Contains(calls[0].body, []byte("private customer response")) {
-		t.Fatal("control-plane payload contains raw request or response data")
+	if bytes.Contains(calls[0].body, []byte("Alice@example.com")) || bytes.Contains(calls[0].body, []byte("private customer response")) || bytes.Contains(calls[0].body, []byte(first.ClientID)) {
+		t.Fatal("control-plane payload contains raw request, response, or client ID data")
 	}
 
 	var rawBatch []map[string]json.RawMessage
@@ -250,6 +250,12 @@ func TestSubmitAsync_ExactSignedPayloadAndOrderedHashChain(t *testing.T) {
 	payloads := decodeBatch(t, calls[0].body)
 	if len(payloads) != 2 {
 		t.Fatalf("batch size = %d, want 2", len(payloads))
+	}
+	if payloads[0].ClientIDHash == first.ClientID || !validSHA256(payloads[0].ClientIDHash) {
+		t.Fatalf("client_id_hash = %q, want an anonymized SHA-256 digest", payloads[0].ClientIDHash)
+	}
+	if payloads[0].ClientIDHash != payloads[1].ClientIDHash {
+		t.Fatal("same client ID changed before salt rotation")
 	}
 	if !payloads[0].ComplianceFlags["pii_detected"] || !payloads[0].ComplianceFlags["pii_redacted"] {
 		t.Fatalf("PII compliance flags = %#v, want detected and redacted", payloads[0].ComplianceFlags)
@@ -285,8 +291,8 @@ func TestSubmitAsync_ExactSignedPayloadAndOrderedHashChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(databaseBytes, []byte("Alice@example.com")) || bytes.Contains(databaseBytes, []byte("private customer response")) {
-		t.Fatal("SQLite queue contains raw request or response data")
+	if bytes.Contains(databaseBytes, []byte("Alice@example.com")) || bytes.Contains(databaseBytes, []byte("private customer response")) || bytes.Contains(databaseBytes, []byte(first.ClientID)) {
+		t.Fatal("SQLite queue contains raw request, response, or client ID data")
 	}
 	info, err := os.Stat(cfg.DatabasePath)
 	if err != nil {
@@ -599,10 +605,10 @@ func TestClient_RejectsInvalidInputsDuplicateAndClosedState(t *testing.T) {
 	if client.SubmitAsync(invalidUUID) {
 		t.Fatal("invalid UUID accepted")
 	}
-	invalidHash := testSubmission(eventOne, time.Now())
-	invalidHash.ClientIDHash = "raw-customer-id"
-	if client.SubmitAsync(invalidHash) {
-		t.Fatal("raw client ID accepted as hash")
+	missingClientID := testSubmission(eventOne, time.Now())
+	missingClientID.ClientID = ""
+	if client.SubmitAsync(missingClientID) {
+		t.Fatal("empty client ID accepted")
 	}
 	valid := testSubmission(eventOne, time.Now())
 	if !client.SubmitAsync(valid) {

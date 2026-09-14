@@ -26,10 +26,22 @@ normal events and recovered backlog to use the same batch endpoint. The control
 plane must treat `event_id` as an idempotency key because a response lost after
 a successful POST can cause at-least-once redelivery.
 
-`client_id_hash` must already be a SHA-256 hex digest. `SubmitAsync` rejects any
-other shape to reduce accidental disclosure of a raw customer identifier. The
-caller remains responsible for ensuring `application_id`, `routing`,
-`compliance_flags`, and `metrics` contain anonymous values.
+The caller supplies its local identifier as `Submission.ClientID`.
+`SubmitAsync` replaces it with an HMAC-SHA256 pseudonym before the event enters
+the asynchronous queue. The clear identifier is never written to SQLite or
+sent to the control plane. The caller remains responsible for ensuring
+`application_id`, `routing`, `compliance_flags`, and `metrics` contain
+anonymous values.
+
+The 256-bit HMAC salt is stored in `.aiproxy_salt` beside the telemetry SQLite
+database by default, with mode `0600`. `Config.SaltPath` can place it elsewhere
+on customer-controlled persistent storage. At startup the client loads the
+existing salt or creates one with `crypto/rand`; salts that are at least 30 days
+old rotate immediately. A background goroutine checks once every 24 hours and
+atomically replaces expired salts. Successful rotations and background errors
+are written through the local `OnError` callback or Go's standard logger. Salt
+rotation deliberately prevents pseudonyms from linking a client across
+long-lived reporting periods.
 
 Raw request and response bytes are accepted only as hash material. They are
 length-delimited and committed with SHA-256, then cleared on a best-effort basis

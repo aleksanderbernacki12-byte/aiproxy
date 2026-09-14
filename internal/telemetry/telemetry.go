@@ -11,10 +11,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"aiproxy/internal/anonymizer"
 )
 
 const (
@@ -31,6 +34,7 @@ var (
 	ErrQueueFull         = errors.New("telemetry: queue is full")
 	ErrInvalidEventID    = errors.New("telemetry: event_id must be a UUID")
 	ErrInvalidClientHash = errors.New("telemetry: client_id_hash must be a SHA-256 hex digest")
+	ErrClientIDRequired  = errors.New("telemetry: client_id is required")
 	ErrDuplicateEvent    = errors.New("telemetry: event_id has already been recorded")
 	ErrTenantKeyRequired = errors.New("telemetry: AIPROXY_TENANT_KEY is required")
 )
@@ -48,8 +52,10 @@ type Config struct {
 	Endpoint       string
 	DatabasePath   string
 	PrivateKeyPath string
-	HTTPClient     HTTPDoer
-	Headers        http.Header
+	// SaltPath defaults to .aiproxy_salt beside DatabasePath.
+	SaltPath   string
+	HTTPClient HTTPDoer
+	Headers    http.Header
 
 	QueueSize        int
 	BatchSize        int
@@ -73,6 +79,7 @@ type Client struct {
 	db         *sql.DB
 	privateKey *ecdsa.PrivateKey
 	keyID      string
+	anonymizer *anonymizer.Anonymizer
 
 	batchSize        int
 	flushInterval    time.Duration
@@ -118,6 +125,29 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	onError := cfg.OnError
+	if onError == nil {
+		onError = func(err error) { log.Printf("aiproxy: %v", err) }
+	}
+	saltPath := strings.TrimSpace(cfg.SaltPath)
+	if saltPath == "" {
+		databasePath, pathErr := filepath.Abs(cfg.DatabasePath)
+		if pathErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("telemetry: resolve anonymizer salt path: %w", pathErr)
+		}
+		saltPath = filepath.Join(filepath.Dir(databasePath), ".aiproxy_salt")
+	}
+	clientAnonymizer, err := anonymizer.New(anonymizer.Config{
+		Path: saltPath,
+		OnError: func(err error) {
+			onError(fmt.Errorf("telemetry: client anonymizer: %w", err))
+		},
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("telemetry: initialize client anonymizer: %w", err)
+	}
 
 	queueSize := cfg.QueueSize
 	if queueSize <= 0 {
@@ -144,6 +174,7 @@ func New(cfg Config) (*Client, error) {
 		maxBackoff = defaultMaxBackoff
 	}
 	if maxBackoff < initialBackoff {
+		clientAnonymizer.Close()
 		_ = db.Close()
 		return nil, errors.New("telemetry: maximum backoff must be at least the initial backoff")
 	}
@@ -154,10 +185,6 @@ func New(cfg Config) (*Client, error) {
 
 	headers := cfg.Headers.Clone()
 	headers.Set("Authorization", "Bearer "+tenantKey)
-	onError := cfg.OnError
-	if onError == nil {
-		onError = func(err error) { log.Printf("aiproxy: %v", err) }
-	}
 	c := &Client{
 		endpoint:         endpoint,
 		httpClient:       httpClient,
@@ -165,6 +192,7 @@ func New(cfg Config) (*Client, error) {
 		db:               db,
 		privateKey:       privateKey,
 		keyID:            identifier,
+		anonymizer:       clientAnonymizer,
 		batchSize:        batchSize,
 		flushInterval:    flushInterval,
 		operationTimeout: operationTimeout,
@@ -187,6 +215,7 @@ func New(cfg Config) (*Client, error) {
 	go func() {
 		<-c.coreDone
 		<-c.errorDone
+		c.anonymizer.Close()
 		_ = c.db.Close()
 		if c.privateKey != nil && c.privateKey.D != nil {
 			c.privateKey.D.SetInt64(0)
@@ -198,9 +227,10 @@ func New(cfg Config) (*Client, error) {
 	return c, nil
 }
 
-// SubmitAsync accepts an event without waiting for hashing, signing, SQLite, or
-// the network. On success ownership of Request, Response, Routing, Metrics, and
-// ComplianceFlags transfers to Client; callers must not mutate them afterward.
+// SubmitAsync anonymizes ClientID and accepts an event without waiting for
+// signing, SQLite, or the network. On success ownership of Request, Response,
+// Routing, Metrics, and ComplianceFlags transfers to Client; callers must not
+// mutate them afterward.
 func (c *Client) SubmitAsync(submission Submission) bool {
 	if c == nil {
 		return false
@@ -218,10 +248,22 @@ func (c *Client) SubmitAsync(submission Submission) bool {
 		c.report(ErrInvalidEventID)
 		return false
 	}
-	if !validSHA256(submission.ClientIDHash) {
-		c.report(ErrInvalidClientHash)
+	clientID := submission.ClientID
+	if clientID == "" {
+		clientID = submission.ClientIDHash
+	}
+	if clientID == "" {
+		c.report(ErrClientIDRequired)
 		return false
 	}
+	clientIDHash, err := c.anonymizer.Hash(clientID)
+	if err != nil {
+		c.report(fmt.Errorf("telemetry: anonymize client_id: %w", err))
+		return false
+	}
+	submission.ClientID = ""
+	submission.ClientIDHash = ""
+	submission.clientIDHash = clientIDHash
 	if strings.TrimSpace(submission.ApplicationID) == "" {
 		c.report(errors.New("telemetry: application_id is required"))
 		return false
