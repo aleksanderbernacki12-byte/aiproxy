@@ -3055,6 +3055,10 @@ record during an authorized investigation.
 Secure Vault health is reported under `compliance.secure_vault` in the same
 authenticated stats response, including encrypted spool backlog, quarantined
 entries, local failures, AWS upload failures, and completed uploads.
+The same operational values are exported at `GET /_aiproxy/metrics` as
+`aiproxy_telemetry_*` and `aiproxy_secure_vault_*` Prometheus series. Backlog
+and queue values are gauges; accepted, dropped, failure, and completion values
+are counters. Latest outcome times use Unix timestamp gauges.
 
 ## Validating a config file
 

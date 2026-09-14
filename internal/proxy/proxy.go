@@ -5348,6 +5348,45 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	writePromMetrics(w, s.Stats.Snapshot(), s.getCostRates(), s.getCostBudget())
+	if provider, ok := s.ComplianceRecorder.(ComplianceStatusProvider); ok {
+		writeCompliancePromMetrics(w, provider.ComplianceStatus())
+	}
+}
+
+func writeCompliancePromMetrics(w io.Writer, status ComplianceStatus) {
+	if telemetry := status.Telemetry; telemetry != nil {
+		writePromValue(w, "aiproxy_telemetry_accepted_total", "counter", "Telemetry events accepted by the asynchronous pipeline.", telemetry.Accepted)
+		writePromValue(w, "aiproxy_telemetry_dropped_total", "counter", "Telemetry events rejected before durable persistence.", telemetry.Dropped)
+		writePromValue(w, "aiproxy_telemetry_persist_failures_total", "counter", "Telemetry events that failed local durable persistence.", telemetry.PersistFailures)
+		writePromValue(w, "aiproxy_telemetry_delivery_failures_total", "counter", "Failed Control Plane delivery attempts.", telemetry.DeliveryFailures)
+		writePromValue(w, "aiproxy_telemetry_delivered_events_total", "counter", "Telemetry events acknowledged by the Control Plane.", telemetry.DeliveredEvents)
+		writePromValue(w, "aiproxy_telemetry_pending", "gauge", "Telemetry events waiting in memory or durable storage.", telemetry.Pending)
+		writePromTime(w, "aiproxy_telemetry_last_delivered_timestamp_seconds", "Unix timestamp of the latest successful telemetry delivery.", telemetry.LastDeliveredAt)
+		writePromTime(w, "aiproxy_telemetry_last_failure_timestamp_seconds", "Unix timestamp of the latest telemetry pipeline failure.", telemetry.LastFailureAt)
+	}
+	if vault := status.SecureVault; vault != nil {
+		writePromValue(w, "aiproxy_secure_vault_accepted_total", "counter", "Evidence records accepted by Secure Vault.", vault.Accepted)
+		writePromValue(w, "aiproxy_secure_vault_dropped_total", "counter", "Evidence records rejected before processing.", vault.Dropped)
+		writePromValue(w, "aiproxy_secure_vault_queue_depth", "gauge", "Evidence records waiting in the in-memory queue.", vault.QueueDepth)
+		writePromValue(w, "aiproxy_secure_vault_spool_pending", "gauge", "Encrypted evidence records waiting on disk.", vault.SpoolPending)
+		writePromValue(w, "aiproxy_secure_vault_quarantined", "gauge", "Unreadable encrypted spool entries in quarantine.", vault.Quarantined)
+		writePromValue(w, "aiproxy_secure_vault_local_failures_total", "counter", "Secure Vault capture or local spool failures.", vault.LocalFailures)
+		writePromValue(w, "aiproxy_secure_vault_upload_failures_total", "counter", "Failed AWS KMS or S3 archive attempts.", vault.UploadFailures)
+		writePromValue(w, "aiproxy_secure_vault_uploaded_total", "counter", "Evidence records successfully archived in S3.", vault.Uploaded)
+		writePromTime(w, "aiproxy_secure_vault_last_uploaded_timestamp_seconds", "Unix timestamp of the latest successful S3 archive.", vault.LastUploadedAt)
+		writePromTime(w, "aiproxy_secure_vault_last_failure_timestamp_seconds", "Unix timestamp of the latest Secure Vault failure.", vault.LastFailureAt)
+	}
+}
+
+func writePromValue[T ~int | ~int64 | ~uint64](w io.Writer, name, metricType, help string, value T) {
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", name, help, name, metricType, name, value)
+}
+
+func writePromTime(w io.Writer, name, help string, value *time.Time) {
+	if value == nil {
+		return
+	}
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", name, help, name, name, value.Unix())
 }
 
 // Summary renders the current stats snapshot as the same block of text
