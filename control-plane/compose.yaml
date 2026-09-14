@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: aiproxy_control
+      POSTGRES_USER: aiproxy
+      POSTGRES_PASSWORD: aiproxy
+    ports:
+      - "5432:5432"
+    volumes:
+      - aiproxy-control-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiproxy -d aiproxy_control"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  aiproxy-control-postgres:
