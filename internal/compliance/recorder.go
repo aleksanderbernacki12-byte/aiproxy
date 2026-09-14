@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"aiproxy/internal/proxy"
+	"aiproxy/internal/securevault"
 	"aiproxy/internal/telemetry"
 )
 
@@ -18,6 +19,10 @@ import (
 type Vault interface {
 	StoreAsync(eventID string, request *http.Request, response *http.Response) bool
 	Shutdown(context.Context) error
+}
+
+type vaultStatus interface {
+	Snapshot() securevault.Snapshot
 }
 
 // Telemetry is implemented by *telemetry.Client.
@@ -104,16 +109,23 @@ func (r *Recorder) Shutdown(ctx context.Context) error {
 // ComplianceStatus returns aggregate health without reading either queue.
 func (r *Recorder) ComplianceStatus() proxy.ComplianceStatus {
 	status := proxy.ComplianceStatus{}
-	provider, ok := r.Telemetry.(telemetryStatus)
-	if !ok {
-		return status
+	if provider, ok := r.Telemetry.(telemetryStatus); ok {
+		snapshot := provider.Snapshot()
+		status.Telemetry = &proxy.TelemetryStatus{
+			Accepted: snapshot.Accepted, Dropped: snapshot.Dropped,
+			PersistFailures: snapshot.PersistFailures, DeliveryFailures: snapshot.DeliveryFailures,
+			DeliveredEvents: snapshot.DeliveredEvents, Pending: snapshot.Pending,
+			LastDeliveredAt: snapshot.LastDeliveredAt, LastFailureAt: snapshot.LastFailureAt,
+		}
 	}
-	snapshot := provider.Snapshot()
-	status.Telemetry = &proxy.TelemetryStatus{
-		Accepted: snapshot.Accepted, Dropped: snapshot.Dropped,
-		PersistFailures: snapshot.PersistFailures, DeliveryFailures: snapshot.DeliveryFailures,
-		DeliveredEvents: snapshot.DeliveredEvents, Pending: snapshot.Pending,
-		LastDeliveredAt: snapshot.LastDeliveredAt, LastFailureAt: snapshot.LastFailureAt,
+	if provider, ok := r.Vault.(vaultStatus); ok {
+		snapshot := provider.Snapshot()
+		status.SecureVault = &proxy.SecureVaultStatus{
+			Accepted: snapshot.Accepted, Dropped: snapshot.Dropped, QueueDepth: snapshot.QueueDepth,
+			SpoolPending: snapshot.SpoolPending, Quarantined: snapshot.Quarantined,
+			LocalFailures: snapshot.LocalFailures, UploadFailures: snapshot.UploadFailures,
+			Uploaded: snapshot.Uploaded, LastUploadedAt: snapshot.LastUploadedAt, LastFailureAt: snapshot.LastFailureAt,
+		}
 	}
 	return status
 }

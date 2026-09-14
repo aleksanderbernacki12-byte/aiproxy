@@ -17,7 +17,8 @@ func TestServeStatsIncludesAggregateComplianceStatus(t *testing.T) {
 	server := &Server{
 		Stats: stats.New(),
 		ComplianceRecorder: statusRecorder{status: ComplianceStatus{
-			Telemetry: &TelemetryStatus{Accepted: 7, Pending: 2, DeliveryFailures: 1},
+			Telemetry:   &TelemetryStatus{Accepted: 7, Pending: 2, DeliveryFailures: 1},
+			SecureVault: &SecureVaultStatus{Accepted: 6, SpoolPending: 3, UploadFailures: 1},
 		}},
 	}
 	response := httptest.NewRecorder()
@@ -30,5 +31,8 @@ func TestServeStatsIncludesAggregateComplianceStatus(t *testing.T) {
 	}
 	if payload.Compliance.Telemetry == nil || payload.Compliance.Telemetry.Accepted != 7 || payload.Compliance.Telemetry.Pending != 2 {
 		t.Fatalf("compliance status = %#v", payload.Compliance)
+	}
+	if payload.Compliance.SecureVault == nil || payload.Compliance.SecureVault.Accepted != 6 || payload.Compliance.SecureVault.SpoolPending != 3 {
+		t.Fatalf("secure vault status = %#v", payload.Compliance)
 	}
 }

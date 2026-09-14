@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"aiproxy/internal/proxy"
+	"aiproxy/internal/securevault"
 	"aiproxy/internal/telemetry"
 )
 
@@ -23,6 +24,7 @@ type vaultCall struct {
 type fakeVault struct {
 	call     vaultCall
 	accepted bool
+	snapshot securevault.Snapshot
 }
 
 func (v *fakeVault) StoreAsync(eventID string, request *http.Request, response *http.Response) bool {
@@ -32,7 +34,8 @@ func (v *fakeVault) StoreAsync(eventID string, request *http.Request, response *
 	return v.accepted
 }
 
-func (*fakeVault) Shutdown(context.Context) error { return nil }
+func (*fakeVault) Shutdown(context.Context) error   { return nil }
+func (v *fakeVault) Snapshot() securevault.Snapshot { return v.snapshot }
 
 type fakeTelemetry struct {
 	submission telemetry.Submission
@@ -110,6 +113,15 @@ func TestRecorderExposesAggregateTelemetryStatus(t *testing.T) {
 	recorder := &Recorder{Telemetry: &fakeTelemetry{snapshot: want}}
 	got := recorder.ComplianceStatus()
 	if got.Telemetry == nil || got.Telemetry.Accepted != want.Accepted || got.Telemetry.Pending != want.Pending || got.Telemetry.DeliveryFailures != want.DeliveryFailures {
+		t.Fatalf("ComplianceStatus() = %#v", got)
+	}
+}
+
+func TestRecorderExposesAggregateSecureVaultStatus(t *testing.T) {
+	want := securevault.Snapshot{Accepted: 5, SpoolPending: 2, UploadFailures: 1}
+	recorder := &Recorder{Vault: &fakeVault{snapshot: want}}
+	got := recorder.ComplianceStatus()
+	if got.SecureVault == nil || got.SecureVault.Accepted != want.Accepted || got.SecureVault.SpoolPending != want.SpoolPending || got.SecureVault.UploadFailures != want.UploadFailures {
 		t.Fatalf("ComplianceStatus() = %#v", got)
 	}
 }

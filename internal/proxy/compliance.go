@@ -48,7 +48,21 @@ type ComplianceStatusProvider interface {
 }
 
 type ComplianceStatus struct {
-	Telemetry *TelemetryStatus `json:"telemetry,omitempty"`
+	Telemetry   *TelemetryStatus   `json:"telemetry,omitempty"`
+	SecureVault *SecureVaultStatus `json:"secure_vault,omitempty"`
+}
+
+type SecureVaultStatus struct {
+	Accepted       uint64     `json:"accepted"`
+	Dropped        uint64     `json:"dropped"`
+	QueueDepth     int        `json:"queue_depth"`
+	SpoolPending   int64      `json:"spool_pending"`
+	Quarantined    int64      `json:"quarantined"`
+	LocalFailures  uint64     `json:"local_failures"`
+	UploadFailures uint64     `json:"upload_failures"`
+	Uploaded       uint64     `json:"uploaded"`
+	LastUploadedAt *time.Time `json:"last_uploaded_at,omitempty"`
+	LastFailureAt  *time.Time `json:"last_failure_at,omitempty"`
 }
 
 type TelemetryStatus struct {

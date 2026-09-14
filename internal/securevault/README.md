@@ -61,3 +61,10 @@ encrypted disk spool. Pass a bounded context during graceful process shutdown.
 Delivery is at least once. If S3 stores an object but the client cannot observe
 the success response, the retry may create another Object-Locked version with
 the same event ID. Consumers should use the event ID as the logical identity.
+
+`Vault.Snapshot()` exposes non-blocking aggregate health: accepted and dropped
+submissions, memory queue depth, encrypted spool backlog, quarantined entries,
+local and AWS upload failures, completed uploads, and latest outcome times.
+Through the compliance recorder these values appear under
+`compliance.secure_vault` in `GET /_aiproxy/stats`; raw evidence and secrets
+are never included.

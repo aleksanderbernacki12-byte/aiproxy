@@ -218,6 +218,11 @@ func TestStoreAsync_EnvelopeEncryptionAndFiveYearComplianceLock(t *testing.T) {
 		t.Fatal("StoreAsync rejected valid work")
 	}
 	eventually(t, func() bool { return len(s3Client.snapshot()) == 1 })
+	eventually(t, func() bool { return vault.Snapshot().Uploaded == 1 })
+	status := vault.Snapshot()
+	if status.Accepted != 1 || status.Dropped != 0 || status.QueueDepth != 0 || status.SpoolPending != 0 || status.UploadFailures != 0 || status.LastUploadedAt == nil {
+		t.Fatalf("Snapshot() = %#v", status)
+	}
 	shutdown(t, vault)
 
 	kmsCalls, kmsInputs, returnedKeys := kmsClient.snapshot()
@@ -338,6 +343,9 @@ func TestStoreAsync_KMSFailureUsesEncryptedSpoolAndRetries(t *testing.T) {
 		_, err := os.Stat(retryPath)
 		return err == nil
 	})
+	if status := vault.Snapshot(); status.UploadFailures != 1 || status.SpoolPending != 1 || status.LastFailureAt == nil {
+		t.Fatalf("outage Snapshot() = %#v", status)
+	}
 	raw, err := os.ReadFile(retryPath)
 	if err != nil {
 		t.Fatal(err)
@@ -364,6 +372,10 @@ func TestStoreAsync_KMSFailureUsesEncryptedSpoolAndRetries(t *testing.T) {
 		_, err := os.Stat(retryPath)
 		return errors.Is(err, os.ErrNotExist)
 	})
+	eventually(t, func() bool { return vault.Snapshot().Uploaded == 1 })
+	if status := vault.Snapshot(); status.Uploaded != 1 || status.SpoolPending != 0 {
+		t.Fatalf("recovered Snapshot() = %#v", status)
+	}
 	shutdown(t, vault)
 	if calls, _, _ := kmsClient.snapshot(); calls != 2 {
 		t.Fatalf("KMS calls = %d, want initial failure plus one retry", calls)

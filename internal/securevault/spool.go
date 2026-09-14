@@ -168,6 +168,25 @@ func (v *Vault) indexExistingEntries() error {
 	return nil
 }
 
+func countSpoolEntries(dir string) (pending, quarantined int64, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0, fmt.Errorf("securevault: count retry spool: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(entry.Name(), workSuffix), strings.HasSuffix(entry.Name(), retrySuffix):
+			pending++
+		case strings.HasSuffix(entry.Name(), corruptSuffix):
+			quarantined++
+		}
+	}
+	return pending, quarantined, nil
+}
+
 func (v *Vault) retryLoop() {
 	defer v.workers.Done()
 	ticker := time.NewTicker(v.retryInterval)
@@ -220,6 +239,10 @@ func (v *Vault) quarantine(filename string, cause error) {
 		v.report(fmt.Errorf("securevault: unreadable spool entry %s (%v), quarantine failed: %w", filepath.Base(filename), cause, err))
 		return
 	}
+	v.spoolPending.Add(-1)
+	v.quarantined.Add(1)
+	v.localFailures.Add(1)
+	v.lastFailureUnix.Store(v.now().UTC().Unix())
 	v.report(fmt.Errorf("securevault: quarantined unreadable spool entry %s: %w", filepath.Base(filename), cause))
 }
 

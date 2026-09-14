@@ -3052,6 +3052,9 @@ Secure Vault and telemetry can be enabled together. The coordinator gives both
 destinations the same `event_id` and the same original request/response bytes,
 allowing a signed SaaS event to be correlated with the encrypted customer-owned
 record during an authorized investigation.
+Secure Vault health is reported under `compliance.secure_vault` in the same
+authenticated stats response, including encrypted spool backlog, quarantined
+entries, local failures, AWS upload failures, and completed uploads.
 
 ## Validating a config file
 

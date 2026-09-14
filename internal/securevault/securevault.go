@@ -106,13 +106,22 @@ type Vault struct {
 	maxBackoff       time.Duration
 	retryInterval    time.Duration
 
-	jobs   chan job
-	errors chan error
-	stop   chan struct{}
-	done   chan struct{}
-	closed atomic.Bool
-	submit sync.RWMutex
-	active sync.Map
+	jobs             chan job
+	errors           chan error
+	stop             chan struct{}
+	done             chan struct{}
+	closed           atomic.Bool
+	accepted         atomic.Uint64
+	dropped          atomic.Uint64
+	spoolPending     atomic.Int64
+	quarantined      atomic.Int64
+	localFailures    atomic.Uint64
+	uploadFailures   atomic.Uint64
+	uploaded         atomic.Uint64
+	lastUploadedUnix atomic.Int64
+	lastFailureUnix  atomic.Int64
+	submit           sync.RWMutex
+	active           sync.Map
 
 	onError func(error)
 	now     func() time.Time
@@ -203,6 +212,13 @@ func New(cfg Config) (*Vault, error) {
 		zero(v.spoolKey)
 		return nil, err
 	}
+	pending, quarantined, err := countSpoolEntries(v.spoolDir)
+	if err != nil {
+		zero(v.spoolKey)
+		return nil, err
+	}
+	v.spoolPending.Store(pending)
+	v.quarantined.Store(quarantined)
 
 	v.workers.Add(workerCount + 2)
 	for i := 0; i < workerCount; i++ {
@@ -234,31 +250,38 @@ func (v *Vault) StoreAsync(eventID string, request *http.Request, response *http
 	// TryRLock preserves the method's non-blocking contract even when Shutdown
 	// is concurrently taking exclusive ownership of submission state.
 	if !v.submit.TryRLock() {
+		v.dropped.Add(1)
 		v.report(ErrClosed)
 		return false
 	}
 	defer v.submit.RUnlock()
 	if v.closed.Load() {
+		v.dropped.Add(1)
 		v.report(ErrClosed)
 		return false
 	}
 	if !validUUID(eventID) {
+		v.dropped.Add(1)
 		v.report(ErrInvalidEventID)
 		return false
 	}
 	if request == nil || response == nil {
+		v.dropped.Add(1)
 		v.report(errors.New("securevault: request and response are required"))
 		return false
 	}
 	eventID = strings.ToLower(eventID)
 	if _, loaded := v.active.LoadOrStore(eventID, struct{}{}); loaded {
+		v.dropped.Add(1)
 		v.report(ErrDuplicateEvent)
 		return false
 	}
 	select {
 	case v.jobs <- job{eventID: eventID, request: request, response: response}:
+		v.accepted.Add(1)
 		return true
 	default:
+		v.dropped.Add(1)
 		v.active.Delete(eventID)
 		v.report(ErrQueueFull)
 		return false
@@ -308,6 +331,8 @@ func (v *Vault) worker() {
 func (v *Vault) handleLiveSafely(work job) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			v.localFailures.Add(1)
+			v.lastFailureUnix.Store(v.now().UTC().Unix())
 			v.report(fmt.Errorf("securevault: capture worker panic for %s: %v", work.eventID, recovered))
 			v.active.Delete(work.eventID)
 		}
@@ -318,6 +343,8 @@ func (v *Vault) handleLiveSafely(work job) {
 func (v *Vault) handleLive(work job) {
 	payload, err := capture(work.eventID, work.request, work.response, v.now())
 	if err != nil {
+		v.localFailures.Add(1)
+		v.lastFailureUnix.Store(v.now().UTC().Unix())
 		v.report(fmt.Errorf("securevault: capture %s: %w", work.eventID, err))
 		v.active.Delete(work.eventID)
 		return
@@ -326,10 +353,13 @@ func (v *Vault) handleLive(work job) {
 	entry := spoolEntry{Version: 1, EventID: work.eventID, Payload: payload, CreatedAt: v.now().UTC()}
 	workPath, err := v.writeEntry(entry, workSuffix)
 	if err != nil {
+		v.localFailures.Add(1)
+		v.lastFailureUnix.Store(v.now().UTC().Unix())
 		v.report(fmt.Errorf("securevault: spool %s: %w", work.eventID, err))
 		v.active.Delete(work.eventID)
 		return
 	}
+	v.spoolPending.Add(1)
 	v.processEntry(workPath, entry)
 }
 
@@ -337,21 +367,32 @@ func (v *Vault) processEntry(workPath string, entry spoolEntry) {
 	err := v.uploadSafely(entry)
 	if err == nil {
 		if removeErr := removeAndSync(workPath); removeErr != nil {
+			v.localFailures.Add(1)
+			v.lastFailureUnix.Store(v.now().UTC().Unix())
 			v.report(fmt.Errorf("securevault: remove completed spool entry %s: %w", entry.EventID, removeErr))
 			return
 		}
 		v.active.Delete(entry.EventID)
+		v.spoolPending.Add(-1)
+		v.uploaded.Add(1)
+		v.lastUploadedUnix.Store(v.now().UTC().Unix())
 		return
 	}
+	v.uploadFailures.Add(1)
+	v.lastFailureUnix.Store(v.now().UTC().Unix())
 	v.report(fmt.Errorf("securevault: archive %s: %w", entry.EventID, err))
 	entry.Attempts++
 	entry.NextAttemptAt = v.now().UTC().Add(v.backoff(entry.Attempts))
 	if writeErr := v.rewriteEntry(workPath, entry); writeErr != nil {
+		v.localFailures.Add(1)
+		v.lastFailureUnix.Store(v.now().UTC().Unix())
 		v.report(fmt.Errorf("securevault: update retry state %s: %w", entry.EventID, writeErr))
 		return
 	}
 	retryPath := entryPath(v.spoolDir, entry.EventID, retrySuffix)
 	if renameErr := renameAndSync(workPath, retryPath); renameErr != nil {
+		v.localFailures.Add(1)
+		v.lastFailureUnix.Store(v.now().UTC().Unix())
 		v.report(fmt.Errorf("securevault: schedule retry %s: %w", entry.EventID, renameErr))
 	}
 }
