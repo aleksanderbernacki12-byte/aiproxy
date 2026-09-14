@@ -37,6 +37,7 @@ func (*fakeVault) Shutdown(context.Context) error { return nil }
 type fakeTelemetry struct {
 	submission telemetry.Submission
 	accepted   bool
+	snapshot   telemetry.Snapshot
 }
 
 func (t *fakeTelemetry) SubmitAsync(submission telemetry.Submission) bool {
@@ -45,6 +46,7 @@ func (t *fakeTelemetry) SubmitAsync(submission telemetry.Submission) bool {
 }
 
 func (*fakeTelemetry) Shutdown(context.Context) error { return nil }
+func (t *fakeTelemetry) Snapshot() telemetry.Snapshot { return t.snapshot }
 
 func TestRecorderFansOutIndependentRawCopiesWithSameEventID(t *testing.T) {
 	vault := &fakeVault{accepted: true}
@@ -100,5 +102,14 @@ func TestRecorderReportsPartialQueueAcceptance(t *testing.T) {
 	}
 	if recorder.RecordAsync(proxy.ComplianceEvent{}) {
 		t.Fatal("recorder reported success when one destination rejected the event")
+	}
+}
+
+func TestRecorderExposesAggregateTelemetryStatus(t *testing.T) {
+	want := telemetry.Snapshot{Accepted: 4, Dropped: 1, Pending: 2, DeliveryFailures: 3}
+	recorder := &Recorder{Telemetry: &fakeTelemetry{snapshot: want}}
+	got := recorder.ComplianceStatus()
+	if got.Telemetry == nil || got.Telemetry.Accepted != want.Accepted || got.Telemetry.Pending != want.Pending || got.Telemetry.DeliveryFailures != want.DeliveryFailures {
+		t.Fatalf("ComplianceStatus() = %#v", got)
 	}
 }

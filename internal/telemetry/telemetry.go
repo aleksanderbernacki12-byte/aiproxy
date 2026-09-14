@@ -87,16 +87,24 @@ type Client struct {
 	initialBackoff   time.Duration
 	maxBackoff       time.Duration
 
-	jobs      chan Submission
-	wake      chan struct{}
-	errors    chan error
-	stop      chan struct{}
-	sequenced chan struct{}
-	coreDone  chan struct{}
-	errorDone chan struct{}
-	done      chan struct{}
-	closed    atomic.Bool
-	submit    sync.RWMutex
+	jobs              chan Submission
+	wake              chan struct{}
+	errors            chan error
+	stop              chan struct{}
+	sequenced         chan struct{}
+	coreDone          chan struct{}
+	errorDone         chan struct{}
+	done              chan struct{}
+	closed            atomic.Bool
+	accepted          atomic.Uint64
+	dropped           atomic.Uint64
+	persistFailures   atomic.Uint64
+	deliveryFailures  atomic.Uint64
+	deliveredEvents   atomic.Uint64
+	durablePending    atomic.Int64
+	lastDeliveredUnix atomic.Int64
+	lastFailureUnix   atomic.Int64
+	submit            sync.RWMutex
 
 	onError func(error)
 	now     func() time.Time
@@ -209,6 +217,13 @@ func New(cfg Config) (*Client, error) {
 		onError:          onError,
 		now:              time.Now,
 	}
+	if pending, countErr := c.pendingCount(context.Background()); countErr == nil {
+		c.durablePending.Store(int64(pending))
+	} else {
+		clientAnonymizer.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("telemetry: count initial pending events: %w", countErr)
+	}
 	go c.sequenceLoop()
 	go c.sendLoop()
 	go c.errorLoop()
@@ -236,20 +251,24 @@ func (c *Client) SubmitAsync(submission Submission) bool {
 		return false
 	}
 	if !c.submit.TryRLock() {
+		c.dropped.Add(1)
 		c.report(ErrClosed)
 		return false
 	}
 	defer c.submit.RUnlock()
 	if c.closed.Load() {
+		c.dropped.Add(1)
 		c.report(ErrClosed)
 		return false
 	}
 	if !validUUID(submission.EventID) {
+		c.dropped.Add(1)
 		c.report(ErrInvalidEventID)
 		return false
 	}
 	clientID := submission.ClientID
 	if clientID == "" {
+		c.dropped.Add(1)
 		clientID = submission.ClientIDHash
 	}
 	if clientID == "" {
@@ -258,6 +277,7 @@ func (c *Client) SubmitAsync(submission Submission) bool {
 	}
 	clientIDHash, err := c.anonymizer.Hash(clientID)
 	if err != nil {
+		c.dropped.Add(1)
 		c.report(fmt.Errorf("telemetry: anonymize client_id: %w", err))
 		return false
 	}
@@ -265,6 +285,7 @@ func (c *Client) SubmitAsync(submission Submission) bool {
 	submission.ClientIDHash = ""
 	submission.clientIDHash = clientIDHash
 	if strings.TrimSpace(submission.ApplicationID) == "" {
+		c.dropped.Add(1)
 		c.report(errors.New("telemetry: application_id is required"))
 		return false
 	}
@@ -273,8 +294,10 @@ func (c *Client) SubmitAsync(submission Submission) bool {
 	}
 	select {
 	case c.jobs <- submission:
+		c.accepted.Add(1)
 		return true
 	default:
+		c.dropped.Add(1)
 		c.report(ErrQueueFull)
 		return false
 	}
@@ -330,10 +353,35 @@ func (c *Client) persistSubmission(submission Submission) {
 	err := c.persist(ctx, submission)
 	cancel()
 	if err != nil {
+		c.persistFailures.Add(1)
+		c.lastFailureUnix.Store(c.now().UTC().Unix())
 		c.report(fmt.Errorf("telemetry: persist %s: %w", submission.EventID, err))
 		return
 	}
+	c.durablePending.Add(1)
 	c.signalSender()
+}
+
+// Snapshot returns a non-blocking point-in-time view. Pending includes both
+// accepted in-memory submissions and durable SQLite rows.
+func (c *Client) Snapshot() Snapshot {
+	if c == nil {
+		return Snapshot{}
+	}
+	return Snapshot{
+		Accepted: c.accepted.Load(), Dropped: c.dropped.Load(),
+		PersistFailures: c.persistFailures.Load(), DeliveryFailures: c.deliveryFailures.Load(),
+		DeliveredEvents: c.deliveredEvents.Load(), Pending: c.durablePending.Load() + int64(len(c.jobs)),
+		LastDeliveredAt: unixTime(c.lastDeliveredUnix.Load()), LastFailureAt: unixTime(c.lastFailureUnix.Load()),
+	}
+}
+
+func unixTime(value int64) *time.Time {
+	if value == 0 {
+		return nil
+	}
+	result := time.Unix(value, 0).UTC()
+	return &result
 }
 
 func (c *Client) signalSender() {

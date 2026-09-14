@@ -3014,6 +3014,10 @@ the Control Plane. Network failures and HTTP 401 responses are logged locally
 and retried from `.aiproxy_telemetry.sqlite`; LLM traffic remains fail-open.
 Use `--telemetry-db` and `--telemetry-salt` to move the durable queue and
 rotating HMAC salt to customer-controlled persistent storage.
+Operational queue health is available under `compliance.telemetry` in the
+authenticated `GET /_aiproxy/stats` response. It reports pending and dropped
+events, persistence/delivery failures, delivered events, and latest outcome
+times without exposing event payloads or identifiers.
 
 Clients can send `X-Aiproxy-Client-Id` and `X-Aiproxy-Application-Id` for local
 attribution. Both headers are consumed by aiproxy and removed before the

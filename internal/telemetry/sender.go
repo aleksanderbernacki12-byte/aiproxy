@@ -51,6 +51,8 @@ func (c *Client) flush(force, shuttingDown bool) {
 			return
 		}
 		if err := c.deliverSafely(events); err != nil {
+			c.deliveryFailures.Add(1)
+			c.lastFailureUnix.Store(c.now().UTC().Unix())
 			c.report(err)
 			ctx, cancel = context.WithTimeout(context.Background(), c.operationTimeout)
 			markErr := c.markFailed(ctx, events)
@@ -67,6 +69,9 @@ func (c *Client) flush(force, shuttingDown bool) {
 			c.report(fmt.Errorf("telemetry: remove delivered batch: %w", err))
 			return
 		}
+		c.durablePending.Add(-int64(len(events)))
+		c.deliveredEvents.Add(uint64(len(events)))
+		c.lastDeliveredUnix.Store(c.now().UTC().Unix())
 		if shuttingDown {
 			// Continue flushing all immediately deliverable shutdown work. A
 			// failed batch remains in SQLite for the next process start.

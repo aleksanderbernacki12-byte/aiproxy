@@ -107,3 +107,9 @@ signatures, and chain state. The P-256 private-key file must also be a regular
 file readable only by its owner. Keep both in customer-controlled persistent
 storage. `Shutdown` drains every accepted in-memory submission into SQLite and
 leaves unavailable batches there for the next process start.
+
+`Client.Snapshot()` exposes non-blocking aggregate health: accepted and
+dropped submissions, pending durable work, persistence and delivery failures,
+delivered events, and latest success/failure times. With the compliance
+recorder these values appear under `compliance.telemetry` in
+`GET /_aiproxy/stats`; no event data or secrets are included.

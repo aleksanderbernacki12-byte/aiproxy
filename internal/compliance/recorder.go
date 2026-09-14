@@ -26,6 +26,10 @@ type Telemetry interface {
 	Shutdown(context.Context) error
 }
 
+type telemetryStatus interface {
+	Snapshot() telemetry.Snapshot
+}
+
 // Recorder fans one immutable proxy snapshot out to independent bounded
 // queues. Either destination may be nil while deployments are being migrated.
 type Recorder struct {
@@ -95,6 +99,23 @@ func (r *Recorder) Shutdown(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// ComplianceStatus returns aggregate health without reading either queue.
+func (r *Recorder) ComplianceStatus() proxy.ComplianceStatus {
+	status := proxy.ComplianceStatus{}
+	provider, ok := r.Telemetry.(telemetryStatus)
+	if !ok {
+		return status
+	}
+	snapshot := provider.Snapshot()
+	status.Telemetry = &proxy.TelemetryStatus{
+		Accepted: snapshot.Accepted, Dropped: snapshot.Dropped,
+		PersistFailures: snapshot.PersistFailures, DeliveryFailures: snapshot.DeliveryFailures,
+		DeliveredEvents: snapshot.DeliveredEvents, Pending: snapshot.Pending,
+		LastDeliveredAt: snapshot.LastDeliveredAt, LastFailureAt: snapshot.LastFailureAt,
+	}
+	return status
 }
 
 func parseURL(value string) *url.URL {

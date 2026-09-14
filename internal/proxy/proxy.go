@@ -4823,7 +4823,8 @@ type statsSnapshotJSON struct {
 	// something each target has its own copy of — so toStatsSnapshotJSON
 	// never sets it; only the top-level caller (serveStats, logSummary)
 	// does, once, after building the rest of the payload.
-	CostBudget *float64 `json:"cost_budget,omitempty"`
+	CostBudget *float64          `json:"cost_budget,omitempty"`
+	Compliance *ComplianceStatus `json:"compliance,omitempty"`
 }
 
 // baseSnapshotJSON copies every plain counter field shared by the
@@ -4942,6 +4943,10 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostRates()), s.getCostBudget())
+	if provider, ok := s.ComplianceRecorder.(ComplianceStatusProvider); ok {
+		status := provider.ComplianceStatus()
+		payload.Compliance = &status
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		s.logError("aiproxy: stats: failed to encode response: %v", err)

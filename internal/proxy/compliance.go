@@ -42,6 +42,26 @@ type ComplianceRecorder interface {
 	RecordAsync(ComplianceEvent) bool
 }
 
+// ComplianceStatusProvider optionally exposes aggregate pipeline health.
+type ComplianceStatusProvider interface {
+	ComplianceStatus() ComplianceStatus
+}
+
+type ComplianceStatus struct {
+	Telemetry *TelemetryStatus `json:"telemetry,omitempty"`
+}
+
+type TelemetryStatus struct {
+	Accepted         uint64     `json:"accepted"`
+	Dropped          uint64     `json:"dropped"`
+	PersistFailures  uint64     `json:"persist_failures"`
+	DeliveryFailures uint64     `json:"delivery_failures"`
+	DeliveredEvents  uint64     `json:"delivered_events"`
+	Pending          int64      `json:"pending"`
+	LastDeliveredAt  *time.Time `json:"last_delivered_at,omitempty"`
+	LastFailureAt    *time.Time `json:"last_failure_at,omitempty"`
+}
+
 func complianceIdentity(header http.Header, authenticatedLabel string) (clientID, applicationID string) {
 	clientID = validComplianceIdentity(header.Get(complianceClientIDHeader))
 	if clientID == "" {

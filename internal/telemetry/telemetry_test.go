@@ -557,6 +557,24 @@ func TestSubmitAsync_FullQueueReturnsImmediately(t *testing.T) {
 	shutdown(t, client)
 }
 
+func TestSnapshotTracksDeliveryWithoutReadingPayloads(t *testing.T) {
+	dir := t.TempDir()
+	_, keyPath := writePrivateKey(t, dir)
+	client, err := New(testConfig(t, dir, keyPath, &fakeHTTP{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !client.SubmitAsync(testSubmission(eventOne, time.Now())) {
+		t.Fatal("submission rejected")
+	}
+	eventually(t, func() bool { return client.Snapshot().DeliveredEvents == 1 })
+	snapshot := client.Snapshot()
+	if snapshot.Accepted != 1 || snapshot.Dropped != 0 || snapshot.Pending != 0 || snapshot.DeliveryFailures != 0 || snapshot.LastDeliveredAt == nil {
+		t.Fatalf("Snapshot() = %#v", snapshot)
+	}
+	shutdown(t, client)
+}
+
 func TestShutdown_DrainsAcceptedEventsToSQLiteDuringOutage(t *testing.T) {
 	dir := t.TempDir()
 	_, keyPath := writePrivateKey(t, dir)
