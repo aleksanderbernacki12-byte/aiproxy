@@ -68,3 +68,16 @@ local and AWS upload failures, completed uploads, and latest outcome times.
 Through the compliance recorder these values appear under
 `compliance.secure_vault` in `GET /_aiproxy/stats`; raw evidence and secrets
 are never included.
+
+## Investigation export
+
+`aiproxy vault-export` retrieves one event from the customer bucket, asks the
+customer KMS to decrypt its DEK with the stored encryption context, verifies
+the AES-GCM tag and archive identity, and writes the raw JSON to a new `0600`
+file. It refuses to overwrite an existing file. Run this only inside the
+customer-controlled investigation environment:
+
+```sh
+aiproxy vault-export -event-id <uuid> -s3-bucket <bucket> \
+  -s3-prefix <prefix> -aws-region eu-north-1 -output ./evidence.json
+```

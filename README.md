@@ -3064,6 +3064,11 @@ Ready-to-load alert rules are provided in
 with investigation steps in the
 [`compliance alert runbook`](docs/operations/compliance-alerts.md).
 
+For an authorized customer-side investigation, `aiproxy vault-export` restores
+one record through the customer's own S3 credentials and KMS permissions. The
+command verifies the encrypted envelope and writes the raw JSON to a new local
+file with mode `0600`; it never overwrites an existing export.
+
 ## Validating a config file
 
 ```

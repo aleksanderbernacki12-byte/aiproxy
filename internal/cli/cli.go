@@ -94,6 +94,8 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 		return runValidate(args[1:], stdout, stderr)
 	case "verify-log":
 		return runVerifyLog(args[1:], stdout, stderr)
+	case "vault-export":
+		return runVaultExport(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -546,6 +548,74 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func runVaultExport(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("vault-export", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	eventID := fs.String("event-id", "", "UUID of the evidence record to export")
+	bucket := fs.String("s3-bucket", "", "customer-owned S3 evidence bucket")
+	prefix := fs.String("s3-prefix", "", "optional S3 object-key prefix")
+	region := fs.String("aws-region", "", "AWS region override; default: standard AWS SDK resolution")
+	output := fs.String("output", "", "new local JSON file for the decrypted evidence (required; mode 0600)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 || strings.TrimSpace(*eventID) == "" || strings.TrimSpace(*bucket) == "" || strings.TrimSpace(*output) == "" {
+		fmt.Fprintln(stderr, "usage: aiproxy vault-export -event-id <uuid> -s3-bucket <bucket> -output <new-file> [-s3-prefix <prefix>] [-aws-region <region>]")
+		return 2
+	}
+	awsOptions := make([]func(*awsconfig.LoadOptions) error, 0, 1)
+	if value := strings.TrimSpace(*region); value != "" {
+		awsOptions = append(awsOptions, awsconfig.WithRegion(value))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	configuration, err := awsconfig.LoadDefaultConfig(ctx, awsOptions...)
+	if err != nil {
+		fmt.Fprintf(stderr, "aiproxy: load AWS configuration: %v\n", err)
+		return 1
+	}
+	plain, err := securevault.Restore(ctx, securevault.RestoreConfig{
+		KMS: kms.NewFromConfig(configuration), S3: s3.NewFromConfig(configuration),
+		Bucket: *bucket, Prefix: *prefix, EventID: *eventID,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "aiproxy: export Secure Vault record: %v\n", err)
+		return 1
+	}
+	defer zeroSecret(plain)
+	if err := writeExclusiveSecretFile(*output, plain); err != nil {
+		fmt.Fprintf(stderr, "aiproxy: write Secure Vault export: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Secure Vault record %s exported to %s\n", strings.ToLower(*eventID), *output)
+	return 0
+}
+
+func writeExclusiveSecretFile(filename string, data []byte) (err error) {
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		_ = file.Close()
+		if !complete {
+			_ = os.Remove(filename)
+		}
+	}()
+	if _, err = file.Write(data); err != nil {
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	complete = true
+	return nil
 }
 
 func decodeSecureVaultSpoolKey(encoded string) ([]byte, error) {
@@ -2564,5 +2634,6 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  start        start the proxy server")
 	fmt.Fprintln(w, "  validate     check a config file for problems without starting the proxy")
 	fmt.Fprintln(w, "  verify-log   verify an audit-signed log file's HMAC chain is intact")
+	fmt.Fprintln(w, "  vault-export decrypt one customer-owned Secure Vault record for investigation")
 	fmt.Fprintln(w, "  help         show this help text")
 }
