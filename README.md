@@ -3059,6 +3059,10 @@ The same operational values are exported at `GET /_aiproxy/metrics` as
 `aiproxy_telemetry_*` and `aiproxy_secure_vault_*` Prometheus series. Backlog
 and queue values are gauges; accepted, dropped, failure, and completion values
 are counters. Latest outcome times use Unix timestamp gauges.
+Ready-to-load alert rules are provided in
+[`deploy/prometheus/aiproxy-alerts.yml`](deploy/prometheus/aiproxy-alerts.yml),
+with investigation steps in the
+[`compliance alert runbook`](docs/operations/compliance-alerts.md).
 
 ## Validating a config file
 
