@@ -3022,6 +3022,33 @@ HMAC-SHA256 pseudonym before persistence or transmission. When the headers are
 absent, aiproxy uses the authenticated proxy-key label and the application name
 `aiproxy`.
 
+Enable the customer-owned raw evidence vault with a KMS key, an S3 bucket that
+already has Object Lock enabled, and a stable 32-byte local spool key:
+
+```sh
+# Run once and store the output in the customer's secret manager:
+openssl rand -base64 32
+export AIPROXY_SECUREVAULT_SPOOL_KEY='<stable value from secret manager>'
+
+aiproxy start \
+  --target https://api.openai.com \
+  --secure-vault-kms-key-id alias/aiproxy-securevault \
+  --secure-vault-s3-bucket customer-compliance-vault \
+  --secure-vault-aws-region eu-north-1
+```
+
+AWS credentials use the standard SDK chain, including environment variables,
+shared AWS configuration, ECS task roles, and EC2 instance roles. Do not
+regenerate `AIPROXY_SECUREVAULT_SPOOL_KEY` while retry files exist: it encrypts
+the local `.aiproxy_securevault` queue during KMS or S3 outages. The key is
+accepted only through the environment. Use `--secure-vault-spool-dir` and
+`--secure-vault-s3-prefix` to override the local queue and object prefix.
+
+Secure Vault and telemetry can be enabled together. The coordinator gives both
+destinations the same `event_id` and the same original request/response bytes,
+allowing a signed SaaS event to be correlated with the encrypted customer-owned
+record during an authorized investigation.
+
 ## Validating a config file
 
 ```

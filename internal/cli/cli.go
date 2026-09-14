@@ -6,6 +6,7 @@ package cli
 import (
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +22,10 @@ import (
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	"aiproxy/internal/anomaly"
 	"aiproxy/internal/auditlog"
 	"aiproxy/internal/breaker"
@@ -34,6 +39,7 @@ import (
 	"aiproxy/internal/limiter"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
+	"aiproxy/internal/securevault"
 	"aiproxy/internal/semcache"
 	"aiproxy/internal/telemetry"
 )
@@ -41,6 +47,8 @@ import (
 // defaultConfigPath is where aiproxy looks for custom rules when --config
 // is not given: aiproxy.json in the current working directory.
 const defaultConfigPath = "aiproxy.json"
+
+const secureVaultSpoolKeyEnvironment = "AIPROXY_SECUREVAULT_SPOOL_KEY"
 
 // Default body regex rules, compiled once at package init so the cost of
 // compiling them is never paid per request.
@@ -112,6 +120,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	telemetryDatabase := fs.String("telemetry-db", ".aiproxy_telemetry.sqlite", "path to the durable local telemetry queue")
 	telemetryPrivateKey := fs.String("telemetry-private-key", "", "path to the owner-only ECDSA P-256 private key used to sign telemetry")
 	telemetrySalt := fs.String("telemetry-salt", "", "path to the rotating client anonymization salt; default: .aiproxy_salt beside -telemetry-db")
+	secureVaultKMSKeyID := fs.String("secure-vault-kms-key-id", "", "AWS KMS key ID or ARN used for envelope encryption; requires -secure-vault-s3-bucket")
+	secureVaultS3Bucket := fs.String("secure-vault-s3-bucket", "", "customer-owned S3 Object Lock bucket; requires -secure-vault-kms-key-id")
+	secureVaultS3Prefix := fs.String("secure-vault-s3-prefix", "", "optional S3 object-key prefix")
+	secureVaultSpoolDir := fs.String("secure-vault-spool-dir", ".aiproxy_securevault", "local encrypted retry-spool directory")
+	secureVaultAWSRegion := fs.String("secure-vault-aws-region", "", "AWS region override; default: standard AWS SDK region resolution")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -143,6 +156,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if (*telemetryEndpoint == "") != (*telemetryPrivateKey == "") {
 		fmt.Fprintln(stderr, "aiproxy: -telemetry-endpoint and -telemetry-private-key must be set together, or not at all")
+		return 2
+	}
+	secureVaultEnabled := *secureVaultKMSKeyID != "" || *secureVaultS3Bucket != ""
+	if (*secureVaultKMSKeyID == "") != (*secureVaultS3Bucket == "") {
+		fmt.Fprintln(stderr, "aiproxy: -secure-vault-kms-key-id and -secure-vault-s3-bucket must be set together, or not at all")
+		return 2
+	}
+	if !secureVaultEnabled && (*secureVaultS3Prefix != "" || *secureVaultAWSRegion != "") {
+		fmt.Fprintln(stderr, "aiproxy: -secure-vault-s3-prefix and -secure-vault-aws-region require Secure Vault to be enabled")
 		return 2
 	}
 
@@ -256,7 +278,44 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		server.AddModelRoute(r.name, r.models, r.targets, r.weights, r.limiter, r.tokenLimiter)
 	}
 
-	var complianceRecorder *compliance.Recorder
+	complianceRecorder := &compliance.Recorder{}
+	if secureVaultEnabled {
+		spoolKey, err := decodeSecureVaultSpoolKey(os.Getenv(secureVaultSpoolKeyEnvironment))
+		if err != nil {
+			fmt.Fprintf(stderr, "aiproxy: initialize Secure Vault: %v\n", err)
+			return 1
+		}
+		awsOptions := make([]func(*awsconfig.LoadOptions) error, 0, 1)
+		if region := strings.TrimSpace(*secureVaultAWSRegion); region != "" {
+			awsOptions = append(awsOptions, awsconfig.WithRegion(region))
+		}
+		awsContext, cancelAWS := context.WithTimeout(context.Background(), 10*time.Second)
+		awsConfiguration, err := awsconfig.LoadDefaultConfig(awsContext, awsOptions...)
+		cancelAWS()
+		if err != nil {
+			zeroSecret(spoolKey)
+			fmt.Fprintf(stderr, "aiproxy: initialize Secure Vault AWS configuration: %v\n", err)
+			return 1
+		}
+		vault, err := securevault.New(securevault.Config{
+			KMS:      kms.NewFromConfig(awsConfiguration),
+			S3:       s3.NewFromConfig(awsConfiguration),
+			KMSKeyID: *secureVaultKMSKeyID,
+			Bucket:   *secureVaultS3Bucket,
+			Prefix:   *secureVaultS3Prefix,
+			SpoolDir: *secureVaultSpoolDir,
+			SpoolKey: spoolKey,
+			OnError: func(err error) {
+				fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+			},
+		})
+		zeroSecret(spoolKey)
+		if err != nil {
+			fmt.Fprintf(stderr, "aiproxy: initialize Secure Vault: %v\n", err)
+			return 1
+		}
+		complianceRecorder.Vault = vault
+	}
 	if *telemetryEndpoint != "" {
 		telemetryClient, err := telemetry.New(telemetry.Config{
 			Endpoint:       *telemetryEndpoint,
@@ -268,18 +327,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			},
 		})
 		if err != nil {
+			shutdownCompliance(complianceRecorder, stderr)
 			fmt.Fprintf(stderr, "aiproxy: initialize telemetry: %v\n", err)
 			return 1
 		}
-		complianceRecorder = &compliance.Recorder{Telemetry: telemetryClient}
+		complianceRecorder.Telemetry = telemetryClient
+	}
+	if complianceRecorder.Vault != nil || complianceRecorder.Telemetry != nil {
 		server.ComplianceRecorder = complianceRecorder
 		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := complianceRecorder.Shutdown(shutdownCtx); err != nil {
-				fmt.Fprintf(stderr, "aiproxy: shutdown compliance pipeline: %v\n", err)
-			}
+			shutdownCompliance(complianceRecorder, stderr)
 		}()
+	} else {
+		complianceRecorder = nil
 	}
 
 	if cfg != nil {
@@ -456,7 +516,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if complianceRecorder != nil {
-		fmt.Fprintln(stdout, "compliance telemetry: enabled (locally queued, client IDs rotate every 30 days)")
+		if complianceRecorder.Telemetry != nil {
+			fmt.Fprintln(stdout, "compliance telemetry: enabled (locally queued, client IDs rotate every 30 days)")
+		}
+		if complianceRecorder.Vault != nil {
+			fmt.Fprintln(stdout, "Secure Vault: enabled (customer KMS/S3, encrypted local retry spool, 5-year COMPLIANCE retention)")
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -481,6 +546,36 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func decodeSecureVaultSpoolKey(encoded string) ([]byte, error) {
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
+		return nil, fmt.Errorf("%s is required and must contain a base64-encoded 32-byte key", secureVaultSpoolKeyEnvironment)
+	}
+	key, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil || len(key) != 32 {
+		zeroSecret(key)
+		return nil, fmt.Errorf("%s must contain a base64-encoded 32-byte key", secureVaultSpoolKeyEnvironment)
+	}
+	return key, nil
+}
+
+func zeroSecret(secret []byte) {
+	for index := range secret {
+		secret[index] = 0
+	}
+}
+
+func shutdownCompliance(recorder *compliance.Recorder, stderr io.Writer) {
+	if recorder == nil {
+		return
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := recorder.Shutdown(shutdownCtx); err != nil {
+		fmt.Fprintf(stderr, "aiproxy: shutdown compliance pipeline: %v\n", err)
+	}
 }
 
 // startReloadOnSIGHUP starts a goroutine that re-reads the config file at

@@ -26,6 +26,26 @@ The S3 bucket must have Object Lock and versioning enabled. The data-plane IAM
 identity needs `kms:GenerateDataKey`, `s3:PutObject`, and
 `s3:PutObjectRetention` for the configured resources.
 
+## CLI configuration
+
+`aiproxy start` enables the vault when both `-secure-vault-kms-key-id` and
+`-secure-vault-s3-bucket` are set. AWS credentials and the default region use
+the AWS SDK credential/configuration chain; `-secure-vault-aws-region` can
+override the resolved region. The encrypted retry queue defaults to
+`.aiproxy_securevault` and can be moved with `-secure-vault-spool-dir`.
+
+The stable spool key must be supplied as a base64-encoded 32-byte value in
+`AIPROXY_SECUREVAULT_SPOOL_KEY`. It is deliberately not available as a CLI
+flag. Generate and retain it in the customer's secret manager, for example:
+
+```sh
+openssl rand -base64 32
+```
+
+`-secure-vault-s3-prefix` optionally places evidence below a customer-selected
+object prefix. KMS/S3 failures remain on the encrypted local queue and never
+block or fail the LLM response.
+
 ## Call contract
 
 Call `StoreAsync` only after the HTTP response has been delivered. A successful
