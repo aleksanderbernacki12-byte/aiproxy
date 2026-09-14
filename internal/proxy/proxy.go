@@ -3250,11 +3250,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		complianceRequestHeader = r.Header.Clone()
 		complianceRequestBody = append([]byte(nil), body...)
 	}
-	// These identify the local caller to aiproxy's compliance pipeline. They
-	// are internal control headers and must never reach an LLM provider.
-	r.Header.Del(complianceClientIDHeader)
-	r.Header.Del(complianceApplicationHeader)
-
 	piiRedactedBody, piiDetected := piifilter.RedactPII(string(evaluatedBody))
 	if piiDetected {
 		evaluatedBody = []byte(piiRedactedBody)
@@ -3271,6 +3266,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for name, values := range evaluatedHeaders {
 		r.Header[name] = values
 	}
+	// These identify the local caller to aiproxy's compliance pipeline. Remove
+	// them after merging evaluated headers so a rule-engine copy cannot restore
+	// them before the request reaches the LLM provider.
+	r.Header.Del(complianceClientIDHeader)
+	r.Header.Del(complianceApplicationHeader)
 	if action == rules.Redact {
 		s.Stats.RecordRedact(targetLabel, ruleName)
 		s.Stats.RecordClientRedact(auth.label)
