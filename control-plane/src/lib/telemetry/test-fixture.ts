@@ -20,7 +20,11 @@ export function createSignedFixture(previousEventHash = "") {
     client_id_hash: "a".repeat(64),
     application_id: "legal-assistant",
     routing: { provider: "customer-azure", model: "gpt-enterprise" },
-    compliance_flags: ["pii_redacted", "policy_passed"],
+    compliance_flags: {
+      pii_detected: true,
+      pii_redacted: true,
+      policy_passed: true,
+    },
     metrics: { latency_ms: 42, input_tokens: 12 },
     cryptography: {
       hash_algorithm: "SHA-256",

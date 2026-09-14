@@ -39,4 +39,26 @@ describe("telemetry schema", () => {
     );
     expect(telemetryBatchSchema.safeParse([event, event]).success).toBe(false);
   });
+
+  it("requires boolean PII compliance flags", () => {
+    const { event } = createSignedFixture();
+    expect(
+      telemetryEventSchema.safeParse({
+        ...event,
+        compliance_flags: { pii_detected: true, pii_redacted: true },
+      }).success,
+    ).toBe(true);
+    expect(
+      telemetryEventSchema.safeParse({
+        ...event,
+        compliance_flags: { pii_detected: true },
+      }).success,
+    ).toBe(false);
+    expect(
+      telemetryEventSchema.safeParse({
+        ...event,
+        compliance_flags: { pii_detected: "yes", pii_redacted: true },
+      }).success,
+    ).toBe(false);
+  });
 });

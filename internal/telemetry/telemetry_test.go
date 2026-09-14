@@ -145,7 +145,7 @@ func testSubmission(eventID string, timestamp time.Time) Submission {
 			"provider": "customer-azure",
 			"model":    "gpt-enterprise",
 		},
-		ComplianceFlags: []string{"pii_redacted", "policy_passed"},
+		ComplianceFlags: map[string]bool{"pii_detected": true, "pii_redacted": true, "policy_passed": true},
 		Metrics: map[string]any{
 			"latency_ms":   42,
 			"input_tokens": 12,
@@ -238,6 +238,9 @@ func TestSubmitAsync_ExactSignedPayloadAndOrderedHashChain(t *testing.T) {
 	payloads := decodeBatch(t, calls[0].body)
 	if len(payloads) != 2 {
 		t.Fatalf("batch size = %d, want 2", len(payloads))
+	}
+	if !payloads[0].ComplianceFlags["pii_detected"] || !payloads[0].ComplianceFlags["pii_redacted"] {
+		t.Fatalf("PII compliance flags = %#v, want detected and redacted", payloads[0].ComplianceFlags)
 	}
 	if payloads[0].Cryptography.RequestResponseHash != firstHash || payloads[1].Cryptography.RequestResponseHash != secondHash {
 		t.Fatal("request/response commitment mismatch")

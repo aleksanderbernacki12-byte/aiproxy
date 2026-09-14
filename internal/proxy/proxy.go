@@ -42,6 +42,7 @@ import (
 	"aiproxy/internal/idempotency"
 	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
+	"aiproxy/internal/piifilter"
 	"aiproxy/internal/rules"
 	"aiproxy/internal/semcache"
 	"aiproxy/internal/stats"
@@ -123,6 +124,10 @@ type requestContextInfo struct {
 	targets     []*url.URL
 	forwardPath string
 	targetLabel string
+	// Carried to the response lifecycle so telemetry emitted after a completed
+	// exchange can report the local PII decision without inspecting content.
+	piiDetected bool
+	piiRedacted bool
 
 	// clientLabel is the authenticated proxy key's attribution label —
 	// "default" for the anonymous Server.ProxyAPIKey, a named
@@ -3219,6 +3224,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Block above. Headers are merged back by name rather than replacing
 	// r.Header wholesale, since evaluatedHeaders only ever covers the
 	// subset filterHeadersForScanning handed to the engine.
+	// PII redaction happens only after routing, cache lookup, policy rules,
+	// and rate limiting have made their existing decisions from the original
+	// request. Only the body sent to the provider is changed.
+	piiRedactedBody, piiDetected := piifilter.RedactPII(string(evaluatedBody))
+	if piiDetected {
+		evaluatedBody = []byte(piiRedactedBody)
+	}
 	r.Body = io.NopCloser(bytes.NewReader(evaluatedBody))
 	r.ContentLength = int64(len(evaluatedBody))
 	// GetBody lets failoverTransport re-read the same already-buffered
@@ -3263,6 +3275,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		idempotencyKey:      idempotencyKey,
 		coalesceOwned:       coalesceOwnedForReqCtx,
 		semanticFingerprint: semanticFingerprintForReqCtx,
+		piiDetected:         piiDetected,
+		piiRedacted:         piiDetected,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 

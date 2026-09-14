@@ -106,7 +106,13 @@ func (c *Client) persist(ctx context.Context, submission Submission) error {
 		payload.Routing = map[string]any{}
 	}
 	if payload.ComplianceFlags == nil {
-		payload.ComplianceFlags = []string{}
+		payload.ComplianceFlags = PIIComplianceFlags(false)
+	}
+	if _, ok := payload.ComplianceFlags["pii_detected"]; !ok {
+		payload.ComplianceFlags["pii_detected"] = false
+	}
+	if _, ok := payload.ComplianceFlags["pii_redacted"]; !ok {
+		payload.ComplianceFlags["pii_redacted"] = false
 	}
 	if payload.Metrics == nil {
 		payload.Metrics = map[string]any{}

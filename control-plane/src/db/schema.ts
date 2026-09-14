@@ -76,7 +76,7 @@ export const telemetryEvents = pgTable(
     clientIdHash: varchar("client_id_hash", { length: 64 }).notNull(),
     applicationId: varchar("application_id", { length: 160 }).notNull(),
     routing: jsonb("routing").$type<Record<string, unknown>>().notNull(),
-    complianceFlags: jsonb("compliance_flags").$type<string[]>().notNull(),
+    complianceFlags: jsonb("compliance_flags").$type<Record<string, boolean>>().notNull(),
     metrics: jsonb("metrics").$type<Record<string, unknown>>().notNull(),
     hashAlgorithm: varchar("hash_algorithm", { length: 32 }).notNull(),
     requestResponseHash: varchar("request_response_hash", { length: 64 }).notNull(),

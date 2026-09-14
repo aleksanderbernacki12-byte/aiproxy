@@ -50,6 +50,7 @@ by the Go batch client. The route:
 
 The raw request and response are represented only by
 `request_response_hash`; they are not accepted anywhere in the JSON schema.
+`compliance_flags` requires boolean `pii_detected` and `pii_redacted` values.
 
 ## Ordered worker
 

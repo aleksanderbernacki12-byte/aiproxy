@@ -15,7 +15,7 @@ Each event has exactly these top-level JSON fields:
   "client_id_hash": "...",
   "application_id": "...",
   "routing": {},
-  "compliance_flags": [],
+  "compliance_flags": {"pii_detected": false, "pii_redacted": false},
   "metrics": {},
   "cryptography": {}
 }

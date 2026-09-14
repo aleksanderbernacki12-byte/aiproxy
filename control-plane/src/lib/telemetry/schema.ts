@@ -37,7 +37,13 @@ export const telemetryEventSchema = z
     client_id_hash: z.string().regex(SHA256),
     application_id: z.string().min(1).max(160),
     routing: metadataObject,
-    compliance_flags: z.array(z.string().min(1).max(128)).max(128),
+    compliance_flags: z
+      .object({
+        pii_detected: z.boolean(),
+        pii_redacted: z.boolean(),
+      })
+      .catchall(z.boolean())
+      .refine((value) => Object.keys(value).length <= 128, "Too many compliance flags"),
     metrics: metadataObject,
     cryptography: cryptographySchema,
   })

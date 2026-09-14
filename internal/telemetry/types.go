@@ -19,7 +19,7 @@ type Submission struct {
 	ClientIDHash    string
 	ApplicationID   string
 	Routing         map[string]any
-	ComplianceFlags []string
+	ComplianceFlags map[string]bool
 	Metrics         map[string]any
 	Request         []byte
 	Response        []byte
@@ -27,14 +27,14 @@ type Submission struct {
 
 // Payload is the exact top-level event object sent to the control plane.
 type Payload struct {
-	EventID         string         `json:"event_id"`
-	Timestamp       time.Time      `json:"timestamp"`
-	ClientIDHash    string         `json:"client_id_hash"`
-	ApplicationID   string         `json:"application_id"`
-	Routing         map[string]any `json:"routing"`
-	ComplianceFlags []string       `json:"compliance_flags"`
-	Metrics         map[string]any `json:"metrics"`
-	Cryptography    Cryptography   `json:"cryptography"`
+	EventID         string          `json:"event_id"`
+	Timestamp       time.Time       `json:"timestamp"`
+	ClientIDHash    string          `json:"client_id_hash"`
+	ApplicationID   string          `json:"application_id"`
+	Routing         map[string]any  `json:"routing"`
+	ComplianceFlags map[string]bool `json:"compliance_flags"`
+	Metrics         map[string]any  `json:"metrics"`
+	Cryptography    Cryptography    `json:"cryptography"`
 }
 
 // Cryptography binds the anonymous metadata to a private request/response
@@ -53,4 +53,14 @@ type queuedEvent struct {
 	sequence int64
 	payload  json.RawMessage
 	attempts int
+}
+
+// PIIComplianceFlags returns the required telemetry flags for a locally
+// inspected request. A detected match is always also reported as redacted;
+// the data plane never forwards a detected value unchanged.
+func PIIComplianceFlags(detected bool) map[string]bool {
+	return map[string]bool{
+		"pii_detected": detected,
+		"pii_redacted": detected,
+	}
 }
