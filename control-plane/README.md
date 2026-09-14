@@ -19,10 +19,6 @@ npm run dev
 The runtime requires:
 
 - `DATABASE_URL`: PostgreSQL connection string.
-- `DASHBOARD_ORGANIZATION_ID`: organization UUID used as the dashboard's
-  server-side tenant scope.
-- `DASHBOARD_ACCESS_KEY`: a separate DPO login credential; do not reuse the
-  data plane tenant key.
 - `DASHBOARD_SESSION_SECRET`: at least 32 random characters used to sign the
   eight-hour HttpOnly DPO session cookie.
 - `CRON_SECRET`: bearer token used by the internal worker route. Vercel adds
@@ -46,6 +42,17 @@ npm run keys:register -- <organization-id> ./instance-public-key.pem "production
 
 The command derives the same SHA-256 SPKI fingerprint that the Go client emits
 as `cryptography.key_id`. The private key remains in the customer data plane.
+
+Create a separate DPO credential after applying migrations. Its plaintext is
+printed once and its role can be `ADMIN`, `DPO`, or read-only `AUDITOR`:
+
+```sh
+npm run dpo:create -- <organization-id> "Primary DPO" DPO
+npm run dpo:revoke -- <credential-id>
+```
+
+Only the SHA-256 digest is stored. An optional ISO expiry can be passed after
+the role. Revocation invalidates existing sessions on their next request.
 
 ## Ingestion
 
@@ -110,10 +117,10 @@ chain.
 
 ## DPO dashboard
 
-`/login` establishes a signed, HttpOnly, SameSite=Strict session scoped to the
-server-configured organization. `/dashboard` rejects missing, expired, or
-tampered sessions before reading telemetry. The DPO credential is separate
-from the ingestion tenant key.
+`/login` resolves a hashed, active DPO credential to its organization and role,
+then establishes a signed, HttpOnly, SameSite=Strict session. `/dashboard`
+rechecks expiry and revocation before every tenant-scoped read. The DPO
+credential is separate from the ingestion tenant key.
 
 `/dashboard` aggregates processed telemetry for the configured organization.
 It lists unique models, calls, token usage, policy violations, and locally

@@ -32,8 +32,6 @@ export type DashboardData = {
   };
 };
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 const modelExpression = sql<string>`coalesce(nullif(${telemetryEvents.routing}->>'model', ''), 'Okänd modell')`;
 const tokenExpression = sql<number>`(
   case
@@ -53,11 +51,6 @@ const policyViolationExpression = sql<boolean>`exists (
   where flag.value = 'true'::jsonb
     and flag.key ~ '(_violation|_breach|_blocked|_failed)$'
 )`;
-
-export function dashboardOrganizationId() {
-  const organizationId = process.env.DASHBOARD_ORGANIZATION_ID?.trim() ?? "";
-  return UUID.test(organizationId) ? organizationId : null;
-}
 
 export function chainStatusFor(
   totalEvents: number,

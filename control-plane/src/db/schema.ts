@@ -21,6 +21,8 @@ export const telemetryVerificationStatus = pgEnum(
   ["VERIFIED", "INVALID_SIGNATURE", "COMPROMISED_CHAIN"],
 );
 
+export const dpoRole = pgEnum("dpo_role", ["ADMIN", "DPO", "AUDITOR"]);
+
 export const organizations = pgTable("organizations", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: varchar("name", { length: 160 }).notNull(),
@@ -28,6 +30,21 @@ export const organizations = pgTable("organizations", {
   tenantKey: varchar("tenant_key", { length: 64 }).notNull().unique(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const dpoAccessKeys = pgTable(
+  "dpo_access_keys",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+    keyHash: varchar("key_hash", { length: 64 }).notNull().unique(),
+    label: varchar("label", { length: 160 }).notNull(),
+    role: dpoRole("role").default("DPO").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [index("dpo_access_keys_organization_idx").on(table.organizationId, table.revokedAt)],
+);
 
 export const telemetryPublicKeys = pgTable(
   "telemetry_public_keys",

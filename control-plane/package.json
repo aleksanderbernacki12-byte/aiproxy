@@ -12,7 +12,9 @@
     "test": "vitest run",
     "db:migrate": "node scripts/migrate.mjs",
     "orgs:create": "node scripts/create-organization.mjs",
-    "keys:register": "node scripts/register-public-key.mjs"
+    "keys:register": "node scripts/register-public-key.mjs",
+    "dpo:create": "node scripts/create-dpo-key.mjs",
+    "dpo:revoke": "node scripts/revoke-dpo-key.mjs"
   },
   "engines": {
     "node": ">=24.0.0"
