@@ -19,6 +19,8 @@ npm run dev
 The runtime requires:
 
 - `DATABASE_URL`: PostgreSQL connection string.
+- `DASHBOARD_ORGANIZATION_ID`: organization UUID used as the dashboard's
+  server-side tenant scope until interactive DPO authentication supplies it.
 - `CRON_SECRET`: bearer token used by the internal worker route. Vercel adds
   this header automatically to configured cron invocations.
 - `TELEMETRY_REORDER_WINDOW_SECONDS`: how long a chain gap remains buffered
@@ -90,6 +92,18 @@ The event ledger makes retries idempotent across both the buffer and main
 tables. Organization-scoped public-key lookups, chain heads, advisory locks,
 and indexes prevent one tenant from reading or advancing another tenant's
 chain.
+
+## DPO dashboard
+
+`/dashboard` aggregates processed telemetry for the configured organization.
+It lists unique models, calls, token usage, policy violations, and locally
+redacted PII incidents. `/dashboard/report` renders the same tenant-scoped data
+as a formal EU AI Act evidence summary with A4 print styles. No raw telemetry
+payloads or cross-organization rows are sent to the browser.
+
+The inventory counts a policy violation when a true compliance flag ends in
+`_violation`, `_breach`, `_blocked`, or `_failed`. A prevented PII leak requires
+both `pii_detected` and `pii_redacted` to be true.
 
 ## Validation
 
