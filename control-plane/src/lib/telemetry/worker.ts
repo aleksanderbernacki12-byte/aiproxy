@@ -33,6 +33,7 @@ function mainTableValues(
   chainSequence: bigint | null,
 ) {
   return {
+    organizationId: row.organizationId,
     eventId: payload.event_id,
     eventTimestamp: new Date(payload.timestamp),
     clientIdHash: payload.client_id_hash,
@@ -54,16 +55,21 @@ function mainTableValues(
   };
 }
 
-async function processKeyChain(keyId: string, now: Date) {
+async function processKeyChain(organizationId: string, keyId: string, now: Date) {
   const database = getDatabase();
   return database.transaction(async (transaction) => {
     await transaction.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtextextended(${keyId}, 0))`,
+      sql`SELECT pg_advisory_xact_lock(hashtextextended(${organizationId + ":" + keyId}, 0))`,
     );
     const rows = await transaction
       .select()
       .from(telemetryBuffer)
-      .where(eq(telemetryBuffer.keyId, keyId))
+      .where(
+        and(
+          eq(telemetryBuffer.organizationId, organizationId),
+          eq(telemetryBuffer.keyId, keyId),
+        ),
+      )
       .orderBy(
         asc(telemetryBuffer.eventTimestamp),
         asc(telemetryBuffer.receivedAt),
@@ -77,7 +83,12 @@ async function processKeyChain(keyId: string, now: Date) {
     const [registeredKey] = await transaction
       .select()
       .from(telemetryPublicKeys)
-      .where(eq(telemetryPublicKeys.keyId, keyId))
+      .where(
+        and(
+          eq(telemetryPublicKeys.organizationId, organizationId),
+          eq(telemetryPublicKeys.keyId, keyId),
+        ),
+      )
       .limit(1);
     if (!registeredKey) {
       await transaction
@@ -86,14 +97,24 @@ async function processKeyChain(keyId: string, now: Date) {
           processingAttempts: sql`${telemetryBuffer.processingAttempts} + 1`,
           lastError: "No public key is registered for key_id",
         })
-        .where(eq(telemetryBuffer.keyId, keyId));
+        .where(
+          and(
+            eq(telemetryBuffer.organizationId, organizationId),
+            eq(telemetryBuffer.keyId, keyId),
+          ),
+        );
       return { verified: 0, compromised: 0, invalid: 0, deferred: rows.length };
     }
 
     const [storedHead] = await transaction
       .select()
       .from(telemetryChainHeads)
-      .where(eq(telemetryChainHeads.keyId, keyId))
+      .where(
+        and(
+          eq(telemetryChainHeads.organizationId, organizationId),
+          eq(telemetryChainHeads.keyId, keyId),
+        ),
+      )
       .limit(1);
     let latestEventHash = storedHead?.latestEventHash ?? "";
     let sequence = storedHead?.sequence ?? 0n;
@@ -164,6 +185,7 @@ async function processKeyChain(keyId: string, now: Date) {
       await transaction
         .insert(telemetryChainHeads)
         .values({
+          organizationId,
           keyId,
           latestEventHash,
           sequence,
@@ -171,7 +193,7 @@ async function processKeyChain(keyId: string, now: Date) {
           updatedAt: now,
         })
         .onConflictDoUpdate({
-          target: telemetryChainHeads.keyId,
+          target: [telemetryChainHeads.organizationId, telemetryChainHeads.keyId],
           set: {
             latestEventHash,
             sequence,
@@ -187,11 +209,14 @@ async function processKeyChain(keyId: string, now: Date) {
 export async function processBufferedTelemetry(now = new Date()) {
   const database = getDatabase();
   const chains = await database
-    .selectDistinct({ keyId: telemetryBuffer.keyId })
+    .selectDistinct({
+      organizationId: telemetryBuffer.organizationId,
+      keyId: telemetryBuffer.keyId,
+    })
     .from(telemetryBuffer);
   const totals = { verified: 0, compromised: 0, invalid: 0, deferred: 0 };
-  for (const { keyId } of chains) {
-    const result = await processKeyChain(keyId, now);
+  for (const { organizationId, keyId } of chains) {
+    const result = await processKeyChain(organizationId, keyId, now);
     totals.verified += result.verified;
     totals.compromised += result.compromised;
     totals.invalid += result.invalid;

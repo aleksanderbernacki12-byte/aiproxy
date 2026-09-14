@@ -1,16 +1,20 @@
 import { bufferTelemetryEvents } from "@/lib/telemetry/ingest";
 import { telemetryBatchSchema } from "@/lib/telemetry/schema";
-import { hasBearerToken } from "@/lib/auth";
+import { authenticateTenant } from "@/lib/tenant-auth";
 
 export const runtime = "nodejs";
 
 const MAX_BODY_BYTES = 1_048_576;
 
 export async function POST(request: Request) {
-  if (!process.env.TELEMETRY_INGEST_TOKEN) {
-    return Response.json({ error: "Telemetry ingest is not configured" }, { status: 503 });
+  let organization;
+  try {
+    organization = await authenticateTenant(request);
+  } catch (error) {
+    console.error("Failed to authenticate telemetry tenant", error);
+    return Response.json({ error: "Telemetry authentication unavailable" }, { status: 503 });
   }
-  if (!hasBearerToken(request, process.env.TELEMETRY_INGEST_TOKEN)) {
+  if (!organization) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
   const contentLength = Number(request.headers.get("content-length") ?? "0");
@@ -37,7 +41,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = await bufferTelemetryEvents(parsed.data);
+    const result = await bufferTelemetryEvents(organization.id, parsed.data);
     return Response.json({ status: "BUFFERED", ...result }, { status: 202 });
   } catch (error) {
     console.error("Failed to buffer telemetry", error);

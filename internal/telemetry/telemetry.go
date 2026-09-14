@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,7 +32,10 @@ var (
 	ErrInvalidEventID    = errors.New("telemetry: event_id must be a UUID")
 	ErrInvalidClientHash = errors.New("telemetry: client_id_hash must be a SHA-256 hex digest")
 	ErrDuplicateEvent    = errors.New("telemetry: event_id has already been recorded")
+	ErrTenantKeyRequired = errors.New("telemetry: AIPROXY_TENANT_KEY is required")
 )
+
+const tenantKeyEnvironment = "AIPROXY_TENANT_KEY"
 
 // HTTPDoer is implemented by *http.Client and allows deterministic transport
 // tests without running a server.
@@ -93,6 +98,10 @@ type Client struct {
 // New loads the ECDSA P-256 private key, opens the SQLite queue, and starts the
 // sequencer and sender. Network delivery runs only on the background sender.
 func New(cfg Config) (*Client, error) {
+	tenantKey := strings.TrimSpace(os.Getenv(tenantKeyEnvironment))
+	if tenantKey == "" {
+		return nil, ErrTenantKeyRequired
+	}
 	endpoint, err := validateEndpoint(cfg.Endpoint)
 	if err != nil {
 		return nil, err
@@ -143,10 +152,16 @@ func New(cfg Config) (*Client, error) {
 		httpClient = &http.Client{}
 	}
 
+	headers := cfg.Headers.Clone()
+	headers.Set("Authorization", "Bearer "+tenantKey)
+	onError := cfg.OnError
+	if onError == nil {
+		onError = func(err error) { log.Printf("aiproxy: %v", err) }
+	}
 	c := &Client{
 		endpoint:         endpoint,
 		httpClient:       httpClient,
-		headers:          cfg.Headers.Clone(),
+		headers:          headers,
 		db:               db,
 		privateKey:       privateKey,
 		keyID:            identifier,
@@ -163,7 +178,7 @@ func New(cfg Config) (*Client, error) {
 		coreDone:         make(chan struct{}),
 		errorDone:        make(chan struct{}),
 		done:             make(chan struct{}),
-		onError:          cfg.OnError,
+		onError:          onError,
 		now:              time.Now,
 	}
 	go c.sequenceLoop()

@@ -3,15 +3,19 @@ import { createSignedFixture } from "@/lib/telemetry/test-fixture";
 
 const mocks = vi.hoisted(() => ({
   bufferTelemetryEvents: vi.fn(),
+  authenticateTenant: vi.fn(),
 }));
 
 vi.mock("@/lib/telemetry/ingest", () => ({
   bufferTelemetryEvents: mocks.bufferTelemetryEvents,
 }));
+vi.mock("@/lib/tenant-auth", () => ({
+  authenticateTenant: mocks.authenticateTenant,
+}));
 
 import { POST } from "./route";
 
-function request(body: unknown, token = "ingest-secret") {
+function request(body: unknown, token = "tenant-secret") {
   return new Request("https://control.example/api/telemetry/ingest", {
     method: "POST",
     headers: {
@@ -24,12 +28,15 @@ function request(body: unknown, token = "ingest-secret") {
 
 describe("POST /api/telemetry/ingest", () => {
   beforeEach(() => {
-    process.env.TELEMETRY_INGEST_TOKEN = "ingest-secret";
+    mocks.authenticateTenant.mockImplementation(async (incoming: Request) =>
+      incoming.headers.get("authorization") === "Bearer tenant-secret"
+        ? { id: "11111111-1111-1111-1111-111111111111", name: "Acme" }
+        : null,
+    );
     mocks.bufferTelemetryEvents.mockResolvedValue({ accepted: 1, duplicates: 0 });
   });
 
   afterEach(() => {
-    delete process.env.TELEMETRY_INGEST_TOKEN;
     vi.clearAllMocks();
   });
 
@@ -42,7 +49,20 @@ describe("POST /api/telemetry/ingest", () => {
       accepted: 1,
       duplicates: 0,
     });
-    expect(mocks.bufferTelemetryEvents).toHaveBeenCalledWith([event]);
+    expect(mocks.bufferTelemetryEvents).toHaveBeenCalledWith(
+      "11111111-1111-1111-1111-111111111111",
+      [event],
+    );
+  });
+
+  it("returns 503 when tenant lookup is unavailable", async () => {
+    const { event } = createSignedFixture();
+    mocks.authenticateTenant.mockRejectedValueOnce(new Error("database offline"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await POST(request(event));
+    expect(response.status).toBe(503);
+    expect(mocks.bufferTelemetryEvents).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 
   it("rejects unauthorized and structurally invalid payloads", async () => {

@@ -119,19 +119,31 @@ func writePrivateKey(t *testing.T, dir string) (*ecdsa.PrivateKey, string) {
 	return key, filename
 }
 
-func testConfig(dir, keyPath string, transport HTTPDoer) Config {
+func testConfig(t *testing.T, dir, keyPath string, transport HTTPDoer) Config {
+	t.Helper()
+	t.Setenv(tenantKeyEnvironment, "tenant-secret")
 	return Config{
-		Endpoint:         "https://control.example/api/telemetry",
-		DatabasePath:     filepath.Join(dir, "telemetry.sqlite"),
-		PrivateKeyPath:   keyPath,
-		HTTPClient:       transport,
-		Headers:          http.Header{"Authorization": {"Bearer instance-token"}},
+		Endpoint:       "https://control.example/api/telemetry",
+		DatabasePath:   filepath.Join(dir, "telemetry.sqlite"),
+		PrivateKeyPath: keyPath,
+		HTTPClient:     transport,
+		Headers: http.Header{
+			"Authorization": {"Bearer must-be-overridden"},
+			"X-Instance":    {"data-plane-test"},
+		},
 		QueueSize:        32,
 		BatchSize:        2,
 		FlushInterval:    5 * time.Millisecond,
 		OperationTimeout: 250 * time.Millisecond,
 		InitialBackoff:   20 * time.Millisecond,
 		MaxBackoff:       80 * time.Millisecond,
+	}
+}
+
+func TestNewRequiresTenantKeyEnvironment(t *testing.T) {
+	t.Setenv(tenantKeyEnvironment, "")
+	if _, err := New(Config{}); !errors.Is(err, ErrTenantKeyRequired) {
+		t.Fatalf("New error = %v, want %v", err, ErrTenantKeyRequired)
 	}
 }
 
@@ -188,7 +200,7 @@ func TestSubmitAsync_ExactSignedPayloadAndOrderedHashChain(t *testing.T) {
 	dir := t.TempDir()
 	privateKey, keyPath := writePrivateKey(t, dir)
 	transport := &fakeHTTP{}
-	cfg := testConfig(dir, keyPath, transport)
+	cfg := testConfig(t, dir, keyPath, transport)
 	cfg.FlushInterval = time.Hour
 	client, err := New(cfg)
 	if err != nil {
@@ -212,8 +224,8 @@ func TestSubmitAsync_ExactSignedPayloadAndOrderedHashChain(t *testing.T) {
 	if calls[0].header.Get("Content-Type") != "application/json" || calls[0].header.Get("X-Aiproxy-Batch-Size") != "2" {
 		t.Fatalf("unexpected headers: %#v", calls[0].header)
 	}
-	if calls[0].header.Get("Authorization") != "Bearer instance-token" {
-		t.Fatal("configured control-plane authorization was not sent")
+	if calls[0].header.Get("Authorization") != "Bearer tenant-secret" {
+		t.Fatal("tenant authorization was not sent")
 	}
 	if bytes.Contains(calls[0].body, []byte("Alice@example.com")) || bytes.Contains(calls[0].body, []byte("private customer response")) {
 		t.Fatal("control-plane payload contains raw request or response data")
@@ -289,7 +301,7 @@ func TestSender_FailureRetriesIdenticalFIFOEventBatch(t *testing.T) {
 	dir := t.TempDir()
 	_, keyPath := writePrivateKey(t, dir)
 	transport := &fakeHTTP{failFor: 1}
-	cfg := testConfig(dir, keyPath, transport)
+	cfg := testConfig(t, dir, keyPath, transport)
 	cfg.BatchSize = 3
 	cfg.FlushInterval = 100 * time.Millisecond
 	client, err := New(cfg)
@@ -319,11 +331,41 @@ func TestSender_FailureRetriesIdenticalFIFOEventBatch(t *testing.T) {
 	}
 }
 
+func TestSender_UnauthorizedIsReportedWithoutBlockingSubmissions(t *testing.T) {
+	dir := t.TempDir()
+	_, keyPath := writePrivateKey(t, dir)
+	transport := &fakeHTTP{statusCode: http.StatusUnauthorized}
+	errorsSeen := make(chan error, 8)
+	cfg := testConfig(t, dir, keyPath, transport)
+	cfg.BatchSize = 1
+	cfg.OnError = func(err error) { errorsSeen <- err }
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if !client.SubmitAsync(testSubmission(eventOne, time.Now())) {
+		t.Fatal("submission rejected")
+	}
+	if elapsed := time.Since(started); elapsed > 50*time.Millisecond {
+		t.Fatalf("SubmitAsync blocked for %s", elapsed)
+	}
+	select {
+	case reported := <-errorsSeen:
+		if !strings.Contains(reported.Error(), "HTTP 401") {
+			t.Fatalf("reported error = %v, want local HTTP 401 error", reported)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP 401 was not reported locally")
+	}
+	shutdown(t, client)
+}
+
 func TestSender_HTTPClientPanicIsRetriedWithoutCrashingProcess(t *testing.T) {
 	dir := t.TempDir()
 	_, keyPath := writePrivateKey(t, dir)
 	transport := &fakeHTTP{panicFor: 1}
-	cfg := testConfig(dir, keyPath, transport)
+	cfg := testConfig(t, dir, keyPath, transport)
 	cfg.BatchSize = 1
 	client, err := New(cfg)
 	if err != nil {
@@ -343,7 +385,7 @@ func TestClient_SQLiteQueueAndChainHeadSurviveRestart(t *testing.T) {
 	dir := t.TempDir()
 	privateKey, keyPath := writePrivateKey(t, dir)
 	failedTransport := &fakeHTTP{failFor: 100}
-	cfg := testConfig(dir, keyPath, failedTransport)
+	cfg := testConfig(t, dir, keyPath, failedTransport)
 	cfg.BatchSize = 1
 	firstClient, err := New(cfg)
 	if err != nil {
@@ -386,7 +428,7 @@ func TestSequencer_ConcurrentSubmissionsProduceOneLinearChain(t *testing.T) {
 	dir := t.TempDir()
 	privateKey, keyPath := writePrivateKey(t, dir)
 	transport := &fakeHTTP{}
-	cfg := testConfig(dir, keyPath, transport)
+	cfg := testConfig(t, dir, keyPath, transport)
 	const eventCount = 50
 	cfg.QueueSize = eventCount
 	cfg.BatchSize = eventCount
@@ -448,7 +490,7 @@ func TestSubmitAsync_NeverWaitsForBlockedControlPlane(t *testing.T) {
 	_, keyPath := writePrivateKey(t, dir)
 	blocked := make(chan struct{})
 	transport := &fakeHTTP{block: blocked, entered: make(chan struct{})}
-	cfg := testConfig(dir, keyPath, transport)
+	cfg := testConfig(t, dir, keyPath, transport)
 	cfg.BatchSize = 1
 	client, err := New(cfg)
 	if err != nil {
@@ -476,7 +518,7 @@ func TestSubmitAsync_NeverWaitsForBlockedControlPlane(t *testing.T) {
 func TestSubmitAsync_FullQueueReturnsImmediately(t *testing.T) {
 	dir := t.TempDir()
 	_, keyPath := writePrivateKey(t, dir)
-	cfg := testConfig(dir, keyPath, &fakeHTTP{})
+	cfg := testConfig(t, dir, keyPath, &fakeHTTP{})
 	cfg.QueueSize = 1
 	cfg.OperationTimeout = time.Second
 	client, err := New(cfg)
@@ -513,7 +555,7 @@ func TestShutdown_DrainsAcceptedEventsToSQLiteDuringOutage(t *testing.T) {
 	dir := t.TempDir()
 	_, keyPath := writePrivateKey(t, dir)
 	transport := &fakeHTTP{failFor: 100}
-	cfg := testConfig(dir, keyPath, transport)
+	cfg := testConfig(t, dir, keyPath, transport)
 	cfg.BatchSize = 100
 	cfg.FlushInterval = time.Hour
 	client, err := New(cfg)
@@ -547,7 +589,7 @@ func TestClient_RejectsInvalidInputsDuplicateAndClosedState(t *testing.T) {
 	dir := t.TempDir()
 	_, keyPath := writePrivateKey(t, dir)
 	transport := &fakeHTTP{}
-	cfg := testConfig(dir, keyPath, transport)
+	cfg := testConfig(t, dir, keyPath, transport)
 	cfg.BatchSize = 1
 	client, err := New(cfg)
 	if err != nil {

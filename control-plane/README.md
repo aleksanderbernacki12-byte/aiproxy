@@ -19,17 +19,23 @@ npm run dev
 The runtime requires:
 
 - `DATABASE_URL`: PostgreSQL connection string.
-- `TELEMETRY_INGEST_TOKEN`: bearer token used by the Go telemetry client.
 - `CRON_SECRET`: bearer token used by the internal worker route. Vercel adds
   this header automatically to configured cron invocations.
 - `TELEMETRY_REORDER_WINDOW_SECONDS`: how long a chain gap remains buffered
   before it is classified as compromised; defaults to 30 seconds.
 
-Register each data-plane instance's public P-256 key before processing its
-events:
+Create an organization first. The command prints its tenant key once; set that
+value as `AIPROXY_TENANT_KEY` in the organization's Go data plane:
 
 ```sh
-npm run keys:register -- ./instance-public-key.pem "customer / instance"
+npm run orgs:create -- "Customer AB"
+```
+
+Register each data-plane instance's public P-256 key under that organization
+before processing its events:
+
+```sh
+npm run keys:register -- <organization-id> ./instance-public-key.pem "production proxy"
 ```
 
 The command derives the same SHA-256 SPKI fingerprint that the Go client emits
@@ -40,12 +46,14 @@ as `cryptography.key_id`. The private key remains in the customer data plane.
 `POST /api/telemetry/ingest` accepts one event or the ordered event array sent
 by the Go batch client. The route:
 
-1. Requires `Authorization: Bearer <TELEMETRY_INGEST_TOKEN>`.
+1. Hashes the `Authorization: Bearer <AIPROXY_TENANT_KEY>` credential and
+   resolves its organization. Plaintext tenant keys are never stored.
 2. Enforces a 1 MiB request limit.
 3. validates every field with strict Zod objects and rejects unknown top-level
    or cryptography properties.
 4. Atomically reserves each `event_id` in a permanent deduplication ledger and
-   writes new events to `telemetry_buffer`.
+   writes new events plus the authenticated organization ID to
+   `telemetry_buffer`.
 5. Returns HTTP 202 without doing signature or chain processing.
 
 The raw request and response are represented only by
@@ -57,7 +65,7 @@ The raw request and response are represented only by
 Vercel calls `GET /api/internal/telemetry/process` every minute. The route is
 protected by `CRON_SECRET` and can also be invoked by another scheduler.
 
-The worker partitions chains by `key_id`, sorts buffered rows by event
+The worker partitions chains by `(organization_id, key_id)`, sorts buffered rows by event
 timestamp, and obtains a PostgreSQL transaction-level advisory lock for each
 chain. The hash link remains authoritative when packets arrive out of order: a
 row whose `previous_event_hash` matches the current head can advance the chain.
@@ -79,8 +87,9 @@ revoked keys, or key fingerprints become `INVALID_SIGNATURE`. Neither status
 advances the verified chain head.
 
 The event ledger makes retries idempotent across both the buffer and main
-tables. PostgreSQL advisory locks prevent concurrent cron executions from
-advancing the same instance chain twice.
+tables. Organization-scoped public-key lookups, chain heads, advisory locks,
+and indexes prevent one tenant from reading or advancing another tenant's
+chain.
 
 ## Validation
 

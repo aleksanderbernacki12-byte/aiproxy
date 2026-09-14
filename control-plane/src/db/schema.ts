@@ -1,9 +1,11 @@
 import {
   bigint,
   bigserial,
+  foreignKey,
   index,
   integer,
   jsonb,
+  primaryKey,
   pgEnum,
   pgTable,
   text,
@@ -19,26 +21,49 @@ export const telemetryVerificationStatus = pgEnum(
   ["VERIFIED", "INVALID_SIGNATURE", "COMPROMISED_CHAIN"],
 );
 
-export const telemetryPublicKeys = pgTable("telemetry_public_keys", {
-  keyId: varchar("key_id", { length: 64 }).primaryKey(),
-  publicKeyPem: text("public_key_pem").notNull(),
-  label: varchar("label", { length: 160 }),
+export const organizations = pgTable("organizations", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  name: varchar("name", { length: 160 }).notNull(),
+  // Stores SHA-256(tenant key), never the bearer credential itself.
+  tenantKey: varchar("tenant_key", { length: 64 }).notNull().unique(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-  revokedAt: timestamp("revoked_at", { withTimezone: true }),
 });
 
-export const telemetryEventIds = pgTable("telemetry_event_ids", {
-  eventId: uuid("event_id").primaryKey(),
-  receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
-});
+export const telemetryPublicKeys = pgTable(
+  "telemetry_public_keys",
+  {
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id),
+    keyId: varchar("key_id", { length: 64 }).notNull(),
+    publicKeyPem: text("public_key_pem").notNull(),
+    label: varchar("label", { length: 160 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [primaryKey({ columns: [table.organizationId, table.keyId] })],
+);
+
+export const telemetryEventIds = pgTable(
+  "telemetry_event_ids",
+  {
+    eventId: uuid("event_id").notNull(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id),
+    receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.organizationId, table.eventId] })],
+);
 
 export const telemetryBuffer = pgTable(
   "telemetry_buffer",
   {
     id: uuid("id").defaultRandom().primaryKey(),
-    eventId: uuid("event_id")
+    organizationId: uuid("organization_id")
       .notNull()
-      .references(() => telemetryEventIds.eventId),
+      .references(() => organizations.id),
+    eventId: uuid("event_id").notNull(),
     eventTimestamp: timestamp("event_timestamp", { withTimezone: true }).notNull(),
     keyId: varchar("key_id", { length: 64 }).notNull(),
     payload: jsonb("payload").$type<TelemetryEvent>().notNull(),
@@ -47,8 +72,13 @@ export const telemetryBuffer = pgTable(
     lastError: text("last_error"),
   },
   (table) => [
-    uniqueIndex("telemetry_buffer_event_id_idx").on(table.eventId),
+    uniqueIndex("telemetry_buffer_event_id_idx").on(table.organizationId, table.eventId),
+    foreignKey({
+      columns: [table.organizationId, table.eventId],
+      foreignColumns: [telemetryEventIds.organizationId, telemetryEventIds.eventId],
+    }),
     index("telemetry_buffer_chain_order_idx").on(
+      table.organizationId,
       table.keyId,
       table.eventTimestamp,
       table.receivedAt,
@@ -57,21 +87,29 @@ export const telemetryBuffer = pgTable(
   ],
 );
 
-export const telemetryChainHeads = pgTable("telemetry_chain_heads", {
-  keyId: varchar("key_id", { length: 64 }).primaryKey(),
-  latestEventHash: varchar("latest_event_hash", { length: 64 }).notNull(),
-  sequence: bigint("sequence", { mode: "bigint" }).notNull(),
-  lastEventTimestamp: timestamp("last_event_timestamp", { withTimezone: true }).notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-});
+export const telemetryChainHeads = pgTable(
+  "telemetry_chain_heads",
+  {
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id),
+    keyId: varchar("key_id", { length: 64 }).notNull(),
+    latestEventHash: varchar("latest_event_hash", { length: 64 }).notNull(),
+    sequence: bigint("sequence", { mode: "bigint" }).notNull(),
+    lastEventTimestamp: timestamp("last_event_timestamp", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.organizationId, table.keyId] })],
+);
 
 export const telemetryEvents = pgTable(
   "telemetry_events",
   {
     id: bigserial("id", { mode: "bigint" }).primaryKey(),
-    eventId: uuid("event_id")
+    organizationId: uuid("organization_id")
       .notNull()
-      .references(() => telemetryEventIds.eventId),
+      .references(() => organizations.id),
+    eventId: uuid("event_id").notNull(),
     eventTimestamp: timestamp("event_timestamp", { withTimezone: true }).notNull(),
     clientIdHash: varchar("client_id_hash", { length: 64 }).notNull(),
     applicationId: varchar("application_id", { length: 160 }).notNull(),
@@ -92,8 +130,16 @@ export const telemetryEvents = pgTable(
     processedAt: timestamp("processed_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
-    uniqueIndex("telemetry_events_event_id_idx").on(table.eventId),
-    index("telemetry_events_chain_idx").on(table.keyId, table.chainSequence),
+    uniqueIndex("telemetry_events_event_id_idx").on(table.organizationId, table.eventId),
+    foreignKey({
+      columns: [table.organizationId, table.eventId],
+      foreignColumns: [telemetryEventIds.organizationId, telemetryEventIds.eventId],
+    }),
+    index("telemetry_events_chain_idx").on(
+      table.organizationId,
+      table.keyId,
+      table.chainSequence,
+    ),
     index("telemetry_events_status_timestamp_idx").on(
       table.status,
       table.eventTimestamp,

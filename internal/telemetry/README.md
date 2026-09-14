@@ -60,6 +60,14 @@ advance the durable chain head.
 
 ## Delivery and durability
 
+`New` requires `AIPROXY_TENANT_KEY` in the process environment. Every batch is
+sent with `Authorization: Bearer <AIPROXY_TENANT_KEY>`; a caller-supplied
+Authorization header cannot override it. A 401 response is reported through
+the local asynchronous `OnError` callback and retained for retry without
+blocking or failing LLM traffic.
+When no `OnError` callback is configured, the package writes the error through
+Go's standard local logger.
+
 A single sequencer hashes, links, signs, and commits an event together with the
 new chain head in one SQLite transaction. This serializes concurrent LLM
 completions and preserves the chain over restarts. A separate sender reads the
