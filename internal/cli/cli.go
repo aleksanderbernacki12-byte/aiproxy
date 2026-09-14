@@ -26,6 +26,7 @@ import (
 	"aiproxy/internal/breaker"
 	"aiproxy/internal/cache"
 	"aiproxy/internal/coalesce"
+	"aiproxy/internal/compliance"
 	"aiproxy/internal/config"
 	"aiproxy/internal/geoip"
 	"aiproxy/internal/idempotency"
@@ -34,6 +35,7 @@ import (
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
 	"aiproxy/internal/semcache"
+	"aiproxy/internal/telemetry"
 )
 
 // defaultConfigPath is where aiproxy looks for custom rules when --config
@@ -106,6 +108,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	tlsKey := fs.String("tls-key", "", "path to a PEM private key file — see -tls-cert")
 	clientCAFile := fs.String("client-ca-file", "", "path to a PEM file of CA certificates trusted to sign client certificates — requires -tls-cert/-tls-key. Once set, every connection to -addr and -admin-addr must present a valid client certificate signed by one of these CAs, verified during the TLS handshake itself (mutual TLS), composing with proxy_api_key as an independent, additive gate rather than replacing it. Empty (default) is ordinary one-way TLS")
 	auditLogKeyFile := fs.String("audit-log-key-file", "", "path to a secret key file — when set, every line appended to log_file is HMAC-chained so later tampering is detectable with `aiproxy verify-log`; requires log_file to be configured")
+	telemetryEndpoint := fs.String("telemetry-endpoint", "", "Control Plane telemetry ingest URL; empty disables SaaS telemetry")
+	telemetryDatabase := fs.String("telemetry-db", ".aiproxy_telemetry.sqlite", "path to the durable local telemetry queue")
+	telemetryPrivateKey := fs.String("telemetry-private-key", "", "path to the owner-only ECDSA P-256 private key used to sign telemetry")
+	telemetrySalt := fs.String("telemetry-salt", "", "path to the rotating client anonymization salt; default: .aiproxy_salt beside -telemetry-db")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -133,6 +139,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	if *adminAddr != "" && *adminAddr == *addr {
 		fmt.Fprintln(stderr, "aiproxy: -admin-addr must be different from -addr (there's no isolation in binding the same address twice)")
+		return 2
+	}
+	if (*telemetryEndpoint == "") != (*telemetryPrivateKey == "") {
+		fmt.Fprintln(stderr, "aiproxy: -telemetry-endpoint and -telemetry-private-key must be set together, or not at all")
 		return 2
 	}
 
@@ -244,6 +254,32 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, r := range lc.modelRoutes {
 		server.AddModelRoute(r.name, r.models, r.targets, r.weights, r.limiter, r.tokenLimiter)
+	}
+
+	var complianceRecorder *compliance.Recorder
+	if *telemetryEndpoint != "" {
+		telemetryClient, err := telemetry.New(telemetry.Config{
+			Endpoint:       *telemetryEndpoint,
+			DatabasePath:   *telemetryDatabase,
+			PrivateKeyPath: *telemetryPrivateKey,
+			SaltPath:       *telemetrySalt,
+			OnError: func(err error) {
+				fmt.Fprintf(stderr, "aiproxy: %v\n", err)
+			},
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "aiproxy: initialize telemetry: %v\n", err)
+			return 1
+		}
+		complianceRecorder = &compliance.Recorder{Telemetry: telemetryClient}
+		server.ComplianceRecorder = complianceRecorder
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := complianceRecorder.Shutdown(shutdownCtx); err != nil {
+				fmt.Fprintf(stderr, "aiproxy: shutdown compliance pipeline: %v\n", err)
+			}
+		}()
 	}
 
 	if cfg != nil {
@@ -418,6 +454,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stdout, "model route: %s (%s) -> %s\n", r.name, models, dest)
 			}
 		}
+	}
+	if complianceRecorder != nil {
+		fmt.Fprintln(stdout, "compliance telemetry: enabled (locally queued, client IDs rotate every 30 days)")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

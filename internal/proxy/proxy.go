@@ -126,8 +126,17 @@ type requestContextInfo struct {
 	targetLabel string
 	// Carried to the response lifecycle so telemetry emitted after a completed
 	// exchange can report the local PII decision without inspecting content.
-	piiDetected bool
-	piiRedacted bool
+	piiDetected           bool
+	piiRedacted           bool
+	requestPolicyRedacted bool
+	// Compliance capture is populated only when a recorder is configured, so
+	// the normal proxy path pays no extra body/header copy cost.
+	complianceEventID       string
+	complianceTimestamp     time.Time
+	complianceClientID      string
+	complianceApplicationID string
+	complianceRequestHeader http.Header
+	complianceRequestBody   []byte
 
 	// clientLabel is the authenticated proxy key's attribution label —
 	// "default" for the anonymous Server.ProxyAPIKey, a named
@@ -367,6 +376,9 @@ type Server struct {
 	Target *url.URL
 	Logger *log.Logger
 	Stats  *stats.Stats // always present; counts every request outcome
+	// ComplianceRecorder receives completed upstream exchanges through a
+	// non-blocking interface. It is configured once before serving begins.
+	ComplianceRecorder ComplianceRecorder
 
 	// LogFormat selects how every log line below is rendered. The zero
 	// value behaves as LogFormatText, so existing callers that never set
@@ -3227,6 +3239,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// PII redaction happens only after routing, cache lookup, policy rules,
 	// and rate limiting have made their existing decisions from the original
 	// request. Only the body sent to the provider is changed.
+	var complianceEventID, complianceClientID, complianceApplicationID string
+	var complianceTimestamp time.Time
+	var complianceRequestHeader http.Header
+	var complianceRequestBody []byte
+	if s.ComplianceRecorder != nil {
+		complianceEventID = generateRequestID()
+		complianceTimestamp = time.Now().UTC()
+		complianceClientID, complianceApplicationID = complianceIdentity(r.Header, auth.label)
+		complianceRequestHeader = r.Header.Clone()
+		complianceRequestBody = append([]byte(nil), body...)
+	}
+	// These identify the local caller to aiproxy's compliance pipeline. They
+	// are internal control headers and must never reach an LLM provider.
+	r.Header.Del(complianceClientIDHeader)
+	r.Header.Del(complianceApplicationHeader)
+
 	piiRedactedBody, piiDetected := piifilter.RedactPII(string(evaluatedBody))
 	if piiDetected {
 		evaluatedBody = []byte(piiRedactedBody)
@@ -3260,23 +3288,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rewritten to the absolute upstream URL, and they need the exact
 	// same target/cache key ServeHTTP already resolved and checked.
 	reqCtx := requestContextInfo{
-		method:              r.Method,
-		url:                 r.URL.String(),
-		requestID:           requestID,
-		cacheKey:            cacheKey,
-		targets:             targets,
-		forwardPath:         forwardPath,
-		targetLabel:         targetLabel,
-		clientLabel:         auth.label,
-		clientCostBudget:    auth.costBudget,
-		tokenLimiter:        effectiveTokenLimiter,
-		latency:             new(time.Duration),
-		idempotencyClient:   auth.label,
-		idempotencyKey:      idempotencyKey,
-		coalesceOwned:       coalesceOwnedForReqCtx,
-		semanticFingerprint: semanticFingerprintForReqCtx,
-		piiDetected:         piiDetected,
-		piiRedacted:         piiDetected,
+		method:                  r.Method,
+		url:                     r.URL.String(),
+		requestID:               requestID,
+		cacheKey:                cacheKey,
+		targets:                 targets,
+		forwardPath:             forwardPath,
+		targetLabel:             targetLabel,
+		clientLabel:             auth.label,
+		clientCostBudget:        auth.costBudget,
+		tokenLimiter:            effectiveTokenLimiter,
+		latency:                 new(time.Duration),
+		idempotencyClient:       auth.label,
+		idempotencyKey:          idempotencyKey,
+		coalesceOwned:           coalesceOwnedForReqCtx,
+		semanticFingerprint:     semanticFingerprintForReqCtx,
+		piiDetected:             piiDetected,
+		piiRedacted:             piiDetected,
+		requestPolicyRedacted:   action == rules.Redact,
+		complianceEventID:       complianceEventID,
+		complianceTimestamp:     complianceTimestamp,
+		complianceClientID:      complianceClientID,
+		complianceApplicationID: complianceApplicationID,
+		complianceRequestHeader: complianceRequestHeader,
+		complianceRequestBody:   complianceRequestBody,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -3351,6 +3386,9 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// ReverseProxy's normal error handling take over.
 		return err
 	}
+	rawResponseBody := append([]byte(nil), body...)
+	rawResponseHeader := resp.Header.Clone()
+	rawResponseStatus := resp.StatusCode
 
 	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, reqCtx.targetLabel, reqCtx.clientLabel)
 	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url, reqCtx.requestID)
@@ -3359,8 +3397,14 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		writeResponseBlockedBody(resp, "response blocked by aiproxy rules")
+		if reqCtx.complianceEventID != "" {
+			resp.Body = newComplianceReadCloser(resp.Body, func() {
+				s.completeCompliance(reqCtx, rawResponseStatus, rawResponseHeader, rawResponseBody, true, false, true)
+			})
+		}
 		return nil
 	}
+	responsePolicyRedacted := action == rules.Redact
 	if action == rules.Redact {
 		s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
 		s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
@@ -3410,6 +3454,11 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	}
 
 	s.logUsageFromBody(reqCtx, body)
+	if reqCtx.complianceEventID != "" {
+		resp.Body = newComplianceReadCloser(resp.Body, func() {
+			s.completeCompliance(reqCtx, rawResponseStatus, rawResponseHeader, rawResponseBody, true, responsePolicyRedacted, false)
+		})
+	}
 
 	return nil
 }
@@ -3426,18 +3475,24 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) {
 	statusCode := resp.StatusCode
 	header := resp.Header
+	rawResponseHeader := resp.Header.Clone()
+	responsePolicyRedacted := false
+	responsePolicyBlocked := false
 
 	tee := &streamTee{
-		src:    resp.Body,
-		engine: s.getEngine(),
-		target: reqCtx.targetLabel,
-		key:    reqCtx.clientLabel,
+		src:        resp.Body,
+		engine:     s.getEngine(),
+		target:     reqCtx.targetLabel,
+		key:        reqCtx.clientLabel,
+		captureRaw: reqCtx.complianceEventID != "",
 		onRedact: func(ruleName string) {
+			responsePolicyRedacted = true
 			s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
 			s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 			s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		},
 		onBlock: func(ruleName string) {
+			responsePolicyBlocked = true
 			s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
 			s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 			s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
@@ -3446,7 +3501,7 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 			s.handleResponseDryRunHits(hits, reqCtx.method, reqCtx.url, reqCtx.requestID)
 		},
 	}
-	tee.onComplete = func(data []byte, cleanEOF bool) {
+	tee.onComplete = func(data, rawData []byte, cleanEOF bool) {
 		// Cache first, log second: a caller that observes the log
 		// line (e.g. a test synchronizing on it) can then rely on the
 		// cache write having already landed. A stream a Block rule cut
@@ -3474,6 +3529,7 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 			}
 		}
 		s.logUsageFromBody(reqCtx, data)
+		s.completeCompliance(reqCtx, statusCode, rawResponseHeader, rawData, cleanEOF, responsePolicyRedacted, responsePolicyBlocked)
 	}
 	resp.Body = tee
 }
@@ -3536,17 +3592,19 @@ type streamTee struct {
 	target string
 	key    string
 
-	tmp     [32 * 1024]byte
-	pending bytes.Buffer // raw bytes read but not yet a complete batch
-	out     bytes.Buffer // processed bytes still owed to Read's caller
-	buf     bytes.Buffer // full accumulated (post-scan) data, for onComplete
+	tmp        [32 * 1024]byte
+	pending    bytes.Buffer // raw bytes read but not yet a complete batch
+	out        bytes.Buffer // processed bytes still owed to Read's caller
+	buf        bytes.Buffer // full accumulated (post-scan) data, for onComplete
+	raw        bytes.Buffer // full original upstream data, for compliance capture
+	captureRaw bool
 
 	blocked bool
 
 	onRedact   func(ruleName string)
 	onBlock    func(ruleName string)
 	onDryRun   func(hits []rules.DryRunMatch)
-	onComplete func(data []byte, cleanEOF bool)
+	onComplete func(data, rawData []byte, cleanEOF bool)
 	cleanEOF   bool
 	once       sync.Once
 }
@@ -3555,6 +3613,9 @@ func (t *streamTee) Read(p []byte) (int, error) {
 	for t.out.Len() == 0 && !t.blocked {
 		n, err := t.src.Read(t.tmp[:])
 		if n > 0 {
+			if t.captureRaw {
+				t.raw.Write(t.tmp[:n])
+			}
 			t.pending.Write(t.tmp[:n])
 			t.processCompleteBatch()
 		}
@@ -3655,7 +3716,7 @@ func (t *streamTee) Close() error {
 	err := t.src.Close()
 	t.once.Do(func() {
 		if t.onComplete != nil {
-			t.onComplete(t.buf.Bytes(), t.cleanEOF)
+			t.onComplete(t.buf.Bytes(), t.raw.Bytes(), t.cleanEOF)
 		}
 	})
 	return err

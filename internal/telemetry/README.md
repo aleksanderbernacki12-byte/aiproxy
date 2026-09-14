@@ -43,6 +43,21 @@ are written through the local `OnError` callback or Go's standard logger. Salt
 rotation deliberately prevents pseudonyms from linking a client across
 long-lived reporting periods.
 
+The `aiproxy start` command enables the pipeline when both
+`-telemetry-endpoint` and `-telemetry-private-key` are set. It uses
+`.aiproxy_telemetry.sqlite` as the durable queue unless `-telemetry-db` is
+provided. `-telemetry-salt` can override the salt location. Set
+`AIPROXY_TENANT_KEY` in the process environment; the key is never accepted as a
+command-line argument because process arguments are commonly visible to other
+local users.
+
+Callers may identify themselves with `X-Aiproxy-Client-Id` and
+`X-Aiproxy-Application-Id`. Aiproxy consumes these headers locally and removes
+them before forwarding. If absent, the authenticated proxy-key label and
+`aiproxy` are used. Completed upstream exchanges are captured for ordinary JSON
+and streaming SSE responses; cache hits do not create an upstream telemetry
+event.
+
 Raw request and response bytes are accepted only as hash material. They are
 length-delimited and committed with SHA-256, then cleared on a best-effort basis
 after sequencing. They are never included in the payload or SQLite database.

@@ -2992,6 +2992,36 @@ as everywhere else. The startup notice and `aiproxy validate`'s summary
 report only a count (`additional webhook destinations: 2`), never the
 destination URLs.
 
+## Compliance telemetry
+
+Compliance telemetry is opt-in. Generate an owner-only ECDSA P-256 key, set
+the organization's tenant credential in the environment, and pass the Control
+Plane ingest endpoint at startup:
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out telemetry-key.pem
+chmod 600 telemetry-key.pem
+export AIPROXY_TENANT_KEY='customer-issued-tenant-key'
+
+aiproxy start \
+  --target https://api.openai.com \
+  --telemetry-endpoint https://compliance.example/api/telemetry/ingest \
+  --telemetry-private-key ./telemetry-key.pem
+```
+
+The proxy queues and signs completed upstream exchanges without waiting for
+the Control Plane. Network failures and HTTP 401 responses are logged locally
+and retried from `.aiproxy_telemetry.sqlite`; LLM traffic remains fail-open.
+Use `--telemetry-db` and `--telemetry-salt` to move the durable queue and
+rotating HMAC salt to customer-controlled persistent storage.
+
+Clients can send `X-Aiproxy-Client-Id` and `X-Aiproxy-Application-Id` for local
+attribution. Both headers are consumed by aiproxy and removed before the
+request reaches the LLM provider. The client identifier becomes a rotating
+HMAC-SHA256 pseudonym before persistence or transmission. When the headers are
+absent, aiproxy uses the authenticated proxy-key label and the application name
+`aiproxy`.
+
 ## Validating a config file
 
 ```
