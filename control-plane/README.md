@@ -92,6 +92,14 @@ Cryptographically valid rows with a stale or unknown predecessor become
 revoked keys, or key fingerprints become `INVALID_SIGNATURE`. Neither status
 advances the verified chain head.
 
+## Operations metrics
+
+`GET /api/internal/metrics` exports tenant-neutral Prometheus metrics and
+requires the same `Authorization: Bearer <CRON_SECRET>` protection as the
+worker. It reports current buffer depth, age of the oldest buffered event, and
+cumulative verified, compromised-chain, and invalid-signature outcomes. The
+endpoint never exports organization IDs, event IDs, or telemetry payloads.
+
 The event ledger makes retries idempotent across both the buffer and main
 tables. Organization-scoped public-key lookups, chain heads, advisory locks,
 and indexes prevent one tenant from reading or advancing another tenant's
