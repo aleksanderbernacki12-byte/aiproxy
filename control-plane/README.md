@@ -20,7 +20,11 @@ The runtime requires:
 
 - `DATABASE_URL`: PostgreSQL connection string.
 - `DASHBOARD_ORGANIZATION_ID`: organization UUID used as the dashboard's
-  server-side tenant scope until interactive DPO authentication supplies it.
+  server-side tenant scope.
+- `DASHBOARD_ACCESS_KEY`: a separate DPO login credential; do not reuse the
+  data plane tenant key.
+- `DASHBOARD_SESSION_SECRET`: at least 32 random characters used to sign the
+  eight-hour HttpOnly DPO session cookie.
 - `CRON_SECRET`: bearer token used by the internal worker route. Vercel adds
   this header automatically to configured cron invocations.
 - `TELEMETRY_REORDER_WINDOW_SECONDS`: how long a chain gap remains buffered
@@ -94,6 +98,11 @@ and indexes prevent one tenant from reading or advancing another tenant's
 chain.
 
 ## DPO dashboard
+
+`/login` establishes a signed, HttpOnly, SameSite=Strict session scoped to the
+server-configured organization. `/dashboard` rejects missing, expired, or
+tampered sessions before reading telemetry. The DPO credential is separate
+from the ingestion tenant key.
 
 `/dashboard` aggregates processed telemetry for the configured organization.
 It lists unique models, calls, token usage, policy violations, and locally

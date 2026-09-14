@@ -21,9 +21,9 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
               <span className="size-2 rounded-full bg-[#277553]" /> Systemet är i drift
             </span>
             <span className="h-5 w-px bg-line" />
-            <span className="grid size-8 place-items-center rounded-full border border-line bg-white font-bold text-government">
-              DS
-            </span>
+            <form action="/api/dashboard/session" method="post">
+              <button formAction="/api/dashboard/logout" className="rounded-sm border border-line bg-white px-3 py-2 font-bold text-government">Logga ut</button>
+            </form>
           </div>
         </div>
       </header>

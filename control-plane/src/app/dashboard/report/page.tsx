@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { ReportButton } from "@/components/report-button";
-import { dashboardOrganizationId, getDashboardData } from "@/lib/dashboard";
+import { getDashboardData } from "@/lib/dashboard";
+import { requireDashboardOrganizationId } from "@/lib/dashboard-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -16,13 +17,13 @@ const timestamp = new Intl.DateTimeFormat("sv-SE", {
 });
 
 export default async function ComplianceReportPage() {
-  const organizationId = dashboardOrganizationId();
-  const data = organizationId ? await getDashboardData(organizationId) : null;
-  if (!organizationId || !data) {
+  const organizationId = await requireDashboardOrganizationId();
+  const data = await getDashboardData(organizationId);
+  if (!data) {
     return (
       <div className="p-8">
         <h1 className="font-serif text-3xl">Rapporten kan inte genereras</h1>
-        <p className="mt-3 text-sm text-muted">En giltig DASHBOARD_ORGANIZATION_ID krävs.</p>
+        <p className="mt-3 text-sm text-muted">Den autentiserade organisationen finns inte i databasen.</p>
       </div>
     );
   }

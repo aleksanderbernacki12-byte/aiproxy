@@ -1,5 +1,6 @@
 import { ReportButton } from "@/components/report-button";
-import { dashboardOrganizationId, getDashboardData } from "@/lib/dashboard";
+import { getDashboardData } from "@/lib/dashboard";
+import { requireDashboardOrganizationId } from "@/lib/dashboard-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -11,8 +12,7 @@ const date = new Intl.DateTimeFormat("sv-SE", {
 });
 
 export default async function DashboardPage() {
-  const organizationId = dashboardOrganizationId();
-  if (!organizationId) return <ConfigurationRequired />;
+  const organizationId = await requireDashboardOrganizationId();
   const data = await getDashboardData(organizationId);
   if (!data) return <ConfigurationRequired organizationMissing />;
 
@@ -159,7 +159,7 @@ function ConfigurationRequired({ organizationMissing = false }: { organizationMi
         <p className="mt-3 text-sm leading-6 text-muted">
           {organizationMissing
             ? "Den konfigurerade organisationen finns inte i databasen."
-            : "Sätt DASHBOARD_ORGANIZATION_ID till organisationens UUID. Ingen telemetri läses innan ett giltigt tenant-ID finns."}
+            : "Dashboardens organisationskontext är inte korrekt konfigurerad."}
         </p>
       </div>
     </div>
