@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import process from "node:process";
 import pg from "pg";
+import { appendSecurityAudit } from "./lib/security-audit.mjs";
 
 const [, , name, suppliedTenantKey] = process.argv;
 if (!name) {
@@ -32,6 +33,7 @@ try {
      VALUES ($1, $2, 'Initial data plane key') RETURNING id`,
     [result.rows[0].id, tenantKeyDigest],
   );
+  await appendSecurityAudit(client, { organizationId: result.rows[0].id, action: "ORGANIZATION_CREATED", resourceType: "ORGANIZATION", resourceId: result.rows[0].id, metadata: { initial_tenant_credential_id: credential.rows[0].id } });
   await client.query("COMMIT");
   transactionOpen = false;
   console.log(`Organization ID: ${result.rows[0].id}`);

@@ -112,6 +112,19 @@ export const reportSigningKeys = pgTable("report_signing_keys", {
   lastUsedAt: timestamp("last_used_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [index("report_signing_keys_last_used_idx").on(table.lastUsedAt, table.keyId)]);
 
+export const securityAuditEvents = pgTable("security_audit_events", {
+  eventId: uuid("event_id").primaryKey(),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+  sequence: bigint("sequence", { mode: "bigint" }).notNull(),
+  previousEventHash: varchar("previous_event_hash", { length: 64 }).notNull(),
+  eventHash: varchar("event_hash", { length: 64 }).notNull(),
+  eventData: jsonb("event_data").$type<Record<string, unknown>>().notNull(),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+}, (table) => [
+  uniqueIndex("security_audit_events_org_sequence_idx").on(table.organizationId, table.sequence),
+  index("security_audit_events_org_time_idx").on(table.organizationId, table.occurredAt, table.sequence),
+]);
+
 export const telemetryPublicKeys = pgTable(
   "telemetry_public_keys",
   {

@@ -1,5 +1,6 @@
 import process from "node:process";
 import pg from "pg";
+import { appendSecurityAudit } from "./lib/security-audit.mjs";
 
 const [, , organizationId, keyId, validUntilInput] = process.argv;
 if (!organizationId || !/^[a-f0-9]{64}$/.test(keyId ?? "")) {
@@ -12,6 +13,7 @@ if (Number.isNaN(validUntil.getTime())) throw new Error("valid-until must be an 
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 try {
   await client.connect();
+  await client.query("BEGIN");
   const result = await client.query(
     `UPDATE telemetry_public_keys
      SET valid_until = $3
@@ -21,5 +23,8 @@ try {
     [organizationId, keyId, validUntil.toISOString()],
   );
   if (result.rowCount !== 1) throw new Error("Active telemetry key not found or invalid retirement time");
+  await appendSecurityAudit(client, { organizationId, action: "TELEMETRY_KEY_RETIRED", resourceType: "TELEMETRY_KEY", resourceId: keyId, metadata: { valid_until: validUntil.toISOString() } });
+  await client.query("COMMIT");
   console.log(`Telemetry key ${keyId} accepts events timestamped before ${validUntil.toISOString()}`);
-} finally { await client.end(); }
+} catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
+finally { await client.end(); }

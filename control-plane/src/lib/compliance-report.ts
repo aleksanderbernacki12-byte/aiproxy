@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 import canonicalize from "canonicalize";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
 import { complianceReports, dpoAccessKeys, reportSigningKeys } from "@/db/schema";
 import { getDashboardData } from "@/lib/dashboard";
@@ -66,7 +66,7 @@ export async function sealComplianceReport(identity: { credentialId: string; org
       target: reportSigningKeys.keyId,
       set: { lastUsedAt: now },
     });
-    return transaction.insert(complianceReports).values({
+    const reports = await transaction.insert(complianceReports).values({
       organizationId: identity.organizationId,
       generatedBy: identity.credentialId,
       payload,
@@ -76,6 +76,13 @@ export async function sealComplianceReport(identity: { credentialId: string; org
       signature,
       createdAt: now,
     }).returning({ id: complianceReports.id });
+    const report = reports[0];
+    if (report) await transaction.execute(sql`SELECT append_security_audit_event(
+      ${identity.organizationId}::uuid, 'DPO_CREDENTIAL', ${identity.credentialId},
+      'COMPLIANCE_REPORT_SEALED', 'COMPLIANCE_REPORT', ${report.id},
+      ${JSON.stringify({ payload_hash: payloadHash, signing_key_id: keyId })}::jsonb
+    )`);
+    return reports;
   });
   if (!stored) throw new Error("Compliance report was not stored");
   return stored.id;

@@ -32,7 +32,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0010_report_signing_keys.sql`. Put a TLS-terminating reverse proxy in front of
+`0011_security_audit_ledger.sql`. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently.
 
 The runtime requires:
@@ -103,7 +103,7 @@ printed once and its role can be `ADMIN`, `DPO`, or read-only `AUDITOR`:
 
 ```sh
 npm run dpo:create -- <organization-id> "Primary DPO" DPO
-npm run dpo:revoke -- <credential-id>
+npm run dpo:revoke -- <organization-id> <credential-id>
 ```
 
 Only the SHA-256 digest is stored. An optional ISO expiry can be passed after
@@ -163,6 +163,21 @@ does not make older reports unverifiable. A tenant can download a public key
 only when at least one of its own reports references that key. The fingerprint
 in the report and archive must still be compared with the copy distributed
 through the independent trusted channel.
+
+## Administrative security ledger
+
+Credential creation and revocation, telemetry signing-key changes, AI-system
+profile updates, organization creation, and report sealing append an event in
+the same transaction as the protected change. PostgreSQL serializes each
+tenant ledger and links entries with domain-separated SHA-256 hashes. Direct
+updates and deletes are rejected by a database trigger.
+
+`/dashboard/audit` recalculates the complete tenant chain against its stored
+head before displaying the 200 latest events. Set `AIPROXY_OPERATOR_ID` to a
+stable internal operator identifier when running administrative CLI commands;
+it defaults to `local-cli` and must never contain credentials or personal data.
+The maintenance setting is reserved for controlled restore and test cleanup;
+a PostgreSQL owner can always disable database triggers.
 
 Generate the signing-key pair without overwriting existing files. The private
 key is created with owner-only permissions:

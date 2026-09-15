@@ -51,6 +51,9 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             >
               <ArchiveIcon /> Rapportarkiv
             </Link>
+            <Link href="/dashboard/audit" className="flex items-center gap-3 rounded-sm px-3 py-2.5 text-sm text-muted hover:bg-white hover:text-ink">
+              <AuditIcon /> Säkerhetslogg
+            </Link>
           </nav>
           <div className="mt-10 border-t border-line pt-5">
             <p className="px-3 text-xs leading-5 text-muted">
@@ -86,6 +89,14 @@ function ArchiveIcon() {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24" className="size-4 fill-none stroke-current" strokeWidth="1.8">
       <path d="M4 7h16v14H4zM3 3h18v4H3zM9 12h6" />
+    </svg>
+  );
+}
+
+function AuditIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="size-4 fill-none stroke-current" strokeWidth="1.8">
+      <path d="M12 3l8 3v6c0 5-3.4 8-8 9-4.6-1-8-4-8-9V6zM8 10h8M8 14h5" />
     </svg>
   );
 }

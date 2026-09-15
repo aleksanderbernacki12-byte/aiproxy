@@ -1,5 +1,6 @@
 import process from "node:process";
 import pg from "pg";
+import { appendSecurityAudit } from "./lib/security-audit.mjs";
 
 const [, , organizationId, keyId, ...reasonParts] = process.argv;
 const reason = reasonParts.join(" ").trim();
@@ -11,11 +12,15 @@ if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 try {
   await client.connect();
+  await client.query("BEGIN");
   const result = await client.query(
     `UPDATE telemetry_public_keys SET revoked_at = now(), revoked_reason = $3
      WHERE organization_id = $1 AND key_id = $2 AND revoked_at IS NULL RETURNING key_id`,
     [organizationId, keyId, reason],
   );
   if (result.rowCount !== 1) throw new Error("Active telemetry key not found");
+  await appendSecurityAudit(client, { organizationId, action: "TELEMETRY_KEY_REVOKED", resourceType: "TELEMETRY_KEY", resourceId: keyId, metadata: { reason } });
+  await client.query("COMMIT");
   console.log(`Immediately revoked telemetry key ${keyId}`);
-} finally { await client.end(); }
+} catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
+finally { await client.end(); }

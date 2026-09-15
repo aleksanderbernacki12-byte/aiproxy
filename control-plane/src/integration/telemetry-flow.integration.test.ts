@@ -100,6 +100,10 @@ describe("telemetry control-plane flow", () => {
     await client.query(`DELETE FROM telemetry_event_ids WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM dpo_access_keys WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM tenant_access_keys WHERE organization_id = $1`, [organizationId]);
+    await client.query(`SELECT set_config('aiproxy.audit_maintenance', 'on', false)`);
+    await client.query(`DELETE FROM security_audit_events WHERE organization_id = $1`, [organizationId]);
+    await client.query(`DELETE FROM security_audit_heads WHERE organization_id = $1`, [organizationId]);
+    await client.query(`SELECT set_config('aiproxy.audit_maintenance', 'off', false)`);
     await client.query(`DELETE FROM organizations WHERE id = $1`, [organizationId]);
     await client.end();
   });
@@ -209,6 +213,18 @@ describe("telemetry control-plane flow", () => {
       generatedByRole: "DPO",
       payloadHash: sealedReport!.payload_hash,
     }]);
+    const { getSecurityAuditLedger } = await import("@/lib/security-audit");
+    const audit = await getSecurityAuditLedger(organizationId);
+    expect(audit.valid).toBe(true);
+    expect(audit.events).toHaveLength(1);
+    expect(audit.events[0].eventData).toMatchObject({
+      actor_type: "DPO_CREDENTIAL", actor_id: dpoCredentialId,
+      action: "COMPLIANCE_REPORT_SEALED", resource_id: reportId,
+    });
+    await expect(client.query(
+      `UPDATE security_audit_events SET event_data = '{}'::jsonb WHERE organization_id = $1`,
+      [organizationId],
+    )).rejects.toThrow(/append-only/);
 
     await client.query(`DELETE FROM ai_systems WHERE organization_id = $1`, [organizationId]);
     const unclassified = await getDashboardData(organizationId);

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import process from "node:process";
 import pg from "pg";
+import { appendSecurityAudit } from "./lib/security-audit.mjs";
 
 const [, , organizationId, applicationId, model, filename] = process.argv;
 if (!organizationId || !applicationId || !model || !filename) {
@@ -29,6 +30,7 @@ if (profile.provider != null && (typeof profile.provider !== "string" || !profil
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 try {
   await client.connect();
+  await client.query("BEGIN");
   const result = await client.query(
     `INSERT INTO ai_systems (
        organization_id, application_id, model, name, provider, intended_purpose,
@@ -47,5 +49,8 @@ try {
       profile.legal_basis.trim(), profile.human_oversight.trim(), JSON.stringify(profile.data_categories ?? []),
       JSON.stringify(profile.deployment_regions ?? []), profile.status ?? "ACTIVE"],
   );
+  await appendSecurityAudit(client, { organizationId, action: "AI_SYSTEM_PROFILE_UPSERTED", resourceType: "AI_SYSTEM", resourceId: result.rows[0].id, metadata: { application_id: applicationId, model, risk_class: profile.risk_class ?? "UNCLASSIFIED", status: profile.status ?? "ACTIVE" } });
+  await client.query("COMMIT");
   console.log(`AI system profile: ${result.rows[0].id}`);
-} finally { await client.end(); }
+} catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
+finally { await client.end(); }

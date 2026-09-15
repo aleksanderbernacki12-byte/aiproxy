@@ -5,6 +5,7 @@ import {
 import { readFile } from "node:fs/promises";
 import process from "node:process";
 import pg from "pg";
+import { appendSecurityAudit } from "./lib/security-audit.mjs";
 
 const [, , organizationId, filename, label = null, validFromInput] = process.argv;
 if (!organizationId || !filename) {
@@ -30,6 +31,7 @@ const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 
 try {
   await client.connect();
+  await client.query("BEGIN");
   await client.query(
     `INSERT INTO telemetry_public_keys(organization_id, key_id, public_key_pem, label, valid_from)
      VALUES ($1, $2, $3, $4, $5)
@@ -39,7 +41,10 @@ try {
          valid_from = COALESCE(telemetry_public_keys.valid_from, EXCLUDED.valid_from)`,
     [organizationId, keyId, publicKeyPem, label, validFrom?.toISOString() ?? null],
   );
+  await appendSecurityAudit(client, { organizationId, action: "TELEMETRY_KEY_REGISTERED", resourceType: "TELEMETRY_KEY", resourceId: keyId, metadata: { label, valid_from: validFrom?.toISOString() ?? null } });
+  await client.query("COMMIT");
   console.log(`Registered telemetry key ${keyId}`);
-} finally {
+} catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
+finally {
   await client.end();
 }
