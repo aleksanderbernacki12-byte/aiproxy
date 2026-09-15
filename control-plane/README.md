@@ -309,7 +309,8 @@ then establishes a signed, HttpOnly, SameSite=Strict session. `/dashboard`
 rechecks expiry and revocation before every tenant-scoped read. The DPO
 credential is separate from the ingestion tenant key. All dashboard POST
 actions require an exact same-origin `Origin` header to prevent cross-site
-session creation, logout, and report sealing.
+session creation, logout, and report sealing. Login accepts only URL-encoded
+forms and stops reading after 4 KiB before any credential lookup.
 
 `/dashboard` aggregates processed telemetry for the configured organization.
 It lists unique models, calls, token usage, policy violations, and locally

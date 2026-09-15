@@ -52,6 +52,19 @@ describe("POST /api/dashboard/session", () => {
     expect(mocks.authenticateDPOAccessKey).not.toHaveBeenCalled();
   });
 
+  it("rejects unsupported, duplicate, and oversized form bodies before authentication", async () => {
+    const unsupported = new Request("https://control.example/api/dashboard/session", {
+      method: "POST", headers: { origin: "https://control.example", "content-type": "application/json" }, body: "{}",
+    });
+    expect((await POST(unsupported)).status).toBe(415);
+    expect((await POST(new Request("https://control.example/api/dashboard/session", {
+      method: "POST", headers: { origin: "https://control.example", "content-type": "application/x-www-form-urlencoded" },
+      body: "access_key=first&access_key=second",
+    }))).status).toBe(303);
+    expect((await POST(request("x".repeat(5000)))).status).toBe(413);
+    expect(mocks.authenticateDPOAccessKey).not.toHaveBeenCalled();
+  });
+
   it("fails closed when session config or Postgres is unavailable", async () => {
     vi.stubEnv("DASHBOARD_SESSION_SECRET", "short");
     expect((await POST(request())).status).toBe(503);
