@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { ReportButton } from "@/components/report-button";
 import { getDashboardData } from "@/lib/dashboard";
-import { requireDashboardOrganizationId } from "@/lib/dashboard-auth";
+import { requireDashboardIdentity } from "@/lib/dashboard-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -17,8 +17,8 @@ const timestamp = new Intl.DateTimeFormat("sv-SE", {
 });
 
 export default async function ComplianceReportPage() {
-  const organizationId = await requireDashboardOrganizationId();
-  const data = await getDashboardData(organizationId);
+  const identity = await requireDashboardIdentity();
+  const data = await getDashboardData(identity.organizationId);
   if (!data) {
     return (
       <div className="p-8">
@@ -39,6 +39,13 @@ export default async function ComplianceReportPage() {
           ← Tillbaka till inventeringen
         </Link>
         <ReportButton mode="print" />
+        {identity.role !== "AUDITOR" && (
+          <form action="/api/dashboard/reports" method="post">
+            <button type="submit" className="min-h-11 rounded-sm border border-government px-4 text-sm font-bold text-government hover:bg-government-light">
+              Försegla och ladda ned
+            </button>
+          </form>
+        )}
       </div>
 
       <article className="report-sheet mx-auto max-w-[900px] border border-line bg-white px-7 py-9 shadow-[0_8px_30px_rgba(20,32,25,0.08)] sm:px-12 sm:py-12">

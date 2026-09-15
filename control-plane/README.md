@@ -32,7 +32,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0007_ai_system_inventory.sql`. Put a TLS-terminating reverse proxy in front of
+`0008_signed_compliance_reports.sql`. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently.
 
 The runtime requires:
@@ -123,6 +123,20 @@ Risk classes are `UNCLASSIFIED`, `MINIMAL`, `LIMITED`, `HIGH`, and
 Unknown JSON fields are rejected to prevent silent documentation mistakes.
 Observed systems without a matching profile or final risk class appear as
 governance gaps in both the DPO dashboard and formal report.
+
+## Sealed compliance reports
+
+Set `REPORT_SIGNING_PRIVATE_KEY` to an Ed25519 PKCS#8 PEM key and distribute
+the corresponding public key through an independent trusted channel. A DPO or
+administrator can use **Försegla och ladda ned** on the report page to persist
+and download a versioned JSON evidence artifact. Auditors can read and print
+the live report but cannot create sealed records.
+
+Each artifact contains the complete tenant-scoped dashboard snapshot, schema
+version, generation time, SHA-256 payload digest, signing-key fingerprint, and
+Ed25519 signature. The signature covers the RFC 8785 canonical payload prefixed
+with `aiproxy-compliance-report-v1\0`. Stored snapshots are never updated, so a
+later governance or telemetry change cannot silently alter an issued report.
 
 ## Ingestion
 

@@ -75,6 +75,22 @@ export const dpoAccessKeys = pgTable(
   (table) => [index("dpo_access_keys_organization_idx").on(table.organizationId, table.revokedAt)],
 );
 
+export const complianceReports = pgTable(
+  "compliance_reports",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+    generatedBy: uuid("generated_by").notNull().references(() => dpoAccessKeys.id),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    payloadHash: varchar("payload_hash", { length: 64 }).notNull(),
+    signatureAlgorithm: varchar("signature_algorithm", { length: 32 }).notNull(),
+    signingKeyId: varchar("signing_key_id", { length: 64 }).notNull(),
+    signature: text("signature").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index("compliance_reports_organization_created_idx").on(table.organizationId, table.createdAt, table.id)],
+);
+
 export const telemetryPublicKeys = pgTable(
   "telemetry_public_keys",
   {
