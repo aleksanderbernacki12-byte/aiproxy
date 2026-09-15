@@ -33,7 +33,7 @@ func TestPIIFilter_RedactsOnlyForwardedBodyAfterRouting(t *testing.T) {
 	srv := proxy.New("unused", defaultURL, rules.NewEngine(rules.Allow))
 	srv.AddModelRoute("chat", []string{"chat-*"}, []*url.URL{modelURL}, nil, nil, nil)
 	frontend := contractFrontend(t, srv)
-	requestBody := `{"model":"chat-small","prompt":"Maila anna@example.com eller använd 900101-0017"}`
+	requestBody := `{"model":"chat-small","prompt":"Maila anna@example.com, ring 070-123 45 67 eller använd 900101-0017"}`
 	response, err := frontend.Client().Post(frontend.URL+"/v1/messages", "application/json", strings.NewReader(requestBody))
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestPIIFilter_RedactsOnlyForwardedBodyAfterRouting(t *testing.T) {
 	if defaultHits.Load() != 0 {
 		t.Fatal("PII filtering changed model-route selection")
 	}
-	want := `{"model":"chat-small","prompt":"Maila [REDACTED_EMAIL] eller använd [REDACTED_SSN]"}`
+	want := `{"model":"chat-small","prompt":"Maila [REDACTED_EMAIL], ring [REDACTED_PHONE] eller använd [REDACTED_SSN]"}`
 	if forwarded != want {
 		t.Fatalf("forwarded body = %q, want %q", forwarded, want)
 	}

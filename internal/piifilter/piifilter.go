@@ -2,6 +2,7 @@ package piifilter
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -11,6 +12,7 @@ const (
 	RedactedIBAN       = "[REDACTED_IBAN]"
 	RedactedEmail      = "[REDACTED_EMAIL]"
 	RedactedCreditCard = "[REDACTED_CREDIT_CARD]"
+	RedactedPhone      = "[REDACTED_PHONE]"
 )
 
 // Redactor is the extension point for local PII detectors. A future ONNX
@@ -87,6 +89,11 @@ func NewRegexRedactor() Redactor {
 			replacement: RedactedCreditCard,
 			valid:       validCardNumber,
 		},
+		{
+			pattern:     regexp.MustCompile(`(?:(?:\+46|\b0046)(?:[ -]?\(0\))?(?:[ -]?[0-9]){7,9}|\b07[02369](?:[ -]?[0-9]){7}|\b08(?:[ -]?[0-9]){7,8})\b`),
+			replacement: RedactedPhone,
+			valid:       validSwedishPhone,
+		},
 	}}
 }
 
@@ -140,10 +147,41 @@ func validSwedishSSN(candidate string) bool {
 	if len(dateDigits) == 8 {
 		layout = "20060102"
 	}
+	dayOffset := 0
+	dayStart := len(dateDigits) - 2
+	day, err := strconv.Atoi(dateDigits[dayStart:])
+	if err != nil {
+		return false
+	}
+	if day > 60 {
+		dayOffset = 60
+		day -= dayOffset
+		dateDigits = dateDigits[:dayStart] + strconv.Itoa(day/10) + strconv.Itoa(day%10)
+	}
 	if _, err := time.Parse(layout, dateDigits); err != nil {
 		return false
 	}
 	return validLuhn(digits[len(digits)-10:])
+}
+
+func validSwedishPhone(candidate string) bool {
+	number := compact(candidate, " ()-")
+	switch {
+	case strings.HasPrefix(number, "+46"):
+		number = "0" + strings.TrimPrefix(number, "+46")
+	case strings.HasPrefix(number, "0046"):
+		number = "0" + strings.TrimPrefix(number, "0046")
+	}
+	if strings.HasPrefix(number, "00") {
+		number = number[1:]
+	}
+	if len(number) < 9 || len(number) > 10 || number[0] != '0' || strings.Trim(number, number[:1]) == "" {
+		return false
+	}
+	if strings.HasPrefix(number, "07") {
+		return len(number) == 10 && strings.ContainsRune("02369", rune(number[2]))
+	}
+	return strings.HasPrefix(number, "08")
 }
 
 func validCardNumber(candidate string) bool {

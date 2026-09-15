@@ -2992,6 +2992,17 @@ as everywhere else. The startup notice and `aiproxy validate`'s summary
 report only a count (`additional webhook destinations: 2`), never the
 destination URLs.
 
+## Local PII redaction
+
+Before an LLM request leaves the data plane, the built-in local filter
+checksum-validates and replaces Swedish personal and coordination numbers,
+IBANs, payment-card numbers, email addresses, Swedish mobile numbers, and
+Stockholm landline numbers. International Swedish telephone forms using `+46`
+or `0046` are normalized before validation. Detection performs no network
+calls, and matches are replaced with typed markers such as `[REDACTED_SSN]` and
+`[REDACTED_PHONE]`. The original request remains available only to the
+customer-controlled encrypted Secure Vault flow.
+
 ## Compliance telemetry
 
 Compliance telemetry is opt-in. Generate an owner-only ECDSA P-256 key, set
