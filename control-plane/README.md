@@ -304,7 +304,9 @@ chain.
 `/login` resolves a hashed, active DPO credential to its organization and role,
 then establishes a signed, HttpOnly, SameSite=Strict session. `/dashboard`
 rechecks expiry and revocation before every tenant-scoped read. The DPO
-credential is separate from the ingestion tenant key.
+credential is separate from the ingestion tenant key. All dashboard POST
+actions require an exact same-origin `Origin` header to prevent cross-site
+session creation, logout, and report sealing.
 
 `/dashboard` aggregates processed telemetry for the configured organization.
 It lists unique models, calls, token usage, policy violations, and locally

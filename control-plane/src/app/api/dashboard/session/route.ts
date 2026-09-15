@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 import { createDashboardSession, dashboardSessionCookie, dashboardSessionMaxAge } from "@/lib/dashboard-session";
 import { authenticateDPOAccessKey } from "@/lib/dpo-auth";
 import { appendSecurityAuditEvent } from "@/lib/security-audit";
+import { hasSameOrigin } from "@/lib/auth";
 
 export async function POST(request: Request) {
+  if (!hasSameOrigin(request)) return Response.json({ error: "Forbidden" }, { status: 403 });
   const form = await request.formData();
   const accessKey = form.get("access_key");
   const sessionSecret = process.env.DASHBOARD_SESSION_SECRET ?? "";

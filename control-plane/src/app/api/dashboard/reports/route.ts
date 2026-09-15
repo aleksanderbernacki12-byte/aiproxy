@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 import { requireDashboardIdentity } from "@/lib/dashboard-auth";
 import { sealComplianceReport } from "@/lib/compliance-report";
+import { hasSameOrigin } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   const identity = await requireDashboardIdentity();
   if (identity.role === "AUDITOR") return Response.json({ error: "Forbidden" }, { status: 403 });
-  if (request.headers.get("origin") !== new URL(request.url).origin) return Response.json({ error: "Forbidden" }, { status: 403 });
+  if (!hasSameOrigin(request)) return Response.json({ error: "Forbidden" }, { status: 403 });
   try {
     const reportId = await sealComplianceReport(identity);
     return NextResponse.redirect(new URL(`/api/dashboard/reports/${reportId}`, request.url), 303);

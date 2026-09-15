@@ -11,7 +11,7 @@ function request(key = "x".repeat(32)) {
   const body = new URLSearchParams({ access_key: key });
   return new Request("https://control.example/api/dashboard/session", {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://control.example" },
     body,
   });
 }
@@ -42,6 +42,14 @@ describe("POST /api/dashboard/session", () => {
     expect(response.status).toBe(303);
     expect(response.headers.get("location")).toContain("/login?error=invalid");
     expect(response.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("rejects cross-origin submissions before checking credentials", async () => {
+    const crossOrigin = new Request("https://control.example/api/dashboard/session", {
+      method: "POST", headers: { origin: "https://attacker.example" },
+    });
+    expect((await POST(crossOrigin)).status).toBe(403);
+    expect(mocks.authenticateDPOAccessKey).not.toHaveBeenCalled();
   });
 
   it("fails closed when session config or Postgres is unavailable", async () => {

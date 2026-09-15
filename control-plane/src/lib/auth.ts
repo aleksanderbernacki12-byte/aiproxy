@@ -13,3 +13,13 @@ export function hasBearerToken(request: Request, expected: string | undefined) {
     timingSafeEqual(actualBytes, wantedBytes)
   );
 }
+
+export function hasSameOrigin(request: Request) {
+  const origin = request.headers.get("origin");
+  if (!origin) return false;
+  try {
+    return new URL(origin).origin === new URL(request.url).origin;
+  } catch {
+    return false;
+  }
+}
