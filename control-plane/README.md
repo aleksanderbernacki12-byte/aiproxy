@@ -32,7 +32,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0006_external_merkle_anchors.sql`. Put a TLS-terminating reverse proxy in front of
+`0007_ai_system_inventory.sql`. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently.
 
 The runtime requires:
@@ -93,6 +93,36 @@ npm run dpo:revoke -- <credential-id>
 
 Only the SHA-256 digest is stored. An optional ISO expiry can be passed after
 the role. Revocation invalidates existing sessions on their next request.
+
+## AI system governance inventory
+
+Telemetry automatically discovers each `(application_id, model)` combination.
+Attach its EU AI Act governance profile with a strict JSON file:
+
+```sh
+npm run systems:upsert -- <organization-id> legal-assistant gpt-4o profile.json
+```
+
+```json
+{
+  "name": "Legal review assistant",
+  "provider": "OpenAI",
+  "intended_purpose": "Draft summaries for mandatory human review",
+  "risk_class": "LIMITED",
+  "system_owner": "Legal Operations",
+  "legal_basis": "Legitimate interest assessment LIA-2026-04",
+  "human_oversight": "A qualified reviewer approves every output",
+  "data_categories": ["business contact data"],
+  "deployment_regions": ["EU"],
+  "status": "ACTIVE"
+}
+```
+
+Risk classes are `UNCLASSIFIED`, `MINIMAL`, `LIMITED`, `HIGH`, and
+`PROHIBITED`; lifecycle states are `ACTIVE`, `SUSPENDED`, and `RETIRED`.
+Unknown JSON fields are rejected to prevent silent documentation mistakes.
+Observed systems without a matching profile or final risk class appear as
+governance gaps in both the DPO dashboard and formal report.
 
 ## Ingestion
 

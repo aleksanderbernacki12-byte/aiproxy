@@ -17,7 +17,8 @@
     "keys:retire": "node scripts/retire-public-key.mjs",
     "keys:revoke": "node scripts/revoke-public-key.mjs",
     "dpo:create": "node scripts/create-dpo-key.mjs",
-    "dpo:revoke": "node scripts/revoke-dpo-key.mjs"
+    "dpo:revoke": "node scripts/revoke-dpo-key.mjs",
+    "systems:upsert": "node scripts/upsert-ai-system.mjs"
   },
   "engines": {
     "node": ">=24.0.0"

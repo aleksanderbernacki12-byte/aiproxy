@@ -79,6 +79,7 @@ describe("telemetry control-plane flow", () => {
       await client.end();
       return;
     }
+    await client.query(`DELETE FROM ai_systems WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_merkle_checkpoints WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_events WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_buffer WHERE organization_id = $1`, [organizationId]);
@@ -143,6 +144,15 @@ describe("telemetry control-plane flow", () => {
     });
     expect(anchorResult).toEqual({ configured: true, attempted: 1, anchored: 1, failed: 0 });
 
+    await client.query(
+      `INSERT INTO ai_systems (
+         organization_id, application_id, model, name, provider, intended_purpose,
+         risk_class, system_owner, legal_basis, human_oversight
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [organizationId, "integration-test", "gpt-enterprise", "Legal assistant", "test-provider",
+        "Assist legal reviewers", "HIGH", "Legal Operations", "Legitimate interest", "Mandatory reviewer approval"],
+    );
+
     const { getDashboardData } = await import("@/lib/dashboard");
     const dashboard = await getDashboardData(organizationId);
     expect(dashboard?.summary).toMatchObject({
@@ -153,6 +163,7 @@ describe("telemetry control-plane flow", () => {
       compromisedEvents: 0,
       invalidSignatures: 0,
       chainStatus: "INTACT",
+      unclassifiedSystems: 0,
     });
     expect(dashboard?.models).toHaveLength(1);
     expect(dashboard?.checkpoint).toMatchObject({
@@ -163,7 +174,13 @@ describe("telemetry control-plane flow", () => {
     const { checkControlPlaneReadiness } = await import("@/lib/readiness");
     expect(await checkControlPlaneReadiness()).toBe(true);
     expect(dashboard?.models[0]).toMatchObject({
-      model: "gpt-enterprise", eventCount: 2, totalTokens: 40, piiIncidents: 2,
+      applicationId: "integration-test", model: "gpt-enterprise", eventCount: 2,
+      totalTokens: 40, piiIncidents: 2, governance: { riskClass: "HIGH", systemOwner: "Legal Operations" },
     });
+
+    await client.query(`DELETE FROM ai_systems WHERE organization_id = $1`, [organizationId]);
+    const unclassified = await getDashboardData(organizationId);
+    expect(unclassified?.summary.unclassifiedSystems).toBe(1);
+    expect(unclassified?.models[0].governance).toBeNull();
   });
 });

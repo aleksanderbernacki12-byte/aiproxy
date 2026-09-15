@@ -3,7 +3,7 @@ import "server-only";
 import { sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
 
-export const expectedMigration = "0006_external_merkle_anchors.sql";
+export const expectedMigration = "0007_ai_system_inventory.sql";
 
 export async function checkControlPlaneReadiness() {
   const result = await getDatabase().execute<{ migration_ready: boolean }>(sql`

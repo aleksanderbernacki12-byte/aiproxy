@@ -77,10 +77,10 @@ export default async function ComplianceReportPage() {
 
         <ReportSection number="01" title="Översikt över AI-användning">
           <p className="max-w-3xl text-sm leading-6 text-muted">
-            Under rapportperioden registrerades {number.format(data.summary.totalEvents)} AI-anrop fördelade på {number.format(data.models.length)} unika modeller. Den sammanlagda användningen var {number.format(data.summary.totalTokens)} tokens.
+            Under rapportperioden registrerades {number.format(data.summary.totalEvents)} AI-anrop fördelade på {number.format(data.models.length)} observerade AI-system. Den sammanlagda användningen var {number.format(data.summary.totalTokens)} tokens.
           </p>
           <div className="mt-6 grid grid-cols-3 border-y border-line">
-            <ReportMetric label="AI-modeller" value={number.format(data.models.length)} />
+            <ReportMetric label="AI-system" value={number.format(data.models.length)} />
             <ReportMetric label="AI-anrop" value={number.format(data.summary.totalEvents)} />
             <ReportMetric label="Tokens" value={number.format(data.summary.totalTokens)} />
           </div>
@@ -96,8 +96,8 @@ export default async function ComplianceReportPage() {
             </thead>
             <tbody className="divide-y divide-line">
               {data.models.map((model) => (
-                <tr key={model.model}>
-                  <td className="px-3 py-3 font-mono font-bold">{model.model}</td>
+                <tr key={`${model.applicationId}:${model.model}:${model.observedProvider}`}>
+                  <td className="px-3 py-3"><span className="font-mono font-bold">{model.model}</span><br /><span className="text-muted">{model.applicationId}</span></td>
                   <td className="px-3 py-3 text-right tabular-nums">{number.format(model.eventCount)}</td>
                   <td className="px-3 py-3 text-right tabular-nums">{number.format(model.totalTokens)}</td>
                   <td className="px-3 py-3 text-right tabular-nums">{number.format(model.policyViolations)}</td>
@@ -108,7 +108,26 @@ export default async function ComplianceReportPage() {
           </table>
         </ReportSection>
 
-        <ReportSection number="02" title="Avvärjda PII-läckor">
+        <ReportSection number="02" title="Styrning och riskklassificering">
+          <p className="text-sm leading-6 text-muted">
+            {data.summary.unclassifiedSystems === 0
+              ? "Samtliga observerade AI-system har en dokumenterad riskklass och styrningsprofil."
+              : `${number.format(data.summary.unclassifiedSystems)} observerade AI-system saknar fastställd riskklass eller styrningsprofil.`}
+          </p>
+          <div className="mt-5 space-y-3">
+            {data.models.map((model) => (
+              <div key={`${model.applicationId}:${model.model}:governance`} className="print-break-inside-avoid border border-line p-4 text-xs">
+                <div className="flex justify-between gap-4"><strong>{model.governance?.name ?? `${model.applicationId} / ${model.model}`}</strong><strong>{model.governance?.riskClass ?? "UNCLASSIFIED"}</strong></div>
+                <p className="mt-2 text-muted">Ändamål: {model.governance?.intendedPurpose ?? "Ej dokumenterat"}</p>
+                <p className="mt-1 text-muted">Systemägare: {model.governance?.systemOwner ?? "Ej dokumenterad"}</p>
+                <p className="mt-1 text-muted">Rättslig grund: {model.governance?.legalBasis ?? "Ej dokumenterad"}</p>
+                <p className="mt-1 text-muted">Mänsklig tillsyn: {model.governance?.humanOversight ?? "Ej dokumenterad"}</p>
+              </div>
+            ))}
+          </div>
+        </ReportSection>
+
+        <ReportSection number="03" title="Avvärjda PII-läckor">
           <div className="print-break-inside-avoid flex items-center gap-6 rounded-sm border border-government/20 bg-government-light/50 p-6">
             <p className="font-serif text-5xl text-government">{number.format(data.summary.piiPrevented)}</p>
             <div>
@@ -120,7 +139,7 @@ export default async function ComplianceReportPage() {
           </div>
         </ReportSection>
 
-        <ReportSection number="03" title="Kryptografisk revisionskedja">
+        <ReportSection number="04" title="Kryptografisk revisionskedja">
           <div className={`print-break-inside-avoid border-l-4 p-5 ${chainIntact ? "border-government bg-government-light/50" : "border-alert bg-alert-light"}`}>
             <div className="flex items-center justify-between gap-5">
               <div>

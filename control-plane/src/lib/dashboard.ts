@@ -1,18 +1,32 @@
 import "server-only";
 
-import { asc, desc, eq, sql } from "drizzle-orm";
-import { organizations, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
+import { aiSystems, organizations, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
 import { getDatabase } from "@/db/client";
 
 export type ChainStatus = "INTACT" | "ATTENTION_REQUIRED" | "NO_EVIDENCE";
 
 export type ModelInventoryRow = {
+  applicationId: string;
   model: string;
+  observedProvider: string;
   eventCount: number;
   totalTokens: number;
   policyViolations: number;
   piiIncidents: number;
   lastSeenAt: Date;
+  governance: {
+    name: string;
+    provider: string | null;
+    intendedPurpose: string;
+    riskClass: "UNCLASSIFIED" | "MINIMAL" | "LIMITED" | "HIGH" | "PROHIBITED";
+    systemOwner: string;
+    legalBasis: string;
+    humanOversight: string;
+    dataCategories: string[];
+    deploymentRegions: string[];
+    status: "ACTIVE" | "SUSPENDED" | "RETIRED";
+  } | null;
 };
 
 export type DashboardData = {
@@ -37,10 +51,12 @@ export type DashboardData = {
     firstEventAt: Date | null;
     lastEventAt: Date | null;
     chainStatus: ChainStatus;
+    unclassifiedSystems: number;
   };
 };
 
 const modelExpression = sql<string>`coalesce(nullif(${telemetryEvents.routing}->>'model', ''), 'Okänd modell')`;
+const providerExpression = sql<string>`coalesce(nullif(${telemetryEvents.routing}->>'provider', ''), 'Okänd leverantör')`;
 const tokenExpression = sql<number>`(
   case
     when jsonb_typeof(${telemetryEvents.metrics}->'total_tokens') = 'number'
@@ -82,7 +98,9 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
   const [models, [summary], [checkpoint]] = await Promise.all([
     database
       .select({
+        applicationId: telemetryEvents.applicationId,
         model: modelExpression.as("model"),
+        observedProvider: providerExpression.as("observed_provider"),
         eventCount: sql<number>`count(*)::integer`.mapWith(Number),
         totalTokens: sql<number>`coalesce(sum(${tokenExpression}), 0)::bigint`.mapWith(Number),
         policyViolations:
@@ -92,11 +110,28 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
         lastSeenAt: sql<Date>`max(${telemetryEvents.eventTimestamp})`.mapWith(
           telemetryEvents.eventTimestamp,
         ),
+        governanceName: aiSystems.name,
+        governanceProvider: aiSystems.provider,
+        intendedPurpose: aiSystems.intendedPurpose,
+        riskClass: aiSystems.riskClass,
+        systemOwner: aiSystems.systemOwner,
+        legalBasis: aiSystems.legalBasis,
+        humanOversight: aiSystems.humanOversight,
+        dataCategories: aiSystems.dataCategories,
+        deploymentRegions: aiSystems.deploymentRegions,
+        systemStatus: aiSystems.status,
       })
       .from(telemetryEvents)
+      .leftJoin(aiSystems, and(
+        eq(aiSystems.organizationId, telemetryEvents.organizationId),
+        eq(aiSystems.applicationId, telemetryEvents.applicationId),
+        eq(aiSystems.model, modelExpression),
+      ))
       .where(eq(telemetryEvents.organizationId, organizationId))
-      .groupBy(modelExpression)
-      .orderBy(asc(modelExpression)),
+      .groupBy(
+        telemetryEvents.applicationId, modelExpression, providerExpression, aiSystems.id,
+      )
+      .orderBy(asc(telemetryEvents.applicationId), asc(modelExpression)),
     database
       .select({
         totalEvents: sql<number>`count(*)::integer`.mapWith(Number),
@@ -147,9 +182,28 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
     firstEventAt: null,
     lastEventAt: null,
   };
+  const inventory = models.map((model) => ({
+    applicationId: model.applicationId,
+    model: model.model,
+    observedProvider: model.observedProvider,
+    eventCount: model.eventCount,
+    totalTokens: model.totalTokens,
+    policyViolations: model.policyViolations,
+    piiIncidents: model.piiIncidents,
+    lastSeenAt: model.lastSeenAt,
+    governance: model.governanceName && model.intendedPurpose && model.riskClass && model.systemOwner && model.legalBasis && model.humanOversight && model.systemStatus
+      ? {
+          name: model.governanceName, provider: model.governanceProvider,
+          intendedPurpose: model.intendedPurpose, riskClass: model.riskClass,
+          systemOwner: model.systemOwner, legalBasis: model.legalBasis,
+          humanOversight: model.humanOversight, dataCategories: model.dataCategories ?? [],
+          deploymentRegions: model.deploymentRegions ?? [], status: model.systemStatus,
+        }
+      : null,
+  }));
   return {
     organization,
-    models,
+    models: inventory,
     checkpoint: checkpoint ?? null,
     summary: {
       ...normalizedSummary,
@@ -158,6 +212,7 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
         normalizedSummary.compromisedEvents,
         normalizedSummary.invalidSignatures,
       ),
+      unclassifiedSystems: inventory.filter((model) => !model.governance || model.governance.riskClass === "UNCLASSIFIED").length,
     },
   };
 }

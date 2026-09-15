@@ -34,7 +34,7 @@ export default async function DashboardPage() {
         <ReportButton />
       </div>
 
-      <section aria-label="Sammanfattning" className="grid border-b border-line md:grid-cols-3">
+      <section aria-label="Sammanfattning" className="grid border-b border-line md:grid-cols-4">
         <Metric label="Aktiva AI-modeller" value={number.format(data.models.length)} detail={`${number.format(data.summary.totalEvents)} registrerade anrop`} />
         <Metric label="Bearbetade tokens" value={number.format(data.summary.totalTokens)} detail="In- och utgående tokens" />
         <Metric
@@ -43,13 +43,19 @@ export default async function DashboardPage() {
           detail={`${number.format(data.summary.verifiedEvents)} kryptografiskt verifierade event`}
           status={data.summary.chainStatus}
         />
+        <Metric
+          label="Styrningsluckor"
+          value={number.format(data.summary.unclassifiedSystems)}
+          detail="Observerade system utan fastställd riskklass"
+          status={data.summary.unclassifiedSystems > 0 ? "ATTENTION_REQUIRED" : "INTACT"}
+        />
       </section>
 
       <section className="mt-8 overflow-hidden rounded-sm border border-line bg-panel shadow-[0_1px_2px_rgba(20,32,25,0.04)]">
         <div className="flex flex-col justify-between gap-3 border-b border-line px-5 py-5 sm:flex-row sm:items-center sm:px-6">
           <div>
             <h2 className="font-serif text-xl">Modellregister</h2>
-            <p className="mt-1 text-xs text-muted">Unika modeller observerade i behandlad telemetri</p>
+            <p className="mt-1 text-xs text-muted">Observerade applikations- och modellkombinationer med styrningsstatus</p>
           </div>
           {data.summary.lastEventAt && (
             <p className="text-xs text-muted">Senast uppdaterad {date.format(data.summary.lastEventAt)}</p>
@@ -62,21 +68,23 @@ export default async function DashboardPage() {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[760px] border-collapse text-left">
+            <table className="w-full min-w-[900px] border-collapse text-left">
               <thead className="bg-[#f0f1ed] text-[10px] uppercase tracking-[0.14em] text-muted">
                 <tr>
                   <th className="px-6 py-3.5 font-bold">AI-modell</th>
                   <th className="px-5 py-3.5 font-bold">Anrop</th>
                   <th className="px-5 py-3.5 font-bold">Tokens</th>
+                  <th className="px-5 py-3.5 font-bold">Riskklass</th>
                   <th className="px-5 py-3.5 text-right font-bold">Policybrott</th>
                   <th className="px-6 py-3.5 text-right font-bold">PII-incidenter</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
                 {data.models.map((model) => (
-                  <tr key={model.model} className="hover:bg-white">
+                  <tr key={`${model.applicationId}:${model.model}:${model.observedProvider}`} className="hover:bg-white">
                     <td className="px-6 py-5">
                       <div className="font-mono text-sm font-bold">{model.model}</div>
+                      <div className="mt-1 text-xs text-muted">{model.applicationId} · {model.observedProvider}</div>
                       <div className="mt-1 text-xs text-muted">Senast använd {date.format(model.lastSeenAt)}</div>
                     </td>
                     <td className="px-5 py-5 text-sm tabular-nums">{number.format(model.eventCount)}</td>
@@ -87,6 +95,11 @@ export default async function DashboardPage() {
                           <span className="block h-full bg-government" style={{ width: `${Math.max((model.totalTokens / maxTokens) * 100, 2)}%` }} />
                         </span>
                       </div>
+                    </td>
+                    <td className="px-5 py-5 text-xs font-bold">
+                      <span className={model.governance?.riskClass === "HIGH" || model.governance?.riskClass === "PROHIBITED" ? "text-alert" : model.governance && model.governance.riskClass !== "UNCLASSIFIED" ? "text-government" : "text-[#76652e]"}>
+                        {model.governance?.riskClass ?? "UNCLASSIFIED"}
+                      </span>
                     </td>
                     <td className="px-5 py-5 text-right text-sm font-bold tabular-nums">
                       <IncidentCount value={model.policyViolations} />
@@ -102,7 +115,13 @@ export default async function DashboardPage() {
         )}
       </section>
 
-      <div className="mt-8 grid gap-4 lg:grid-cols-2">
+      <div className="mt-8 grid gap-4 lg:grid-cols-3">
+        <EvidenceCard
+          title="AI-styrningsregister"
+          value={data.summary.unclassifiedSystems === 0 ? "Komplett klassificerat" : `${number.format(data.summary.unclassifiedSystems)} luckor`}
+          description="Riskklass, ändamål, ansvarig och mänsklig tillsyn kopplas till varje observerat AI-system."
+          warning={data.summary.unclassifiedSystems > 0}
+        />
         <EvidenceCard
           title="PII-skydd"
           value={`${number.format(data.summary.piiPrevented)} avvärjda läckor`}

@@ -23,6 +23,8 @@ export const telemetryVerificationStatus = pgEnum(
 
 export const dpoRole = pgEnum("dpo_role", ["ADMIN", "DPO", "AUDITOR"]);
 export const merkleAnchorStatus = pgEnum("merkle_anchor_status", ["PENDING", "ANCHORED"]);
+export const aiRiskClass = pgEnum("ai_risk_class", ["UNCLASSIFIED", "MINIMAL", "LIMITED", "HIGH", "PROHIBITED"]);
+export const aiSystemStatus = pgEnum("ai_system_status", ["ACTIVE", "SUSPENDED", "RETIRED"]);
 
 export const organizations = pgTable("organizations", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -31,6 +33,32 @@ export const organizations = pgTable("organizations", {
   tenantKey: varchar("tenant_key", { length: 64 }).notNull().unique(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const aiSystems = pgTable(
+  "ai_systems",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+    applicationId: varchar("application_id", { length: 160 }).notNull(),
+    model: varchar("model", { length: 160 }).notNull(),
+    name: varchar("name", { length: 200 }).notNull(),
+    provider: varchar("provider", { length: 160 }),
+    intendedPurpose: text("intended_purpose").notNull(),
+    riskClass: aiRiskClass("risk_class").default("UNCLASSIFIED").notNull(),
+    systemOwner: varchar("system_owner", { length: 200 }).notNull(),
+    legalBasis: text("legal_basis").notNull(),
+    humanOversight: text("human_oversight").notNull(),
+    dataCategories: jsonb("data_categories").$type<string[]>().default([]).notNull(),
+    deploymentRegions: jsonb("deployment_regions").$type<string[]>().default([]).notNull(),
+    status: aiSystemStatus("status").default("ACTIVE").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("ai_systems_identity_idx").on(table.organizationId, table.applicationId, table.model),
+    index("ai_systems_organization_risk_idx").on(table.organizationId, table.riskClass, table.status),
+  ],
+);
 
 export const dpoAccessKeys = pgTable(
   "dpo_access_keys",
