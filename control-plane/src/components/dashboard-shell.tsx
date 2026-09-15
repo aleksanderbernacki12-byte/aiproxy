@@ -45,6 +45,12 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             >
               <DocumentIcon /> Bevisrapport
             </Link>
+            <Link
+              href="/dashboard/reports"
+              className="flex items-center gap-3 rounded-sm px-3 py-2.5 text-sm text-muted hover:bg-white hover:text-ink"
+            >
+              <ArchiveIcon /> Rapportarkiv
+            </Link>
           </nav>
           <div className="mt-10 border-t border-line pt-5">
             <p className="px-3 text-xs leading-5 text-muted">
@@ -72,6 +78,14 @@ function DocumentIcon() {
     <svg aria-hidden="true" viewBox="0 0 24 24" className="size-4 fill-none stroke-current" strokeWidth="1.8">
       <path d="M6 3h8l4 4v14H6z" />
       <path d="M14 3v5h5M9 13h6M9 17h6" />
+    </svg>
+  );
+}
+
+function ArchiveIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="size-4 fill-none stroke-current" strokeWidth="1.8">
+      <path d="M4 7h16v14H4zM3 3h18v4H3zM9 12h6" />
     </svg>
   );
 }

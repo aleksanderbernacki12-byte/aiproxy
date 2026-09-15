@@ -2,9 +2,9 @@ import "server-only";
 
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 import canonicalize from "canonicalize";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
-import { complianceReports } from "@/db/schema";
+import { complianceReports, dpoAccessKeys } from "@/db/schema";
 import { getDashboardData } from "@/lib/dashboard";
 
 const SIGNATURE_DOMAIN = Buffer.from("aiproxy-compliance-report-v1\0");
@@ -86,4 +86,19 @@ export async function getSealedReport(reportId: string, organizationId: string):
     signature: report.signature,
     created_at: report.createdAt.toISOString(),
   } : null;
+}
+
+export async function listSealedReports(organizationId: string, limit = 100) {
+  return getDatabase().select({
+    id: complianceReports.id,
+    createdAt: complianceReports.createdAt,
+    payloadHash: complianceReports.payloadHash,
+    signingKeyId: complianceReports.signingKeyId,
+    generatedByLabel: dpoAccessKeys.label,
+    generatedByRole: dpoAccessKeys.role,
+  }).from(complianceReports)
+    .innerJoin(dpoAccessKeys, eq(dpoAccessKeys.id, complianceReports.generatedBy))
+    .where(eq(complianceReports.organizationId, organizationId))
+    .orderBy(desc(complianceReports.createdAt), desc(complianceReports.id))
+    .limit(Math.min(Math.max(limit, 1), 100));
 }

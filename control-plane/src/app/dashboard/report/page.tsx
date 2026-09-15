@@ -38,6 +38,7 @@ export default async function ComplianceReportPage() {
         <Link href="/dashboard" className="text-sm font-bold text-government hover:underline">
           ← Tillbaka till inventeringen
         </Link>
+        <Link href="/dashboard/reports" className="text-sm font-bold text-government hover:underline">Rapportarkiv</Link>
         <ReportButton mode="print" />
         {identity.role !== "AUDITOR" && (
           <form action="/api/dashboard/reports" method="post">
