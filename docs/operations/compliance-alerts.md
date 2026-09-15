@@ -56,10 +56,20 @@ invoke `/api/internal/telemetry/anchor` with `CRON_SECRET` and confirm both the
 pending count and oldest age decrease. Preserve rejected receipts and anchor
 provider logs if the root, checkpoint ID, or signature did not verify.
 
+## Administrative audit chain broken
+
+Treat this as a possible Control Plane integrity incident. Restrict database
+write access, preserve database and application logs, and take a consistent
+backup before investigating. Compare the affected organization's event hashes,
+sequence links, and stored chain head with its latest independently retained
+sealed compliance report. Do not enable `aiproxy.audit_maintenance` or repair
+rows until the original evidence and incident timeline have been preserved.
+
 ## Installation
 
 Load `deploy/prometheus/aiproxy-alerts.yml` through Prometheus `rule_files` and
 route `severity: critical` to the compliance/security on-call path. Tune only
 the backlog thresholds to measured traffic volume; alerts for dropped events,
 local persistence failures, quarantine, compromised chains, and invalid
-signatures should remain zero-tolerance.
+signatures should remain zero-tolerance. Administrative audit-chain failures
+must also remain zero-tolerance.

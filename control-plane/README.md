@@ -281,8 +281,10 @@ records during retries.
 `GET /api/internal/metrics` exports tenant-neutral Prometheus metrics and
 requires the same `Authorization: Bearer <CRON_SECRET>` protection as the
 worker. It reports current buffer depth, age of the oldest buffered event, and
-cumulative verified, compromised-chain, and invalid-signature outcomes. The
-endpoint never exports organization IDs, event IDs, or telemetry payloads.
+cumulative verified, compromised-chain, and invalid-signature outcomes. It
+also reports the number of administrative audit chains that fail complete
+verification. The endpoint never exports organization IDs, event IDs, or
+telemetry payloads.
 Shared alert rules for the Control Plane and Go data plane live in
 `../deploy/prometheus/aiproxy-alerts.yml`; the corresponding runbook is
 `../docs/operations/compliance-alerts.md`.

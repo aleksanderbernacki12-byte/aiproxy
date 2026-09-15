@@ -224,6 +224,8 @@ describe("telemetry control-plane flow", () => {
       actor_type: "DPO_CREDENTIAL", actor_id: dpoCredentialId,
       action: "COMPLIANCE_REPORT_SEALED", resource_id: reportId,
     });
+    const { getControlPlaneMetrics } = await import("@/lib/operations");
+    expect((await getControlPlaneMetrics()).brokenSecurityAuditChains).toBe(0);
     await expect(client.query(
       `UPDATE security_audit_events SET event_data = '{}'::jsonb WHERE organization_id = $1`,
       [organizationId],

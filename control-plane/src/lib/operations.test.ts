@@ -15,6 +15,7 @@ describe("Control Plane Prometheus metrics", () => {
       invalidSignatureEvents: 1,
       pendingAnchors: 3,
       oldestPendingAnchorSeconds: 900,
+      brokenSecurityAuditChains: 2,
     });
     for (const line of [
       "aiproxy_control_plane_buffer_pending 4",
@@ -24,6 +25,7 @@ describe("Control Plane Prometheus metrics", () => {
       "aiproxy_control_plane_invalid_signature_events_total 1",
       "aiproxy_control_plane_pending_merkle_anchors 3",
       "aiproxy_control_plane_oldest_pending_anchor_seconds 900",
+      "aiproxy_control_plane_broken_security_audit_chains 2",
     ]) expect(output).toContain(line);
     expect(output).not.toContain("organization");
   });

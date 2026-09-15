@@ -12,11 +12,12 @@ export type ControlPlaneMetrics = {
   invalidSignatureEvents: number;
   pendingAnchors: number;
   oldestPendingAnchorSeconds: number;
+  brokenSecurityAuditChains: number;
 };
 
 export async function getControlPlaneMetrics(now = new Date()): Promise<ControlPlaneMetrics> {
   const database = getDatabase();
-  const [[buffer], [events], [anchors]] = await Promise.all([
+  const [[buffer], [events], [anchors], auditChains] = await Promise.all([
     database.select({
       pending: sql<number>`count(*)::integer`.mapWith(Number),
       oldest: sql<Date | null>`min(${telemetryBuffer.receivedAt})`,
@@ -30,6 +31,10 @@ export async function getControlPlaneMetrics(now = new Date()): Promise<ControlP
       pending: sql<number>`count(*) filter (where ${telemetryMerkleCheckpoints.anchorStatus} = 'PENDING')::integer`.mapWith(Number),
       oldest: sql<Date | null>`min(${telemetryMerkleCheckpoints.createdAt}) filter (where ${telemetryMerkleCheckpoints.anchorStatus} = 'PENDING')`,
     }).from(telemetryMerkleCheckpoints),
+    database.execute<{ broken: number }>(sql`
+      SELECT count(*) filter (where not verify_security_audit_chain(organization_id))::integer AS broken
+      FROM security_audit_heads
+    `),
   ]);
   const oldest = buffer?.oldest ? new Date(buffer.oldest) : null;
   const oldestAnchor = anchors?.oldest ? new Date(anchors.oldest) : null;
@@ -41,6 +46,7 @@ export async function getControlPlaneMetrics(now = new Date()): Promise<ControlP
     invalidSignatureEvents: events?.invalidSignature ?? 0,
     pendingAnchors: anchors?.pending ?? 0,
     oldestPendingAnchorSeconds: oldestAnchor ? Math.max(0, Math.floor((now.getTime() - oldestAnchor.getTime()) / 1000)) : 0,
+    brokenSecurityAuditChains: auditChains.rows[0]?.broken ?? 0,
   };
 }
 
@@ -67,6 +73,9 @@ export function formatControlPlaneMetrics(metrics: ControlPlaneMetrics) {
     "# HELP aiproxy_control_plane_oldest_pending_anchor_seconds Age in seconds of the oldest checkpoint awaiting external anchoring.",
     "# TYPE aiproxy_control_plane_oldest_pending_anchor_seconds gauge",
     `aiproxy_control_plane_oldest_pending_anchor_seconds ${metrics.oldestPendingAnchorSeconds}`,
+    "# HELP aiproxy_control_plane_broken_security_audit_chains Administrative audit chains that fail complete verification.",
+    "# TYPE aiproxy_control_plane_broken_security_audit_chains gauge",
+    `aiproxy_control_plane_broken_security_audit_chains ${metrics.brokenSecurityAuditChains}`,
     "",
   ].join("\n");
 }
