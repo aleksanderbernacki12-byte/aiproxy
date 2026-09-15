@@ -7,7 +7,7 @@ import { GET } from "./route";
 afterEach(() => vi.clearAllMocks());
 
 describe("GET /api/health/ready", () => {
-  it("reports readiness only after database migrations", async () => {
+  it("reports readiness only after configuration and database checks", async () => {
     mocks.checkControlPlaneReadiness.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
     expect((await GET()).status).toBe(200);
     expect((await GET()).status).toBe(503);

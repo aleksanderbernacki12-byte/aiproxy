@@ -148,9 +148,13 @@ describe("telemetry control-plane flow", () => {
     expect(await createMerkleCheckpoints()).toMatchObject({ created: 0 });
 
     const anchorKeys = generateKeyPairSync("ed25519");
+    const reportKeys = generateKeyPairSync("ed25519");
+    vi.stubEnv("DASHBOARD_SESSION_SECRET", "s".repeat(32));
+    vi.stubEnv("CRON_SECRET", "c".repeat(32));
     vi.stubEnv("MERKLE_ANCHOR_URL", "http://independent-anchor.test/v1/checkpoints");
-    vi.stubEnv("MERKLE_ANCHOR_TOKEN", "integration-anchor-token");
+    vi.stubEnv("MERKLE_ANCHOR_TOKEN", "a".repeat(32));
     vi.stubEnv("MERKLE_ANCHOR_PUBLIC_KEY", anchorKeys.publicKey.export({ type: "spki", format: "pem" }).toString());
+    vi.stubEnv("REPORT_SIGNING_PRIVATE_KEY", reportKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
     const { anchorPendingCheckpoints, anchorReceiptSigningBytes } = await import("@/lib/telemetry/anchor");
     const anchorFetcher = async (_input: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as { checkpoint_id: string; root_hash: string };
@@ -209,8 +213,6 @@ describe("telemetry control-plane flow", () => {
       totalTokens: 40, piiIncidents: 2, governance: { riskClass: "HIGH", systemOwner: "Legal Operations" },
     });
 
-    const reportKeys = generateKeyPairSync("ed25519");
-    vi.stubEnv("REPORT_SIGNING_PRIVATE_KEY", reportKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
     const { sealComplianceReport, getSealedReport, getReportVerificationKey, listSealedReports, verifySealedReport } = await import("@/lib/compliance-report");
     const reportId = await sealComplianceReport({ credentialId: dpoCredentialId, organizationId });
     const sealedReport = await getSealedReport(reportId, organizationId);

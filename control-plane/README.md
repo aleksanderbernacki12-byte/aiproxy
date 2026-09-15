@@ -19,12 +19,15 @@ npm run dev
 Set `POSTGRES_PORT` when port 5432 is already occupied, for example
 `POSTGRES_PORT=55432 docker compose up -d postgres`.
 
-For a complete self-hosted deployment, provide independent secrets of at
-least 32 random characters and start the full stack:
+For a complete self-hosted deployment, provide every runtime value listed
+below. The session, cron, and anchor bearer secrets must be independent random
+values of at least 32 characters. Then start the full stack:
 
 ```sh
 export DASHBOARD_SESSION_SECRET='<random-session-secret>'
 export CRON_SECRET='<different-random-worker-secret>'
+export MERKLE_ANCHOR_TOKEN='<different-random-anchor-secret>'
+# Also set the anchor URL/public key and report-signing private key.
 docker compose up --build -d
 ```
 
@@ -32,7 +35,9 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0012_security_audit_anchors.sql`. Put a TLS-terminating reverse proxy in front of
+`0014_retention_and_legal_hold.sql`. It also validates every required secret,
+the report and anchor Ed25519 keys, the production anchor HTTPS URL, and the
+telemetry reorder window. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently. Every
 route emits CSP, clickjacking, MIME-sniffing, referrer, browser-permission, and
 one-year HTTPS transport policies. Keep production access on HTTPS so HSTS and
@@ -59,6 +64,8 @@ The runtime requires:
 - `MERKLE_ANCHOR_PUBLIC_KEY`: PEM-encoded Ed25519 public key used to verify
   anchor receipts. The corresponding private key stays with the independent
   anchor operator.
+- `REPORT_SIGNING_PRIVATE_KEY`: PEM-encoded Ed25519 PKCS#8 private key used to
+  seal compliance reports. Keep it separate from the anchor operator's key.
 
 Create an organization first. The command prints its tenant key once; set that
 value as `AIPROXY_TENANT_KEY` in the organization's Go data plane:
