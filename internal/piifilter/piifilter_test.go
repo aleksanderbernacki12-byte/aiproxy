@@ -6,8 +6,8 @@ import (
 )
 
 func TestRedactPII(t *testing.T) {
-	input := `{"short_ssn":"900101-0017","long_ssn":"19900101-0017","coordination":"900161-0014","email":"Anna.Example+legal@bolag.se","iban":"SE45 5000 0000 0583 9825 7466","card":"4111-1111-1111-1111","mobile":"+46 (0)70-123 45 67","landline":"08-123 456 78"}`
-	want := `{"short_ssn":"[REDACTED_SSN]","long_ssn":"[REDACTED_SSN]","coordination":"[REDACTED_SSN]","email":"[REDACTED_EMAIL]","iban":"[REDACTED_IBAN]","card":"[REDACTED_CREDIT_CARD]","mobile":"[REDACTED_PHONE]","landline":"[REDACTED_PHONE]"}`
+	input := `{"short_ssn":"900101-0017","long_ssn":"19900101-0017","coordination":"900161-0014","email":"Anna.Example+legal@bolag.se","iban":"SE45 5000 0000 0583 9825 7466","card":"4111-1111-1111-1111","mobile":"+46 (0)70-123 45 67","landline":"08-123 456 78","address":"Sankt Eriksgatan 12B, 112 39 Stockholm"}`
+	want := `{"short_ssn":"[REDACTED_SSN]","long_ssn":"[REDACTED_SSN]","coordination":"[REDACTED_SSN]","email":"[REDACTED_EMAIL]","iban":"[REDACTED_IBAN]","card":"[REDACTED_CREDIT_CARD]","mobile":"[REDACTED_PHONE]","landline":"[REDACTED_PHONE]","address":"[REDACTED_ADDRESS]"}`
 	got, found := RedactPII(input)
 	if !found {
 		t.Fatal("found = false, want true")
@@ -19,6 +19,14 @@ func TestRedactPII(t *testing.T) {
 
 func TestRedactPIILeavesNonPhoneNumbersUntouched(t *testing.T) {
 	input := "order 070-12, version 08.1234, international +46 123"
+	got, found := RedactPII(input)
+	if found || got != input {
+		t.Fatalf("RedactPII = %q, %v; want unchanged", got, found)
+	}
+}
+
+func TestRedactPIILeavesNonAddressesUntouched(t *testing.T) {
+	input := "version 12B, postkod 000 00, gatan är lång, vägen 0 och kontakta Storgatan senare"
 	got, found := RedactPII(input)
 	if found || got != input {
 		t.Fatalf("RedactPII = %q, %v; want unchanged", got, found)

@@ -13,6 +13,7 @@ const (
 	RedactedEmail      = "[REDACTED_EMAIL]"
 	RedactedCreditCard = "[REDACTED_CREDIT_CARD]"
 	RedactedPhone      = "[REDACTED_PHONE]"
+	RedactedAddress    = "[REDACTED_ADDRESS]"
 )
 
 // Redactor is the extension point for local PII detectors. A future ONNX
@@ -93,6 +94,11 @@ func NewRegexRedactor() Redactor {
 			pattern:     regexp.MustCompile(`(?:(?:\+46|\b0046)(?:[ -]?\(0\))?(?:[ -]?[0-9]){7,9}|\b07[02369](?:[ -]?[0-9]){7}|\b08(?:[ -]?[0-9]){7,8})\b`),
 			replacement: RedactedPhone,
 			valid:       validSwedishPhone,
+		},
+		{
+			pattern:     regexp.MustCompile(`(?i)\b(?:(?:sankt|s:t|norra|södra|östra|västra|gamla|nya)[ ]+)?[a-zåäöé-]{2,}(?:gatan|vägen|gränd|allé|allen|gata|väg|stigen|backen|kajen|torget|platsen)[ ]+[0-9]{1,4}[a-z]?(?:,[ ]*[1-9][0-9]{2}[ ]?[0-9]{2}[ ]+[a-zåäöé-]{2,}(?:[ ]+[a-zåäöé-]{2,}){0,2})?\b`),
+			replacement: RedactedAddress,
+			valid:       validSwedishAddress,
 		},
 	}}
 }
@@ -182,6 +188,34 @@ func validSwedishPhone(candidate string) bool {
 		return len(number) == 10 && strings.ContainsRune("02369", rune(number[2]))
 	}
 	return strings.HasPrefix(number, "08")
+}
+
+func validSwedishAddress(candidate string) bool {
+	address := strings.SplitN(candidate, ",", 2)
+	fields := strings.Fields(address[0])
+	if len(fields) < 2 {
+		return false
+	}
+	house := strings.TrimRight(fields[len(fields)-1], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	number, err := strconv.Atoi(house)
+	if err != nil || number < 1 || number > 9999 {
+		return false
+	}
+	if len(address) == 1 {
+		return true
+	}
+	postal := strings.Fields(address[1])
+	if len(postal) < 2 {
+		return false
+	}
+	postalDigits := postal[0]
+	if len(postal) >= 3 && len(postal[0]) == 3 && len(postal[1]) == 2 {
+		postalDigits = postal[0] + postal[1]
+	}
+	if len(postalDigits) != 5 || strings.Trim(postalDigits, "0123456789") != "" {
+		return false
+	}
+	return postalDigits != "00000"
 }
 
 func validCardNumber(candidate string) bool {
