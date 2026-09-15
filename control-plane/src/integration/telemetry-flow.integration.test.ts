@@ -104,9 +104,11 @@ describe("telemetry control-plane flow", () => {
     await client.query(`DELETE FROM tenant_access_keys WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM security_audit_checkpoints WHERE organization_id = $1`, [organizationId]);
     await client.query(`SELECT set_config('aiproxy.audit_maintenance', 'on', false)`);
+    await client.query(`DELETE FROM telemetry_tombstones WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM security_audit_events WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM security_audit_heads WHERE organization_id = $1`, [organizationId]);
     await client.query(`SELECT set_config('aiproxy.audit_maintenance', 'off', false)`);
+    await client.query(`DELETE FROM organization_retention_policies WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM organizations WHERE id = $1`, [organizationId]);
     await client.end();
   });
@@ -276,5 +278,26 @@ describe("telemetry control-plane flow", () => {
       body: JSON.stringify(first),
     }));
     expect(rejected.status).toBe(401);
+
+    await client.query(
+      `INSERT INTO organization_retention_policies
+       (organization_id, telemetry_retention_days, legal_hold, legal_hold_reason, legal_hold_set_at)
+       VALUES ($1, 30, true, 'CASE-2026-17', now())`, [organizationId],
+    );
+    const { enforceRetentionPolicies } = await import("@/lib/retention");
+    const retentionNow = new Date("2026-10-20T12:00:00.000Z");
+    expect(await enforceRetentionPolicies(retentionNow)).toEqual({ organizations: 1, held: 1, purged: 0 });
+    await client.query(
+      `UPDATE organization_retention_policies SET legal_hold=false, legal_hold_reason=NULL, legal_hold_set_at=NULL WHERE organization_id=$1`,
+      [organizationId],
+    );
+    expect(await enforceRetentionPolicies(retentionNow)).toEqual({ organizations: 1, held: 0, purged: 2 });
+    const retainedEvidence = await getDashboardData(organizationId);
+    expect(retainedEvidence?.retention).toMatchObject({ telemetryRetentionDays: 30, legalHold: false, tombstoneCount: 2 });
+    expect(retainedEvidence?.models).toHaveLength(0);
+    expect(retainedEvidence?.summary.chainStatus).toBe("INTACT");
+    await expect(client.query(
+      `UPDATE telemetry_tombstones SET event_hash=$2 WHERE organization_id=$1`, [organizationId, "c".repeat(64)],
+    )).rejects.toThrow(/append-only/);
   });
 });

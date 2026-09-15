@@ -26,5 +26,7 @@ async function checkpointAndAnchor() {
 }
 
 await run("/api/internal/telemetry/process");
+await run("/api/internal/retention/run");
 setInterval(() => void run("/api/internal/telemetry/process"), 60_000);
 setInterval(() => void checkpointAndAnchor(), 5 * 60_000);
+setInterval(() => void run("/api/internal/retention/run"), 24 * 60 * 60_000);

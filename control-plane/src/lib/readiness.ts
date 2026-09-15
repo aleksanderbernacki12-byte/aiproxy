@@ -3,7 +3,7 @@ import "server-only";
 import { sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
 
-export const expectedMigration = "0013_dashboard_login_throttling.sql";
+export const expectedMigration = "0014_retention_and_legal_hold.sql";
 
 export async function checkControlPlaneReadiness() {
   const result = await getDatabase().execute<{ migration_ready: boolean }>(sql`

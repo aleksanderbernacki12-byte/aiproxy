@@ -1,6 +1,7 @@
 import {
   bigint,
   bigserial,
+  boolean,
   foreignKey,
   index,
   integer,
@@ -96,6 +97,30 @@ export const dashboardLoginAttempts = pgTable("dashboard_login_attempts", {
   blockedUntil: timestamp("blocked_until", { withTimezone: true }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
 }, (table) => [index("dashboard_login_attempts_cleanup_idx").on(table.updatedAt)]);
+
+export const organizationRetentionPolicies = pgTable("organization_retention_policies", {
+  organizationId: uuid("organization_id").primaryKey().references(() => organizations.id),
+  telemetryRetentionDays: integer("telemetry_retention_days").notNull(),
+  legalHold: boolean("legal_hold").default(false).notNull(),
+  legalHoldReason: varchar("legal_hold_reason", { length: 500 }),
+  legalHoldSetAt: timestamp("legal_hold_set_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const telemetryTombstones = pgTable("telemetry_tombstones", {
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+  eventId: uuid("event_id").notNull(),
+  eventTimestamp: timestamp("event_timestamp", { withTimezone: true }).notNull(),
+  eventHash: varchar("event_hash", { length: 64 }).notNull(),
+  previousEventHash: varchar("previous_event_hash", { length: 64 }).notNull(),
+  keyId: varchar("key_id", { length: 64 }).notNull(),
+  chainSequence: bigint("chain_sequence", { mode: "bigint" }).notNull(),
+  purgedAt: timestamp("purged_at", { withTimezone: true }).notNull(),
+  retentionDays: integer("retention_days").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.eventId] }),
+  index("telemetry_tombstones_org_time_idx").on(table.organizationId, table.eventTimestamp),
+]);
 
 export const complianceReports = pgTable(
   "compliance_reports",

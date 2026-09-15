@@ -177,6 +177,29 @@ only when at least one of its own reports references that key. The fingerprint
 in the report and archive must still be compared with the copy distributed
 through the independent trusted channel.
 
+## Retention and legal hold
+
+Automatic telemetry retention is opt-in per organization. Configure a period
+from 30 to 3650 days, or place and release a legal hold with a case reference:
+
+```sh
+npm run retention -- set <organization-id> 365
+npm run retention -- hold <organization-id> "CASE-2026-17"
+npm run retention -- release <organization-id> "CASE-2026-17 closed"
+```
+
+The daily worker at `GET /api/internal/retention/run` requires `CRON_SECRET`.
+It never purges a tenant without an explicit policy, and an active legal hold
+stops all of that tenant's purging. Only `VERIFIED` events older than the policy
+period and covered by an externally anchored chain head are eligible. Each run
+moves at most 500 events per tenant into append-only tombstones containing only
+event identity, timestamp, chain hashes, key ID, sequence, and purge metadata.
+Deduplication IDs, chain heads, Merkle checkpoints, administrative audit events,
+and sealed reports remain intact. Invalid-signature and compromised-chain rows
+are retained for investigation. Policy changes, legal holds, releases, and
+completed purge batches are recorded in the administrative audit chain. Use a
+case reference rather than personal data in legal-hold reasons.
+
 ## Administrative security ledger
 
 Credential creation and revocation, telemetry signing-key changes, AI-system

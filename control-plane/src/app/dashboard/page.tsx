@@ -34,6 +34,12 @@ export default async function DashboardPage() {
         <ReportButton />
       </div>
 
+      {data.retention?.legalHold && (
+        <div className="mt-6 border-l-4 border-alert bg-alert-light p-4 text-sm text-alert">
+          <strong>Legal hold är aktiv.</strong> Automatisk gallring är stoppad. {data.retention.legalHoldReason}
+        </div>
+      )}
+
       <section aria-label="Sammanfattning" className="grid border-b border-line md:grid-cols-4">
         <Metric label="Aktiva AI-modeller" value={number.format(data.models.length)} detail={`${number.format(data.summary.totalEvents)} registrerade anrop`} />
         <Metric label="Bearbetade tokens" value={number.format(data.summary.totalTokens)} detail="In- och utgående tokens" />

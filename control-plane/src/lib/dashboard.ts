@@ -40,6 +40,13 @@ export type DashboardData = {
     anchorId: string | null;
     anchoredAt: Date | null;
   } | null;
+  retention: {
+    telemetryRetentionDays: number;
+    legalHold: boolean;
+    legalHoldReason: string | null;
+    legalHoldSetAt: Date | null;
+    tombstoneCount: number;
+  } | null;
   summary: {
     totalEvents: number;
     totalTokens: number;
@@ -95,7 +102,7 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
     .limit(1);
   if (!organization) return null;
 
-  const [models, [summary], [checkpoint]] = await Promise.all([
+  const [models, [summary], [checkpoint], retentionResult] = await Promise.all([
     database
       .select({
         applicationId: telemetryEvents.applicationId,
@@ -169,6 +176,17 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
     }).from(telemetryMerkleCheckpoints)
       .where(eq(telemetryMerkleCheckpoints.organizationId, organizationId))
       .orderBy(desc(telemetryMerkleCheckpoints.createdAt), desc(telemetryMerkleCheckpoints.id)).limit(1),
+    database.execute<{
+      telemetry_retention_days: number | null; legal_hold: boolean | null;
+      legal_hold_reason: string | null; legal_hold_set_at: Date | null; tombstone_count: number;
+    }>(sql`
+      SELECT policy.telemetry_retention_days, policy.legal_hold,
+        policy.legal_hold_reason, policy.legal_hold_set_at,
+        (SELECT count(*)::integer FROM telemetry_tombstones WHERE organization_id = ${organizationId}::uuid) AS tombstone_count
+      FROM organizations organization
+      LEFT JOIN organization_retention_policies policy ON policy.organization_id = organization.id
+      WHERE organization.id = ${organizationId}::uuid
+    `),
   ]);
 
   const normalizedSummary = summary ?? {
@@ -201,14 +219,22 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
         }
       : null,
   }));
+  const retention = retentionResult.rows[0];
   return {
     organization,
     models: inventory,
     checkpoint: checkpoint ?? null,
+    retention: retention?.telemetry_retention_days != null && retention.legal_hold != null ? {
+      telemetryRetentionDays: retention.telemetry_retention_days,
+      legalHold: retention.legal_hold,
+      legalHoldReason: retention.legal_hold_reason,
+      legalHoldSetAt: retention.legal_hold_set_at,
+      tombstoneCount: retention.tombstone_count,
+    } : null,
     summary: {
       ...normalizedSummary,
       chainStatus: chainStatusFor(
-        normalizedSummary.totalEvents,
+        normalizedSummary.totalEvents + (retention?.tombstone_count ?? 0),
         normalizedSummary.compromisedEvents,
         normalizedSummary.invalidSignatures,
       ),

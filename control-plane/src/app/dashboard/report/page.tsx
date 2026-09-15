@@ -190,7 +190,19 @@ export default async function ComplianceReportPage() {
           )}
         </ReportSection>
 
-        <ReportSection number="05" title="Administrativ säkerhetslogg">
+        <ReportSection number="05" title="Retention och legal hold">
+          {data.retention ? (
+            <dl className="grid border-y border-line py-4 text-xs sm:grid-cols-3">
+              <ReportField label="Telemetriretention" value={`${number.format(data.retention.telemetryRetentionDays)} dagar`} />
+              <ReportField label="Legal hold" value={data.retention.legalHold ? "Aktiv – gallring stoppad" : "Inte aktiv"} />
+              <ReportField label="Gallrade event" value={number.format(data.retention.tombstoneCount)} />
+            </dl>
+          ) : <p className="text-sm text-muted">Ingen automatisk retention är konfigurerad.</p>}
+          {data.retention?.legalHoldReason && <p className="mt-4 text-xs text-muted">Grund för legal hold: {data.retention.legalHoldReason}</p>}
+          <p className="mt-4 text-xs leading-5 text-muted">Gallring kräver ett verifierat externt ankare och bevarar eventets kryptografiska kedjelänk som en append-only tombstone.</p>
+        </ReportSection>
+
+        <ReportSection number="06" title="Administrativ säkerhetslogg">
           <div className={`print-break-inside-avoid border-l-4 p-5 ${administrativeAudit.status === "INTACT" ? "border-government bg-government-light/50" : administrativeAudit.status === "NO_EVIDENCE" ? "border-line bg-[#f4f5f2]" : "border-alert bg-alert-light"}`}>
             <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">Append-only-kedja</p>
             <p className={`mt-2 font-serif text-2xl ${administrativeAudit.status === "ATTENTION_REQUIRED" ? "text-alert" : "text-government"}`}>
