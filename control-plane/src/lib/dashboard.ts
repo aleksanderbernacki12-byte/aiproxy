@@ -1,7 +1,7 @@
 import "server-only";
 
-import { asc, eq, sql } from "drizzle-orm";
-import { organizations, telemetryEvents } from "@/db/schema";
+import { asc, desc, eq, sql } from "drizzle-orm";
+import { organizations, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
 import { getDatabase } from "@/db/client";
 
 export type ChainStatus = "INTACT" | "ATTENTION_REQUIRED" | "NO_EVIDENCE";
@@ -18,6 +18,7 @@ export type ModelInventoryRow = {
 export type DashboardData = {
   organization: { id: string; name: string };
   models: ModelInventoryRow[];
+  checkpoint: { rootHash: string; leafCount: number; createdAt: Date } | null;
   summary: {
     totalEvents: number;
     totalTokens: number;
@@ -71,7 +72,7 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
     .limit(1);
   if (!organization) return null;
 
-  const [models, [summary]] = await Promise.all([
+  const [models, [summary], [checkpoint]] = await Promise.all([
     database
       .select({
         model: modelExpression.as("model"),
@@ -116,6 +117,13 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
       })
       .from(telemetryEvents)
       .where(eq(telemetryEvents.organizationId, organizationId)),
+    database.select({
+      rootHash: telemetryMerkleCheckpoints.rootHash,
+      leafCount: telemetryMerkleCheckpoints.leafCount,
+      createdAt: telemetryMerkleCheckpoints.createdAt,
+    }).from(telemetryMerkleCheckpoints)
+      .where(eq(telemetryMerkleCheckpoints.organizationId, organizationId))
+      .orderBy(desc(telemetryMerkleCheckpoints.createdAt), desc(telemetryMerkleCheckpoints.id)).limit(1),
   ]);
 
   const normalizedSummary = summary ?? {
@@ -132,6 +140,7 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
   return {
     organization,
     models,
+    checkpoint: checkpoint ?? null,
     summary: {
       ...normalizedSummary,
       chainStatus: chainStatusFor(

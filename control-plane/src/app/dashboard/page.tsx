@@ -111,7 +111,9 @@ export default async function DashboardPage() {
         <EvidenceCard
           title="Kedjeintegritet"
           value={chainIntact ? "Verifierad och sammanhängande" : "Avvikelse registrerad"}
-          description={`${number.format(data.summary.compromisedEvents)} kedjebrott · ${number.format(data.summary.invalidSignatures)} ogiltiga signaturer`}
+          description={data.checkpoint
+            ? `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle-checkpoint ${data.checkpoint.rootHash.slice(0, 12)}…`
+            : `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle-checkpoint inväntas`}
           warning={!chainIntact && data.summary.chainStatus !== "NO_EVIDENCE"}
         />
       </div>

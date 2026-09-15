@@ -3,6 +3,10 @@
     {
       "path": "/api/internal/telemetry/process",
       "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/internal/telemetry/checkpoint",
+      "schedule": "*/5 * * * *"
     }
   ]
 }

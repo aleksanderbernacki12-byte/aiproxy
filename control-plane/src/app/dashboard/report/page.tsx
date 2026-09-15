@@ -142,6 +142,15 @@ export default async function ComplianceReportPage() {
           <p className="mt-5 text-xs leading-5 text-muted">
             Varje event är signerat med ECDSA P-256 och länkat till föregående eventhash. Kontrollplanet verifierar signaturen, eventhashen och föregående länks hash innan eventet registreras i revisionskedjan.
           </p>
+          {data.checkpoint && (
+            <dl className="mt-5 border border-line p-4 text-xs">
+              <dt className="font-bold uppercase tracking-[0.12em] text-muted">Senaste Merkle-checkpoint</dt>
+              <dd className="mt-2 break-all font-mono">{data.checkpoint.rootHash}</dd>
+              <dd className="mt-2 text-muted">
+                {number.format(data.checkpoint.leafCount)} kedjehuvuden · {timestamp.format(data.checkpoint.createdAt)}
+              </dd>
+            </dl>
+          )}
         </ReportSection>
 
         <footer className="mt-12 border-t border-line pt-5 text-[9px] leading-4 text-muted">

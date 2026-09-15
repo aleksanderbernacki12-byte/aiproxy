@@ -74,6 +74,7 @@ describe("telemetry control-plane flow", () => {
       await client.end();
       return;
     }
+    await client.query(`DELETE FROM telemetry_merkle_checkpoints WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_events WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_buffer WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_chain_heads WHERE organization_id = $1`, [organizationId]);
@@ -113,6 +114,10 @@ describe("telemetry control-plane flow", () => {
       { event_id: eventTwoId, status: "VERIFIED", chain_sequence: "2" },
     ]);
 
+    const { createMerkleCheckpoints } = await import("@/lib/telemetry/checkpoint");
+    expect(await createMerkleCheckpoints()).toMatchObject({ created: 1 });
+    expect(await createMerkleCheckpoints()).toMatchObject({ created: 0 });
+
     const { getDashboardData } = await import("@/lib/dashboard");
     const dashboard = await getDashboardData(organizationId);
     expect(dashboard?.summary).toMatchObject({
@@ -125,6 +130,8 @@ describe("telemetry control-plane flow", () => {
       chainStatus: "INTACT",
     });
     expect(dashboard?.models).toHaveLength(1);
+    expect(dashboard?.checkpoint).toMatchObject({ leafCount: 1 });
+    expect(dashboard?.checkpoint?.rootHash).toMatch(/^[a-f0-9]{64}$/);
     expect(dashboard?.models[0]).toMatchObject({
       model: "gpt-enterprise", eventCount: 2, totalTokens: 40, piiIncidents: 2,
     });

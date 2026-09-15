@@ -122,6 +122,24 @@ export const telemetryChainHeads = pgTable(
   (table) => [primaryKey({ columns: [table.organizationId, table.keyId] })],
 );
 
+export type MerkleCheckpointHead = { key_id: string; event_hash: string; sequence: string };
+
+export const telemetryMerkleCheckpoints = pgTable(
+  "telemetry_merkle_checkpoints",
+  {
+    id: bigserial("id", { mode: "bigint" }).primaryKey(),
+    organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+    rootHash: varchar("root_hash", { length: 64 }).notNull(),
+    leafCount: integer("leaf_count").notNull(),
+    chainHeads: jsonb("chain_heads").$type<MerkleCheckpointHead[]>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("telemetry_merkle_checkpoints_root_idx").on(table.organizationId, table.rootHash),
+    index("telemetry_merkle_checkpoints_latest_idx").on(table.organizationId, table.createdAt, table.id),
+  ],
+);
+
 export const telemetryEvents = pgTable(
   "telemetry_events",
   {

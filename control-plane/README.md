@@ -120,6 +120,16 @@ Cryptographically valid rows with a stale or unknown predecessor become
 revoked keys, or key fingerprints become `INVALID_SIGNATURE`. Neither status
 advances the verified chain head.
 
+## Merkle checkpoints
+
+`GET /api/internal/telemetry/checkpoint` runs every five minutes with the same
+`CRON_SECRET` protection. It sorts each organization's verified chain heads,
+hashes tenant-bound leaves, and reduces them to a SHA-256 Merkle root. A new
+checkpoint is stored only when the root changes. Its complete head snapshot
+makes the root reproducible and is exposed in the tenant-scoped evidence
+report. This is an internal cryptographic checkpoint; external timestamping or
+public-ledger anchoring remains a separate deployment step.
+
 ## Operations metrics
 
 `GET /api/internal/metrics` exports tenant-neutral Prometheus metrics and
