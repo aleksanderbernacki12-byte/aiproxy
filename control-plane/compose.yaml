@@ -15,5 +15,51 @@ services:
       timeout: 3s
       retries: 20
 
+  migrate:
+    build:
+      context: .
+      target: migrations
+    environment:
+      DATABASE_URL: postgresql://aiproxy:aiproxy@postgres:5432/aiproxy_control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      target: runtime
+    environment:
+      DATABASE_URL: postgresql://aiproxy:aiproxy@postgres:5432/aiproxy_control
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-}
+      CRON_SECRET: ${CRON_SECRET:-}
+      TELEMETRY_REORDER_WINDOW_SECONDS: ${TELEMETRY_REORDER_WINDOW_SECONDS:-30}
+    ports:
+      - "${CONTROL_PLANE_PORT:-3000}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  scheduler:
+    build:
+      context: .
+      target: runtime
+    command: ["node", "scripts/scheduler.mjs"]
+    environment:
+      CONTROL_PLANE_INTERNAL_URL: http://app:3000
+      CRON_SECRET: ${CRON_SECRET:-}
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   aiproxy-control-postgres:

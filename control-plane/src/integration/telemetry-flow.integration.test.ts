@@ -52,9 +52,14 @@ describe("telemetry control-plane flow", () => {
   beforeAll(async () => {
     await client.connect();
     databaseConnected = true;
+    await client.query(`CREATE TABLE IF NOT EXISTS control_plane_migrations (
+      filename text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )`);
     const migrations = (await readdir(resolve("db/migrations"))).filter((name) => name.endsWith(".sql")).sort();
     for (const migration of migrations) {
       await client.query(await readFile(resolve("db/migrations", migration), "utf8"));
+      await client.query(`INSERT INTO control_plane_migrations(filename) VALUES ($1) ON CONFLICT DO NOTHING`, [migration]);
     }
     await client.query(
       `INSERT INTO organizations (id, name, tenant_key) VALUES ($1, $2, $3)`,
@@ -132,6 +137,9 @@ describe("telemetry control-plane flow", () => {
     expect(dashboard?.models).toHaveLength(1);
     expect(dashboard?.checkpoint).toMatchObject({ leafCount: 1 });
     expect(dashboard?.checkpoint?.rootHash).toMatch(/^[a-f0-9]{64}$/);
+
+    const { checkControlPlaneReadiness } = await import("@/lib/readiness");
+    expect(await checkControlPlaneReadiness()).toBe(true);
     expect(dashboard?.models[0]).toMatchObject({
       model: "gpt-enterprise", eventCount: 2, totalTokens: 40, piiIncidents: 2,
     });

@@ -19,6 +19,22 @@ npm run dev
 Set `POSTGRES_PORT` when port 5432 is already occupied, for example
 `POSTGRES_PORT=55432 docker compose up -d postgres`.
 
+For a complete self-hosted deployment, provide independent secrets of at
+least 32 random characters and start the full stack:
+
+```sh
+export DASHBOARD_SESSION_SECRET='<random-session-secret>'
+export CRON_SECRET='<different-random-worker-secret>'
+docker compose up --build -d
+```
+
+Compose runs migrations to completion before starting the non-root standalone
+Next.js container. A separate scheduler invokes telemetry processing every
+minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
+process; `/api/health/ready` also requires PostgreSQL and migration
+`0005_merkle_checkpoints.sql`. Put a TLS-terminating reverse proxy in front of
+port 3000 in production and back up the PostgreSQL volume independently.
+
 The runtime requires:
 
 - `DATABASE_URL`: PostgreSQL connection string.
