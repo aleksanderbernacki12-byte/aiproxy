@@ -21,6 +21,7 @@ const keyId = createHash("sha256")
   .digest("hex");
 let databaseConnected = false;
 let organizationCreated = false;
+let createdReportSigningKeyId: string | null = null;
 
 function signedEvent(eventId: string, timestamp: string, previousHash: string, inputTokens: number, signer: KeyObject) {
   const event: TelemetryEvent = {
@@ -90,6 +91,7 @@ describe("telemetry control-plane flow", () => {
     }
     await client.query(`DELETE FROM ai_systems WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM compliance_reports WHERE organization_id = $1`, [organizationId]);
+    if (createdReportSigningKeyId) await client.query(`DELETE FROM report_signing_keys WHERE key_id = $1`, [createdReportSigningKeyId]);
     await client.query(`DELETE FROM telemetry_merkle_checkpoints WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_events WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_buffer WHERE organization_id = $1`, [organizationId]);
@@ -192,11 +194,15 @@ describe("telemetry control-plane flow", () => {
 
     const reportKeys = generateKeyPairSync("ed25519");
     vi.stubEnv("REPORT_SIGNING_PRIVATE_KEY", reportKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString());
-    const { sealComplianceReport, getSealedReport, listSealedReports, verifySealedReport } = await import("@/lib/compliance-report");
+    const { sealComplianceReport, getSealedReport, getReportVerificationKey, listSealedReports, verifySealedReport } = await import("@/lib/compliance-report");
     const reportId = await sealComplianceReport({ credentialId: dpoCredentialId, organizationId });
     const sealedReport = await getSealedReport(reportId, organizationId);
     expect(sealedReport).not.toBeNull();
+    createdReportSigningKeyId = sealedReport!.signing_key_id;
     expect(verifySealedReport(sealedReport!, reportKeys.publicKey.export({ type: "spki", format: "pem" }).toString())).toBe(true);
+    expect(await getReportVerificationKey(sealedReport!.signing_key_id, organizationId)).toBe(
+      reportKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+    );
     expect(await listSealedReports(organizationId)).toMatchObject([{
       id: reportId,
       generatedByLabel: "Integration DPO",

@@ -105,6 +105,13 @@ export const complianceReports = pgTable(
   (table) => [index("compliance_reports_organization_created_idx").on(table.organizationId, table.createdAt, table.id)],
 );
 
+export const reportSigningKeys = pgTable("report_signing_keys", {
+  keyId: varchar("key_id", { length: 64 }).primaryKey(),
+  publicKeyPem: text("public_key_pem").notNull(),
+  firstUsedAt: timestamp("first_used_at", { withTimezone: true }).defaultNow().notNull(),
+  lastUsedAt: timestamp("last_used_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [index("report_signing_keys_last_used_idx").on(table.lastUsedAt, table.keyId)]);
+
 export const telemetryPublicKeys = pgTable(
   "telemetry_public_keys",
   {

@@ -42,7 +42,7 @@ export default async function ReportArchivePage() {
                     <td className="px-6 py-5 font-bold">{timestamp.format(report.createdAt)}<br /><span className="font-mono text-[10px] font-normal text-muted">{report.id}</span></td>
                     <td className="px-5 py-5">{report.generatedByLabel}<br /><span className="text-muted">{report.generatedByRole}</span></td>
                     <td className="px-5 py-5 font-mono">{report.payloadHash.slice(0, 16)}…</td>
-                    <td className="px-5 py-5 font-mono">{report.signingKeyId.slice(0, 16)}…</td>
+                    <td className="px-5 py-5 font-mono">{report.signingKeyId.slice(0, 16)}…<br /><a href={`/api/dashboard/report-keys/${report.signingKeyId}`} className="font-sans font-bold text-government hover:underline">Hämta publiknyckel</a></td>
                     <td className="px-6 py-5 text-right"><a href={`/api/dashboard/reports/${report.id}`} className="font-bold text-government hover:underline">Ladda ned JSON</a></td>
                   </tr>
                 ))}

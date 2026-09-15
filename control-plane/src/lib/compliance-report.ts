@@ -4,7 +4,7 @@ import { createHash, createPrivateKey, createPublicKey, sign, verify } from "nod
 import canonicalize from "canonicalize";
 import { and, desc, eq } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
-import { complianceReports, dpoAccessKeys } from "@/db/schema";
+import { complianceReports, dpoAccessKeys, reportSigningKeys } from "@/db/schema";
 import { getDashboardData } from "@/lib/dashboard";
 
 const SIGNATURE_DOMAIN = Buffer.from("aiproxy-compliance-report-v1\0");
@@ -22,7 +22,7 @@ function reportSigningKey() {
   if (privateKey.asymmetricKeyType !== "ed25519") throw new Error("REPORT_SIGNING_PRIVATE_KEY must be Ed25519");
   const publicKey = createPublicKey(privateKey);
   const keyId = createHash("sha256").update(publicKey.export({ type: "spki", format: "der" })).digest("hex");
-  return { privateKey, keyId };
+  return { privateKey, publicKeyPem: publicKey.export({ type: "spki", format: "pem" }).toString(), keyId };
 }
 
 export type SealedReport = {
@@ -57,18 +57,26 @@ export async function sealComplianceReport(identity: { credentialId: string; org
   })) as Record<string, unknown>;
   const canonical = canonicalPayload(payload);
   const payloadHash = createHash("sha256").update(canonical).digest("hex");
-  const { privateKey, keyId } = reportSigningKey();
+  const { privateKey, publicKeyPem, keyId } = reportSigningKey();
   const signature = sign(null, Buffer.concat([SIGNATURE_DOMAIN, canonical]), privateKey).toString("base64");
-  const [stored] = await getDatabase().insert(complianceReports).values({
-    organizationId: identity.organizationId,
-    generatedBy: identity.credentialId,
-    payload,
-    payloadHash,
-    signatureAlgorithm: "Ed25519",
-    signingKeyId: keyId,
-    signature,
-    createdAt: now,
-  }).returning({ id: complianceReports.id });
+  const [stored] = await getDatabase().transaction(async (transaction) => {
+    await transaction.insert(reportSigningKeys).values({
+      keyId, publicKeyPem, firstUsedAt: now, lastUsedAt: now,
+    }).onConflictDoUpdate({
+      target: reportSigningKeys.keyId,
+      set: { lastUsedAt: now },
+    });
+    return transaction.insert(complianceReports).values({
+      organizationId: identity.organizationId,
+      generatedBy: identity.credentialId,
+      payload,
+      payloadHash,
+      signatureAlgorithm: "Ed25519",
+      signingKeyId: keyId,
+      signature,
+      createdAt: now,
+    }).returning({ id: complianceReports.id });
+  });
   if (!stored) throw new Error("Compliance report was not stored");
   return stored.id;
 }
@@ -101,4 +109,13 @@ export async function listSealedReports(organizationId: string, limit = 100) {
     .where(eq(complianceReports.organizationId, organizationId))
     .orderBy(desc(complianceReports.createdAt), desc(complianceReports.id))
     .limit(Math.min(Math.max(limit, 1), 100));
+}
+
+export async function getReportVerificationKey(keyId: string, organizationId: string) {
+  const [key] = await getDatabase().select({ publicKeyPem: reportSigningKeys.publicKeyPem })
+    .from(reportSigningKeys)
+    .innerJoin(complianceReports, eq(complianceReports.signingKeyId, reportSigningKeys.keyId))
+    .where(and(eq(reportSigningKeys.keyId, keyId), eq(complianceReports.organizationId, organizationId)))
+    .limit(1);
+  return key?.publicKeyPem ?? null;
 }

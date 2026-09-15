@@ -32,7 +32,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0009_tenant_access_keys.sql`. Put a TLS-terminating reverse proxy in front of
+`0010_report_signing_keys.sql`. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently.
 
 The runtime requires:
@@ -156,6 +156,13 @@ The tenant-scoped `/dashboard/reports` archive lists the 100 latest artifacts
 with their issuer, payload digest, and signing-key fingerprint. DPOs and
 auditors can download historical JSON without loading its payload into the
 archive page.
+
+The public half of every report key is archived automatically on first use and
+linked from each report row. Rotating `REPORT_SIGNING_PRIVATE_KEY` therefore
+does not make older reports unverifiable. A tenant can download a public key
+only when at least one of its own reports references that key. The fingerprint
+in the report and archive must still be compared with the copy distributed
+through the independent trusted channel.
 
 Generate the signing-key pair without overwriting existing files. The private
 key is created with owner-only permissions:
