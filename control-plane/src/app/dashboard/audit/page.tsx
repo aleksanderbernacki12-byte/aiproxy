@@ -24,6 +24,11 @@ export default async function SecurityAuditPage() {
       <div className={`mt-7 border-l-4 p-5 ${ledger.valid ? "border-government bg-government-light" : "border-alert bg-alert-light"}`}>
         <p className="text-xs font-bold uppercase tracking-[0.14em] text-muted">Kedjestatus</p>
         <p className={`mt-2 font-serif text-2xl ${ledger.valid ? "text-government" : "text-alert"}`}>{ledger.valid ? "Verifierad och sammanhängande" : "Integritetsfel kräver utredning"}</p>
+        <p className="mt-2 text-xs text-muted">
+          {ledger.evidence.anchor?.status === "ANCHORED"
+            ? `Externt förankrad · ${ledger.evidence.anchor.anchorId ?? "verifierat kvitto"}`
+            : ledger.evidence.anchor ? "Extern förankring väntar" : "Ingen extern checkpoint ännu"}
+        </p>
       </div>
       <section className="mt-6 overflow-hidden border border-line bg-panel">
         {ledger.events.length === 0 ? <p className="p-10 text-center text-sm text-muted">Inga administrativa händelser registrerade.</p> : (

@@ -5,7 +5,7 @@ import canonicalize from "canonicalize";
 import { asc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { getDatabase } from "@/db/client";
-import { telemetryMerkleCheckpoints } from "@/db/schema";
+import { securityAuditCheckpoints, telemetryMerkleCheckpoints } from "@/db/schema";
 
 const MAX_BATCH = 5;
 const RECEIPT_DOMAIN = Buffer.from("aiproxy-merkle-anchor-receipt-v1\0");
@@ -57,23 +57,34 @@ export async function anchorPendingCheckpoints(fetcher: typeof fetch = fetch) {
   const config = anchorConfig();
   if (!config) return { configured: false, attempted: 0, anchored: 0, failed: 0 };
   const database = getDatabase();
-  const checkpoints = await database.select({
-    id: telemetryMerkleCheckpoints.id,
-    rootHash: telemetryMerkleCheckpoints.rootHash,
-    leafCount: telemetryMerkleCheckpoints.leafCount,
-    createdAt: telemetryMerkleCheckpoints.createdAt,
-  }).from(telemetryMerkleCheckpoints)
-    .where(eq(telemetryMerkleCheckpoints.anchorStatus, "PENDING"))
-    .orderBy(asc(telemetryMerkleCheckpoints.createdAt), asc(telemetryMerkleCheckpoints.id)).limit(MAX_BATCH);
+  const [telemetry, audit] = await Promise.all([
+    database.select({
+      id: telemetryMerkleCheckpoints.id, rootHash: telemetryMerkleCheckpoints.rootHash,
+      leafCount: telemetryMerkleCheckpoints.leafCount, createdAt: telemetryMerkleCheckpoints.createdAt,
+    }).from(telemetryMerkleCheckpoints).where(eq(telemetryMerkleCheckpoints.anchorStatus, "PENDING"))
+      .orderBy(asc(telemetryMerkleCheckpoints.createdAt), asc(telemetryMerkleCheckpoints.id)).limit(MAX_BATCH),
+    database.select({
+      id: securityAuditCheckpoints.id, rootHash: securityAuditCheckpoints.rootHash,
+      createdAt: securityAuditCheckpoints.createdAt,
+    }).from(securityAuditCheckpoints).where(eq(securityAuditCheckpoints.anchorStatus, "PENDING"))
+      .orderBy(asc(securityAuditCheckpoints.createdAt), asc(securityAuditCheckpoints.id)).limit(MAX_BATCH),
+  ]);
+  const checkpoints = [
+    ...telemetry.map((checkpoint) => ({ ...checkpoint, kind: "telemetry" as const })),
+    ...audit.map((checkpoint) => ({ ...checkpoint, leafCount: 1, kind: "security_audit" as const })),
+  ].sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || Number(left.id - right.id)).slice(0, MAX_BATCH);
   let anchored = 0;
   let failed = 0;
   for (const checkpoint of checkpoints) {
     const checkpointId = checkpoint.id.toString();
     const outcome = await database.transaction(async (transaction) => {
-      const lock = await transaction.execute<{ anchor_status: string }>(sql`
-        SELECT anchor_status FROM telemetry_merkle_checkpoints
-        WHERE id = ${checkpoint.id} FOR UPDATE
-      `);
+      const lock = checkpoint.kind === "telemetry"
+        ? await transaction.execute<{ anchor_status: string }>(sql`
+            SELECT anchor_status FROM telemetry_merkle_checkpoints WHERE id = ${checkpoint.id} FOR UPDATE
+          `)
+        : await transaction.execute<{ anchor_status: string }>(sql`
+            SELECT anchor_status FROM security_audit_checkpoints WHERE id = ${checkpoint.id} FOR UPDATE
+          `);
       if (lock.rows[0]?.anchor_status !== "PENDING") return "skipped" as const;
       try {
         const response = await fetcher(config.url, {
@@ -95,20 +106,31 @@ export async function anchorPendingCheckpoints(fetcher: typeof fetch = fetch) {
         if (anchoredAt < checkpoint.createdAt || anchoredAt.getTime() > Date.now() + 5 * 60_000) {
           throw new Error("Anchor receipt timestamp is outside the accepted interval");
         }
-        await transaction.update(telemetryMerkleCheckpoints).set({
-          anchorStatus: "ANCHORED",
-          anchorAttempts: sql`${telemetryMerkleCheckpoints.anchorAttempts} + 1`,
-          anchorLastError: null,
-          anchorId: verification.receipt.anchor_id,
-          anchoredAt,
-          anchorReceipt: verification.receipt,
-        }).where(eq(telemetryMerkleCheckpoints.id, checkpoint.id));
+        if (checkpoint.kind === "telemetry") {
+          await transaction.update(telemetryMerkleCheckpoints).set({
+            anchorStatus: "ANCHORED", anchorAttempts: sql`${telemetryMerkleCheckpoints.anchorAttempts} + 1`,
+            anchorLastError: null, anchorId: verification.receipt.anchor_id,
+            anchoredAt, anchorReceipt: verification.receipt,
+          }).where(eq(telemetryMerkleCheckpoints.id, checkpoint.id));
+        } else {
+          await transaction.update(securityAuditCheckpoints).set({
+            anchorStatus: "ANCHORED", anchorAttempts: sql`${securityAuditCheckpoints.anchorAttempts} + 1`,
+            anchorLastError: null, anchorId: verification.receipt.anchor_id,
+            anchoredAt, anchorReceipt: verification.receipt,
+          }).where(eq(securityAuditCheckpoints.id, checkpoint.id));
+        }
         return "anchored" as const;
       } catch (error) {
-        await transaction.update(telemetryMerkleCheckpoints).set({
-          anchorAttempts: sql`${telemetryMerkleCheckpoints.anchorAttempts} + 1`,
-          anchorLastError: error instanceof Error ? error.message.slice(0, 500) : "External anchoring failed",
-        }).where(eq(telemetryMerkleCheckpoints.id, checkpoint.id));
+        const anchorLastError = error instanceof Error ? error.message.slice(0, 500) : "External anchoring failed";
+        if (checkpoint.kind === "telemetry") {
+          await transaction.update(telemetryMerkleCheckpoints).set({
+            anchorAttempts: sql`${telemetryMerkleCheckpoints.anchorAttempts} + 1`, anchorLastError,
+          }).where(eq(telemetryMerkleCheckpoints.id, checkpoint.id));
+        } else {
+          await transaction.update(securityAuditCheckpoints).set({
+            anchorAttempts: sql`${securityAuditCheckpoints.anchorAttempts} + 1`, anchorLastError,
+          }).where(eq(securityAuditCheckpoints.id, checkpoint.id));
+        }
         return "failed" as const;
       }
     });

@@ -32,7 +32,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0011_security_audit_ledger.sql`. Put a TLS-terminating reverse proxy in front of
+`0012_security_audit_anchors.sql`. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently. Every
 route emits CSP, clickjacking, MIME-sniffing, referrer, browser-permission, and
 one-year HTTPS transport policies. Keep production access on HTTPS so HSTS and
@@ -184,7 +184,11 @@ their audit event cannot be appended; invalid credentials and missing resources
 are not logged because they cannot be assigned safely to a tenant ledger.
 
 `/dashboard/audit` recalculates the complete tenant chain against its stored
-head before displaying the 200 latest events. Set `AIPROXY_OPERATOR_ID` to a
+head before displaying the 200 latest events. Every scheduled checkpoint run
+also verifies each audit chain, creates a tenant-bound SHA-256 checkpoint when
+its head changes, and submits it through the independently verified anchor
+channel. Audit and telemetry checkpoints share a global numeric ID sequence so
+external receipts and idempotency keys cannot collide. Set `AIPROXY_OPERATOR_ID` to a
 stable internal operator identifier when running administrative CLI commands;
 it defaults to `local-cli` and must never contain credentials or personal data.
 The maintenance setting is reserved for controlled restore and test cleanup;
@@ -255,14 +259,16 @@ advances the verified chain head.
 ## Merkle checkpoints
 
 `GET /api/internal/telemetry/checkpoint` runs every five minutes with the same
-`CRON_SECRET` protection. It sorts each organization's verified chain heads,
-hashes tenant-bound leaves, and reduces them to a SHA-256 Merkle root. A new
+`CRON_SECRET` protection. It sorts each organization's verified telemetry chain
+heads, hashes tenant-bound leaves, and reduces them to a SHA-256 Merkle root. It
+also verifies and checkpoints changed administrative audit heads. A new
 checkpoint is stored only when the root changes. Its complete head snapshot
 makes the root reproducible and is exposed in the tenant-scoped evidence
 report.
 
-`GET /api/internal/telemetry/anchor` sends pending checkpoints to the configured
-independent anchor in batches of five. The request contains only checkpoint ID,
+`GET /api/internal/telemetry/anchor` sends pending telemetry and audit
+checkpoints to the configured independent anchor in chronological batches of
+five. The request contains only checkpoint ID,
 root hash, hash algorithm, leaf count, and creation time; tenant IDs and
 telemetry are excluded. The endpoint must return this strict JSON receipt:
 

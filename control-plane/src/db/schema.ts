@@ -125,6 +125,32 @@ export const securityAuditEvents = pgTable("security_audit_events", {
   index("security_audit_events_org_time_idx").on(table.organizationId, table.occurredAt, table.sequence),
 ]);
 
+export const securityAuditHeads = pgTable("security_audit_heads", {
+  organizationId: uuid("organization_id").primaryKey().references(() => organizations.id),
+  sequence: bigint("sequence", { mode: "bigint" }).notNull(),
+  latestEventHash: varchar("latest_event_hash", { length: 64 }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+});
+
+export const securityAuditCheckpoints = pgTable("security_audit_checkpoints", {
+  id: bigint("id", { mode: "bigint" }).primaryKey(),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+  sequence: bigint("sequence", { mode: "bigint" }).notNull(),
+  eventHash: varchar("event_hash", { length: 64 }).notNull(),
+  rootHash: varchar("root_hash", { length: 64 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  anchorStatus: merkleAnchorStatus("anchor_status").default("PENDING").notNull(),
+  anchorAttempts: integer("anchor_attempts").default(0).notNull(),
+  anchorLastError: text("anchor_last_error"),
+  anchorId: varchar("anchor_id", { length: 240 }),
+  anchoredAt: timestamp("anchored_at", { withTimezone: true }),
+  anchorReceipt: jsonb("anchor_receipt").$type<Record<string, unknown>>(),
+}, (table) => [
+  uniqueIndex("security_audit_checkpoints_root_idx").on(table.organizationId, table.rootHash),
+  uniqueIndex("security_audit_checkpoints_sequence_idx").on(table.organizationId, table.sequence),
+  index("security_audit_checkpoints_latest_idx").on(table.organizationId, table.createdAt, table.id),
+]);
+
 export const telemetryPublicKeys = pgTable(
   "telemetry_public_keys",
   {

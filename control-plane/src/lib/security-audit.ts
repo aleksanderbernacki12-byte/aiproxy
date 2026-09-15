@@ -10,6 +10,7 @@ export type SecurityAuditEvidence = {
   latestSequence: string;
   latestEventHash: string;
   latestEventAt: Date | null;
+  anchor: { rootHash: string; status: "PENDING" | "ANCHORED"; anchorId: string | null; anchoredAt: Date | null } | null;
 };
 
 export async function appendSecurityAuditEvent(input: {
@@ -34,12 +35,20 @@ export async function getSecurityAuditEvidence(organizationId: string): Promise<
     latest_sequence: string;
     latest_event_hash: string;
     latest_event_at: Date | null;
+    anchor_root_hash: string | null;
+    anchor_status: "PENDING" | "ANCHORED" | null;
+    anchor_id: string | null;
+    anchored_at: Date | null;
   }>(sql`
     SELECT verify_security_audit_chain(${organizationId}::uuid) AS valid,
       count(*)::integer AS event_count,
       coalesce(max(sequence), 0)::text AS latest_sequence,
       coalesce((array_agg(event_hash ORDER BY sequence DESC))[1], '') AS latest_event_hash,
-      max(occurred_at) AS latest_event_at
+      max(occurred_at) AS latest_event_at,
+      (SELECT root_hash FROM security_audit_checkpoints WHERE organization_id = ${organizationId}::uuid ORDER BY created_at DESC, id DESC LIMIT 1) AS anchor_root_hash,
+      (SELECT anchor_status FROM security_audit_checkpoints WHERE organization_id = ${organizationId}::uuid ORDER BY created_at DESC, id DESC LIMIT 1) AS anchor_status,
+      (SELECT anchor_id FROM security_audit_checkpoints WHERE organization_id = ${organizationId}::uuid ORDER BY created_at DESC, id DESC LIMIT 1) AS anchor_id,
+      (SELECT anchored_at FROM security_audit_checkpoints WHERE organization_id = ${organizationId}::uuid ORDER BY created_at DESC, id DESC LIMIT 1) AS anchored_at
     FROM security_audit_events
     WHERE organization_id = ${organizationId}::uuid
   `);
@@ -51,6 +60,10 @@ export async function getSecurityAuditEvidence(organizationId: string): Promise<
     latestSequence: row?.latest_sequence ?? "0",
     latestEventHash: row?.latest_event_hash ?? "",
     latestEventAt: row?.latest_event_at ?? null,
+    anchor: row?.anchor_root_hash && row.anchor_status ? {
+      rootHash: row.anchor_root_hash, status: row.anchor_status,
+      anchorId: row.anchor_id, anchoredAt: row.anchored_at,
+    } : null,
   };
 }
 

@@ -2,7 +2,7 @@ import "server-only";
 
 import { sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
-import { telemetryBuffer, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
+import { securityAuditCheckpoints, telemetryBuffer, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
 
 export type ControlPlaneMetrics = {
   bufferPending: number;
@@ -17,7 +17,7 @@ export type ControlPlaneMetrics = {
 
 export async function getControlPlaneMetrics(now = new Date()): Promise<ControlPlaneMetrics> {
   const database = getDatabase();
-  const [[buffer], [events], [anchors], auditChains] = await Promise.all([
+  const [[buffer], [events], [anchors], [auditAnchors], auditChains] = await Promise.all([
     database.select({
       pending: sql<number>`count(*)::integer`.mapWith(Number),
       oldest: sql<Date | null>`min(${telemetryBuffer.receivedAt})`,
@@ -31,20 +31,25 @@ export async function getControlPlaneMetrics(now = new Date()): Promise<ControlP
       pending: sql<number>`count(*) filter (where ${telemetryMerkleCheckpoints.anchorStatus} = 'PENDING')::integer`.mapWith(Number),
       oldest: sql<Date | null>`min(${telemetryMerkleCheckpoints.createdAt}) filter (where ${telemetryMerkleCheckpoints.anchorStatus} = 'PENDING')`,
     }).from(telemetryMerkleCheckpoints),
+    database.select({
+      pending: sql<number>`count(*) filter (where ${securityAuditCheckpoints.anchorStatus} = 'PENDING')::integer`.mapWith(Number),
+      oldest: sql<Date | null>`min(${securityAuditCheckpoints.createdAt}) filter (where ${securityAuditCheckpoints.anchorStatus} = 'PENDING')`,
+    }).from(securityAuditCheckpoints),
     database.execute<{ broken: number }>(sql`
       SELECT count(*) filter (where not verify_security_audit_chain(organization_id))::integer AS broken
       FROM security_audit_heads
     `),
   ]);
   const oldest = buffer?.oldest ? new Date(buffer.oldest) : null;
-  const oldestAnchor = anchors?.oldest ? new Date(anchors.oldest) : null;
+  const anchorDates = [anchors?.oldest, auditAnchors?.oldest].filter((value): value is Date => Boolean(value)).map((value) => new Date(value));
+  const oldestAnchor = anchorDates.length > 0 ? new Date(Math.min(...anchorDates.map((value) => value.getTime()))) : null;
   return {
     bufferPending: buffer?.pending ?? 0,
     oldestBufferedSeconds: oldest ? Math.max(0, Math.floor((now.getTime() - oldest.getTime()) / 1000)) : 0,
     verifiedEvents: events?.verified ?? 0,
     compromisedEvents: events?.compromised ?? 0,
     invalidSignatureEvents: events?.invalidSignature ?? 0,
-    pendingAnchors: anchors?.pending ?? 0,
+    pendingAnchors: (anchors?.pending ?? 0) + (auditAnchors?.pending ?? 0),
     oldestPendingAnchorSeconds: oldestAnchor ? Math.max(0, Math.floor((now.getTime() - oldestAnchor.getTime()) / 1000)) : 0,
     brokenSecurityAuditChains: auditChains.rows[0]?.broken ?? 0,
   };

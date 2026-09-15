@@ -100,6 +100,7 @@ describe("telemetry control-plane flow", () => {
     await client.query(`DELETE FROM telemetry_event_ids WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM dpo_access_keys WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM tenant_access_keys WHERE organization_id = $1`, [organizationId]);
+    await client.query(`DELETE FROM security_audit_checkpoints WHERE organization_id = $1`, [organizationId]);
     await client.query(`SELECT set_config('aiproxy.audit_maintenance', 'on', false)`);
     await client.query(`DELETE FROM security_audit_events WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM security_audit_heads WHERE organization_id = $1`, [organizationId]);
@@ -147,7 +148,7 @@ describe("telemetry control-plane flow", () => {
     vi.stubEnv("MERKLE_ANCHOR_TOKEN", "integration-anchor-token");
     vi.stubEnv("MERKLE_ANCHOR_PUBLIC_KEY", anchorKeys.publicKey.export({ type: "spki", format: "pem" }).toString());
     const { anchorPendingCheckpoints, anchorReceiptSigningBytes } = await import("@/lib/telemetry/anchor");
-    const anchorResult = await anchorPendingCheckpoints(async (_input, init) => {
+    const anchorFetcher = async (_input: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as { checkpoint_id: string; root_hash: string };
       const receipt = {
         anchor_id: "integration-ledger-1",
@@ -159,7 +160,8 @@ describe("telemetry control-plane flow", () => {
       };
       receipt.signature = sign(null, anchorReceiptSigningBytes(receipt), anchorKeys.privateKey).toString("base64");
       return Response.json(receipt);
-    });
+    };
+    const anchorResult = await anchorPendingCheckpoints(anchorFetcher);
     expect(anchorResult).toEqual({ configured: true, attempted: 1, anchored: 1, failed: 0 });
 
     await client.query(
@@ -229,7 +231,23 @@ describe("telemetry control-plane flow", () => {
       organizationId, actorId: dpoCredentialId, action: "COMPLIANCE_REPORT_DOWNLOADED",
       resourceType: "COMPLIANCE_REPORT", resourceId: reportId,
     });
-    expect((await getSecurityAuditLedger(organizationId)).events).toHaveLength(2);
+    const { createSecurityAuditCheckpoints } = await import("@/lib/security-audit-checkpoint");
+    expect(await createSecurityAuditCheckpoints()).toMatchObject({ created: 1, invalid: 0 });
+    expect(await createSecurityAuditCheckpoints()).toMatchObject({ created: 0, invalid: 0 });
+    expect(await anchorPendingCheckpoints(anchorFetcher)).toEqual({ configured: true, attempted: 1, anchored: 1, failed: 0 });
+    const anchoredAudit = await getSecurityAuditLedger(organizationId);
+    expect(anchoredAudit.events).toHaveLength(2);
+    expect(anchoredAudit.evidence.anchor).toMatchObject({ status: "ANCHORED", anchorId: "integration-ledger-1" });
+    const originalAuditHash = await client.query<{ event_hash: string }>(
+      `SELECT event_hash FROM security_audit_events WHERE organization_id = $1 AND sequence = 1`, [organizationId],
+    );
+    await client.query(`ALTER TABLE security_audit_events DISABLE TRIGGER security_audit_events_immutable`);
+    await client.query(`UPDATE security_audit_events SET event_hash = $2 WHERE organization_id = $1 AND sequence = 1`, [organizationId, "b".repeat(64)]);
+    await client.query(`ALTER TABLE security_audit_events ENABLE TRIGGER security_audit_events_immutable`);
+    expect(await createSecurityAuditCheckpoints()).toMatchObject({ created: 0, invalid: 1 });
+    await client.query(`ALTER TABLE security_audit_events DISABLE TRIGGER security_audit_events_immutable`);
+    await client.query(`UPDATE security_audit_events SET event_hash = $2 WHERE organization_id = $1 AND sequence = 1`, [organizationId, originalAuditHash.rows[0].event_hash]);
+    await client.query(`ALTER TABLE security_audit_events ENABLE TRIGGER security_audit_events_immutable`);
     const { getControlPlaneMetrics } = await import("@/lib/operations");
     expect((await getControlPlaneMetrics()).brokenSecurityAuditChains).toBe(0);
     await expect(client.query(

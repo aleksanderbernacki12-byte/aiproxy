@@ -203,6 +203,13 @@ export default async function ComplianceReportPage() {
             <dt className="mt-4 font-bold uppercase tracking-[0.12em] text-muted">Senaste eventhash</dt>
             <dd className="mt-2 break-all font-mono">{administrativeAudit.latestEventHash || "Ingen hash ännu"}</dd>
             {administrativeAudit.latestEventAt && <dd className="mt-2 text-muted">Senast uppdaterad {timestamp.format(administrativeAudit.latestEventAt)}</dd>}
+            <dt className="mt-4 font-bold uppercase tracking-[0.12em] text-muted">Extern förankring</dt>
+            <dd className="mt-2">
+              {administrativeAudit.anchor?.status === "ANCHORED" && administrativeAudit.anchor.anchoredAt
+                ? `Verifierat ankarkvitto ${administrativeAudit.anchor.anchorId ?? ""} · ${timestamp.format(administrativeAudit.anchor.anchoredAt)}`
+                : administrativeAudit.anchor ? "Inväntar verifierat ankarkvitto" : "Ingen audit-checkpoint ännu"}
+            </dd>
+            {administrativeAudit.anchor && <dd className="mt-2 break-all font-mono">{administrativeAudit.anchor.rootHash}</dd>}
           </dl>
           <p className="mt-5 text-xs leading-5 text-muted">Rapportens signerade snapshot innehåller kedjans verifieringsstatus, eventantal och senaste hash före rapportens egen förseglingshändelse.</p>
         </ReportSection>
