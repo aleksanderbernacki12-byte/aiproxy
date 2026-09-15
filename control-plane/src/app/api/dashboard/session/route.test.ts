@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ authenticateDPOAccessKey: vi.fn(), appendSecurityAuditEvent: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  authenticateDPOAccessKey: vi.fn(), appendSecurityAuditEvent: vi.fn(),
+  hashLoginSource: vi.fn(() => "source-hash"), getLoginThrottle: vi.fn(),
+  recordLoginFailure: vi.fn(), clearLoginFailures: vi.fn(),
+}));
 vi.mock("@/lib/dpo-auth", () => mocks);
 vi.mock("@/lib/security-audit", () => ({ appendSecurityAuditEvent: mocks.appendSecurityAuditEvent }));
+vi.mock("@/lib/login-throttle", () => ({
+  hashLoginSource: mocks.hashLoginSource, getLoginThrottle: mocks.getLoginThrottle,
+  recordLoginFailure: mocks.recordLoginFailure, clearLoginFailures: mocks.clearLoginFailures,
+}));
 vi.mock("server-only", () => ({}));
 
 import { POST } from "./route";
@@ -19,6 +27,7 @@ function request(key = "x".repeat(32)) {
 describe("POST /api/dashboard/session", () => {
   beforeEach(() => {
     vi.stubEnv("DASHBOARD_SESSION_SECRET", "s".repeat(32));
+    mocks.getLoginThrottle.mockResolvedValue({ allowed: true, retryAfterSeconds: 0 });
     mocks.authenticateDPOAccessKey.mockResolvedValue({ credentialId: "key-1", organizationId: "org-1", role: "DPO", label: "Primary DPO" });
   });
   afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); });
@@ -42,6 +51,7 @@ describe("POST /api/dashboard/session", () => {
     expect(response.status).toBe(303);
     expect(response.headers.get("location")).toContain("/login?error=invalid");
     expect(response.headers.get("set-cookie")).toBeNull();
+    expect(mocks.recordLoginFailure).toHaveBeenCalledWith("source-hash");
   });
 
   it("rejects cross-origin submissions before checking credentials", async () => {
@@ -49,6 +59,14 @@ describe("POST /api/dashboard/session", () => {
       method: "POST", headers: { origin: "https://attacker.example" },
     });
     expect((await POST(crossOrigin)).status).toBe(403);
+    expect(mocks.authenticateDPOAccessKey).not.toHaveBeenCalled();
+  });
+
+  it("returns a retry interval without checking credentials when the source is blocked", async () => {
+    mocks.getLoginThrottle.mockResolvedValueOnce({ allowed: false, retryAfterSeconds: 321 });
+    const response = await POST(request());
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("321");
     expect(mocks.authenticateDPOAccessKey).not.toHaveBeenCalled();
   });
 

@@ -38,6 +38,13 @@ route emits CSP, clickjacking, MIME-sniffing, referrer, browser-permission, and
 one-year HTTPS transport policies. Keep production access on HTTPS so HSTS and
 Secure session cookies are effective.
 
+The dashboard login limiter allows five failed attempts per pseudonymous source
+in 15 minutes and works across application instances through PostgreSQL. Source
+addresses are HMAC-SHA256 hashed with the session secret and never stored. The
+TLS reverse proxy must remove client-supplied forwarding headers and set a
+trusted `X-Forwarded-For` or `X-Real-IP`; otherwise clients can evade source
+throttling. Attempt rows expire opportunistically after 24 hours.
+
 The runtime requires:
 
 - `DATABASE_URL`: PostgreSQL connection string.

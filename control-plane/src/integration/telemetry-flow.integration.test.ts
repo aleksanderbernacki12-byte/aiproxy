@@ -12,7 +12,8 @@ const tenantKey = `integration-${randomUUID()}-${randomUUID()}`;
 const organizationId = randomUUID();
 const eventOneId = randomUUID();
 const eventTwoId = randomUUID();
-const dpoCredentialId = randomUUID();
+  const dpoCredentialId = randomUUID();
+  const loginSourceHash = "d".repeat(64);
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
 const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
@@ -89,6 +90,7 @@ describe("telemetry control-plane flow", () => {
       await client.end();
       return;
     }
+    await client.query(`DELETE FROM dashboard_login_attempts WHERE source_hash = $1`, [loginSourceHash]);
     await client.query(`DELETE FROM ai_systems WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM compliance_reports WHERE organization_id = $1`, [organizationId]);
     if (createdReportSigningKeyId) await client.query(`DELETE FROM report_signing_keys WHERE key_id = $1`, [createdReportSigningKeyId]);
@@ -193,6 +195,13 @@ describe("telemetry control-plane flow", () => {
 
     const { checkControlPlaneReadiness } = await import("@/lib/readiness");
     expect(await checkControlPlaneReadiness()).toBe(true);
+    const { clearLoginFailures, getLoginThrottle, recordLoginFailure } = await import("@/lib/login-throttle");
+    const throttleNow = new Date("2026-09-15T12:00:00.000Z");
+    expect((await getLoginThrottle(loginSourceHash, throttleNow)).allowed).toBe(true);
+    for (let attempt = 0; attempt < 5; attempt += 1) await recordLoginFailure(loginSourceHash, throttleNow);
+    expect(await getLoginThrottle(loginSourceHash, throttleNow)).toMatchObject({ allowed: false, retryAfterSeconds: 900 });
+    await clearLoginFailures(loginSourceHash);
+    expect((await getLoginThrottle(loginSourceHash, throttleNow)).allowed).toBe(true);
     expect(dashboard?.models[0]).toMatchObject({
       applicationId: "integration-test", model: "gpt-enterprise", eventCount: 2,
       totalTokens: 40, piiIncidents: 2, governance: { riskClass: "HIGH", systemOwner: "Legal Operations" },

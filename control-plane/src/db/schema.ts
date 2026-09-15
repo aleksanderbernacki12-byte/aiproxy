@@ -89,6 +89,14 @@ export const dpoAccessKeys = pgTable(
   (table) => [index("dpo_access_keys_organization_idx").on(table.organizationId, table.revokedAt)],
 );
 
+export const dashboardLoginAttempts = pgTable("dashboard_login_attempts", {
+  sourceHash: varchar("source_hash", { length: 64 }).primaryKey(),
+  windowStartedAt: timestamp("window_started_at", { withTimezone: true }).notNull(),
+  failures: integer("failures").notNull(),
+  blockedUntil: timestamp("blocked_until", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (table) => [index("dashboard_login_attempts_cleanup_idx").on(table.updatedAt)]);
+
 export const complianceReports = pgTable(
   "compliance_reports",
   {
