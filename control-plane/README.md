@@ -153,6 +153,21 @@ Ed25519 signature. The signature covers the RFC 8785 canonical payload prefixed
 with `aiproxy-compliance-report-v1\0`. Stored snapshots are never updated, so a
 later governance or telemetry change cannot silently alter an issued report.
 
+Generate the signing-key pair without overwriting existing files. The private
+key is created with owner-only permissions:
+
+```sh
+npm run reports:keygen -- report-private.pem report-public.pem
+```
+
+An auditor can verify a downloaded artifact entirely offline. The command
+checks the strict envelope, canonical payload hash, Ed25519 public-key
+fingerprint, and signature, and prints no report contents:
+
+```sh
+npm run reports:verify -- aiproxy-compliance-<report-id>.json report-public.pem
+```
+
 ## Ingestion
 
 `POST /api/telemetry/ingest` accepts one event or the ordered event array sent

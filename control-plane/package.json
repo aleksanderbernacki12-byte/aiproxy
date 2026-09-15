@@ -20,7 +20,9 @@
     "keys:revoke": "node scripts/revoke-public-key.mjs",
     "dpo:create": "node scripts/create-dpo-key.mjs",
     "dpo:revoke": "node scripts/revoke-dpo-key.mjs",
-    "systems:upsert": "node scripts/upsert-ai-system.mjs"
+    "systems:upsert": "node scripts/upsert-ai-system.mjs",
+    "reports:keygen": "node scripts/generate-report-signing-key.mjs",
+    "reports:verify": "node scripts/verify-compliance-report.mjs"
   },
   "engines": {
     "node": ">=24.0.0"
