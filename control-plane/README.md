@@ -33,7 +33,10 @@ Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
 `0011_security_audit_ledger.sql`. Put a TLS-terminating reverse proxy in front of
-port 3000 in production and back up the PostgreSQL volume independently.
+port 3000 in production and back up the PostgreSQL volume independently. Every
+route emits CSP, clickjacking, MIME-sniffing, referrer, browser-permission, and
+one-year HTTPS transport policies. Keep production access on HTTPS so HSTS and
+Secure session cookies are effective.
 
 The runtime requires:
 
