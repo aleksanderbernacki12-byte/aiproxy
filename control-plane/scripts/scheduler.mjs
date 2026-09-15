@@ -4,7 +4,7 @@ const secret = process.env.CRON_SECRET;
 const baseUrl = process.env.CONTROL_PLANE_INTERNAL_URL ?? "http://app:3000";
 if (!secret || secret.length < 32) throw new Error("CRON_SECRET must contain at least 32 characters");
 
-let processing = false;
+const running = new Set();
 async function invoke(path) {
   const response = await fetch(new URL(path, baseUrl), {
     headers: { authorization: `Bearer ${secret}` },
@@ -13,13 +13,18 @@ async function invoke(path) {
 }
 
 async function run(path) {
-  if (processing) return;
-  processing = true;
+  if (running.has(path)) return;
+  running.add(path);
   try { await invoke(path); }
   catch (error) { console.error("Control Plane scheduled task failed", error); }
-  finally { processing = false; }
+  finally { running.delete(path); }
+}
+
+async function checkpointAndAnchor() {
+  await run("/api/internal/telemetry/checkpoint");
+  await run("/api/internal/telemetry/anchor");
 }
 
 await run("/api/internal/telemetry/process");
 setInterval(() => void run("/api/internal/telemetry/process"), 60_000);
-setInterval(() => void run("/api/internal/telemetry/checkpoint"), 5 * 60_000);
+setInterval(() => void checkpointAndAnchor(), 5 * 60_000);

@@ -18,7 +18,14 @@ export type ModelInventoryRow = {
 export type DashboardData = {
   organization: { id: string; name: string };
   models: ModelInventoryRow[];
-  checkpoint: { rootHash: string; leafCount: number; createdAt: Date } | null;
+  checkpoint: {
+    rootHash: string;
+    leafCount: number;
+    createdAt: Date;
+    anchorStatus: "PENDING" | "ANCHORED";
+    anchorId: string | null;
+    anchoredAt: Date | null;
+  } | null;
   summary: {
     totalEvents: number;
     totalTokens: number;
@@ -121,6 +128,9 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
       rootHash: telemetryMerkleCheckpoints.rootHash,
       leafCount: telemetryMerkleCheckpoints.leafCount,
       createdAt: telemetryMerkleCheckpoints.createdAt,
+      anchorStatus: telemetryMerkleCheckpoints.anchorStatus,
+      anchorId: telemetryMerkleCheckpoints.anchorId,
+      anchoredAt: telemetryMerkleCheckpoints.anchoredAt,
     }).from(telemetryMerkleCheckpoints)
       .where(eq(telemetryMerkleCheckpoints.organizationId, organizationId))
       .orderBy(desc(telemetryMerkleCheckpoints.createdAt), desc(telemetryMerkleCheckpoints.id)).limit(1),

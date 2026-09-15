@@ -7,6 +7,10 @@
     {
       "path": "/api/internal/telemetry/checkpoint",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/internal/telemetry/anchor",
+      "schedule": "2-59/5 * * * *"
     }
   ]
 }

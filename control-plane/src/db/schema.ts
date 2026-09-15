@@ -22,6 +22,7 @@ export const telemetryVerificationStatus = pgEnum(
 );
 
 export const dpoRole = pgEnum("dpo_role", ["ADMIN", "DPO", "AUDITOR"]);
+export const merkleAnchorStatus = pgEnum("merkle_anchor_status", ["PENDING", "ANCHORED"]);
 
 export const organizations = pgTable("organizations", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -133,6 +134,12 @@ export const telemetryMerkleCheckpoints = pgTable(
     leafCount: integer("leaf_count").notNull(),
     chainHeads: jsonb("chain_heads").$type<MerkleCheckpointHead[]>().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    anchorStatus: merkleAnchorStatus("anchor_status").default("PENDING").notNull(),
+    anchorAttempts: integer("anchor_attempts").default(0).notNull(),
+    anchorLastError: text("anchor_last_error"),
+    anchorId: varchar("anchor_id", { length: 240 }),
+    anchoredAt: timestamp("anchored_at", { withTimezone: true }),
+    anchorReceipt: jsonb("anchor_receipt").$type<Record<string, unknown>>(),
   },
   (table) => [
     uniqueIndex("telemetry_merkle_checkpoints_root_idx").on(table.organizationId, table.rootHash),

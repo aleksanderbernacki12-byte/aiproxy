@@ -79,3 +79,10 @@ groups:
         annotations:
           summary: Control Plane rejected invalid cryptographic evidence
           runbook_url: docs/operations/compliance-alerts.md#compromised-chain-or-invalid-signature
+      - alert: AiproxyMerkleAnchoringDelayed
+        expr: aiproxy_control_plane_oldest_pending_anchor_seconds > 900
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Control Plane cannot externally anchor Merkle checkpoints
+          runbook_url: docs/operations/compliance-alerts.md#external-merkle-anchoring-delay

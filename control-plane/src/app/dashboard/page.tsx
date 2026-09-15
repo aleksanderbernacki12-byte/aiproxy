@@ -112,7 +112,7 @@ export default async function DashboardPage() {
           title="Kedjeintegritet"
           value={chainIntact ? "Verifierad och sammanhängande" : "Avvikelse registrerad"}
           description={data.checkpoint
-            ? `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle-checkpoint ${data.checkpoint.rootHash.slice(0, 12)}…`
+            ? `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle ${data.checkpoint.anchorStatus === "ANCHORED" ? "externt förankrad" : "väntar på extern förankring"}`
             : `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle-checkpoint inväntas`}
           warning={!chainIntact && data.summary.chainStatus !== "NO_EVIDENCE"}
         />

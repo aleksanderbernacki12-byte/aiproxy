@@ -123,6 +123,26 @@ describe("telemetry control-plane flow", () => {
     expect(await createMerkleCheckpoints()).toMatchObject({ created: 1 });
     expect(await createMerkleCheckpoints()).toMatchObject({ created: 0 });
 
+    const anchorKeys = generateKeyPairSync("ed25519");
+    vi.stubEnv("MERKLE_ANCHOR_URL", "http://independent-anchor.test/v1/checkpoints");
+    vi.stubEnv("MERKLE_ANCHOR_TOKEN", "integration-anchor-token");
+    vi.stubEnv("MERKLE_ANCHOR_PUBLIC_KEY", anchorKeys.publicKey.export({ type: "spki", format: "pem" }).toString());
+    const { anchorPendingCheckpoints, anchorReceiptSigningBytes } = await import("@/lib/telemetry/anchor");
+    const anchorResult = await anchorPendingCheckpoints(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as { checkpoint_id: string; root_hash: string };
+      const receipt = {
+        anchor_id: "integration-ledger-1",
+        checkpoint_id: request.checkpoint_id,
+        root_hash: request.root_hash,
+        anchored_at: new Date().toISOString(),
+        signature_algorithm: "Ed25519" as const,
+        signature: "placeholder-signature-value-long-enough",
+      };
+      receipt.signature = sign(null, anchorReceiptSigningBytes(receipt), anchorKeys.privateKey).toString("base64");
+      return Response.json(receipt);
+    });
+    expect(anchorResult).toEqual({ configured: true, attempted: 1, anchored: 1, failed: 0 });
+
     const { getDashboardData } = await import("@/lib/dashboard");
     const dashboard = await getDashboardData(organizationId);
     expect(dashboard?.summary).toMatchObject({
@@ -135,7 +155,9 @@ describe("telemetry control-plane flow", () => {
       chainStatus: "INTACT",
     });
     expect(dashboard?.models).toHaveLength(1);
-    expect(dashboard?.checkpoint).toMatchObject({ leafCount: 1 });
+    expect(dashboard?.checkpoint).toMatchObject({
+      leafCount: 1, anchorStatus: "ANCHORED", anchorId: "integration-ledger-1",
+    });
     expect(dashboard?.checkpoint?.rootHash).toMatch(/^[a-f0-9]{64}$/);
 
     const { checkControlPlaneReadiness } = await import("@/lib/readiness");

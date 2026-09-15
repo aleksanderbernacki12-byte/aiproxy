@@ -32,7 +32,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0005_merkle_checkpoints.sql`. Put a TLS-terminating reverse proxy in front of
+`0006_external_merkle_anchors.sql`. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently.
 
 The runtime requires:
@@ -44,6 +44,11 @@ The runtime requires:
   this header automatically to configured cron invocations.
 - `TELEMETRY_REORDER_WINDOW_SECONDS`: how long a chain gap remains buffered
   before it is classified as compromised; defaults to 30 seconds.
+- `MERKLE_ANCHOR_URL`: HTTPS endpoint for an independent append-only anchor.
+- `MERKLE_ANCHOR_TOKEN`: bearer credential sent only to the anchor endpoint.
+- `MERKLE_ANCHOR_PUBLIC_KEY`: PEM-encoded Ed25519 public key used to verify
+  anchor receipts. The corresponding private key stays with the independent
+  anchor operator.
 
 Create an organization first. The command prints its tenant key once; set that
 value as `AIPROXY_TENANT_KEY` in the organization's Go data plane:
@@ -143,8 +148,30 @@ advances the verified chain head.
 hashes tenant-bound leaves, and reduces them to a SHA-256 Merkle root. A new
 checkpoint is stored only when the root changes. Its complete head snapshot
 makes the root reproducible and is exposed in the tenant-scoped evidence
-report. This is an internal cryptographic checkpoint; external timestamping or
-public-ledger anchoring remains a separate deployment step.
+report.
+
+`GET /api/internal/telemetry/anchor` sends pending checkpoints to the configured
+independent anchor in batches of five. The request contains only checkpoint ID,
+root hash, hash algorithm, leaf count, and creation time; tenant IDs and
+telemetry are excluded. The endpoint must return this strict JSON receipt:
+
+```json
+{
+  "anchor_id": "append-only-ledger-reference",
+  "checkpoint_id": "42",
+  "root_hash": "64-lowercase-hex-characters",
+  "anchored_at": "2026-09-15T18:00:00.000Z",
+  "signature_algorithm": "Ed25519",
+  "signature": "base64-signature"
+}
+```
+
+The signature covers the RFC 8785 canonical receipt with an empty `signature`
+field, prefixed by `aiproxy-merkle-anchor-receipt-v1\0`. Control Plane accepts
+the receipt only when its checkpoint ID and root match and its Ed25519
+signature verifies. Failures remain `PENDING`, record a bounded local error,
+and retry on the next schedule. An idempotency key prevents duplicate external
+records during retries.
 
 ## Operations metrics
 

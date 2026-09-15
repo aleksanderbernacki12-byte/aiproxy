@@ -47,6 +47,15 @@ and data-plane `key_id` in the database, preserve the affected rows and logs,
 and compare the registered public key with the customer instance. Do not alter
 the chain head or reclassify the event before the investigation is documented.
 
+## External Merkle anchoring delay
+
+Check HTTPS and DNS connectivity to `MERKLE_ANCHOR_URL`, then verify the
+dedicated bearer credential and Ed25519 public receipt key. Inspect
+`anchor_last_error` without deleting pending checkpoints. After recovery,
+invoke `/api/internal/telemetry/anchor` with `CRON_SECRET` and confirm both the
+pending count and oldest age decrease. Preserve rejected receipts and anchor
+provider logs if the root, checkpoint ID, or signature did not verify.
+
 ## Installation
 
 Load `deploy/prometheus/aiproxy-alerts.yml` through Prometheus `rule_files` and

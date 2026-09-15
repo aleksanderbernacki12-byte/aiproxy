@@ -149,6 +149,12 @@ export default async function ComplianceReportPage() {
               <dd className="mt-2 text-muted">
                 {number.format(data.checkpoint.leafCount)} kedjehuvuden · {timestamp.format(data.checkpoint.createdAt)}
               </dd>
+              <dt className="mt-4 font-bold uppercase tracking-[0.12em] text-muted">Extern förankring</dt>
+              <dd className="mt-2">
+                {data.checkpoint.anchorStatus === "ANCHORED" && data.checkpoint.anchoredAt
+                  ? `Verifierat ankarkvitto ${data.checkpoint.anchorId ?? ""} · ${timestamp.format(data.checkpoint.anchoredAt)}`
+                  : "Inväntar verifierat ankarkvitto"}
+              </dd>
             </dl>
           )}
         </ReportSection>
