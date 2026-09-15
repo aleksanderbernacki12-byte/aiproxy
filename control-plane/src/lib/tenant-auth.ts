@@ -1,8 +1,8 @@
 import "server-only";
 
 import { createHash } from "node:crypto";
-import { eq } from "drizzle-orm";
-import { organizations } from "@/db/schema";
+import { and, eq, gt, isNull, or } from "drizzle-orm";
+import { organizations, tenantAccessKeys } from "@/db/schema";
 import { getDatabase } from "@/db/client";
 
 export type AuthenticatedOrganization = {
@@ -24,14 +24,19 @@ export async function authenticateTenant(
   request: Request,
 ): Promise<AuthenticatedOrganization | null> {
   const tenantKey = extractBearerToken(request);
-  if (!tenantKey) {
+  if (!tenantKey || tenantKey.length < 32) {
     return null;
   }
   const digest = digestTenantKey(tenantKey);
   const [organization] = await getDatabase()
     .select({ id: organizations.id, name: organizations.name })
-    .from(organizations)
-    .where(eq(organizations.tenantKey, digest))
+    .from(tenantAccessKeys)
+    .innerJoin(organizations, eq(organizations.id, tenantAccessKeys.organizationId))
+    .where(and(
+      eq(tenantAccessKeys.keyHash, digest),
+      isNull(tenantAccessKeys.revokedAt),
+      or(isNull(tenantAccessKeys.expiresAt), gt(tenantAccessKeys.expiresAt, new Date())),
+    ))
     .limit(1);
   return organization ?? null;
 }

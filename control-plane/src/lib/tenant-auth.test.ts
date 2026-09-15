@@ -36,11 +36,12 @@ describe("tenant authentication", () => {
       .fn()
       .mockResolvedValue([{ id: "11111111-1111-1111-1111-111111111111", name: "Acme" }]);
     const where = vi.fn(() => ({ limit }));
-    const from = vi.fn(() => ({ where }));
+    const innerJoin = vi.fn(() => ({ where }));
+    const from = vi.fn(() => ({ innerJoin }));
     const select = vi.fn(() => ({ from }));
     mocks.getDatabase.mockReturnValue({ select });
     const request = new Request("https://control.example/api/telemetry/ingest", {
-      headers: { authorization: "Bearer customer-secret" },
+      headers: { authorization: `Bearer ${"customer-secret".padEnd(32, "x")}` },
     });
 
     await expect(authenticateTenant(request)).resolves.toEqual({
@@ -49,12 +50,22 @@ describe("tenant authentication", () => {
     });
     expect(select).toHaveBeenCalledOnce();
     expect(where).toHaveBeenCalledOnce();
+    expect(innerJoin).toHaveBeenCalledOnce();
     expect(limit).toHaveBeenCalledWith(1);
   });
 
   it("rejects a missing credential without querying Postgres", async () => {
     mocks.getDatabase.mockClear();
     const request = new Request("https://control.example/api/telemetry/ingest");
+    await expect(authenticateTenant(request)).resolves.toBeNull();
+    expect(mocks.getDatabase).not.toHaveBeenCalled();
+  });
+
+  it("rejects undersized credentials without querying Postgres", async () => {
+    mocks.getDatabase.mockClear();
+    const request = new Request("https://control.example/api/telemetry/ingest", {
+      headers: { authorization: "Bearer short" },
+    });
     await expect(authenticateTenant(request)).resolves.toBeNull();
     expect(mocks.getDatabase).not.toHaveBeenCalled();
   });

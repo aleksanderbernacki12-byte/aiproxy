@@ -13,6 +13,8 @@
     "test:integration": "node scripts/run-integration-tests.mjs",
     "db:migrate": "node scripts/migrate.mjs",
     "orgs:create": "node scripts/create-organization.mjs",
+    "tenant-keys:create": "node scripts/create-tenant-key.mjs",
+    "tenant-keys:revoke": "node scripts/revoke-tenant-key.mjs",
     "keys:register": "node scripts/register-public-key.mjs",
     "keys:retire": "node scripts/retire-public-key.mjs",
     "keys:revoke": "node scripts/revoke-public-key.mjs",

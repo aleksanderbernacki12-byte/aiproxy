@@ -29,10 +29,24 @@ export const aiSystemStatus = pgEnum("ai_system_status", ["ACTIVE", "SUSPENDED",
 export const organizations = pgTable("organizations", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: varchar("name", { length: 160 }).notNull(),
-  // Stores SHA-256(tenant key), never the bearer credential itself.
+  // Legacy digest retained for migration compatibility; authentication uses tenantAccessKeys.
   tenantKey: varchar("tenant_key", { length: 64 }).notNull().unique(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const tenantAccessKeys = pgTable(
+  "tenant_access_keys",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+    keyHash: varchar("key_hash", { length: 64 }).notNull().unique(),
+    label: varchar("label", { length: 160 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [index("tenant_access_keys_organization_idx").on(table.organizationId, table.revokedAt, table.expiresAt)],
+);
 
 export const aiSystems = pgTable(
   "ai_systems",

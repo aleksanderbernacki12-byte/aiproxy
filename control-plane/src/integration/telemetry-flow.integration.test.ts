@@ -68,6 +68,10 @@ describe("telemetry control-plane flow", () => {
     );
     organizationCreated = true;
     await client.query(
+      `INSERT INTO tenant_access_keys (organization_id, key_hash, label) VALUES ($1,$2,$3)`,
+      [organizationId, createHash("sha256").update(tenantKey).digest("hex"), "Integration data plane"],
+    );
+    await client.query(
       `INSERT INTO telemetry_public_keys (organization_id, key_id, public_key_pem, label)
        VALUES ($1, $2, $3, $4)`,
       [organizationId, keyId, publicKeyPem, "integration-test"],
@@ -93,6 +97,7 @@ describe("telemetry control-plane flow", () => {
     await client.query(`DELETE FROM telemetry_public_keys WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_event_ids WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM dpo_access_keys WHERE organization_id = $1`, [organizationId]);
+    await client.query(`DELETE FROM tenant_access_keys WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM organizations WHERE id = $1`, [organizationId]);
     await client.end();
   });
@@ -197,5 +202,13 @@ describe("telemetry control-plane flow", () => {
     const unclassified = await getDashboardData(organizationId);
     expect(unclassified?.summary.unclassifiedSystems).toBe(1);
     expect(unclassified?.models[0].governance).toBeNull();
+
+    await client.query(`UPDATE tenant_access_keys SET revoked_at=now() WHERE organization_id=$1`, [organizationId]);
+    const rejected = await POST(new Request("http://localhost/api/telemetry/ingest", {
+      method: "POST",
+      headers: { authorization: `Bearer ${tenantKey}`, "content-type": "application/json" },
+      body: JSON.stringify(first),
+    }));
+    expect(rejected.status).toBe(401);
   });
 });

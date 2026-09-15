@@ -32,7 +32,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0008_signed_compliance_reports.sql`. Put a TLS-terminating reverse proxy in front of
+`0009_tenant_access_keys.sql`. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently.
 
 The runtime requires:
@@ -56,6 +56,21 @@ value as `AIPROXY_TENANT_KEY` in the organization's Go data plane:
 ```sh
 npm run orgs:create -- "Customer AB"
 ```
+
+The initial credential is stored in `tenant_access_keys`; only its SHA-256
+digest is retained. Rotate it without interrupting ingestion by creating an
+overlapping credential, updating `AIPROXY_TENANT_KEY` in the data plane, and
+then revoking the old credential ID:
+
+```sh
+npm run tenant-keys:create -- <organization-id> "production rotation" [expires-at-ISO]
+npm run tenant-keys:revoke -- <organization-id> <old-credential-id>
+```
+
+Each organization can have multiple active data-plane credentials. Expired or
+revoked credentials return HTTP 401 while LLM traffic remains fail-open in the
+Go proxy. Existing installations are migrated automatically as a labelled
+primary credential.
 
 Register each data-plane instance's public P-256 key under that organization
 before processing its events:
