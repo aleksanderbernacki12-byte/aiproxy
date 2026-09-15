@@ -6,6 +6,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
 import { complianceReports, dpoAccessKeys, reportSigningKeys } from "@/db/schema";
 import { getDashboardData } from "@/lib/dashboard";
+import { getSecurityAuditEvidence } from "@/lib/security-audit";
 
 const SIGNATURE_DOMAIN = Buffer.from("aiproxy-compliance-report-v1\0");
 
@@ -48,12 +49,15 @@ export function verifySealedReport(report: SealedReport, publicKeyPem: string) {
 }
 
 export async function sealComplianceReport(identity: { credentialId: string; organizationId: string }, now = new Date()) {
-  const dashboard = await getDashboardData(identity.organizationId);
+  const [dashboard, administrativeAudit] = await Promise.all([
+    getDashboardData(identity.organizationId),
+    getSecurityAuditEvidence(identity.organizationId),
+  ]);
   if (!dashboard) throw new Error("Organization not found");
   const payload = JSON.parse(JSON.stringify({
     schema_version: "aiproxy-compliance-report-v1",
     generated_at: now.toISOString(),
-    evidence: dashboard,
+    evidence: { ...dashboard, administrative_audit: administrativeAudit },
   })) as Record<string, unknown>;
   const canonical = canonicalPayload(payload);
   const payloadHash = createHash("sha256").update(canonical).digest("hex");

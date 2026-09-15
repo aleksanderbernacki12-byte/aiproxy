@@ -2,6 +2,7 @@ import Link from "next/link";
 import { ReportButton } from "@/components/report-button";
 import { getDashboardData } from "@/lib/dashboard";
 import { requireDashboardIdentity } from "@/lib/dashboard-auth";
+import { getSecurityAuditEvidence } from "@/lib/security-audit";
 
 export const dynamic = "force-dynamic";
 
@@ -18,7 +19,10 @@ const timestamp = new Intl.DateTimeFormat("sv-SE", {
 
 export default async function ComplianceReportPage() {
   const identity = await requireDashboardIdentity();
-  const data = await getDashboardData(identity.organizationId);
+  const [data, administrativeAudit] = await Promise.all([
+    getDashboardData(identity.organizationId),
+    getSecurityAuditEvidence(identity.organizationId),
+  ]);
   if (!data) {
     return (
       <div className="p-8">
@@ -184,6 +188,23 @@ export default async function ComplianceReportPage() {
               </dd>
             </dl>
           )}
+        </ReportSection>
+
+        <ReportSection number="05" title="Administrativ säkerhetslogg">
+          <div className={`print-break-inside-avoid border-l-4 p-5 ${administrativeAudit.status === "INTACT" ? "border-government bg-government-light/50" : administrativeAudit.status === "NO_EVIDENCE" ? "border-line bg-[#f4f5f2]" : "border-alert bg-alert-light"}`}>
+            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">Append-only-kedja</p>
+            <p className={`mt-2 font-serif text-2xl ${administrativeAudit.status === "ATTENTION_REQUIRED" ? "text-alert" : "text-government"}`}>
+              {administrativeAudit.status === "INTACT" ? "Verifierad och sammanhängande" : administrativeAudit.status === "NO_EVIDENCE" ? "Inga administrativa event" : "Integritetsfel kräver utredning"}
+            </p>
+          </div>
+          <dl className="mt-5 border border-line p-4 text-xs">
+            <dt className="font-bold uppercase tracking-[0.12em] text-muted">Registrerade event</dt>
+            <dd className="mt-2">{number.format(administrativeAudit.eventCount)} · senaste sekvens {administrativeAudit.latestSequence}</dd>
+            <dt className="mt-4 font-bold uppercase tracking-[0.12em] text-muted">Senaste eventhash</dt>
+            <dd className="mt-2 break-all font-mono">{administrativeAudit.latestEventHash || "Ingen hash ännu"}</dd>
+            {administrativeAudit.latestEventAt && <dd className="mt-2 text-muted">Senast uppdaterad {timestamp.format(administrativeAudit.latestEventAt)}</dd>}
+          </dl>
+          <p className="mt-5 text-xs leading-5 text-muted">Rapportens signerade snapshot innehåller kedjans verifieringsstatus, eventantal och senaste hash före rapportens egen förseglingshändelse.</p>
         </ReportSection>
 
         <footer className="mt-12 border-t border-line pt-5 text-[9px] leading-4 text-muted">

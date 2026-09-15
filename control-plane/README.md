@@ -152,6 +152,9 @@ version, generation time, SHA-256 payload digest, signing-key fingerprint, and
 Ed25519 signature. The signature covers the RFC 8785 canonical payload prefixed
 with `aiproxy-compliance-report-v1\0`. Stored snapshots are never updated, so a
 later governance or telemetry change cannot silently alter an issued report.
+The signed evidence also records the administrative audit chain's verification
+status, event count, latest sequence, and latest hash immediately before the
+report's own sealing event is appended.
 The tenant-scoped `/dashboard/reports` archive lists the 100 latest artifacts
 with their issuer, payload digest, and signing-key fingerprint. DPOs and
 auditors can download historical JSON without loading its payload into the

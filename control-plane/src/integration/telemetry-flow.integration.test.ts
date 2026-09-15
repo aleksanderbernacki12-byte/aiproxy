@@ -202,6 +202,9 @@ describe("telemetry control-plane flow", () => {
     const reportId = await sealComplianceReport({ credentialId: dpoCredentialId, organizationId });
     const sealedReport = await getSealedReport(reportId, organizationId);
     expect(sealedReport).not.toBeNull();
+    expect(sealedReport!.payload).toMatchObject({
+      evidence: { administrative_audit: { status: "NO_EVIDENCE", eventCount: 0, latestSequence: "0", latestEventHash: "" } },
+    });
     createdReportSigningKeyId = sealedReport!.signing_key_id;
     expect(verifySealedReport(sealedReport!, reportKeys.publicKey.export({ type: "spki", format: "pem" }).toString())).toBe(true);
     expect(await getReportVerificationKey(sealedReport!.signing_key_id, organizationId)).toBe(
