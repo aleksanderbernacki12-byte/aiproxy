@@ -16,6 +16,20 @@ const MAX_EVENTS_PER_CHAIN = 500;
 type BufferedRow = typeof telemetryBuffer.$inferSelect;
 type VerificationStatus = "VERIFIED" | "INVALID_SIGNATURE" | "COMPROMISED_CHAIN";
 
+export function telemetryKeyValidity(
+  key: { validFrom: Date | null; validUntil: Date | null; revokedAt: Date | null },
+  eventTimestamp: Date,
+) {
+  if (key.revokedAt) return { ok: false as const, reason: "The registered public key is revoked" };
+  if (key.validFrom && eventTimestamp < key.validFrom) {
+    return { ok: false as const, reason: "The event predates the public key validity period" };
+  }
+  if (key.validUntil && eventTimestamp >= key.validUntil) {
+    return { ok: false as const, reason: "The event postdates the public key validity period" };
+  }
+  return { ok: true as const };
+}
+
 function reorderWindowMilliseconds() {
   const configured = Number(process.env.TELEMETRY_REORDER_WINDOW_SECONDS);
   const seconds =
@@ -148,9 +162,10 @@ async function processKeyChain(organizationId: string, keyId: string, now: Date)
         continue;
       }
       const payload = parsed.data;
-      const verification = registeredKey.revokedAt
-        ? { ok: false as const, reason: "The registered public key is revoked" }
-        : verifyTelemetryCryptography(payload, registeredKey.publicKeyPem);
+      const keyValidity = telemetryKeyValidity(registeredKey, new Date(payload.timestamp));
+      const verification = keyValidity.ok
+        ? verifyTelemetryCryptography(payload, registeredKey.publicKeyPem)
+        : keyValidity;
 
       let status: VerificationStatus;
       let reason: string | null;

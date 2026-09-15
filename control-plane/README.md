@@ -46,6 +46,22 @@ npm run keys:register -- <organization-id> ./instance-public-key.pem "production
 The command derives the same SHA-256 SPKI fingerprint that the Go client emits
 as `cryptography.key_id`. The private key remains in the customer data plane.
 
+For a planned rotation, register the replacement key first, switch the data
+plane to it, and then retire the old key. Retirement still accepts delayed
+events whose signed timestamp precedes the cutoff:
+
+```sh
+npm run keys:register -- <organization-id> ./next-public-key.pem "rotation 2026-10"
+npm run keys:retire -- <organization-id> <old-key-id> [cutoff-ISO]
+```
+
+Use immediate revocation only when a private key may be compromised. Revoked
+keys reject every still-buffered event and require a local incident reason:
+
+```sh
+npm run keys:revoke -- <organization-id> <key-id> "suspected key exposure"
+```
+
 Create a separate DPO credential after applying migrations. Its plaintext is
 printed once and its role can be `ADMIN`, `DPO`, or read-only `AUDITOR`:
 
@@ -90,11 +106,13 @@ A missing predecessor remains buffered for the reorder window.
 For each candidate, the worker:
 
 1. Revalidates the stored event schema.
-2. Loads the registered public key and confirms its SPKI fingerprint.
-3. Recalculates `event_hash` with RFC 8785 JSON Canonicalization Scheme.
-4. Verifies the ECDSA P-256/SHA-256 ASN.1 DER signature.
-5. Checks `previous_event_hash` against `telemetry_chain_heads`.
-6. Moves the row to `telemetry_events` and advances the head in the same
+2. Confirms that the event timestamp is inside the registered key's validity
+   interval and that the key has not been revoked.
+3. Confirms the public key's SPKI fingerprint.
+4. Recalculates `event_hash` with RFC 8785 JSON Canonicalization Scheme.
+5. Verifies the ECDSA P-256/SHA-256 ASN.1 DER signature.
+6. Checks `previous_event_hash` against `telemetry_chain_heads`.
+7. Moves the row to `telemetry_events` and advances the head in the same
    transaction.
 
 Cryptographically valid rows with a stale or unknown predecessor become

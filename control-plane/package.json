@@ -14,6 +14,8 @@
     "db:migrate": "node scripts/migrate.mjs",
     "orgs:create": "node scripts/create-organization.mjs",
     "keys:register": "node scripts/register-public-key.mjs",
+    "keys:retire": "node scripts/retire-public-key.mjs",
+    "keys:revoke": "node scripts/revoke-public-key.mjs",
     "dpo:create": "node scripts/create-dpo-key.mjs",
     "dpo:revoke": "node scripts/revoke-dpo-key.mjs"
   },

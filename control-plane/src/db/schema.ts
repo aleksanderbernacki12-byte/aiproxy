@@ -56,7 +56,10 @@ export const telemetryPublicKeys = pgTable(
     publicKeyPem: text("public_key_pem").notNull(),
     label: varchar("label", { length: 160 }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    validFrom: timestamp("valid_from", { withTimezone: true }),
+    validUntil: timestamp("valid_until", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    revokedReason: varchar("revoked_reason", { length: 240 }),
   },
   (table) => [primaryKey({ columns: [table.organizationId, table.keyId] })],
 );

@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, randomUUID, sign, type KeyObject } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -52,7 +52,8 @@ describe("telemetry control-plane flow", () => {
   beforeAll(async () => {
     await client.connect();
     databaseConnected = true;
-    for (const migration of ["0001_telemetry.sql", "0002_tenant_isolation.sql", "0003_dpo_access.sql"]) {
+    const migrations = (await readdir(resolve("db/migrations"))).filter((name) => name.endsWith(".sql")).sort();
+    for (const migration of migrations) {
       await client.query(await readFile(resolve("db/migrations", migration), "utf8"));
     }
     await client.query(
