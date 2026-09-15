@@ -16,6 +16,9 @@ npm run db:migrate
 npm run dev
 ```
 
+Set `POSTGRES_PORT` when port 5432 is already occupied, for example
+`POSTGRES_PORT=55432 docker compose up -d postgres`.
+
 The runtime requires:
 
 - `DATABASE_URL`: PostgreSQL connection string.
@@ -140,4 +143,13 @@ npm run lint
 npm run typecheck
 npm run build
 npm audit
+```
+
+The PostgreSQL integration test applies every migration to an explicitly
+disposable database. It sends an out-of-order signed chain through ingestion,
+runs the worker, and verifies the resulting dashboard aggregate:
+
+```sh
+TEST_DATABASE_URL=postgresql://aiproxy:aiproxy@localhost:5432/aiproxy_control \
+  npm run test:integration
 ```

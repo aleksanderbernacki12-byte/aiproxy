@@ -10,6 +10,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit --incremental false",
     "test": "vitest run",
+    "test:integration": "node scripts/run-integration-tests.mjs",
     "db:migrate": "node scripts/migrate.mjs",
     "orgs:create": "node scripts/create-organization.mjs",
     "keys:register": "node scripts/register-public-key.mjs",

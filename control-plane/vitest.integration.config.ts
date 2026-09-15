@@ -9,7 +9,6 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    exclude: ["src/integration/**", "**/node_modules/**", "**/.git/**"],
-    coverage: { reporter: ["text"] },
+    include: ["src/integration/**/*.integration.test.ts"],
   },
 });
