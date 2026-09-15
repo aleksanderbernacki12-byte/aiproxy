@@ -175,6 +175,11 @@ the same transaction as the protected change. PostgreSQL serializes each
 tenant ledger and links entries with domain-separated SHA-256 hashes. Direct
 updates and deletes are rejected by a database trigger.
 
+Successful dashboard login and downloads of sealed reports or their public
+verification keys are also recorded. These sensitive accesses fail closed if
+their audit event cannot be appended; invalid credentials and missing resources
+are not logged because they cannot be assigned safely to a tenant ledger.
+
 `/dashboard/audit` recalculates the complete tenant chain against its stored
 head before displaying the 200 latest events. Set `AIPROXY_OPERATOR_ID` to a
 stable internal operator identifier when running administrative CLI commands;

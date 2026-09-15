@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ authenticateDPOAccessKey: vi.fn() }));
+const mocks = vi.hoisted(() => ({ authenticateDPOAccessKey: vi.fn(), appendSecurityAuditEvent: vi.fn() }));
 vi.mock("@/lib/dpo-auth", () => mocks);
+vi.mock("@/lib/security-audit", () => ({ appendSecurityAuditEvent: mocks.appendSecurityAuditEvent }));
 vi.mock("server-only", () => ({}));
 
 import { POST } from "./route";
@@ -30,6 +31,9 @@ describe("POST /api/dashboard/session", () => {
     expect(cookie).toContain("aiproxy_dpo_session=");
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("SameSite=strict");
+    expect(mocks.appendSecurityAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      organizationId: "org-1", actorId: "key-1", action: "DASHBOARD_SESSION_CREATED",
+    }));
   });
 
   it("rejects invalid credentials without creating a session", async () => {
@@ -47,6 +51,15 @@ describe("POST /api/dashboard/session", () => {
     mocks.authenticateDPOAccessKey.mockRejectedValueOnce(new Error("offline"));
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     expect((await POST(request())).status).toBe(503);
+    errorSpy.mockRestore();
+  });
+
+  it("does not create a session when the security event cannot be recorded", async () => {
+    mocks.appendSecurityAuditEvent.mockRejectedValueOnce(new Error("offline"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await POST(request());
+    expect(response.status).toBe(503);
+    expect(response.headers.get("set-cookie")).toBeNull();
     errorSpy.mockRestore();
   });
 });

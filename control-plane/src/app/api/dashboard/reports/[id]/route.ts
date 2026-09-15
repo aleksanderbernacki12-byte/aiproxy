@@ -1,5 +1,6 @@
 import { requireDashboardIdentity } from "@/lib/dashboard-auth";
 import { getSealedReport } from "@/lib/compliance-report";
+import { appendSecurityAuditEvent } from "@/lib/security-audit";
 
 export const runtime = "nodejs";
 
@@ -11,6 +12,18 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
   }
   const report = await getSealedReport(id, identity.organizationId);
   if (!report) return Response.json({ error: "Not found" }, { status: 404 });
+  try {
+    await appendSecurityAuditEvent({
+      organizationId: identity.organizationId,
+      actorId: identity.credentialId,
+      action: "COMPLIANCE_REPORT_DOWNLOADED",
+      resourceType: "COMPLIANCE_REPORT",
+      resourceId: report.report_id,
+    });
+  } catch (error) {
+    console.error("Compliance report access audit failed", error);
+    return Response.json({ error: "Report access could not be recorded" }, { status: 503 });
+  }
   return Response.json(report, {
     headers: {
       "Cache-Control": "private, no-store",

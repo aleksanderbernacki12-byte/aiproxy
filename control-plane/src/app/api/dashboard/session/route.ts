@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createDashboardSession, dashboardSessionCookie, dashboardSessionMaxAge } from "@/lib/dashboard-session";
 import { authenticateDPOAccessKey } from "@/lib/dpo-auth";
+import { appendSecurityAuditEvent } from "@/lib/security-audit";
 
 export async function POST(request: Request) {
   const form = await request.formData();
@@ -16,6 +17,19 @@ export async function POST(request: Request) {
   }
   if (!identity) {
     return NextResponse.redirect(new URL("/login?error=invalid", request.url), 303);
+  }
+  try {
+    await appendSecurityAuditEvent({
+      organizationId: identity.organizationId,
+      actorId: identity.credentialId,
+      action: "DASHBOARD_SESSION_CREATED",
+      resourceType: "DASHBOARD_SESSION",
+      resourceId: identity.credentialId,
+      metadata: { role: identity.role },
+    });
+  } catch (error) {
+    console.error("Dashboard session audit failed", error);
+    return Response.json({ error: "Authentication service unavailable" }, { status: 503 });
   }
   const response = NextResponse.redirect(new URL("/dashboard", request.url), 303);
   response.cookies.set(dashboardSessionCookie, createDashboardSession(identity, sessionSecret), {

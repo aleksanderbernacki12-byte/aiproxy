@@ -12,6 +12,21 @@ export type SecurityAuditEvidence = {
   latestEventAt: Date | null;
 };
 
+export async function appendSecurityAuditEvent(input: {
+  organizationId: string;
+  actorId: string;
+  action: string;
+  resourceType: string;
+  resourceId: string;
+  metadata?: Record<string, unknown>;
+}) {
+  await getDatabase().execute(sql`SELECT append_security_audit_event(
+    ${input.organizationId}::uuid, 'DPO_CREDENTIAL', ${input.actorId},
+    ${input.action}, ${input.resourceType}, ${input.resourceId},
+    ${JSON.stringify(input.metadata ?? {})}::jsonb
+  )`);
+}
+
 export async function getSecurityAuditEvidence(organizationId: string): Promise<SecurityAuditEvidence> {
   const result = await getDatabase().execute<{
     valid: boolean;

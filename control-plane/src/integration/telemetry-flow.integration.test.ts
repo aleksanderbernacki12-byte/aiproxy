@@ -224,6 +224,12 @@ describe("telemetry control-plane flow", () => {
       actor_type: "DPO_CREDENTIAL", actor_id: dpoCredentialId,
       action: "COMPLIANCE_REPORT_SEALED", resource_id: reportId,
     });
+    const { appendSecurityAuditEvent } = await import("@/lib/security-audit");
+    await appendSecurityAuditEvent({
+      organizationId, actorId: dpoCredentialId, action: "COMPLIANCE_REPORT_DOWNLOADED",
+      resourceType: "COMPLIANCE_REPORT", resourceId: reportId,
+    });
+    expect((await getSecurityAuditLedger(organizationId)).events).toHaveLength(2);
     const { getControlPlaneMetrics } = await import("@/lib/operations");
     expect((await getControlPlaneMetrics()).brokenSecurityAuditChains).toBe(0);
     await expect(client.query(
