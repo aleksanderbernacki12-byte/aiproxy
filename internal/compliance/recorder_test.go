@@ -51,6 +51,26 @@ func (t *fakeTelemetry) SubmitAsync(submission telemetry.Submission) bool {
 func (*fakeTelemetry) Shutdown(context.Context) error { return nil }
 func (t *fakeTelemetry) Snapshot() telemetry.Snapshot { return t.snapshot }
 
+func TestSanitizeEvidenceHeadersRedactsCredentialClasses(t *testing.T) {
+	headers := make(http.Header, len(evidenceSecretHeaders)+1)
+	for _, name := range evidenceSecretHeaders {
+		headers[name] = []string{"secret-one", "secret-two"}
+	}
+	headers["Content-Type"] = []string{"application/json"}
+	sanitized := sanitizeEvidenceHeaders(headers)
+	for _, name := range evidenceSecretHeaders {
+		if got := sanitized[name]; len(got) != 1 || got[0] != redactedEvidenceSecret {
+			t.Errorf("%s = %q, want one redaction marker", name, got)
+		}
+		if got := headers[name]; len(got) != 2 {
+			t.Errorf("source %s mutated: %q", name, got)
+		}
+	}
+	if got := sanitized.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want preserved", got)
+	}
+}
+
 func TestRecorderFansOutIndependentRawCopiesWithSameEventID(t *testing.T) {
 	vault := &fakeVault{accepted: true}
 	sender := &fakeTelemetry{accepted: true}
@@ -66,11 +86,21 @@ func TestRecorderFansOutIndependentRawCopiesWithSameEventID(t *testing.T) {
 		Metrics:         map[string]any{"total_tokens": 17},
 		RequestMethod:   http.MethodPost,
 		RequestURL:      "/v1/chat?case=7",
-		RequestHeader:   http.Header{"Content-Type": {"application/json"}},
-		RequestBody:     []byte(`{"prompt":"alice@example.com"}`),
-		ResponseStatus:  http.StatusCreated,
-		ResponseHeader:  http.Header{"Content-Type": {"application/json"}},
-		ResponseBody:    []byte(`{"answer":"raw"}`),
+		RequestHeader: http.Header{
+			"Content-Type":        {"application/json"},
+			"Authorization":       {"Bearer upstream-secret"},
+			"Proxy-Authorization": {"Bearer proxy-secret"},
+			"X-Api-Key":           {"provider-key"},
+			"X-Trace-Id":          {"trace-7"},
+			"x-goog-api-key":      {"google-key"},
+		},
+		RequestBody:    []byte(`{"prompt":"alice@example.com"}`),
+		ResponseStatus: http.StatusCreated,
+		ResponseHeader: http.Header{
+			"Content-Type": {"application/json"},
+			"Set-Cookie":   {"session=secret"},
+		},
+		ResponseBody: []byte(`{"answer":"raw"}`),
 	}
 	if !recorder.RecordAsync(event) {
 		t.Fatal("valid event was rejected")
@@ -80,6 +110,23 @@ func TestRecorderFansOutIndependentRawCopiesWithSameEventID(t *testing.T) {
 	}
 	if string(vault.call.requestBody) != string(event.RequestBody) || string(vault.call.responseBody) != string(event.ResponseBody) {
 		t.Fatal("vault did not receive the raw exchange")
+	}
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "X-Api-Key"} {
+		if got := vault.call.request.Header.Get(name); got != redactedEvidenceSecret {
+			t.Fatalf("vault request header %s = %q, want redacted", name, got)
+		}
+	}
+	if got := vault.call.request.Header["x-goog-api-key"]; len(got) != 1 || got[0] != redactedEvidenceSecret {
+		t.Fatalf("non-canonical secret header = %q, want redacted", got)
+	}
+	if got := vault.call.response.Header.Get("Set-Cookie"); got != redactedEvidenceSecret {
+		t.Fatalf("vault response Set-Cookie = %q, want redacted", got)
+	}
+	if got := vault.call.request.Header.Get("X-Trace-Id"); got != "trace-7" {
+		t.Fatalf("non-secret evidence header = %q, want preserved", got)
+	}
+	if got := event.RequestHeader.Get("Authorization"); got != "Bearer upstream-secret" {
+		t.Fatalf("caller-owned headers were mutated: %q", got)
 	}
 	if string(sender.submission.Request) != string(event.RequestBody) || string(sender.submission.Response) != string(event.ResponseBody) {
 		t.Fatal("telemetry commitment did not receive the same raw exchange")

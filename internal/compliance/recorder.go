@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/securevault"
@@ -42,6 +43,33 @@ type Recorder struct {
 	Telemetry Telemetry
 }
 
+const redactedEvidenceSecret = "[REDACTED_SECRET]"
+
+var evidenceSecretHeaders = [...]string{
+	"Api-Key",
+	"Authentication-Info",
+	"Authorization",
+	"Cookie",
+	"Proxy-Authorization",
+	"Set-Cookie",
+	"X-Amz-Security-Token",
+	"X-Api-Key",
+	"X-Goog-Api-Key",
+}
+
+func sanitizeEvidenceHeaders(headers http.Header) http.Header {
+	sanitized := headers.Clone()
+	for presentName := range sanitized {
+		for _, secretName := range evidenceSecretHeaders {
+			if strings.EqualFold(presentName, secretName) {
+				sanitized[presentName] = []string{redactedEvidenceSecret}
+				break
+			}
+		}
+	}
+	return sanitized
+}
+
 var _ proxy.ComplianceRecorder = (*Recorder)(nil)
 
 // RecordAsync performs only local copies and non-blocking queue submissions.
@@ -57,14 +85,14 @@ func (r *Recorder) RecordAsync(event proxy.ComplianceEvent) bool {
 		request := &http.Request{
 			Method:        event.RequestMethod,
 			URL:           parseURL(event.RequestURL),
-			Header:        event.RequestHeader.Clone(),
+			Header:        sanitizeEvidenceHeaders(event.RequestHeader),
 			Body:          io.NopCloser(bytes.NewReader(requestBody)),
 			ContentLength: int64(len(requestBody)),
 		}
 		response := &http.Response{
 			StatusCode:    event.ResponseStatus,
 			Status:        strconv.Itoa(event.ResponseStatus) + " " + http.StatusText(event.ResponseStatus),
-			Header:        event.ResponseHeader.Clone(),
+			Header:        sanitizeEvidenceHeaders(event.ResponseHeader),
 			Body:          io.NopCloser(bytes.NewReader(responseBody)),
 			ContentLength: int64(len(responseBody)),
 			Request:       request,

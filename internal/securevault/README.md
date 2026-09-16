@@ -2,6 +2,9 @@
 
 `securevault` archives complete, unredacted HTTP exchanges inside the customer's
 data plane. It does not depend on the proxy, routing, or cache packages.
+When used through the compliance coordinator, reusable credentials and cookies
+in HTTP headers are replaced with `[REDACTED_SECRET]` before capture. Request
+and response bodies remain original for authorized investigations.
 
 ## Storage flow
 
