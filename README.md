@@ -3030,6 +3030,13 @@ the Control Plane. Network failures and HTTP 401 responses are logged locally
 and retried from `.aiproxy_telemetry.sqlite`; LLM traffic remains fail-open.
 Use `--telemetry-db` and `--telemetry-salt` to move the durable queue and
 rotating HMAC salt to customer-controlled persistent storage.
+The SQLite database defaults to a 256 MiB limit, configurable with
+`--telemetry-max-db-bytes` (minimum 1 MiB). Reserve additional space for its
+rollback journal. If storage fills, existing evidence remains queued and new
+events that cannot be persisted are counted as lost; LLM traffic continues.
+Database capacity and storage-full failures are exposed in health metrics.
+See the [storage budget documentation](internal/telemetry/README.md#storage-budget)
+and [runbook](docs/operations/compliance-alerts.md#telemetry-storage-budget).
 Operational queue health is available under `compliance.telemetry` in the
 authenticated `GET /_aiproxy/stats` response. It reports pending and dropped
 events, persistence/delivery failures, delivered events, and latest outcome

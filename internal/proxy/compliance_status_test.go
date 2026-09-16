@@ -44,7 +44,7 @@ func TestServeMetricsIncludesCompliancePipelineHealth(t *testing.T) {
 	server := &Server{
 		Stats: stats.New(),
 		ComplianceRecorder: statusRecorder{status: ComplianceStatus{
-			Telemetry:   &TelemetryStatus{Pending: 4, DeliveryFailures: 2, LastFailureAt: &timestamp},
+			Telemetry:   &TelemetryStatus{Pending: 4, DeliveryFailures: 2, LastFailureAt: &timestamp, StorageFullFailures: 1, DatabaseBytes: 81920, DatabaseUsedBytes: 65536, DatabaseLimitBytes: 1048576},
 			SecureVault: &SecureVaultStatus{SpoolPending: 3, Quarantined: 1, UploadFailures: 5},
 		}},
 	}
@@ -53,6 +53,10 @@ func TestServeMetricsIncludesCompliancePipelineHealth(t *testing.T) {
 	body := response.Body.String()
 	for _, expected := range []string{
 		"aiproxy_telemetry_pending 4",
+		"aiproxy_telemetry_storage_full_failures_total 1",
+		"aiproxy_telemetry_database_bytes 81920",
+		"aiproxy_telemetry_database_used_bytes 65536",
+		"aiproxy_telemetry_database_limit_bytes 1048576",
 		"aiproxy_telemetry_delivery_failures_total 2",
 		"aiproxy_telemetry_last_failure_timestamp_seconds 1800000000",
 		"aiproxy_secure_vault_spool_pending 3",

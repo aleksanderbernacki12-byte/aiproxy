@@ -120,6 +120,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	auditLogKeyFile := fs.String("audit-log-key-file", "", "path to a secret key file — when set, every line appended to log_file is HMAC-chained so later tampering is detectable with `aiproxy verify-log`; requires log_file to be configured")
 	telemetryEndpoint := fs.String("telemetry-endpoint", "", "Control Plane telemetry ingest URL; empty disables SaaS telemetry")
 	telemetryDatabase := fs.String("telemetry-db", ".aiproxy_telemetry.sqlite", "path to the durable local telemetry queue")
+	telemetryMaxDatabaseBytes := fs.Int64("telemetry-max-db-bytes", telemetry.DefaultMaxDatabaseBytes, "maximum telemetry SQLite database bytes (minimum 1048576); reserve additional disk space for the rollback journal")
 	telemetryPrivateKey := fs.String("telemetry-private-key", "", "path to the owner-only ECDSA P-256 private key used to sign telemetry")
 	telemetrySalt := fs.String("telemetry-salt", "", "path to the rotating client anonymization salt; default: .aiproxy_salt beside -telemetry-db")
 	secureVaultKMSKeyID := fs.String("secure-vault-kms-key-id", "", "AWS KMS key ID or ARN used for envelope encryption; requires -secure-vault-s3-bucket")
@@ -158,6 +159,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if (*telemetryEndpoint == "") != (*telemetryPrivateKey == "") {
 		fmt.Fprintln(stderr, "aiproxy: -telemetry-endpoint and -telemetry-private-key must be set together, or not at all")
+		return 2
+	}
+	if *telemetryMaxDatabaseBytes < telemetry.MinMaxDatabaseBytes {
+		fmt.Fprintln(stderr, "aiproxy: -telemetry-max-db-bytes must be at least 1048576")
 		return 2
 	}
 	secureVaultEnabled := *secureVaultKMSKeyID != "" || *secureVaultS3Bucket != ""
@@ -320,10 +325,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if *telemetryEndpoint != "" {
 		telemetryClient, err := telemetry.New(telemetry.Config{
-			Endpoint:       *telemetryEndpoint,
-			DatabasePath:   *telemetryDatabase,
-			PrivateKeyPath: *telemetryPrivateKey,
-			SaltPath:       *telemetrySalt,
+			Endpoint:         *telemetryEndpoint,
+			DatabasePath:     *telemetryDatabase,
+			MaxDatabaseBytes: *telemetryMaxDatabaseBytes,
+			PrivateKeyPath:   *telemetryPrivateKey,
+			SaltPath:         *telemetrySalt,
 			OnError: func(err error) {
 				fmt.Fprintf(stderr, "aiproxy: %v\n", err)
 			},

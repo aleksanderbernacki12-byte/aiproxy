@@ -19,6 +19,23 @@ Check connectivity, TLS and DNS to the Control Plane, then verify
 credential. Confirm that pending events decrease after connectivity returns;
 the sender retains order and retries automatically.
 
+## Telemetry storage budget
+
+Compare `aiproxy_telemetry_database_used_bytes` with
+`aiproxy_telemetry_database_limit_bytes`, and check actual free disk space.
+The default SQLite budget is 256 MiB; configure `--telemetry-max-db-bytes`
+to increase it, allowing additional disk space for the rollback journal
+(at least twice the budget plus filesystem overhead). Restart with the same
+database and signing key after changing the budget.
+
+Restore delivery to release pages occupied by queued payloads. The file can
+remain large because free pages are reused; use the used-bytes metric for the
+capacity alert. The permanent deduplication ledger also consumes the budget
+and is never automatically purged. Do not delete it or discard queued evidence.
+When storage is full, new events are lost before joining the durable hash
+chain; document the evidence gap even when later deliveries succeed. Storage
+failure counters reset on restart, so retain the monitoring history.
+
 ## Secure Vault backlog or upload failure
 
 Check AWS credential resolution, KMS permissions, S3 permissions, region, and

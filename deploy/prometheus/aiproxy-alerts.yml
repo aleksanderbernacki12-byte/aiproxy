@@ -1,6 +1,19 @@
 groups:
   - name: aiproxy-data-plane-compliance
     rules:
+      - alert: AiproxyTelemetryStorageNearLimit
+        expr: aiproxy_telemetry_database_used_bytes / aiproxy_telemetry_database_limit_bytes > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Aiproxy telemetry database is approaching its storage budget
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-storage-budget
+      - alert: AiproxyTelemetryStorageFull
+        expr: increase(aiproxy_telemetry_storage_full_failures_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: Aiproxy lost telemetry because its database budget or disk was full
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-storage-budget
       - alert: AiproxyTelemetryDropped
         expr: increase(aiproxy_telemetry_dropped_total[10m]) > 0
         for: 2m

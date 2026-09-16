@@ -640,7 +640,7 @@ func TestShutdown_DrainsAcceptedEventsToSQLiteDuringOutage(t *testing.T) {
 	}
 	shutdown(t, client)
 
-	db, err := openStore(cfg.DatabasePath)
+	db, err := openStore(cfg.DatabasePath, cfg.MaxDatabaseBytes)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,10 +3,21 @@ package cli
 import (
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestStartRejectsInvalidTelemetryDatabaseBudget(t *testing.T) {
+	for _, budget := range []int64{-1, 0, 1048575} {
+		var stdout, stderr bytes.Buffer
+		code := runStart([]string{"-telemetry-max-db-bytes", fmt.Sprint(budget)}, &stdout, &stderr)
+		if code != 2 || !strings.Contains(stderr.String(), "-telemetry-max-db-bytes must be at least") {
+			t.Fatalf("budget %d: code=%d stderr=%q", budget, code, stderr.String())
+		}
+	}
+}
 
 func TestStartTelemetryFlagsMustBeConfiguredTogether(t *testing.T) {
 	for _, test := range []struct {

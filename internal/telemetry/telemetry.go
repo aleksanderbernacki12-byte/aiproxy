@@ -49,9 +49,11 @@ type HTTPDoer interface {
 
 // Config controls the local durable queue and the control-plane sender.
 type Config struct {
-	Endpoint       string
-	DatabasePath   string
-	PrivateKeyPath string
+	Endpoint     string
+	DatabasePath string
+	// MaxDatabaseBytes defaults to 256 MiB; excludes SQLite journal overhead.
+	MaxDatabaseBytes int64
+	PrivateKeyPath   string
 	// SaltPath defaults to .aiproxy_salt beside DatabasePath.
 	SaltPath string
 	// HTTP clients are copied with redirects disabled. Other HTTPDoer
@@ -89,24 +91,29 @@ type Client struct {
 	initialBackoff   time.Duration
 	maxBackoff       time.Duration
 
-	jobs              chan Submission
-	wake              chan struct{}
-	errors            chan error
-	stop              chan struct{}
-	sequenced         chan struct{}
-	coreDone          chan struct{}
-	errorDone         chan struct{}
-	done              chan struct{}
-	closed            atomic.Bool
-	accepted          atomic.Uint64
-	dropped           atomic.Uint64
-	persistFailures   atomic.Uint64
-	deliveryFailures  atomic.Uint64
-	deliveredEvents   atomic.Uint64
-	durablePending    atomic.Int64
-	lastDeliveredUnix atomic.Int64
-	lastFailureUnix   atomic.Int64
-	submit            sync.RWMutex
+	jobs                chan Submission
+	wake                chan struct{}
+	errors              chan error
+	stop                chan struct{}
+	sequenced           chan struct{}
+	coreDone            chan struct{}
+	errorDone           chan struct{}
+	done                chan struct{}
+	closed              atomic.Bool
+	accepted            atomic.Uint64
+	dropped             atomic.Uint64
+	persistFailures     atomic.Uint64
+	deliveryFailures    atomic.Uint64
+	deliveredEvents     atomic.Uint64
+	durablePending      atomic.Int64
+	storageFullFailures atomic.Uint64
+	databaseBytes       atomic.Int64
+	databaseUsedBytes   atomic.Int64
+	databaseLimitBytes  atomic.Int64
+	storageMu           sync.Mutex
+	lastDeliveredUnix   atomic.Int64
+	lastFailureUnix     atomic.Int64
+	submit              sync.RWMutex
 
 	onError func(error)
 	now     func() time.Time
@@ -131,7 +138,7 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: fingerprint public key: %w", err)
 	}
-	db, err := openStore(cfg.DatabasePath)
+	db, err := openStore(cfg.DatabasePath, cfg.MaxDatabaseBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -233,6 +240,7 @@ func New(cfg Config) (*Client, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("telemetry: count initial pending events: %w", countErr)
 	}
+	c.refreshStorage()
 	go c.sequenceLoop()
 	go c.sendLoop()
 	go c.errorLoop()
@@ -312,8 +320,9 @@ func (c *Client) SubmitAsync(submission Submission) bool {
 	}
 }
 
-// Shutdown drains accepted submissions into SQLite and stops the sender. Any
-// undelivered events remain durable for the next New call using the same path.
+// Shutdown attempts to persist all accepted submissions and stops the sender.
+// Storage failures are reported asynchronously; successfully persisted events
+// remain durable for the next New call using the same path.
 func (c *Client) Shutdown(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -351,6 +360,7 @@ func (c *Client) sequenceLoop() {
 }
 
 func (c *Client) persistSubmission(submission Submission) {
+	defer c.refreshStorage()
 	defer zero(submission.Request)
 	defer zero(submission.Response)
 	defer func() {
@@ -363,6 +373,10 @@ func (c *Client) persistSubmission(submission Submission) {
 	cancel()
 	if err != nil {
 		c.persistFailures.Add(1)
+		if storageFull(err) {
+			c.storageFullFailures.Add(1)
+			c.dropped.Add(1)
+		}
 		c.lastFailureUnix.Store(c.now().UTC().Unix())
 		c.report(fmt.Errorf("telemetry: persist %s: %w", submission.EventID, err))
 		return
@@ -381,6 +395,8 @@ func (c *Client) Snapshot() Snapshot {
 		Accepted: c.accepted.Load(), Dropped: c.dropped.Load(),
 		PersistFailures: c.persistFailures.Load(), DeliveryFailures: c.deliveryFailures.Load(),
 		DeliveredEvents: c.deliveredEvents.Load(), Pending: c.durablePending.Load() + int64(len(c.jobs)),
+		StorageFullFailures: c.storageFullFailures.Load(), DatabaseBytes: c.databaseBytes.Load(),
+		DatabaseUsedBytes: c.databaseUsedBytes.Load(), DatabaseLimitBytes: c.databaseLimitBytes.Load(),
 		LastDeliveredAt: unixTime(c.lastDeliveredUnix.Load()), LastFailureAt: unixTime(c.lastFailureUnix.Load()),
 	}
 }

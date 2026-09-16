@@ -156,11 +156,14 @@ func TestRecorderReportsPartialQueueAcceptance(t *testing.T) {
 }
 
 func TestRecorderExposesAggregateTelemetryStatus(t *testing.T) {
-	want := telemetry.Snapshot{Accepted: 4, Dropped: 1, Pending: 2, DeliveryFailures: 3}
+	want := telemetry.Snapshot{Accepted: 4, Dropped: 1, Pending: 2, DeliveryFailures: 3, StorageFullFailures: 1, DatabaseBytes: 81920, DatabaseUsedBytes: 65536, DatabaseLimitBytes: 1048576}
 	recorder := &Recorder{Telemetry: &fakeTelemetry{snapshot: want}}
 	got := recorder.ComplianceStatus()
 	if got.Telemetry == nil || got.Telemetry.Accepted != want.Accepted || got.Telemetry.Pending != want.Pending || got.Telemetry.DeliveryFailures != want.DeliveryFailures {
 		t.Fatalf("ComplianceStatus() = %#v", got)
+	}
+	if got.Telemetry.StorageFullFailures != want.StorageFullFailures || got.Telemetry.DatabaseBytes != want.DatabaseBytes || got.Telemetry.DatabaseUsedBytes != want.DatabaseUsedBytes || got.Telemetry.DatabaseLimitBytes != want.DatabaseLimitBytes {
+		t.Fatalf("storage health was not forwarded: %+v", got.Telemetry)
 	}
 }
 

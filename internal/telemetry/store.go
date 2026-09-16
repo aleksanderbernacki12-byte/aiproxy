@@ -6,13 +6,34 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
+
+const (
+	DefaultMaxDatabaseBytes int64 = 256 << 20
+	MinMaxDatabaseBytes     int64 = 1 << 20
+)
+
+func databaseBudget(value int64) (int64, error) {
+	if value == 0 {
+		return DefaultMaxDatabaseBytes, nil
+	}
+	if value < MinMaxDatabaseBytes {
+		return 0, errors.New("telemetry: database budget must be at least 1 MiB")
+	}
+	return value, nil
+}
+
+func storageFull(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == 13 // SQLITE_FULL
+}
 
 const schema = `
 CREATE TABLE IF NOT EXISTS telemetry_state (
@@ -34,7 +55,11 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
 );
 `
 
-func openStore(filename string) (*sql.DB, error) {
+func openStore(filename string, maxBytes int64) (*sql.DB, error) {
+	maxBytes, err := databaseBudget(maxBytes)
+	if err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(filename) == "" {
 		return nil, errors.New("telemetry: SQLite database path is required")
 	}
@@ -54,17 +79,44 @@ func openStore(filename string) (*sql.DB, error) {
 		return nil, fmt.Errorf("telemetry: inspect SQLite database: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", abs)
+	path := filepath.ToSlash(abs)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	location := url.URL{Scheme: "file", Path: path}
+	db, err := sql.Open("sqlite", location.String())
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: open SQLite database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	// Read the existing page size before constructing the connection pragmas.
+	// DSN pragmas also apply if database/sql replaces a failed connection.
+	var pageSize int64
+	if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("telemetry: read SQLite page size: %w", err)
+	}
+	_ = db.Close()
+	pragmas := url.Values{}
+	for _, pragma := range []string{"busy_timeout(5000)", "journal_mode(DELETE)", "synchronous(FULL)", "foreign_keys(ON)", fmt.Sprintf("max_page_count(%d)", maxBytes/pageSize)} {
+		pragmas.Add("_pragma", pragma)
+	}
+	location.RawQuery = pragmas.Encode()
+	db, err = sql.Open("sqlite", location.String())
+	if err != nil {
+		return nil, fmt.Errorf("telemetry: open bounded SQLite database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	cleanup := func(cause error) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, cause
 	}
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;`); err != nil {
-		return cleanup(fmt.Errorf("telemetry: configure SQLite: %w", err))
+	var maxPages int64
+	if err := db.QueryRow(`PRAGMA max_page_count`).Scan(&maxPages); err != nil {
+		return cleanup(fmt.Errorf("telemetry: configure SQLite budget: %w", err))
+	}
+	if maxPages != maxBytes/pageSize {
+		return cleanup(errors.New("telemetry: database exceeds configured budget or budget exceeds SQLite limit; increase the budget to preserve existing evidence"))
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return cleanup(fmt.Errorf("telemetry: initialize SQLite schema: %w", err))
@@ -73,6 +125,24 @@ func openStore(filename string) (*sql.DB, error) {
 		return cleanup(fmt.Errorf("telemetry: secure SQLite permissions: %w", err))
 	}
 	return db, nil
+}
+
+// refreshStorage runs only in background work, never on the LLM request path.
+func (c *Client) refreshStorage() {
+	c.storageMu.Lock()
+	defer c.storageMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), c.operationTimeout)
+	defer cancel()
+	var pageSize, pages, freePages, maxPages int64
+	err := c.db.QueryRowContext(ctx, `SELECT page_size, page_count, freelist_count, max_page_count
+		FROM pragma_page_size(), pragma_page_count(), pragma_freelist_count(), pragma_max_page_count()`).Scan(&pageSize, &pages, &freePages, &maxPages)
+	if err != nil {
+		c.report(fmt.Errorf("telemetry: read storage health: %w", err))
+		return
+	}
+	c.databaseBytes.Store(pages * pageSize)
+	c.databaseUsedBytes.Store((pages - freePages) * pageSize)
+	c.databaseLimitBytes.Store(maxPages * pageSize)
 }
 
 func (c *Client) persist(ctx context.Context, submission Submission) error {

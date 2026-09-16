@@ -66,14 +66,18 @@ type SecureVaultStatus struct {
 }
 
 type TelemetryStatus struct {
-	Accepted         uint64     `json:"accepted"`
-	Dropped          uint64     `json:"dropped"`
-	PersistFailures  uint64     `json:"persist_failures"`
-	DeliveryFailures uint64     `json:"delivery_failures"`
-	DeliveredEvents  uint64     `json:"delivered_events"`
-	Pending          int64      `json:"pending"`
-	LastDeliveredAt  *time.Time `json:"last_delivered_at,omitempty"`
-	LastFailureAt    *time.Time `json:"last_failure_at,omitempty"`
+	Accepted            uint64     `json:"accepted"`
+	Dropped             uint64     `json:"dropped"`
+	PersistFailures     uint64     `json:"persist_failures"`
+	DeliveryFailures    uint64     `json:"delivery_failures"`
+	DeliveredEvents     uint64     `json:"delivered_events"`
+	Pending             int64      `json:"pending"`
+	StorageFullFailures uint64     `json:"storage_full_failures"`
+	DatabaseBytes       int64      `json:"database_bytes"`
+	DatabaseUsedBytes   int64      `json:"database_used_bytes"`
+	DatabaseLimitBytes  int64      `json:"database_limit_bytes"`
+	LastDeliveredAt     *time.Time `json:"last_delivered_at,omitempty"`
+	LastFailureAt       *time.Time `json:"last_failure_at,omitempty"`
 }
 
 func complianceIdentity(header http.Header, authenticatedLabel string) (clientID, applicationID string) {

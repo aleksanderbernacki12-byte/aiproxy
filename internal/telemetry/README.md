@@ -113,11 +113,43 @@ exponential backoff.
 The SQLite file is created with mode `0600`; it contains anonymous telemetry,
 signatures, and chain state. The P-256 private-key file must also be a regular
 file readable only by its owner. Keep both in customer-controlled persistent
-storage. `Shutdown` drains every accepted in-memory submission into SQLite and
-leaves unavailable batches there for the next process start.
+storage. `Shutdown` attempts to persist every accepted in-memory submission,
+reports storage failures, and leaves persisted unavailable batches for the
+next process start.
 
 `Client.Snapshot()` exposes non-blocking aggregate health: accepted and
 dropped submissions, pending durable work, persistence and delivery failures,
 delivered events, and latest success/failure times. With the compliance
 recorder these values appear under `compliance.telemetry` in
 `GET /_aiproxy/stats`; no event data or secrets are included.
+
+### Storage budget
+
+`--telemetry-max-db-bytes` limits the SQLite database to 268435456 bytes
+(256 MiB) by default, with a minimum of 1048576 bytes (1 MiB). The package
+equivalent is `Config.MaxDatabaseBytes`; zero selects the default. The limit
+rounds down to whole SQLite pages and includes indexes, chain state, and the
+permanent event-ID ledger, not just pending payloads. It is reapplied to every
+database connection. Startup rejects an existing database larger than the
+budget without deleting evidence; increase the configured budget to reopen it.
+
+SQLite's rollback journal is outside this file limit. Reserve at least twice
+the budget plus filesystem overhead, and use a dedicated volume or filesystem
+quota when a strict total disk limit is required. The in-memory queue is still
+bounded by event count, not bytes.
+
+When SQLite reports full storage, the entire new event transaction rolls back:
+neither the chain head nor the permanent event ID advances. Existing events
+remain queued. The new event is lost and increments `dropped`,
+`persist_failures`, and `storage_full_failures`; LLM traffic continues.
+`SubmitAsync` success means in-memory admission, not guaranteed persistence.
+Delivered payloads free reusable pages, so persistence can resume after delivery
+recovers. The permanent event-ID ledger continues to grow even after delivery;
+monitor capacity and increase the budget before it fills. Do not delete that
+ledger or the database to reclaim space.
+
+Snapshots and Prometheus expose database allocated bytes, used bytes (excluding
+reusable free pages), the effective limit, and storage-full failures. Values are
+refreshed at startup and after background persistence and successful removal of
+delivered batches. Counters reset on process restart. The supplied alerts warn
+above 80% used capacity and report storage-full event loss as critical.

@@ -70,6 +70,7 @@ func (c *Client) flush(force, shuttingDown bool) {
 			return
 		}
 		c.durablePending.Add(-int64(len(events)))
+		c.refreshStorage()
 		c.deliveredEvents.Add(uint64(len(events)))
 		c.lastDeliveredUnix.Store(c.now().UTC().Unix())
 		if shuttingDown {
