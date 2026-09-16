@@ -57,6 +57,20 @@ groups:
         annotations:
           summary: Secure Vault has unreadable quarantined evidence
           runbook_url: docs/operations/compliance-alerts.md#secure-vault-local-failure-or-quarantine
+      - alert: AiproxyPIIRedactionSpike
+        expr: |
+          sum by (target) (increase(aiproxy_pii_redacted_total[15m])) > 10
+          and
+          sum by (target) (increase(aiproxy_pii_redacted_total[15m]))
+            / clamp_min(sum by (target) (
+                increase(aiproxy_requests_allowed_total[15m])
+                + increase(aiproxy_requests_redacted_total[15m])
+              ), 1) > 0.20
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: Aiproxy is redacting PII from an unusual share of requests
+          runbook_url: docs/operations/compliance-alerts.md#pii-redaction-spike
 
   - name: aiproxy-control-plane-compliance
     rules:

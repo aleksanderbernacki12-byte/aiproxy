@@ -33,6 +33,16 @@ Check disk capacity and permissions on the spool directory. Preserve all
 authenticated or decoded with the configured spool key; investigate key
 rotation or file corruption before attempting recovery.
 
+## PII redaction spike
+
+Confirm whether the affected route recently changed its clients, prompt
+templates, or workload. Compare the aggregate model and application inventory
+in the Control Plane with the deployment timeline. Do not add prompt contents,
+matched values, or long-lived client identifiers to metrics or alert labels.
+If the increase is expected, tune both the minimum event count and percentage
+threshold for that environment; retaining both conditions prevents low-volume
+routes from alerting on a single redaction.
+
 ## Control Plane buffer delay
 
 Verify that the scheduled worker calls `/api/internal/telemetry/process` with
@@ -69,7 +79,7 @@ rows until the original evidence and incident timeline have been preserved.
 
 Load `deploy/prometheus/aiproxy-alerts.yml` through Prometheus `rule_files` and
 route `severity: critical` to the compliance/security on-call path. Tune only
-the backlog thresholds to measured traffic volume; alerts for dropped events,
-local persistence failures, quarantine, compromised chains, and invalid
-signatures should remain zero-tolerance. Administrative audit-chain failures
-must also remain zero-tolerance.
+the backlog and PII-spike thresholds to measured traffic volume; alerts for
+dropped events, local persistence failures, quarantine, compromised chains,
+and invalid signatures should remain zero-tolerance. Administrative
+audit-chain failures must also remain zero-tolerance.
