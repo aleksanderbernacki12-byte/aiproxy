@@ -378,6 +378,17 @@ both `pii_detected` and `pii_redacted` to be true.
 
 ## Validation
 
+The shared GitHub Actions workflow runs on pushes to `main`, pull requests,
+and release tags through the release workflow. Control Plane validation uses
+Node.js 24, locked npm dependencies, and an isolated PostgreSQL 17 service.
+It runs lint, unit tests, database integration tests (including migrations),
+the production build, and typechecking. The build generates the Next.js route
+types before the standalone typecheck runs.
+
+Release builds require this validation and the Go formatting, vet, and race
+tests on Linux, macOS, and Windows to pass on the release commit. A failed
+verification blocks GitHub Release, container, Homebrew, and Scoop publication.
+
 ```sh
 npm test
 npm run lint

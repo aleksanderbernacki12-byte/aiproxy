@@ -12,8 +12,15 @@ permissions:
   packages: write
 
 jobs:
+  verify:
+    name: Verify release commit
+    permissions:
+      contents: read
+    uses: ./.github/workflows/test.yml
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -130,7 +137,7 @@ jobs:
       - name: Compute checksums
         working-directory: release
         run: |
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create release and upload assets
