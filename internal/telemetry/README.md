@@ -92,8 +92,16 @@ sent with `Authorization: Bearer <AIPROXY_TENANT_KEY>`; a caller-supplied
 Authorization header cannot override it. A 401 response is reported through
 the local asynchronous `OnError` callback and retained for retry without
 blocking or failing LLM traffic.
+HTTP redirects are rejected and the batch remains queued for retry. Configure
+the ingest endpoint directly: a redirect must never forward telemetry or tenant
+credentials, or turn a redirected GET into a successful delivery. Supplied
+`*http.Client` values are copied with redirects disabled; custom `HTTPDoer`
+implementations must likewise return redirects without following them.
 When no `OnError` callback is configured, the package writes the error through
 Go's standard local logger.
+Delivery diagnostics omit arbitrary transport error and panic text, which can
+contain credentials, URL parameters, or payloads. They report HTTP status codes,
+timeouts, cancellation, and generic transport or client-panic failures instead.
 
 A single sequencer hashes, links, signs, and commits an event together with the
 new chain head in one SQLite transaction. This serializes concurrent LLM

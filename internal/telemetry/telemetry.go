@@ -53,7 +53,9 @@ type Config struct {
 	DatabasePath   string
 	PrivateKeyPath string
 	// SaltPath defaults to .aiproxy_salt beside DatabasePath.
-	SaltPath   string
+	SaltPath string
+	// HTTP clients are copied with redirects disabled. Other HTTPDoer
+	// implementations must return redirects without following them.
 	HTTPClient HTTPDoer
 	Headers    http.Header
 
@@ -189,6 +191,13 @@ func New(cfg Config) (*Client, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{}
+	}
+	if client, ok := httpClient.(*http.Client); ok {
+		copy := *client
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		httpClient = &copy
 	}
 
 	headers := cfg.Headers.Clone()

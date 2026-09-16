@@ -10,8 +10,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -27,6 +29,49 @@ const (
 	eventOne = "550e8400-e29b-41d4-a716-446655440000"
 	eventTwo = "550e8400-e29b-41d4-a716-446655440001"
 )
+
+func TestDeliveryRejectsRedirectsAndRetainsBatch(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		for _, custom := range []bool{false, true} {
+			t.Run(fmt.Sprintf("status_%d/custom_%t", status, custom), func(t *testing.T) {
+				var destinationCalls atomic.Int64
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/ingest" {
+						http.Redirect(w, r, "/destination", status)
+						return
+					}
+					destinationCalls.Add(1)
+					w.WriteHeader(http.StatusAccepted)
+				}))
+				defer server.Close()
+				dir := t.TempDir()
+				_, keyPath := writePrivateKey(t, dir)
+				cfg := testConfig(t, dir, keyPath, nil)
+				cfg.Endpoint = server.URL + "/ingest"
+				cfg.OnError = func(error) {}
+				original := &http.Client{Timeout: time.Second}
+				if custom {
+					cfg.HTTPClient = original
+				}
+				client, err := New(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !client.SubmitAsync(testSubmission(eventOne, time.Now())) {
+					t.Fatal("submission rejected")
+				}
+				eventually(t, func() bool { return client.deliveryFailures.Load() > 0 })
+				shutdown(t, client)
+				if destinationCalls.Load() != 0 || client.deliveredEvents.Load() != 0 || client.durablePending.Load() != 1 {
+					t.Fatal("redirect followed or pending batch lost")
+				}
+				if original.CheckRedirect != nil {
+					t.Fatal("caller-owned HTTP client was modified")
+				}
+			})
+		}
+	}
+}
 
 type httpCall struct {
 	body    []byte

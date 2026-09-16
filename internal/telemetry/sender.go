@@ -83,7 +83,7 @@ func (c *Client) flush(force, shuttingDown bool) {
 func (c *Client) deliverSafely(events []queuedEvent) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("telemetry: control-plane client panic: %v", recovered)
+			err = errors.New("telemetry: control-plane client panic")
 		}
 	}()
 	return c.deliver(events)
@@ -119,7 +119,16 @@ func (c *Client) deliver(events []queuedEvent) error {
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
-		return fmt.Errorf("telemetry: send control-plane batch: %w", err)
+		// Transport errors (including url.Error) and custom clients can embed
+		// URLs, credentials, or payloads. Never expose their arbitrary text.
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return fmt.Errorf("telemetry: send control-plane batch: %w", context.DeadlineExceeded)
+		case errors.Is(err, context.Canceled):
+			return fmt.Errorf("telemetry: send control-plane batch: %w", context.Canceled)
+		default:
+			return errors.New("telemetry: send control-plane batch: transport failure")
+		}
 	}
 	if response == nil {
 		return errors.New("telemetry: control plane returned a nil response")
