@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit --incremental false",
     "test": "vitest run && node --test scripts/scheduler-config.node-test.mjs",
     "test:integration": "node scripts/run-integration-tests.mjs",
+    "test:recovery": "node scripts/run-integration-tests.mjs --recovery",
     "db:migrate": "node scripts/migrate.mjs",
     "orgs:create": "node scripts/create-organization.mjs",
     "tenant-keys:create": "node scripts/create-tenant-key.mjs",

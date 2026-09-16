@@ -5,6 +5,7 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { calculateEventHash, signingBytes } from "@/lib/telemetry/cryptography";
 import type { TelemetryEvent } from "@/lib/telemetry/schema";
+import { verifyBackupRecovery } from "./recovery";
 
 vi.mock("server-only", () => ({}));
 
@@ -251,6 +252,7 @@ describe("telemetry control-plane flow", () => {
     const anchoredAudit = await getSecurityAuditLedger(organizationId);
     expect(anchoredAudit.events).toHaveLength(2);
     expect(anchoredAudit.evidence.anchor).toMatchObject({ status: "ANCHORED", anchorId: "integration-ledger-1" });
+    if (process.env.TEST_BACKUP_RECOVERY === "1") await verifyBackupRecovery(client, organizationId);
     const originalAuditHash = await client.query<{ event_hash: string }>(
       `SELECT event_hash FROM security_audit_events WHERE organization_id = $1 AND sequence = 1`, [organizationId],
     );
@@ -298,8 +300,9 @@ describe("telemetry control-plane flow", () => {
     expect(retainedEvidence?.retention).toMatchObject({ telemetryRetentionDays: 30, legalHold: false, tombstoneCount: 2 });
     expect(retainedEvidence?.models).toHaveLength(0);
     expect(retainedEvidence?.summary.chainStatus).toBe("INTACT");
+    if (process.env.TEST_BACKUP_RECOVERY === "1") await verifyBackupRecovery(client, organizationId);
     await expect(client.query(
       `UPDATE telemetry_tombstones SET event_hash=$2 WHERE organization_id=$1`, [organizationId, "c".repeat(64)],
     )).rejects.toThrow(/append-only/);
-  });
+  }, 120_000);
 });

@@ -378,6 +378,12 @@ both `pii_detected` and `pii_redacted` to be true.
 
 ## Validation
 
+Backup and restore verification is available through `npm run test:recovery`.
+It includes the integration flow and actual PostgreSQL dump/restore checks
+before and after retention. See the
+[backup and recovery runbook](../docs/operations/backup-recovery.md) for local
+requirements, CI behavior, and the separate production recovery procedure.
+
 The shared GitHub Actions workflow runs on pushes to `main`, pull requests,
 and release tags through the release workflow. Control Plane validation uses
 Node.js 24, locked npm dependencies, and an isolated PostgreSQL 17 service.

@@ -11,7 +11,8 @@ const result = spawnSync(
   ["./node_modules/vitest/vitest.mjs", "run", "--config", "vitest.integration.config.ts"],
   {
     cwd: process.cwd(),
-    env: { ...process.env, DATABASE_URL: databaseUrl },
+    env: { ...process.env, DATABASE_URL: databaseUrl,
+      TEST_BACKUP_RECOVERY: process.argv.includes("--recovery") ? "1" : "0" },
     stdio: "inherit",
   },
 );

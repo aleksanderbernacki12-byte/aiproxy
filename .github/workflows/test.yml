@@ -90,8 +90,10 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      - name: PostgreSQL integration tests
-        run: npm run test:integration
+      - name: PostgreSQL integration and backup recovery tests
+        env:
+          TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: npm run test:recovery
 
       # Build generates Next.js route types required by the standalone check.
       - name: Production build
