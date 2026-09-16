@@ -60,6 +60,7 @@ services:
     environment:
       CONTROL_PLANE_INTERNAL_URL: http://app:3000
       CRON_SECRET: ${CRON_SECRET:-}
+      SCHEDULER_REQUEST_TIMEOUT_MS: ${SCHEDULER_REQUEST_TIMEOUT_MS:-70000}
     depends_on:
       app:
         condition: service_healthy

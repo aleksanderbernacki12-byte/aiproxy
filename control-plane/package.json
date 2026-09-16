@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "vitest run",
+    "test": "vitest run && node --test scripts/scheduler-config.node-test.mjs",
     "test:integration": "node scripts/run-integration-tests.mjs",
     "db:migrate": "node scripts/migrate.mjs",
     "orgs:create": "node scripts/create-organization.mjs",

@@ -57,6 +57,9 @@ The runtime requires:
   eight-hour HttpOnly DPO session cookie.
 - `CRON_SECRET`: bearer token used by the internal worker route. Vercel adds
   this header automatically to configured cron invocations.
+- `SCHEDULER_REQUEST_TIMEOUT_MS`: timeout for each self-hosted scheduler call;
+  defaults to 70 seconds and must be between 5 and 300 seconds. A timed-out
+  call is released so a later interval can retry it.
 - `TELEMETRY_REORDER_WINDOW_SECONDS`: how long a chain gap remains buffered
   before it is classified as compromised; defaults to 30 seconds.
 - `MERKLE_ANCHOR_URL`: HTTPS endpoint for an independent append-only anchor.

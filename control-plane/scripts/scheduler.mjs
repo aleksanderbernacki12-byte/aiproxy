@@ -1,15 +1,23 @@
 import process from "node:process";
+import { internalBaseUrl, requestTimeout } from "./scheduler-config.mjs";
 
 const secret = process.env.CRON_SECRET;
-const baseUrl = process.env.CONTROL_PLANE_INTERNAL_URL ?? "http://app:3000";
 if (!secret || secret.length < 32) throw new Error("CRON_SECRET must contain at least 32 characters");
+
+const baseUrl = internalBaseUrl(process.env.CONTROL_PLANE_INTERNAL_URL ?? "http://app:3000");
+const timeoutMs = requestTimeout(process.env.SCHEDULER_REQUEST_TIMEOUT_MS);
 
 const running = new Set();
 async function invoke(path) {
   const response = await fetch(new URL(path, baseUrl), {
     headers: { authorization: `Bearer ${secret}` },
+    signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!response.ok) throw new Error(`${path} returned HTTP ${response.status}`);
+  try {
+    if (!response.ok) throw new Error(`${path} returned HTTP ${response.status}`);
+  } finally {
+    await response.body?.cancel();
+  }
 }
 
 async function run(path) {
