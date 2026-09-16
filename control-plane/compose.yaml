@@ -2,15 +2,15 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: aiproxy_control
-      POSTGRES_USER: aiproxy
-      POSTGRES_PASSWORD: aiproxy
+      POSTGRES_DB: ${POSTGRES_DB:-aiproxy_control}
+      POSTGRES_USER: ${POSTGRES_USER:-aiproxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - aiproxy-control-postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aiproxy -d aiproxy_control"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aiproxy} -d ${POSTGRES_DB:-aiproxy_control}"]
       interval: 2s
       timeout: 3s
       retries: 20
@@ -20,7 +20,7 @@ services:
       context: .
       target: migrations
     environment:
-      DATABASE_URL: postgresql://aiproxy:aiproxy@postgres:5432/aiproxy_control
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aiproxy}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-aiproxy_control}
     depends_on:
       postgres:
         condition: service_healthy
@@ -31,7 +31,7 @@ services:
       context: .
       target: runtime
     environment:
-      DATABASE_URL: postgresql://aiproxy:aiproxy@postgres:5432/aiproxy_control
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aiproxy}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-aiproxy_control}
       DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-}
       CRON_SECRET: ${CRON_SECRET:-}
       TELEMETRY_REORDER_WINDOW_SECONDS: ${TELEMETRY_REORDER_WINDOW_SECONDS:-30}

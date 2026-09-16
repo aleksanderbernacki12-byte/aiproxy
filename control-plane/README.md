@@ -10,6 +10,7 @@ Use Node.js 24 or newer. Copy `.env.example` to `.env.local`, then start and
 migrate PostgreSQL:
 
 ```sh
+export POSTGRES_PASSWORD='<random-hex-database-password>'
 docker compose up -d postgres
 set -a; source .env.local; set +a
 npm run db:migrate
@@ -27,9 +28,16 @@ values of at least 32 characters. Then start the full stack:
 export DASHBOARD_SESSION_SECRET='<random-session-secret>'
 export CRON_SECRET='<different-random-worker-secret>'
 export MERKLE_ANCHOR_TOKEN='<different-random-anchor-secret>'
+export POSTGRES_PASSWORD='<random-hex-database-password>'
 # Also set the anchor URL/public key and report-signing private key.
 docker compose up --build -d
 ```
+
+Compose refuses to render or start without `POSTGRES_PASSWORD`. Use the same
+random hexadecimal value in `DATABASE_URL`, because Compose also places it in
+the internal PostgreSQL URL; no shared password is committed. `POSTGRES_USER` and
+`POSTGRES_DB` remain configurable and default to `aiproxy` and
+`aiproxy_control`.
 
 Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
