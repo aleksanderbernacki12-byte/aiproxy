@@ -3094,7 +3094,10 @@ with investigation steps in the
 For an authorized customer-side investigation, `aiproxy vault-export` restores
 one record through the customer's own S3 credentials and KMS permissions. The
 command verifies the encrypted envelope and writes the raw JSON to a new local
-file with mode `0600`; it never overwrites an existing export.
+file with mode `0600` on Unix; it never overwrites an existing export.
+On Windows, restrict the destination directory's ACL to the authorized operator
+before exporting: Go's Unix mode bits do not establish owner-only Windows ACLs.
+The same requirement applies to local spool, telemetry, salt, and key directories.
 
 ## Validating a config file
 

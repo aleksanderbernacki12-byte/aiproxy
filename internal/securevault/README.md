@@ -76,7 +76,7 @@ are never included.
 
 `aiproxy vault-export` retrieves one event from the customer bucket, asks the
 customer KMS to decrypt its DEK with the stored encryption context, verifies
-the AES-GCM tag and archive identity, and writes the raw JSON to a new `0600`
+the AES-GCM tag and archive identity, and writes the raw JSON to a new `0600` (Unix)
 file. It refuses to overwrite an existing file. Run this only inside the
 customer-controlled investigation environment:
 

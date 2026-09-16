@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -357,7 +358,9 @@ func TestStoreAsync_KMSFailureUsesEncryptedSpoolAndRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows uses inherited ACLs; encryption and retry behavior remain
+	// checked on every platform, while 0600 is a Unix-only guarantee.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("spool permissions = %#o, want 0600", info.Mode().Perm())
 	}
 	entry, err := vault.readEntry(retryPath)

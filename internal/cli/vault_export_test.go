@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -15,7 +16,9 @@ func TestWriteExclusiveSecretFileSecuresAndNeverOverwrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows access is governed by the destination directory's ACL, not
+	// Unix mode bits. Content and exclusive creation are checked on every OS.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %#o", info.Mode().Perm())
 	}
 	if err := writeExclusiveSecretFile(filename, []byte("replacement")); err == nil {
