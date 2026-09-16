@@ -3253,6 +3253,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	piiRedactedBody, piiDetected := piifilter.RedactPII(string(evaluatedBody))
 	if piiDetected {
 		evaluatedBody = []byte(piiRedactedBody)
+		s.Stats.RecordPIIRedact(targetLabel)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(evaluatedBody))
 	r.ContentLength = int64(len(evaluatedBody))
@@ -4733,6 +4734,7 @@ type statsSnapshotJSON struct {
 	TotalTokens      int64 `json:"total_tokens"`
 	ResponseBlocked  int64 `json:"response_blocked"`
 	ResponseRedacted int64 `json:"response_redacted"`
+	PIIRedacted      int64 `json:"pii_redacted"`
 
 	// Failover counts how many times this target's candidate list moved
 	// on to the next URL because an earlier one was unreachable — always
@@ -4846,6 +4848,7 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		TotalTokens:            snap.TotalTokens,
 		ResponseBlocked:        snap.ResponseBlocked,
 		ResponseRedacted:       snap.ResponseRedacted,
+		PIIRedacted:            snap.PIIRedacted,
 		DryRunBlocked:          snap.DryRunBlocked,
 		DryRunRedacted:         snap.DryRunRedacted,
 		ResponseDryRunBlocked:  snap.ResponseDryRunBlocked,
@@ -5090,6 +5093,7 @@ var promCounters = []struct {
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
 	{"aiproxy_responses_redacted_total", "Total number of upstream responses forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.ResponseRedacted }},
+	{"aiproxy_pii_redacted_total", "Total number of request bodies locally scrubbed of PII before upstream delivery.", func(s stats.Snapshot) int64 { return s.PIIRedacted }},
 	{"aiproxy_failover_total", "Total number of times this target's candidate list moved on to the next URL because an earlier one was unreachable.", func(s stats.Snapshot) int64 { return s.Failover }},
 	{"aiproxy_shadow_sent_total", "Total number of requests mirrored to this target's own shadow destination.", func(s stats.Snapshot) int64 { return s.ShadowSent }},
 	{"aiproxy_shadow_error_total", "Total number of shadow-mirror attempts that never completed a round trip.", func(s stats.Snapshot) int64 { return s.ShadowError }},

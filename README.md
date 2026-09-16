@@ -3004,6 +3004,9 @@ are removed with the address. Detection performs no network
 calls, and matches are replaced with typed markers such as `[REDACTED_SSN]` and
 `[REDACTED_PHONE]`. The original request remains available only to the
 customer-controlled encrypted Secure Vault flow.
+The authenticated stats endpoint exposes only the aggregate `pii_redacted`
+counter, and Prometheus exports `aiproxy_pii_redacted_total` per route. Neither
+metric contains matched values or request contents.
 
 ## Compliance telemetry
 

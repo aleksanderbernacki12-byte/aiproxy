@@ -24,6 +24,7 @@ func TestStats_RecordsAndSnapshotsCorrectly(t *testing.T) {
 	s.RecordResponseBlock("default", "aws-access-key")
 	s.RecordResponseRedact("default", "openai-api-key")
 	s.RecordResponseRedact("default", "openai-api-key")
+	s.RecordPIIRedact("default")
 
 	snap := s.Snapshot()
 	if snap.Allowed != 2 {
@@ -49,6 +50,9 @@ func TestStats_RecordsAndSnapshotsCorrectly(t *testing.T) {
 	}
 	if snap.ResponseRedacted != 2 {
 		t.Errorf("ResponseRedacted = %d, want 2", snap.ResponseRedacted)
+	}
+	if snap.PIIRedacted != 1 || snap.PerTarget["default"].PIIRedacted != 1 {
+		t.Errorf("PIIRedacted = total %d, target %d; want 1, 1", snap.PIIRedacted, snap.PerTarget["default"].PIIRedacted)
 	}
 
 	awsKey, ok := snap.PerRule["aws-access-key"]
@@ -93,6 +97,7 @@ func TestStats_ConcurrentRecordingIsAccurate(t *testing.T) {
 			s.RecordAllow("default")
 			s.RecordBlock("default", "test-rule")
 			s.RecordRedact("default", "test-rule")
+			s.RecordPIIRedact("default")
 			s.RecordRateLimited("default")
 			s.RecordCacheHit("default")
 			s.RecordTokensUsed("default", 1)
@@ -109,6 +114,9 @@ func TestStats_ConcurrentRecordingIsAccurate(t *testing.T) {
 	}
 	if snap.Redacted != n {
 		t.Errorf("Redacted = %d, want %d", snap.Redacted, n)
+	}
+	if snap.PIIRedacted != n {
+		t.Errorf("PIIRedacted = %d, want %d", snap.PIIRedacted, n)
 	}
 	if snap.RateLimited != n {
 		t.Errorf("RateLimited = %d, want %d", snap.RateLimited, n)

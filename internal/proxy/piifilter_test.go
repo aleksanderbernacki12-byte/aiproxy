@@ -49,6 +49,10 @@ func TestPIIFilter_RedactsOnlyForwardedBodyAfterRouting(t *testing.T) {
 	if forwarded != want {
 		t.Fatalf("forwarded body = %q, want %q", forwarded, want)
 	}
+	snapshot := srv.Stats.Snapshot()
+	if snapshot.PIIRedacted != 1 || snapshot.PerTarget["model:chat"].PIIRedacted != 1 {
+		t.Fatalf("PII redaction stats = total %d, targets %#v; want one model:chat redaction", snapshot.PIIRedacted, snapshot.PerTarget)
+	}
 }
 
 func TestPIIFilter_PreservesOriginalCacheIdentity(t *testing.T) {

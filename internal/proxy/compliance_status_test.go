@@ -64,3 +64,17 @@ func TestServeMetricsIncludesCompliancePipelineHealth(t *testing.T) {
 		}
 	}
 }
+
+func TestServeMetricsIncludesAggregatePIIRedactionsWithoutContent(t *testing.T) {
+	server := &Server{Stats: stats.New()}
+	server.Stats.RecordPIIRedact("chat")
+	response := httptest.NewRecorder()
+	server.serveMetrics(response, httptest.NewRequest("GET", metricsPath, nil))
+	body := response.Body.String()
+	if !strings.Contains(body, `aiproxy_pii_redacted_total{target="chat"} 1`) {
+		t.Fatalf("metrics missing aggregate PII count: %q", body)
+	}
+	if strings.Contains(body, "alice@example.com") {
+		t.Fatal("metrics exposed request content")
+	}
+}
