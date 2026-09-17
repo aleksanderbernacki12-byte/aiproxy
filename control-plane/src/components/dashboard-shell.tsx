@@ -33,6 +33,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             Styrning
           </p>
           <nav aria-label="Huvudnavigation" className="space-y-1">
+            <Link href="/dashboard/systems" className="flex items-center gap-3 rounded-sm px-3 py-2.5 text-sm text-muted hover:bg-white hover:text-ink">Systemprofiler</Link>
             <Link
               href="/dashboard"
               className="flex items-center gap-3 rounded-sm bg-government-light px-3 py-2.5 text-sm font-bold text-government"

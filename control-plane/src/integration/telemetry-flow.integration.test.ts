@@ -304,5 +304,28 @@ describe("telemetry control-plane flow", () => {
     await expect(client.query(
       `UPDATE telemetry_tombstones SET event_hash=$2 WHERE organization_id=$1`, [organizationId, "c".repeat(64)],
     )).rejects.toThrow(/append-only/);
+
+    const { saveAISystem, listAISystems } = await import("@/lib/ai-systems");
+    const profile = { application_id: "integration-test", model: "gpt-enterprise", name: "Governed system",
+      provider: "test-provider", intended_purpose: "Review documents", risk_class: "HIGH" as const,
+      system_owner: "Legal", legal_basis: "Assessment 12", human_oversight: "Mandatory review",
+      data_categories: ["business records"], deployment_regions: ["EU"], status: "ACTIVE" as const };
+    const identity = { organizationId, credentialId: dpoCredentialId };
+    const systemId = await saveAISystem(identity, profile);
+    expect(await listAISystems(randomUUID())).toEqual([]);
+    expect(await saveAISystem(identity, { ...profile, name: "Updated system" })).toBe(systemId);
+    expect(await listAISystems(organizationId)).toMatchObject([{ id: systemId, name: "Updated system" }]);
+    const profileAudit = await getSecurityAuditLedger(organizationId);
+    expect(profileAudit.valid).toBe(true);
+    expect(profileAudit.events.some((event) => event.eventData.action === "AI_SYSTEM_PROFILE_UPSERTED")).toBe(true);
+    // A rejected audit insert must roll back the profile change, too.
+    await client.query(`ALTER TABLE security_audit_events ADD CONSTRAINT reject_profile_test
+      CHECK (event_data->>'action' <> 'AI_SYSTEM_PROFILE_UPSERTED') NOT VALID`);
+    try {
+      await expect(saveAISystem(identity, { ...profile, name: "Must roll back" })).rejects.toThrow();
+      expect(await listAISystems(organizationId)).toMatchObject([{ id: systemId, name: "Updated system" }]);
+    } finally {
+      await client.query(`ALTER TABLE security_audit_events DROP CONSTRAINT reject_profile_test`);
+    }
   }, 120_000);
 });

@@ -1,4 +1,5 @@
 import { ReportButton } from "@/components/report-button";
+import Link from "next/link";
 import { getDashboardData } from "@/lib/dashboard";
 import { requireDashboardOrganizationId } from "@/lib/dashboard-auth";
 
@@ -31,7 +32,10 @@ export default async function DashboardPage() {
             Sammanställning av behandlad telemetri från organisationens anslutna data plane-instanser.
           </p>
         </div>
-        <ReportButton />
+        <div className="flex flex-wrap items-center gap-3">
+          <Link href="/dashboard/systems" className="rounded-sm border border-line bg-white px-4 py-2 text-sm font-bold text-government">Systemprofiler</Link>
+          <ReportButton />
+        </div>
       </div>
 
       {data.retention?.legalHold && (

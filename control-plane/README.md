@@ -139,6 +139,16 @@ the role. Revocation invalidates existing sessions on their next request.
 
 ## AI system governance inventory
 
+Open **Systemprofiler** from the dashboard to register or edit governance
+profiles. DPOs and administrators can save; auditors can view existing profiles.
+Each profile is identified by its application ID and model. Saving an existing
+pair updates that profile. The organization always comes from the authenticated
+session, and the profile change and audit event commit atomically. Requests
+require same-origin JSON, reject unknown fields, and are limited to 64 KiB.
+Use organizational functions and case references, not personal data or prompts.
+These profiles document governance; risk class and lifecycle status do not
+automatically block or change data-plane traffic.
+
 Telemetry automatically discovers each `(application_id, model)` combination.
 Attach its EU AI Act governance profile with a strict JSON file:
 
