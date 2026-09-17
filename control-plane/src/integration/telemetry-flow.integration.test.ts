@@ -295,6 +295,32 @@ describe("telemetry control-plane flow", () => {
       `UPDATE organization_retention_policies SET legal_hold=false, legal_hold_reason=NULL, legal_hold_set_at=NULL WHERE organization_id=$1`,
       [organizationId],
     );
+    // Pause the worker after policy discovery, then commit a policy change.
+    // The worker must re-read it inside the purge transaction.
+    for (const change of ["hold", "extend"] as const) {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", ["retention:" + organizationId]);
+      const pending = enforceRetentionPolicies(retentionNow);
+      try {
+        await vi.waitFor(async () => {
+          await client.query("SELECT pg_stat_clear_snapshot()");
+          const waiting = await client.query(`SELECT 1 FROM pg_stat_activity
+            WHERE datname=current_database() AND pid <> pg_backend_pid()
+              AND wait_event='advisory' AND query LIKE '%pg_advisory_xact_lock%'`);
+          expect(waiting.rowCount).toBeGreaterThan(0);
+        }, { timeout: 5000, interval: 20 });
+        await client.query(change === "hold"
+          ? `UPDATE organization_retention_policies SET legal_hold=true, legal_hold_reason='CONCURRENT-HOLD', legal_hold_set_at=now() WHERE organization_id=$1`
+          : `UPDATE organization_retention_policies SET telemetry_retention_days=3650 WHERE organization_id=$1`, [organizationId]);
+        await client.query("COMMIT");
+        expect(await pending).toEqual({ organizations: 1, held: change === "hold" ? 1 : 0, purged: 0 });
+      } finally {
+        await client.query("ROLLBACK");
+        await pending;
+      }
+      await client.query(`UPDATE organization_retention_policies SET legal_hold=false,
+        legal_hold_reason=NULL, legal_hold_set_at=NULL, telemetry_retention_days=30 WHERE organization_id=$1`, [organizationId]);
+    }
     expect(await enforceRetentionPolicies(retentionNow)).toEqual({ organizations: 1, held: 0, purged: 2 });
     const retainedEvidence = await getDashboardData(organizationId);
     expect(retainedEvidence?.retention).toMatchObject({ telemetryRetentionDays: 30, legalHold: false, tombstoneCount: 2 });

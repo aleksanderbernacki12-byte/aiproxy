@@ -228,6 +228,11 @@ are retained for investigation. Policy changes, legal holds, releases, and
 completed purge batches are recorded in the administrative audit chain. Use a
 case reference rather than personal data in legal-hold reasons.
 
+Retention workers re-read and lock each organization’s policy inside the purge
+transaction. A legal hold or longer retention period committed before that lock
+is honored by the pending purge. Policy changes wait for any purge already
+holding the row lock; a hold cannot undo a purge that has already committed.
+
 ## Administrative security ledger
 
 Credential creation and revocation, telemetry signing-key changes, AI-system

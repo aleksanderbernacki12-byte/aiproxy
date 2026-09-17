@@ -6,9 +6,16 @@ import { organizationRetentionPolicies } from "@/db/schema";
 
 const BATCH_SIZE = 500;
 
-async function purgeOrganization(organizationId: string, retentionDays: number, now: Date) {
+async function purgeOrganization(organizationId: string, now: Date) {
   return getDatabase().transaction(async (transaction) => {
     await transaction.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"retention:" + organizationId}, 0))`);
+    // Read the current policy under a row lock. Policy updates (including CLI
+    // legal holds) must finish before this read or wait until this purge commits.
+    const [policy] = await transaction.select().from(organizationRetentionPolicies)
+      .where(eq(organizationRetentionPolicies.organizationId, organizationId)).for("update");
+    if (!policy) return { held: 0, purged: 0 };
+    if (policy.legalHold) return { held: 1, purged: 0 };
+    const retentionDays = policy.telemetryRetentionDays;
     const result = await transaction.execute<{ purged: number }>(sql`
       WITH candidates AS (
         SELECT event.id
@@ -50,17 +57,18 @@ async function purgeOrganization(organizationId: string, retentionDays: number, 
       'TELEMETRY_RETENTION_EXECUTED', 'TELEMETRY_BATCH', ${now.toISOString()},
       ${JSON.stringify({ purged, retention_days: retentionDays })}::jsonb
     )`);
-    return purged;
+    return { held: 0, purged };
   });
 }
 
 export async function enforceRetentionPolicies(now = new Date()) {
-  const policies = await getDatabase().select().from(organizationRetentionPolicies);
+  const policies = await getDatabase().select({ organizationId: organizationRetentionPolicies.organizationId }).from(organizationRetentionPolicies);
   let purged = 0;
   let held = 0;
   for (const policy of policies) {
-    if (policy.legalHold) { held += 1; continue; }
-    purged += await purgeOrganization(policy.organizationId, policy.telemetryRetentionDays, now);
+    const result = await purgeOrganization(policy.organizationId, now);
+    held += result.held;
+    purged += result.purged;
   }
   return { organizations: policies.length, held, purged };
 }
