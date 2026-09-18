@@ -344,6 +344,30 @@ describe("telemetry control-plane flow", () => {
     const profileAudit = await getSecurityAuditLedger(organizationId);
     expect(profileAudit.valid).toBe(true);
     expect(profileAudit.events.some((event) => event.eventData.action === "AI_SYSTEM_PROFILE_UPSERTED")).toBe(true);
+    const { updateRetentionPolicy, RetentionConflictError } = await import("@/lib/retention-admin");
+    const { getRetentionPolicy } = await import("@/lib/retention");
+    await updateRetentionPolicy(identity, { command: "set", days: 365 });
+    await updateRetentionPolicy(identity, { command: "hold", reason: "CASE-18" });
+    await updateRetentionPolicy(identity, { command: "set", days: 730 });
+    expect(await getRetentionPolicy(organizationId)).toMatchObject({ telemetryRetentionDays: 730, legalHold: true });
+    expect(await getRetentionPolicy(randomUUID())).toBeNull();
+    await client.query(`ALTER TABLE security_audit_events ADD CONSTRAINT reject_retention_test
+      CHECK (event_data->>'action' NOT IN ('LEGAL_HOLD_RELEASED', 'RETENTION_POLICY_UPDATED')) NOT VALID`);
+    try {
+      await expect(updateRetentionPolicy(identity, { command: "release", reason: "closed" })).rejects.toThrow();
+      await expect(updateRetentionPolicy(identity, { command: "set", days: 30 })).rejects.toThrow();
+      expect(await getRetentionPolicy(organizationId)).toMatchObject({ telemetryRetentionDays: 730, legalHold: true });
+    } finally {
+      await client.query(`ALTER TABLE security_audit_events DROP CONSTRAINT reject_retention_test`);
+    }
+    await updateRetentionPolicy(identity, { command: "release", reason: "CASE-18 closed" });
+    expect(await getRetentionPolicy(organizationId)).toMatchObject({ legalHold: false, legalHoldReason: null });
+    await expect(updateRetentionPolicy(identity, { command: "release", reason: "again" })).rejects.toBeInstanceOf(RetentionConflictError);
+    const retentionAudit = await getSecurityAuditLedger(organizationId);
+    expect(retentionAudit.valid).toBe(true);
+    for (const action of ["RETENTION_POLICY_UPDATED", "LEGAL_HOLD_ENABLED", "LEGAL_HOLD_RELEASED"]) {
+      expect(retentionAudit.events.some((event) => event.eventData.action === action && event.eventData.actor_id === dpoCredentialId)).toBe(true);
+    }
     // A rejected audit insert must roll back the profile change, too.
     await client.query(`ALTER TABLE security_audit_events ADD CONSTRAINT reject_profile_test
       CHECK (event_data->>'action' <> 'AI_SYSTEM_PROFILE_UPSERTED') NOT VALID`);

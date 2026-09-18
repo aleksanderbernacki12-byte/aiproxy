@@ -207,6 +207,12 @@ through the independent trusted channel.
 
 ## Retention and legal hold
 
+DPO and ADMIN users can configure retention and activate or release legal holds
+at `/dashboard/retention`; AUDITOR users have read-only access. Each change and
+its audit event commit atomically. The API derives the organization from the
+session, requires same-origin JSON, limits bodies to 4 KiB, and validates days
+and case references. Changing retention days preserves an active hold.
+
 Automatic telemetry retention is opt-in per organization. Configure a period
 from 30 to 3650 days, or place and release a legal hold with a case reference:
 

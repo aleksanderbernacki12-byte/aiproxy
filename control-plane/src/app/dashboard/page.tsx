@@ -33,6 +33,7 @@ export default async function DashboardPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
+          <Link href="/dashboard/retention" className="rounded-sm border border-line bg-white px-4 py-2 text-sm font-bold text-government">Lagring</Link>
           <Link href="/dashboard/systems" className="rounded-sm border border-line bg-white px-4 py-2 text-sm font-bold text-government">Systemprofiler</Link>
           <ReportButton />
         </div>
