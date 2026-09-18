@@ -241,6 +241,11 @@ holding the row lock; a hold cannot undo a purge that has already committed.
 
 ## Administrative security ledger
 
+The dashboard audit log supports pages of 200 events using a validated sequence
+cursor. New events do not shift older pages. Every page remains scoped to the
+signed-in organization, and chain status covers the whole log. An empty log is
+shown as having no evidence, rather than as a verified chain.
+
 Credential creation and revocation, telemetry signing-key changes, AI-system
 profile updates, organization creation, and report sealing append an event in
 the same transaction as the protected change. PostgreSQL serializes each

@@ -377,5 +377,24 @@ describe("telemetry control-plane flow", () => {
     } finally {
       await client.query(`ALTER TABLE security_audit_events DROP CONSTRAINT reject_profile_test`);
     }
+    // More than one page, including a new append between page requests.
+    await client.query(`SELECT append_security_audit_event($1::uuid, 'SYSTEM', 'pagination-test',
+      'PAGINATION_TEST', 'TEST', n::text, '{}'::jsonb) FROM generate_series(1, 201) n`, [organizationId]);
+    const firstPage = await getSecurityAuditLedger(organizationId);
+    expect(firstPage.events).toHaveLength(200);
+    expect(firstPage.nextCursor).not.toBeNull();
+    await appendSecurityAuditEvent({ organizationId, actorId: dpoCredentialId,
+      action: "PAGINATION_NEW_EVENT", resourceType: "TEST", resourceId: "new" });
+    const secondPage = await getSecurityAuditLedger(organizationId, BigInt(firstPage.nextCursor!));
+    expect(secondPage.nextCursor).toBeNull();
+    const sequences = [...firstPage.events, ...secondPage.events].map((event) => event.sequence.toString());
+    expect(new Set(sequences).size).toBe(firstPage.evidence.eventCount);
+    expect(sequences).toHaveLength(firstPage.evidence.eventCount);
+    expect(secondPage.events.every((event) => event.sequence < BigInt(firstPage.nextCursor!))).toBe(true);
+    expect(secondPage.evidence.eventCount).toBe(firstPage.evidence.eventCount + 1);
+    const otherTenant = await getSecurityAuditLedger(randomUUID(), BigInt(firstPage.nextCursor!));
+    expect(otherTenant.events).toEqual([]);
+    expect(otherTenant.evidence.status).toBe("NO_EVIDENCE");
+    expect(otherTenant.nextCursor).toBeNull();
   }, 120_000);
 });

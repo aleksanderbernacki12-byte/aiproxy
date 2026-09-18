@@ -1,6 +1,6 @@
 import "server-only";
 
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, lt, sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
 import { securityAuditEvents } from "@/db/schema";
 
@@ -67,7 +67,7 @@ export async function getSecurityAuditEvidence(organizationId: string): Promise<
   };
 }
 
-export async function getSecurityAuditLedger(organizationId: string) {
+export async function getSecurityAuditLedger(organizationId: string, before?: bigint) {
   const database = getDatabase();
   const [evidence, events] = await Promise.all([
     getSecurityAuditEvidence(organizationId),
@@ -78,8 +78,11 @@ export async function getSecurityAuditLedger(organizationId: string) {
       eventData: securityAuditEvents.eventData,
       occurredAt: securityAuditEvents.occurredAt,
     }).from(securityAuditEvents)
-      .where(eq(securityAuditEvents.organizationId, organizationId))
-      .orderBy(desc(securityAuditEvents.sequence)).limit(200),
+      .where(and(eq(securityAuditEvents.organizationId, organizationId),
+        before === undefined ? undefined : lt(securityAuditEvents.sequence, before)))
+      .orderBy(desc(securityAuditEvents.sequence)).limit(201),
   ]);
-  return { valid: evidence.status !== "ATTENTION_REQUIRED", evidence, events };
+  const page = events.slice(0, 200);
+  return { valid: evidence.status !== "ATTENTION_REQUIRED", evidence, events: page,
+    nextCursor: events.length > 200 ? page[page.length - 1].sequence.toString() : null };
 }
