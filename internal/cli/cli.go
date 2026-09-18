@@ -96,6 +96,8 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 		return runVerifyLog(args[1:], stdout, stderr)
 	case "vault-export":
 		return runVaultExport(args[1:], stdout, stderr)
+	case "vault-check":
+		return runVaultCheck(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -596,6 +598,39 @@ func runVaultExport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "Secure Vault record %s exported to %s\n", strings.ToLower(*eventID), *output)
+	return 0
+}
+
+func runVaultCheck(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("vault-check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	keyID := fs.String("kms-key-id", "", "AWS KMS key ID or ARN used for envelope encryption")
+	bucket := fs.String("s3-bucket", "", "customer-owned S3 evidence bucket")
+	region := fs.String("aws-region", "", "AWS region override; default: standard AWS SDK resolution")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 || strings.TrimSpace(*keyID) == "" || strings.TrimSpace(*bucket) == "" {
+		fmt.Fprintln(stderr, "usage: aiproxy vault-check -kms-key-id <key-id-or-arn> -s3-bucket <bucket> [-aws-region <region>]")
+		return 2
+	}
+	awsOptions := make([]func(*awsconfig.LoadOptions) error, 0, 1)
+	if value := strings.TrimSpace(*region); value != "" {
+		awsOptions = append(awsOptions, awsconfig.WithRegion(value))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	configuration, err := awsconfig.LoadDefaultConfig(ctx, awsOptions...)
+	if err != nil {
+		fmt.Fprintf(stderr, "aiproxy: load AWS configuration: %v\n", err)
+		return 1
+	}
+	if err := securevault.CheckAWSConfig(ctx, kms.NewFromConfig(configuration), s3.NewFromConfig(configuration), *keyID, *bucket); err != nil {
+		fmt.Fprintf(stderr, "aiproxy: Secure Vault AWS check failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "Secure Vault AWS check passed: KMS GenerateDataKey succeeded and S3 Object Lock is enabled")
+	fmt.Fprintln(stdout, "Note: s3:PutObject and s3:PutObjectRetention are exercised by the first evidence upload")
 	return 0
 }
 
@@ -2641,5 +2676,6 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  validate     check a config file for problems without starting the proxy")
 	fmt.Fprintln(w, "  verify-log   verify an audit-signed log file's HMAC chain is intact")
 	fmt.Fprintln(w, "  vault-export decrypt one customer-owned Secure Vault record for investigation")
+	fmt.Fprintln(w, "  vault-check  verify KMS GenerateDataKey and S3 Object Lock configuration")
 	fmt.Fprintln(w, "  help         show this help text")
 }

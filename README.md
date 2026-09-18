@@ -3070,6 +3070,9 @@ regenerate `AIPROXY_SECUREVAULT_SPOOL_KEY` while retry files exist: it encrypts
 the local `.aiproxy_securevault` queue during KMS or S3 outages. The key is
 accepted only through the environment. Use `--secure-vault-spool-dir` and
 `--secure-vault-s3-prefix` to override the local queue and object prefix.
+Run `aiproxy vault-check -kms-key-id <key> -s3-bucket <bucket>` before enabling
+production traffic to verify KMS `GenerateDataKey` and S3 Object Lock using the
+same AWS credential chain.
 
 Secure Vault and telemetry can be enabled together. The coordinator gives both
 destinations the same `event_id` and the same original request/response bytes,

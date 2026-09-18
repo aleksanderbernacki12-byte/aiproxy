@@ -49,6 +49,21 @@ openssl rand -base64 32
 object prefix. KMS/S3 failures remain on the encrypted local queue and never
 block or fail the LLM response.
 
+Before enabling production traffic, verify the resolved AWS identity, KMS
+permission, and bucket Object Lock configuration without writing an immutable
+test object:
+
+```sh
+aiproxy vault-check -kms-key-id alias/aiproxy-securevault \
+  -s3-bucket customer-compliance-vault -aws-region eu-north-1
+```
+
+The check calls KMS `GenerateDataKey` with the production encryption context,
+clears the returned plaintext key, and reads the bucket's Object Lock setting.
+AWS does not offer a non-writing equivalent for `PutObject`; verify
+`s3:PutObject` and `s3:PutObjectRetention` with the first controlled evidence
+upload and monitor the local Secure Vault failure counters.
+
 ## Call contract
 
 Call `StoreAsync` only after the HTTP response has been delivered. A successful
