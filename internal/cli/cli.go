@@ -635,7 +635,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 				lc.coalescer = coalesce.NewGroup(coalesce.DefaultWaitTimeout)
 			}
 			if cfg.SemanticCacheEnabled && cfg.SemanticCacheThreshold > 0 {
-				lc.semanticIndex = semcache.NewIndex(semcache.DefaultIndexSize)
+				lc.semanticIndex = semcache.NewIndex(semcache.DefaultIndexSize, semcache.DefaultMaxTargets)
 				lc.semanticCacheThreshold = cfg.SemanticCacheThreshold
 			}
 		}

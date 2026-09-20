@@ -61,7 +61,7 @@ func TestSimilarity_OneEmptyIsZero(t *testing.T) {
 }
 
 func TestIndex_AddAndFindBest_ExactMatch(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	fp := semcache.Fingerprint("what is the capital of Sweden")
 	ix.Add("targetA", fp, "rh", "cachekey-1")
 
@@ -78,7 +78,7 @@ func TestIndex_AddAndFindBest_ExactMatch(t *testing.T) {
 }
 
 func TestIndex_FindBest_BelowThresholdNotFound(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	ix.Add("targetA", semcache.Fingerprint("what is the capital of Sweden"), "rh", "cachekey-1")
 
 	_, _, ok := ix.FindBest("targetA", semcache.Fingerprint("explain how photosynthesis works in plants"), "rh", 0.5)
@@ -88,7 +88,7 @@ func TestIndex_FindBest_BelowThresholdNotFound(t *testing.T) {
 }
 
 func TestIndex_FindBest_AtExactlyThresholdCountsAsMatch(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	a := []uint64{1, 2, 3, 4}
 	b := []uint64{3, 4, 5, 6} // similarity exactly 2/6
 	ix.Add("targetA", a, "rh", "cachekey-1")
@@ -101,7 +101,7 @@ func TestIndex_FindBest_AtExactlyThresholdCountsAsMatch(t *testing.T) {
 }
 
 func TestIndex_FindBest_ReturnsHighestSimilarityAmongMultiple(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	query := []uint64{1, 2, 3, 4, 5}
 	ix.Add("targetA", []uint64{1, 2, 3}, "rh", "low-overlap")    // 3/5 = 0.6
 	ix.Add("targetA", []uint64{1, 2, 3, 4, 5}, "rh", "exact")    // 5/5 = 1.0
@@ -114,7 +114,7 @@ func TestIndex_FindBest_ReturnsHighestSimilarityAmongMultiple(t *testing.T) {
 }
 
 func TestIndex_Add_EvictsOldestWhenAtCapacity(t *testing.T) {
-	ix := semcache.NewIndex(2)
+	ix := semcache.NewIndex(2, 10)
 	first := semcache.Fingerprint("what is the capital of Sweden")
 	ix.Add("targetA", first, "rh", "cachekey-1")
 	ix.Add("targetA", semcache.Fingerprint("explain how photosynthesis works"), "rh", "cachekey-2")
@@ -129,7 +129,7 @@ func TestIndex_Add_EvictsOldestWhenAtCapacity(t *testing.T) {
 }
 
 func TestIndex_MultiTargetIsolation(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	fp := semcache.Fingerprint("what is the capital of Sweden")
 	ix.Add("targetA", fp, "rh", "cachekey-1")
 
@@ -139,7 +139,7 @@ func TestIndex_MultiTargetIsolation(t *testing.T) {
 }
 
 func TestIndex_Len(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	if n := ix.Len("targetA"); n != 0 {
 		t.Fatalf("Len on empty index = %d, want 0", n)
 	}
@@ -155,7 +155,7 @@ func TestIndex_Len(t *testing.T) {
 // only, that the oldest entries are evicted in strict FIFO order and
 // exactly the newest maxSize entries survive.
 func TestIndex_Add_RingBufferWrapsAcrossMultipleCycles(t *testing.T) {
-	ix := semcache.NewIndex(3)
+	ix := semcache.NewIndex(3, 10)
 	texts := []string{
 		"alpha bravo charlie delta",
 		"echo foxtrot golf hotel",
@@ -192,7 +192,7 @@ func TestIndex_Add_RingBufferWrapsAcrossMultipleCycles(t *testing.T) {
 }
 
 func TestIndex_FindBest_RequiresExactRemainderHashMatch(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	fp := semcache.Fingerprint("explain the capital of Sweden")
 	ix.Add("target-a", fp, "remainder-hash-x", "cache-key-1")
 
@@ -226,7 +226,7 @@ func TestIndex_FindBest_RequiresExactRemainderHashMatch(t *testing.T) {
 // only partially overlaps it (similarity 0.4) — so the mismatched entry
 // is deliberately the more-similar one here.
 func TestIndex_FindBest_CrossoverWithMultipleEntries(t *testing.T) {
-	ix := semcache.NewIndex(10)
+	ix := semcache.NewIndex(10, 10)
 	query := semcache.Fingerprint("explain the capital of Sweden")
 	// Mismatched remainder hash, but identical text to the query ->
 	// similarity 1.0, the highest possible.
@@ -248,7 +248,7 @@ func TestIndex_FindBest_CrossoverWithMultipleEntries(t *testing.T) {
 
 	// Same check with insertion order reversed, in case ordering matters
 	// to the implementation.
-	ix2 := semcache.NewIndex(10)
+	ix2 := semcache.NewIndex(10, 10)
 	ix2.Add("targetA", semcache.Fingerprint("the capital of sweden is stockholm"), "hash-this-model", "cache-key-right")
 	ix2.Add("targetA", semcache.Fingerprint("explain the capital of Sweden"), "hash-other-model", "cache-key-wrong")
 	key2, _, ok2 := ix2.FindBest("targetA", query, "hash-this-model", 0.3)
@@ -262,7 +262,7 @@ func TestIndex_FindBest_CrossoverWithMultipleEntries(t *testing.T) {
 // first Add and instead behaves as a cap of 1.
 func TestNewIndex_NonPositiveMaxSizeClampsToOne(t *testing.T) {
 	for _, maxSize := range []int{0, -1, -100} {
-		ix := semcache.NewIndex(maxSize)
+		ix := semcache.NewIndex(maxSize, 10)
 		ix.Add("targetA", semcache.Fingerprint("some example text here"), "rh", "k1")
 		if n := ix.Len("targetA"); n != 1 {
 			t.Fatalf("NewIndex(%d): Len after first Add = %d, want 1", maxSize, n)
@@ -275,5 +275,127 @@ func TestNewIndex_NonPositiveMaxSizeClampsToOne(t *testing.T) {
 		if _, _, ok := ix.FindBest("targetA", semcache.Fingerprint("some example text here"), "rh", 0.99); ok {
 			t.Fatalf("NewIndex(%d): expected first entry to be evicted once at capacity 1", maxSize)
 		}
+	}
+}
+
+// TestNewIndex_NonPositiveMaxTargetsClampsToOne confirms NewIndex's
+// documented guard on the OTHER constructor argument: a non-positive
+// maxTargets no longer disables the total-target cap and instead
+// behaves as a cap of 1, without panicking on the first Add.
+func TestNewIndex_NonPositiveMaxTargetsClampsToOne(t *testing.T) {
+	for _, maxTargets := range []int{0, -1, -100} {
+		ix := semcache.NewIndex(10, maxTargets)
+		ix.Add("targetA", semcache.Fingerprint("some example text here"), "rh", "k1")
+		if n := ix.TargetCount(); n != 1 {
+			t.Fatalf("NewIndex(10, %d): TargetCount after first Add = %d, want 1", maxTargets, n)
+		}
+
+		ix.Add("targetB", semcache.Fingerprint("another unrelated text now"), "rh", "k2")
+		if n := ix.TargetCount(); n != 1 {
+			t.Fatalf("NewIndex(10, %d): TargetCount after second target's Add = %d, want 1 (cap clamped to 1)", maxTargets, n)
+		}
+		if n := ix.Len("targetA"); n != 0 {
+			t.Fatalf("NewIndex(10, %d): expected targetA to have been evicted entirely once targetB was added at capacity 1, Len = %d", maxTargets, n)
+		}
+	}
+}
+
+// TestIndex_ExceedingMaxTargetsEvictsSingleLRUTarget adds one more
+// distinct target than maxTargets allows and confirms exactly the
+// single least-recently-used target — targetA, added first and never
+// touched again — is evicted entirely: TargetCount stays at the cap,
+// and targetA's own Len/FindBest behave as if it had never existed.
+// The other, more-recently-added targets must all survive.
+func TestIndex_ExceedingMaxTargetsEvictsSingleLRUTarget(t *testing.T) {
+	ix := semcache.NewIndex(10, 3)
+	fpA := semcache.Fingerprint("some example text about apples")
+	fpB := semcache.Fingerprint("some example text about bananas")
+	fpC := semcache.Fingerprint("some example text about cherries")
+	fpD := semcache.Fingerprint("some example text about dates")
+
+	ix.Add("targetA", fpA, "rh", "kA")
+	ix.Add("targetB", fpB, "rh", "kB")
+	ix.Add("targetC", fpC, "rh", "kC")
+	if n := ix.TargetCount(); n != 3 {
+		t.Fatalf("TargetCount after 3 targets at cap 3 = %d, want 3", n)
+	}
+
+	// A 4th, brand-new target pushes the index over maxTargets (3).
+	ix.Add("targetD", fpD, "rh", "kD")
+
+	if n := ix.TargetCount(); n != 3 {
+		t.Fatalf("TargetCount after exceeding maxTargets = %d, want 3 (cap enforced)", n)
+	}
+	if n := ix.Len("targetA"); n != 0 {
+		t.Fatalf("targetA.Len() = %d, want 0 (least-recently-used target must be evicted entirely)", n)
+	}
+	if _, _, ok := ix.FindBest("targetA", fpA, "rh", 0.99); ok {
+		t.Fatal("targetA still matches via FindBest after being evicted — its ring was not actually removed")
+	}
+	for _, target := range []string{"targetB", "targetC", "targetD"} {
+		if n := ix.Len(target); n != 1 {
+			t.Fatalf("%s.Len() = %d, want 1 (must survive eviction of the LRU target)", target, n)
+		}
+	}
+}
+
+// TestIndex_FindBestReadProtectsTargetFromEvictionAheadOfNewerWrite
+// proves recency is genuinely LRU across BOTH reads (FindBest) and
+// writes (Add), not just Add insertion order: targetA is added first,
+// then read via FindBest (which must count as "used" and move it to
+// the back), then two more targets are Added. Since maxTargets is 2,
+// this should evict targetB (Added after targetA but never touched
+// again) rather than targetA (Added before targetB, but read more
+// recently). A touch-on-write-only implementation would instead evict
+// targetA here, since it is older in Add-order — this test would fail
+// against that implementation.
+func TestIndex_FindBestReadProtectsTargetFromEvictionAheadOfNewerWrite(t *testing.T) {
+	ix := semcache.NewIndex(10, 2)
+	fpA := semcache.Fingerprint("some example text about apples")
+	fpB := semcache.Fingerprint("some example text about bananas")
+	fpC := semcache.Fingerprint("some example text about cherries")
+
+	ix.Add("targetA", fpA, "rh", "kA") // order: [A]
+	ix.Add("targetB", fpB, "rh", "kB") // order: [A, B]
+
+	// Read targetA via FindBest — must move it to the back (most
+	// recently used), ahead of targetB, even though targetB was
+	// Add'ed more recently than targetA was first created.
+	if _, _, ok := ix.FindBest("targetA", fpA, "rh", 0.99); !ok {
+		t.Fatal("expected targetA to be found before touching recency")
+	}
+	// order should now be: [B, A]
+
+	// A brand-new target pushes the index over maxTargets (2). The
+	// least-recently-used target is now B (untouched since its own
+	// Add), not A (protected by the FindBest read above).
+	ix.Add("targetC", fpC, "rh", "kC")
+
+	if n := ix.TargetCount(); n != 2 {
+		t.Fatalf("TargetCount = %d, want 2", n)
+	}
+	if n := ix.Len("targetB"); n != 0 {
+		t.Fatalf("targetB.Len() = %d, want 0 (targetB is the true LRU target and should have been evicted)", n)
+	}
+	if n := ix.Len("targetA"); n != 1 {
+		t.Fatalf("targetA.Len() = %d, want 1 (a FindBest read should have protected targetA from eviction)", n)
+	}
+	if n := ix.Len("targetC"); n != 1 {
+		t.Fatalf("targetC.Len() = %d, want 1 (the target just written must always survive its own Add)", n)
+	}
+}
+
+// TestIndex_FindBestOnNonexistentTargetDoesNotCreateRing confirms
+// FindBest never creates a ring as a side effect of a lookup miss —
+// otherwise repeatedly calling FindBest with distinct, never-Add'ed
+// target strings would itself be a way to inflate TargetCount without
+// ever calling Add.
+func TestIndex_FindBestOnNonexistentTargetDoesNotCreateRing(t *testing.T) {
+	ix := semcache.NewIndex(10, 5)
+	for i := 0; i < 20; i++ {
+		ix.FindBest(fmt.Sprintf("nonexistent-target-%d", i), semcache.Fingerprint("some text here today"), "rh", 0.5)
+	}
+	if n := ix.TargetCount(); n != 0 {
+		t.Fatalf("TargetCount after only FindBest misses = %d, want 0 (a miss must never create a ring)", n)
 	}
 }

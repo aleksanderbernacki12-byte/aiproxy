@@ -75,7 +75,7 @@ func TestReview_CacheMustEnforceClientRules(t *testing.T) {
 func TestReview_SemanticCacheMustRespectModelAndStream(t *testing.T) {
 	s := reviewServer(t, func(w http.ResponseWriter, r *http.Request) { b, _ := io.ReadAll(r.Body); fmt.Fprint(w, string(b)) })
 	reviewCache(t, s)
-	s.SemanticIndex = semcache.NewIndex(100)
+	s.SemanticIndex = semcache.NewIndex(100, 100)
 	s.SemanticCacheThreshold = 0.99
 	a := `{"model":"model-a","stream":false,"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`
 	b := `{"model":"model-b","stream":true,"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`

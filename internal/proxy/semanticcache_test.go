@@ -32,7 +32,7 @@ func newSemanticCacheTestServer(t *testing.T, upstream *httptest.Server, thresho
 	}
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.Cache = c
-	srv.SemanticIndex = semcache.NewIndex(semcache.DefaultIndexSize)
+	srv.SemanticIndex = semcache.NewIndex(semcache.DefaultIndexSize, 100)
 	srv.SemanticCacheThreshold = threshold
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
@@ -171,7 +171,7 @@ func TestServer_SemanticCache_HitStillCompletesIdempotencyClaim(t *testing.T) {
 	}
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.Cache = c
-	srv.SemanticIndex = semcache.NewIndex(semcache.DefaultIndexSize)
+	srv.SemanticIndex = semcache.NewIndex(semcache.DefaultIndexSize, 100)
 	srv.SemanticCacheThreshold = 0.5
 	srv.Idempotency = idempotency.NewRegistry(time.Minute, idempotency.DefaultWaitTimeout)
 	srv.Logger = log.New(io.Discard, "", 0)
@@ -332,7 +332,7 @@ func TestServer_SemanticCache_ReloadConfigHotSwapsThresholdAndEnablement(t *test
 		t.Fatalf("expected no semantic cache hit before reload, got %q", got)
 	}
 
-	idx := semcache.NewIndex(semcache.DefaultIndexSize)
+	idx := semcache.NewIndex(semcache.DefaultIndexSize, 100)
 	srv.ReloadConfig(srv.Engine, nil, c, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, idx, 0.5, "", nil)
 
 	// Deliberately a different prompt pair from the pre-reload requests

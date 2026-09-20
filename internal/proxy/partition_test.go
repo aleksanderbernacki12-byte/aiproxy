@@ -158,7 +158,7 @@ func TestSemanticCache_IsolatesByUpstreamCredential(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		fmt.Fprint(w, "answer to: "+string(b)+" for "+r.Header.Get("Authorization"))
 	})
-	s.SemanticIndex = semcache.NewIndex(100)
+	s.SemanticIndex = semcache.NewIndex(100, 100)
 	s.SemanticCacheThreshold = 0.5
 	first := `{"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`
 	second := `{"messages":[{"role":"user","content":"What is the capital city of Sweden"}]}`
@@ -181,7 +181,7 @@ func TestSemanticCache_IsolatesByDestinationPath(t *testing.T) {
 	s := partitionTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "answer from "+r.URL.Path)
 	})
-	s.SemanticIndex = semcache.NewIndex(100)
+	s.SemanticIndex = semcache.NewIndex(100, 100)
 	s.SemanticCacheThreshold = 0.5
 	body := `{"messages":[{"role":"user","content":"Explain the capital of Sweden"}]}`
 	partitionCall(s, "POST", "/openai/deployments/gpt-4o-prod/chat/completions", body, nil)
