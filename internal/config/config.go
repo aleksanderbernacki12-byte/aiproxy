@@ -827,20 +827,21 @@ type Config struct {
 	// field existed.
 	ProxyAPIKeys []ProxyAPIKeyEntry `json:"proxy_api_keys,omitempty"`
 
-	// AdminAPIKey configures the key that, once wired up by a later
-	// task, will be required — via the same "Proxy-Authorization:
-	// Bearer <key>" header and constant-time comparison as ProxyAPIKey —
-	// to reach any of the five admin paths (GET /_aiproxy/stats,
-	// /_aiproxy/metrics, /_aiproxy/dashboard, POST /_aiproxy/cache/clear,
-	// GET/POST/DELETE /_aiproxy/drain), at which point ProxyAPIKey/
-	// ProxyAPIKeys will stop working against those paths entirely —
-	// there will be no fallback to accepting an ordinary client key,
-	// regardless of whether -admin-addr is also set. Not yet enforced
-	// as of this commit: this field is currently parsed, validated, and
-	// threaded through to Server.AdminAPIKey, but nothing checks it —
-	// every admin path still accepts ProxyAPIKey/ProxyAPIKeys exactly as
-	// before this field existed, and `aiproxy validate` does not yet
-	// warn when both this and AdminAPIKeys are unset. See
+	// AdminAPIKey configures the key required — via the same
+	// "Proxy-Authorization: Bearer <key>" header and constant-time
+	// comparison as ProxyAPIKey, but checked by proxy.Server's
+	// checkAdminAuth instead of checkProxyAuth — to reach any of the
+	// five admin paths (GET /_aiproxy/stats, /_aiproxy/metrics,
+	// /_aiproxy/dashboard, POST /_aiproxy/cache/clear, GET/POST/DELETE
+	// /_aiproxy/drain). Once this or AdminAPIKeys is set, ProxyAPIKey/
+	// ProxyAPIKeys stop working against those paths entirely — there is
+	// no fallback to accepting an ordinary client key, regardless of
+	// whether -admin-addr is also set. Until then (neither set),
+	// checkAdminAuth falls back to checkProxyAuth's own result, so an
+	// ordinary proxy key keeps reaching the admin surface exactly as it
+	// did before this field existed — that backward-compatible default
+	// is why `aiproxy validate` does not yet warn when both this and
+	// AdminAPIKeys are unset (a later task's job). See
 	// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6 for
 	// why closing this gap matters in a shared/multi-tenant deployment.
 	AdminAPIKey string `json:"admin_api_key,omitempty"`

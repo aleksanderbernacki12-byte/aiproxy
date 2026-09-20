@@ -261,12 +261,12 @@ const cacheClearPath = "/_aiproxy/cache/clear"
 // returns a small, self-contained HTML page that polls statsPath in
 // the browser and renders it as a live-updating table, for a
 // zero-setup visual glance at a running proxy without building any
-// separate tooling. Gated by IP allow/deny lists and proxy
-// authentication exactly like statsPath/metricsPath — no exception:
-// this page's own background fetch to statsPath from the browser is
-// subject to the exact same check, so in a proxy_api_key-gated setup a
-// browser (which can't attach a custom header to a plain navigation)
-// simply can't load usable data here — curl or the Prometheus endpoint
+// separate tooling. Gated by IP allow/deny lists and checkAdminAuth
+// exactly like statsPath/metricsPath — no exception: this page's own
+// background fetch to statsPath from the browser is subject to the
+// exact same check, so in an admin-key-gated setup a browser (which
+// can't attach a custom header to a plain navigation) simply can't
+// load usable data here — curl or the Prometheus endpoint
 // remain the answer for that case. Confirmed via a real browser
 // (Chromium): a 407 response is actually worse than "can't attach the
 // header" — the browser intercepts it at the network stack itself,
@@ -312,9 +312,9 @@ const healthzPath = "/_aiproxy/healthz"
 // actually in flight), so a deploy script can poll it until draining is
 // actually safe to act on instead of guessing a fixed grace period the
 // way a plain SIGTERM/http.Server.Shutdown grace window would otherwise
-// have to. Gated by IP allow/deny lists and proxy authentication
-// exactly like cacheClearPath — draining a proxy is exactly as
-// sensitive an operation as clearing its cache, and reporting whether
+// have to. Gated by IP allow/deny lists and checkAdminAuth exactly like
+// cacheClearPath — draining a proxy is exactly as sensitive an
+// operation as clearing its cache, and reporting whether
 // it's draining is exactly as sensitive as reading its stats. See
 // serveDrain.
 const drainPath = "/_aiproxy/drain"
@@ -641,7 +641,7 @@ type Server struct {
 	// ProxyAPIKeys identity, so a caller that never presents a key (or
 	// one aiproxy doesn't even require) still can't monopolize the
 	// proxy the way it could sharing one server-wide Limiter with every
-	// other unidentified caller. Checked in checkNetworkAndAuthAccess,
+	// other unidentified caller. Checked in checkNetworkAccess,
 	// the same network-layer point as IPAllowList/IPDenyList, before
 	// proxy authentication. nil (the default, whenever
 	// max_requests_per_minute_per_ip isn't configured) disables this
@@ -694,10 +694,10 @@ type Server struct {
 
 	// AdminAPIKey, if set, is required to reach any of the five admin
 	// paths (stats, metrics, dashboard, cache-clear, drain) — checked by
-	// a later task's checkAdminAuth instead of checkProxyAuth,
-	// completely independent of ProxyAPIKey/ProxyAPIKeys. See
-	// config.Config.AdminAPIKey's own doc comment for the fail-closed
-	// behavior once this (or AdminAPIKeys) is set at all.
+	// checkAdminAuth instead of checkProxyAuth, completely independent
+	// of ProxyAPIKey/ProxyAPIKeys. See config.Config.AdminAPIKey's own
+	// doc comment for the fail-closed behavior once this (or
+	// AdminAPIKeys) is set at all.
 	AdminAPIKey string
 
 	// AdminAPIKeys lists additional named admin keys beyond AdminAPIKey,
@@ -747,13 +747,14 @@ type Server struct {
 	ClientCAPool *x509.CertPool
 
 	// AdminAddr, if non-empty, moves the whole admin surface — statsPath,
-	// metricsPath, dashboardPath, cacheClearPath — onto a second listener
-	// bound to this address instead of Addr: ListenAndServe starts a
-	// second http.Server for it, serving nothing but that surface (see
-	// adminMux), gated by exactly the same IPAllowList/IPDenyList/
-	// CountryAllowList/CountryDenyList/ProxyAPIKey checks as ever —
-	// moving where the admin surface is reachable from doesn't change
-	// what's required to reach it. healthzPath is deliberately NOT moved:
+	// metricsPath, dashboardPath, cacheClearPath, drainPath — onto a
+	// second listener bound to this address instead of Addr:
+	// ListenAndServe starts a second http.Server for it, serving nothing
+	// but that surface (see adminMux), gated by exactly the same
+	// IPAllowList/IPDenyList/CountryAllowList/CountryDenyList/
+	// checkAdminAuth checks as ever — moving where the admin surface is
+	// reachable from doesn't change what's required to reach it.
+	// healthzPath is deliberately NOT moved:
 	// it stays reachable on Addr unconditionally (an orchestrator's
 	// liveness probe targets the same port the service actually listens
 	// on) and is additionally served on AdminAddr too, for an operator
@@ -1944,7 +1945,7 @@ func (s *Server) getIPLists() ([]*net.IPNet, []*net.IPNet) {
 	return s.IPAllowList, s.IPDenyList
 }
 
-// getIPLimiter returns IPLimiter under lock, for checkNetworkAndAuthAccess.
+// getIPLimiter returns IPLimiter under lock, for checkNetworkAccess.
 func (s *Server) getIPLimiter() *iplimiter.Registry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -2736,7 +2737,7 @@ func (c *CORSConfig) allowedOrigin(origin string) (string, bool) {
 // for the same response.
 //
 // Called exactly once per request, at the very top of
-// checkNetworkAndAuthAccess — before the IP/country/proxy-auth checks,
+// checkNetworkAccess — before the IP/country/proxy-auth checks,
 // same as healthzPath's own precedent, since a browser's CORS
 // preflight can never carry those credentials in the first place (see
 // corsPreflightRequest). That single call covers every response this
@@ -2817,7 +2818,7 @@ const maxRequestIDLen = 128
 // resolveRequestID returns r's own X-Request-Id header value when
 // it's present and safe to log and echo back verbatim, otherwise a
 // freshly generated one — always stamped on the response either way
-// (see checkNetworkAndAuthAccess), so a client that didn't send one
+// (see checkNetworkAccess), so a client that didn't send one
 // still gets told what aiproxy is calling this request, for its own
 // logs. "Safe" means non-empty, no longer than maxRequestIDLen, and
 // made up only of characters that can never break a log line (JSON or
@@ -3061,10 +3062,10 @@ func (s *Server) checkNetworkAndAdminAuthAccess(w http.ResponseWriter, r *http.R
 
 // adminMux is AdminAddr's own http.Handler, when configured: it serves
 // nothing but healthzPath and the admin surface (statsPath, metricsPath,
-// dashboardPath, cacheClearPath), gated by exactly the same checks as
-// Addr applies to them (see checkNetworkAndAdminAuthAccess) — it never
-// forwards to the upstream target, since that was never this listener's
-// job to begin with.
+// dashboardPath, cacheClearPath, drainPath), gated by exactly the same
+// checks as Addr applies to them (see checkNetworkAndAdminAuthAccess) —
+// it never forwards to the upstream target, since that was never this
+// listener's job to begin with.
 type adminMux struct {
 	server *Server
 }
@@ -3135,6 +3136,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.serveCacheClear(w, r)
 		case drainPath:
 			s.serveDrain(w, r)
+		default:
+			writeError(w, r, http.StatusNotFound, "not_found", "404 page not found", "")
 		}
 		return
 	}
