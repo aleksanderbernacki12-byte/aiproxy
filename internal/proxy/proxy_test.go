@@ -7205,10 +7205,12 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 
 // TestServer_ReloadConfig_SwapsAdminAPIKeyLive proves ReloadConfig
 // correctly threads AdminAPIKey/AdminAPIKeys through to the live Server
-// struct. It does NOT test that AdminAPIKey actually gates any admin
-// path — no auth-checking logic exists yet (that's a later task), so
-// there is nothing behavioral to assert here beyond the field itself
-// surviving the reload.
+// struct. It deliberately stays narrow — asserting just the field
+// value, not HTTP behavior — since checkAdminAuth actually gating the
+// admin surface with this field is already covered end-to-end
+// elsewhere (adminauth_test.go, reviewfindings_test.go); this test's
+// own job is only to prove a hot reload doesn't drop or stale the
+// field itself.
 func TestServer_ReloadConfig_SwapsAdminAPIKeyLive(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

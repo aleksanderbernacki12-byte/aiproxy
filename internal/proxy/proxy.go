@@ -1648,6 +1648,29 @@ type modelField struct {
 // requests LESS likely to be treated as identical, never more — but it
 // does mean remainder must always be treated as potentially containing
 // raw user content: hash it, never log or persist it raw.
+//
+// Known residual gap: content is blanked into the approximately-matched
+// text regardless of the message's own role, so a "system"/"developer"
+// message's own instructions are matched approximately (via Jaccard
+// similarity on shingles) exactly like an ordinary user message, not
+// held to the exact-match remainder's own stricter standard — only the
+// role label itself (e.g. "system") survives into remainder, never its
+// content. A single caller varying its own system prompt (different
+// personas, a safety-instruction update, per-end-user customization
+// proxied through one credential) with a similar-enough user question
+// could still receive a response generated under a materially
+// different system instruction. This can only affect that one caller's
+// own traffic, never cross-caller — see semanticPartitionTarget and
+// partitionIdentity, which already scope the whole semantic index to
+// one authenticated caller/credential — so it isn't the cross-tenant
+// leak finding #3 targets, but it's real enough to document rather
+// than let README's "message roles... must agree" phrasing overstate
+// what's actually exact-matched. Moving system/developer content into
+// remainder instead of text would close this at the cost of *reducing*
+// legitimate cache hits for callers who vary formatting/wording of an
+// otherwise-stable system prompt — a real tradeoff, not an oversight,
+// left for a future task to make deliberately if it turns out to
+// matter in practice.
 func extractPromptText(body []byte) (text string, remainder []byte, ok bool) {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(body, &top); err != nil {

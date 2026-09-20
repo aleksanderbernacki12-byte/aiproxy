@@ -569,11 +569,11 @@ performs against real traffic before trusting it enough to actually
 block on, the same way you would for a new `custom_rules` entry — see
 [Dry-run mode for rules](#dry-run-mode-for-rules).
 
-Like every other rule in this proxy, these are only evaluated on a
-genuine cache miss — a response already served from the on-disk or
-semantic cache is not re-scanned, so a rule change (including turning
-one of these on) only affects new, not-yet-cached content going
-forward.
+Like every other rule in this proxy, these are evaluated on every
+cached, coalesced, semantic-cache, or idempotency-replayed response too
+— not just on a genuine cache miss — so turning one of these on (or any
+other rule) also applies retroactively to whatever's already sitting in
+the cache the moment the next request would have replayed it.
 
 Every pattern here is checked in both directions — the request and the
 upstream's own response — for free: it's the same `bodyRules` mechanism
@@ -1374,7 +1374,14 @@ in semantic caching, with no effect on the exact-match cache.
 A semantic cache hit additionally requires an exact match on everything
 except the prompt text itself — model, streaming mode, message roles,
 tool definitions, response format, and generation parameters all must
-agree; only the free-text prompt content is matched approximately.
+agree; only the free-text prompt content is matched approximately. That
+approximate matching applies to every message's own content regardless
+of role, including `system`/`developer` messages — only the role label
+itself is exact-matched, not what it says — so two requests whose
+system prompt differs but whose user question is similar enough can
+still be treated as a match. Scoped to one caller's own traffic (never
+across callers or credentials, see below), but worth knowing if you
+vary system prompts per end-user through a single shared credential.
 
 Unlike a [coalesced request](#request-coalescing), a semantic cache hit
 is always marked with `X-Semantic-Cache-Hit: true` and
