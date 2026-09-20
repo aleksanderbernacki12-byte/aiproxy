@@ -21,8 +21,7 @@ export function getDatabase() {
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000,
     });
-  if (process.env.NODE_ENV !== "production") {
-    globalDatabase.aiproxyPool = pool;
-  }
+  // Reuse the bounded pool in production too; creating one per query exhausts PostgreSQL.
+  globalDatabase.aiproxyPool = pool;
   return drizzle(pool, { schema });
 }

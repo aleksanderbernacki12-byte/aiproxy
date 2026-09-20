@@ -9,7 +9,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    exclude: ["src/integration/**", "**/node_modules/**", "**/.git/**"],
+    exclude: ["e2e/**", "src/integration/**", "**/node_modules/**", "**/.git/**"],
     coverage: { reporter: ["text"] },
   },
 });

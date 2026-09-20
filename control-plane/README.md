@@ -437,3 +437,34 @@ runs the worker, and verifies the resulting dashboard aggregate:
 TEST_DATABASE_URL=postgresql://aiproxy:aiproxy@localhost:5432/aiproxy_control \
   npm run test:integration
 ```
+
+## Browser end-to-end tests
+
+CI runs Playwright Chromium against the standalone production build in desktop
+and mobile viewports. It covers rejected and successful login, logout, DPO/ADMIN
+profile editing, retention and legal holds, audit records, AUDITOR restrictions,
+and cross-organization profile isolation. These are functional checks, not
+pixel-perfect visual approval or coverage of Firefox/WebKit.
+
+To run locally with a disposable loopback PostgreSQL service whose role can
+create databases:
+
+```sh
+npm ci
+npx playwright install chromium
+npm run build
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/test_db npm run test:e2e
+```
+
+The runner creates a uniquely named database, applies migrations, generates
+synthetic credentials, starts its own server on localhost:32187, and drops only
+its own database when finished (including ordinary test failures). It refuses
+remote database hosts and does not reuse a running web server. After a forced
+process termination, an `aiproxy_e2e_` database may require manual cleanup.
+Failure screenshots, traces and HTML reports are uploaded by CI for seven days;
+these artifacts contain synthetic test credentials and must never use production
+data. Open a local report with `npx playwright show-report`.
+
+Production connections share a bounded PostgreSQL pool. The `same-origin`
+Referrer-Policy preserves Origin on internal form submissions while suppressing
+referrers to external sites; strict origin checks remain enabled.

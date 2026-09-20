@@ -24,7 +24,8 @@
     "systems:upsert": "node scripts/upsert-ai-system.mjs",
     "reports:keygen": "node scripts/generate-report-signing-key.mjs",
     "reports:verify": "node scripts/verify-compliance-report.mjs",
-    "retention": "node scripts/retention-policy.mjs"
+    "retention": "node scripts/retention-policy.mjs",
+    "test:e2e": "node scripts/run-e2e.mjs"
   },
   "engines": {
     "node": ">=24.0.0"
@@ -39,6 +40,7 @@
     "zod": "^4.6.4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^24.13.4",
     "@types/pg": "^8.23.1",

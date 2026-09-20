@@ -9,7 +9,7 @@ describe("Control Plane security headers", () => {
     expect(configured["Content-Security-Policy"]).toContain("object-src 'none'");
     expect(configured["X-Content-Type-Options"]).toBe("nosniff");
     expect(configured["X-Frame-Options"]).toBe("DENY");
-    expect(configured["Referrer-Policy"]).toBe("no-referrer");
+    expect(configured["Referrer-Policy"]).toBe("same-origin");
 
     const routes = await nextConfig.headers?.();
     expect(routes).toEqual([{ source: "/(.*)", headers: [...securityHeaders] }]);
