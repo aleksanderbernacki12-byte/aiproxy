@@ -29,12 +29,26 @@ const DefaultIndexSize = 2000
 // remainderHash and cacheKey, i.e. 24 + 16 + 16 = 56. One fully
 // pre-allocated ring therefore costs DefaultIndexSize * 56 = 2000 * 56
 // = 112,000 bytes (~109KiB) even before a single Add fills it in. At
-// DefaultMaxTargets = 1000, the worst case — every tracked target's
-// ring fully allocated — is 1000 * 112,000 = 112,000,000 bytes
-// (~107MiB): a fixed, sane ceiling for a proxy process, not the
+// DefaultMaxTargets = 2000, the worst case — every tracked target's
+// ring fully allocated — is 2000 * 112,000 = 224,000,000 bytes
+// (~214MiB): a fixed, sane ceiling for a proxy process, not the
 // hundreds of megabytes an unbounded map of client-controlled target
 // strings (see Index's own doc comment) could otherwise reach.
-const DefaultMaxTargets = 1000
+//
+// Sizing this isn't just about memory: a target is (targetLabel,
+// caller-credential identity, resolved destination), so the number of
+// LEGITIMATE targets a deployment actually needs is roughly (distinct
+// routes) * (distinct caller credentials) * (distinct destinations per
+// route — e.g. Azure OpenAI deployments) — all admin/tenant-controlled,
+// not attacker-controlled. Set too low relative to that product, every
+// new legitimate partition evicts another still-warm one: not a crash
+// or leak, just a silent semantic-cache hit-rate regression, visible
+// only as an unexplained drop in per-target semantic-cache-hit stats.
+// 2000 gives real headroom over the roughly-1000-target figure a
+// fairly large multi-tenant deployment (dozens of keys times tens of
+// destinations) would already reach, while still bounding worst-case
+// memory to a fixed, known ceiling instead of leaving it unbounded.
+const DefaultMaxTargets = 2000
 
 // shingleSize is the number of consecutive words hashed together into
 // one shingle. 3 is the standard middle ground for near-duplicate
@@ -235,6 +249,11 @@ func (ix *Index) touch(target string) *ring {
 		ix.order.MoveToBack(el)
 		return ix.rings[target]
 	}
+	// Defensive: rings and elements are only ever mutated together by
+	// this method, so ok is always expected false here (the ix.elements
+	// check above already ruled out target being tracked) — kept as a
+	// guard against a future edit desyncing the two maps, not because
+	// it's expected to ever trigger today.
 	r, ok := ix.rings[target]
 	if !ok {
 		r = newRing(ix.maxSize)

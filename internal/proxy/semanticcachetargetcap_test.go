@@ -40,7 +40,7 @@ func TestSemanticCache_TargetCountCappedAgainstQueryStringVariation(t *testing.T
 		}
 	}
 
-	if n := idx.TargetCount(); n > maxTargets {
-		t.Fatalf("TargetCount = %d after %d distinct query-string destinations, want <= %d (maxTargets cap not enforced)", n, distinctDestinations, maxTargets)
+	if n := idx.TargetCount(); n != maxTargets {
+		t.Fatalf("TargetCount = %d after %d distinct query-string destinations, want exactly %d (either the cap isn't enforced, or these requests never reached the semantic cache at all)", n, distinctDestinations, maxTargets)
 	}
 }
