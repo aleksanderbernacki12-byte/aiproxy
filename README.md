@@ -486,6 +486,27 @@ rate to price that key's tokens at. Hot-reloadable via
 [SIGHUP](#reloading-config-without-restarting), like every other field
 on a `proxy_api_keys` entry.
 
+### Admin authentication
+
+`admin_api_key` and `admin_api_keys` gate the five admin paths — `GET
+/_aiproxy/stats`, `/_aiproxy/metrics`, `/_aiproxy/dashboard`, `POST
+/_aiproxy/cache/clear`, and `GET`/`POST`/`DELETE` `/_aiproxy/drain` —
+completely independently of `proxy_api_key`/`proxy_api_keys`. Once either is
+set, an ordinary client proxy key stops working against these paths
+entirely: there is no fallback, regardless of whether `-admin-addr` is also
+configured. Leave both unset to keep today's behavior (any configured proxy
+key, or no authentication at all if none is configured, can reach the admin
+surface) — `aiproxy validate` warns when this is the case.
+
+```json
+{
+  "admin_api_key": "a-separate-secret-from-any-client-key",
+  "admin_api_keys": [
+    { "name": "ops-oncall", "key": "..." }
+  ]
+}
+```
+
 ## Built-in secret patterns
 
 No config needed — these block by default the moment aiproxy starts:
@@ -1118,10 +1139,19 @@ nothing to dry-run otherwise.
 
 `cache_enabled` is optional and off by default. When true, every 200 OK
 response is stored under `.aiproxy_cache/` in the working directory,
-keyed by a SHA256 hash of the request method, target URL, and body. An
-identical request served later is answered straight from that file and
-never reaches the upstream target. `.aiproxy_cache/` is already listed in
-`.gitignore`.
+keyed by a SHA256 hash of the request method, target URL, and body.
+Cache entries are partitioned by the authenticated client and the
+credential presented to the upstream target — two different callers, or
+two different upstream credentials from the same caller, never share a
+cached response. An identical request served later is answered straight
+from that file and never reaches the upstream target. `.aiproxy_cache/`
+is already listed in `.gitignore`.
+
+Every cached, coalesced, or idempotency-replayed response is re-checked
+against the currently active rules before being served — a response
+that was fine to store under an older policy, or before a rule existed,
+is blocked or redacted exactly as a live response would be if it no
+longer passes.
 
 Set `cache_ttl_seconds` alongside it to expire an entry a fixed time
 after it was written, instead of caching forever:
@@ -1277,8 +1307,10 @@ own duplicate:
 Only meaningful alongside `cache_enabled` — the identity requests are
 collapsed by is the same content-derived cache key the real cache
 already computes, so `aiproxy validate` rejects
-`cache_request_coalescing` set without it. Completely transparent to
-the client: a coalesced response carries no marker header the way an
+`cache_request_coalescing` set without it. Request coalescing shares
+the cache's own partitioning, so two different callers' concurrent
+identical requests are never collapsed into one. Completely transparent
+to the client: a coalesced response carries no marker header the way an
 [idempotency replay](#idempotency-key-deduplication) deliberately does
 — the client never opted into this, so it should never be able to tell
 the difference from an ordinary forward. Once the owning request
@@ -1338,19 +1370,27 @@ wording, which would require real, meaning-based embeddings; a request
 whose body doesn't match any recognized shape simply never participates
 in semantic caching, with no effect on the exact-match cache.
 
+A semantic cache hit additionally requires an exact match on everything
+except the prompt text itself — model, streaming mode, message roles,
+tool definitions, response format, and generation parameters all must
+agree; only the free-text prompt content is matched approximately.
+
 Unlike a [coalesced request](#request-coalescing), a semantic cache hit
 is always marked with `X-Semantic-Cache-Hit: true` and
 `X-Semantic-Cache-Similarity: 0.93` response headers: it can serve the
 answer to a *materially different* request than the one the client
 actually sent, and the client should be able to detect that.
 
-Like the exact-match cache, this is scoped per target, not per caller:
-two different `proxy_api_keys` entries hitting the same target can
-share both an exact and a semantic cache hit. The similarity threshold
-makes an accidental cross-caller match easier to trigger than the
-exact cache's byte-for-byte requirement, so pick a conservative
-threshold if different callers' traffic on the same target could
-plausibly contain similar-but-sensitive content.
+Like the exact-match cache, this is scoped per target *and* per
+caller: the same [partitioning by authenticated client and upstream
+credential](#custom-rules-rate-limiting-caching-and-cost-estimation)
+applies here too, so two different callers, or two different upstream
+credentials from the same caller, can never share a semantic cache hit
+either. The similarity threshold still makes an accidental match easier
+to trigger than the exact cache's byte-for-byte requirement, so pick a
+conservative threshold if a single caller's own traffic on one target
+could plausibly contain similar-but-sensitive content across separate
+requests.
 
 Each semantic cache hit is logged (`[SEMANTIC CACHE HIT]`, purple;
 `"semantic_cache_hit"` under `--log-format json`) and counted in
