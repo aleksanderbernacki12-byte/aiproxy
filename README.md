@@ -493,7 +493,7 @@ on a `proxy_api_keys` entry.
 /_aiproxy/cache/clear`, and `GET`/`POST`/`DELETE` `/_aiproxy/drain` —
 completely independently of `proxy_api_key`/`proxy_api_keys`. Once either is
 set, an ordinary client proxy key stops working against these paths
-entirely: there is no fallback, regardless of whether `-admin-addr` is also
+entirely: there is no fallback, regardless of whether `--admin-addr` is also
 configured. Leave both unset to keep today's behavior (any configured proxy
 key, or no authentication at all if none is configured, can reach the admin
 surface) — `aiproxy validate` warns when this is the case.
@@ -1147,11 +1147,12 @@ cached response. An identical request served later is answered straight
 from that file and never reaches the upstream target. `.aiproxy_cache/`
 is already listed in `.gitignore`.
 
-Every cached, coalesced, or idempotency-replayed response is re-checked
-against the currently active rules before being served — a response
-that was fine to store under an older policy, or before a rule existed,
-is blocked or redacted exactly as a live response would be if it no
-longer passes.
+Every cached, [coalesced](#request-coalescing), or
+[idempotency](#idempotency-key-deduplication)-replayed response is
+re-checked against the currently active rules before being served — a
+response that was fine to store under an older policy, or before a
+rule existed, is blocked or redacted exactly as a live response would
+be if it no longer passes.
 
 Set `cache_ttl_seconds` alongside it to expire an entry a fixed time
 after it was written, instead of caching forever:
