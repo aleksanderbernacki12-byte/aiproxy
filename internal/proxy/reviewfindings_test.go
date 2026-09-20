@@ -1,3 +1,10 @@
+// Package proxy_test: this file keeps the security review's own named
+// findings permanently greppable by their original names, even though
+// Tasks 2, 5, 6, and 8 already added equivalent coverage under different
+// helper names. The overlap is intentional, not duplicate cruft — see
+// docs/reviews/2026-09-12-v0.74.1-system-review.md and
+// docs/reviews/2026-09-12-v0.74.1-repro/review_findings_test.go.txt for the
+// findings these tests are named after.
 package proxy_test
 
 import (
@@ -82,6 +89,10 @@ func TestReview_SemanticCacheMustRespectModelAndStream(t *testing.T) {
 func TestReview_ClientKeyMustNotControlDrain(t *testing.T) {
 	s := reviewServer(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
 	s.ProxyAPIKeys = []proxy.ProxyKey{{Name: "ordinary-client", Key: "client-key"}}
+	// Required to exercise the fail-closed path: with no admin key
+	// configured at all, checkAdminAuth intentionally falls back to
+	// checkProxyAuth (Task 8's backward-compatible default), so an
+	// ordinary client key would reach drain by design, not by bug.
 	s.AdminAPIKey = "admin-secret"
 	got := partitionCall(s, "POST", "/_aiproxy/drain", "", map[string]string{"Proxy-Authorization": "Bearer client-key"})
 	if got.Code == 200 {
