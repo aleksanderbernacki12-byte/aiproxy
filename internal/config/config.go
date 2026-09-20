@@ -840,8 +840,8 @@ type Config struct {
 	// checkAdminAuth falls back to checkProxyAuth's own result, so an
 	// ordinary proxy key keeps reaching the admin surface exactly as it
 	// did before this field existed — that backward-compatible default
-	// is why `aiproxy validate` does not yet warn when both this and
-	// AdminAPIKeys are unset (a later task's job). See
+	// is why `aiproxy validate` warns when both this and AdminAPIKeys
+	// are unset instead of refusing to validate outright. See
 	// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6 for
 	// why closing this gap matters in a shared/multi-tenant deployment.
 	AdminAPIKey string `json:"admin_api_key,omitempty"`
