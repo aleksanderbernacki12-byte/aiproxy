@@ -468,3 +468,30 @@ data. Open a local report with `npx playwright show-report`.
 Production connections share a bounded PostgreSQL pool. The `same-origin`
 Referrer-Policy preserves Origin on internal form submissions while suppressing
 referrers to external sites; strict origin checks remain enabled.
+
+
+## Portal access administration
+
+`/dashboard/access` lets ADMIN users list portal credential metadata, create
+ADMIN/DPO/AUDITOR credentials with a lifetime of 1–365 days, and revoke other
+credentials in their organization. DPO and AUDITOR users cannot list or manage
+credentials. Telemetry access keys and signing keys remain CLI-managed.
+
+New keys are generated with 256 bits of randomness and returned only once in a
+`Cache-Control: no-store` response; only the SHA-256 hash is stored. Save the key
+before leaving the page. If a create response is lost, inspect the credential
+list, revoke the inaccessible credential, and create another one. Labels should
+contain functional references, not personal data. Keys are never written to the
+audit metadata or browser storage.
+
+Each change and its audit event commit atomically. Portal mutations serialize
+per organization and revalidate the acting administrator inside the transaction.
+Self-revocation is rejected. Revocation also invalidates existing sessions on
+their next protected server request. These portal protections do not replace
+operational controls on privileged CLI/database access. Expiring credentials
+still require timely rotation; self-revocation protection cannot prevent expiry.
+
+Playwright covers one-time key display, ADMIN creation, AUDITOR restrictions,
+organization isolation, and revocation of an already signed-in session in desktop
+and mobile Chromium. Integration tests cover hash-only persistence, audit
+rollback and simultaneous administrator revocations.

@@ -377,6 +377,48 @@ describe("telemetry control-plane flow", () => {
     } finally {
       await client.query(`ALTER TABLE security_audit_events DROP CONSTRAINT reject_profile_test`);
     }
+    const { changeAccessCredential, listAccessCredentials, AccessConflictError, AccessDeniedError } = await import("@/lib/access-admin");
+    const { authenticateDPOAccessKey, validateDPOIdentity } = await import("@/lib/dpo-auth");
+    const adminId = randomUUID();
+    await client.query(`INSERT INTO dpo_access_keys(id,organization_id,key_hash,label,role)
+      VALUES($1,$2,$3,'Access admin','ADMIN')`, [adminId, organizationId, createHash("sha256").update(randomUUID()).digest("hex")]);
+    const admin = { organizationId, credentialId: adminId, role: "ADMIN" };
+    const createInput = { command: "create" as const, label: "Portal auditor", role: "AUDITOR" as const, expires_in_days: 30 };
+    await expect(changeAccessCredential({ ...admin, role: "DPO" }, createInput)).rejects.toBeInstanceOf(AccessDeniedError);
+    await expect(changeAccessCredential({ ...admin, credentialId: dpoCredentialId }, createInput)).rejects.toBeInstanceOf(AccessDeniedError);
+    await expect(changeAccessCredential(admin, { command: "revoke", credential_id: adminId.toUpperCase() })).rejects.toBeInstanceOf(AccessConflictError);
+    await expect(changeAccessCredential(admin, { command: "revoke", credential_id: randomUUID() })).rejects.toBeInstanceOf(AccessConflictError);
+    const created = await changeAccessCredential(admin, createInput);
+    const loggedIn = await authenticateDPOAccessKey(created.access_key!);
+    expect(loggedIn).toMatchObject({ credentialId: created.id, organizationId, role: "AUDITOR" });
+    const listed = await listAccessCredentials(admin);
+    expect(JSON.stringify(listed)).not.toContain(created.access_key!);
+    expect(listed.find((credential) => credential.id === created.id)).not.toHaveProperty("key_hash");
+    const stored = await client.query(`SELECT key_hash,expires_at FROM dpo_access_keys WHERE id=$1`, [created.id]);
+    expect(stored.rows[0].key_hash).toBe(createHash("sha256").update(created.access_key!).digest("hex"));
+    expect(stored.rows[0].expires_at.getTime()).toBeGreaterThan(Date.now() + 29 * 86400000);
+    await client.query(`ALTER TABLE security_audit_events ADD CONSTRAINT reject_access_test
+      CHECK (event_data->>'action' NOT IN ('DPO_CREDENTIAL_CREATED','DPO_CREDENTIAL_REVOKED')) NOT VALID`);
+    try {
+      await expect(changeAccessCredential(admin, createInput)).rejects.toThrow();
+      expect(await listAccessCredentials(admin)).toHaveLength(listed.length);
+      await expect(changeAccessCredential(admin, { command: "revoke", credential_id: created.id })).rejects.toThrow();
+      expect(await validateDPOIdentity(loggedIn!)).toBe(true);
+    } finally { await client.query(`ALTER TABLE security_audit_events DROP CONSTRAINT reject_access_test`); }
+    await changeAccessCredential(admin, { command: "revoke", credential_id: created.id });
+    expect(await validateDPOIdentity(loggedIn!)).toBe(false);
+    expect(await authenticateDPOAccessKey(created.access_key!)).toBeNull();
+    const accessAudit = await getSecurityAuditLedger(organizationId);
+    expect(accessAudit.valid).toBe(true);
+    expect(JSON.stringify(accessAudit.events.map((event) => event.eventData))).not.toContain(created.access_key!);
+    const peerA = await changeAccessCredential(admin, { ...createInput, role: "ADMIN" });
+    const peerB = await changeAccessCredential(admin, { ...createInput, role: "ADMIN" });
+    const concurrent = await Promise.allSettled([
+      changeAccessCredential({ ...admin, credentialId: peerA.id }, { command: "revoke", credential_id: peerB.id }),
+      changeAccessCredential({ ...admin, credentialId: peerB.id }, { command: "revoke", credential_id: peerA.id }),
+    ]);
+    expect(concurrent.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(concurrent.filter((result) => result.status === "rejected")).toHaveLength(1);
     // More than one page, including a new append between page requests.
     await client.query(`SELECT append_security_audit_event($1::uuid, 'SYSTEM', 'pagination-test',
       'PAGINATION_TEST', 'TEST', n::text, '{}'::jsonb) FROM generate_series(1, 201) n`, [organizationId]);
