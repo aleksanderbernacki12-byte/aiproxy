@@ -1452,6 +1452,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	}
 
 	fmt.Fprintf(stdout, "%s is valid.\n", loadedFrom)
+	if cfg.AdminAPIKey == "" && len(cfg.AdminAPIKeys) == 0 {
+		fmt.Fprintln(stdout, "WARNING: admin_api_key/admin_api_keys are not set — /_aiproxy/drain, /_aiproxy/cache/clear, /_aiproxy/stats, /_aiproxy/metrics, and /_aiproxy/dashboard currently accept any configured proxy_api_key/proxy_api_keys (or, if none are configured, anyone who can reach the proxy at all). Set admin_api_key or admin_api_keys to require a separate credential for these operations.")
+	}
 	fmt.Fprintf(stdout, "  custom rules:            %d\n", len(cfg.CustomRules))
 	fmt.Fprintf(stdout, "  target routes:           %d\n", len(cfg.Targets))
 	fmt.Fprintf(stdout, "  routes with failover:    %d\n", countFailoverTargets(cfg))
@@ -1480,6 +1483,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  rules in dry-run:        %d\n", countDryRunRules(cfg))
 	fmt.Fprintf(stdout, "  proxy authentication:    %v\n", cfg.ProxyAPIKey != "")
 	fmt.Fprintf(stdout, "  additional proxy keys:   %d\n", len(cfg.ProxyAPIKeys))
+	fmt.Fprintf(stdout, "  admin authentication:    %v\n", cfg.AdminAPIKey != "" || len(cfg.AdminAPIKeys) > 0)
 	fmt.Fprintf(stdout, "  IP allow list entries:   %d\n", len(cfg.IPAllowList))
 	fmt.Fprintf(stdout, "  IP deny list entries:    %d\n", len(cfg.IPDenyList))
 	fmt.Fprintf(stdout, "  GeoIP ranges file:       %s\n", geoIPRangesFileDisplay(cfg.GeoIPRangesFile))
