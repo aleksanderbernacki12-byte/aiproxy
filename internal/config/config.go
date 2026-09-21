@@ -827,6 +827,34 @@ type Config struct {
 	// field existed.
 	ProxyAPIKeys []ProxyAPIKeyEntry `json:"proxy_api_keys,omitempty"`
 
+	// AdminAPIKey configures the key required — via the same
+	// "Proxy-Authorization: Bearer <key>" header and constant-time
+	// comparison as ProxyAPIKey, but checked by proxy.Server's
+	// checkAdminAuth instead of checkProxyAuth — to reach any of the
+	// five admin paths (GET /_aiproxy/stats, /_aiproxy/metrics,
+	// /_aiproxy/dashboard, POST /_aiproxy/cache/clear, GET/POST/DELETE
+	// /_aiproxy/drain). Once this or AdminAPIKeys is set, ProxyAPIKey/
+	// ProxyAPIKeys stop working against those paths entirely — there is
+	// no fallback to accepting an ordinary client key, regardless of
+	// whether -admin-addr is also set. Until then (neither set),
+	// checkAdminAuth falls back to checkProxyAuth's own result, so an
+	// ordinary proxy key keeps reaching the admin surface exactly as it
+	// did before this field existed — that backward-compatible default
+	// is why `aiproxy validate` warns when both this and AdminAPIKeys
+	// are unset instead of refusing to validate outright. See
+	// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6 for
+	// why closing this gap matters in a shared/multi-tenant deployment.
+	AdminAPIKey string `json:"admin_api_key,omitempty"`
+
+	// AdminAPIKeys lists additional named admin keys beyond AdminAPIKey,
+	// the same relationship ProxyAPIKeys has to ProxyAPIKey. Reuses
+	// ProxyAPIKeyEntry's shape as-is even though an admin key has no
+	// practical use for MaxRequestsPerMinute/MaxTokensPerMinute/
+	// CostBudget/CostBudgetHardStop — introducing a separate, narrower
+	// type purely to omit fields that are simply never set on an admin
+	// key would be more code for no behavioral difference.
+	AdminAPIKeys []ProxyAPIKeyEntry `json:"admin_api_keys,omitempty"`
+
 	// IPAllowList, if non-empty, restricts which client IPs may reach
 	// the proxy at all: a request whose remote IP doesn't match any
 	// entry here is rejected with a 403, before proxy_api_key or

@@ -490,3 +490,48 @@ func TestCache_Get_StaleEntryStillServedAsAHit(t *testing.T) {
 		t.Fatalf("IsStale(%v) with TTL=80ms = false, want true", age)
 	}
 }
+
+func TestKey_DifferentPartitionsProduceDifferentKeys(t *testing.T) {
+	a := cache.Key("GET", "https://api.example.com/v1/chat", "partition-alice", []byte(`{"x":1}`))
+	b := cache.Key("GET", "https://api.example.com/v1/chat", "partition-bob", []byte(`{"x":1}`))
+	if a == b {
+		t.Fatalf("same method/url/body but different partitionID produced identical keys: %q", a)
+	}
+}
+
+func TestKey_SamePartitionAndInputsProduceSameKey(t *testing.T) {
+	a := cache.Key("GET", "https://api.example.com/v1/chat", "partition-alice", []byte(`{"x":1}`))
+	b := cache.Key("GET", "https://api.example.com/v1/chat", "partition-alice", []byte(`{"x":1}`))
+	if a != b {
+		t.Fatalf("identical inputs produced different keys: %q vs %q", a, b)
+	}
+}
+
+// TestKey_NoCollisionAcrossPartitionIDAndBodyBoundary pins the collision
+// an earlier field order allowed: with body directly followed by
+// partitionID and only a single NUL separating them, an attacker-
+// controlled body containing its own NUL byte could shift bytes across
+// that boundary and produce the same hash for two logically different
+// (body, partitionID) pairs. body must be hashed last so nothing follows
+// it for such a shift to land on.
+func TestKey_NoCollisionAcrossPartitionIDAndBodyBoundary(t *testing.T) {
+	a := cache.Key("POST", "https://u/v1", "C", []byte("A\x00B"))
+	b := cache.Key("POST", "https://u/v1", "B\x00C", []byte("A"))
+	if a == b {
+		t.Fatal("body/partitionID boundary is ambiguous: two different (body, partitionID) pairs produced the same key")
+	}
+}
+
+// TestKey_EmptyPartitionIDStillProducesUsableKey proves an empty
+// partitionID isn't treated as a special "no partition" case — if
+// partitionID computation ever broke and silently produced "", this
+// test would still see a normal-looking, usable key rather than a panic
+// or degenerate value, so such a regression would need to be caught
+// elsewhere (it would otherwise silently restore pre-fix global
+// sharing).
+func TestKey_EmptyPartitionIDStillProducesUsableKey(t *testing.T) {
+	k := cache.Key("GET", "https://api.example.com/v1/chat", "", []byte(`{"x":1}`))
+	if len(k) != 64 {
+		t.Fatalf("Key with empty partitionID = %q (len %d), want a 64-char hex SHA256 digest", k, len(k))
+	}
+}

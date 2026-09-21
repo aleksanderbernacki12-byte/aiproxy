@@ -13,6 +13,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -184,6 +185,21 @@ type requestContextInfo struct {
 	// on-disk cache entry.
 	semanticFingerprint []uint64
 
+	// semanticRemainderHash is the SHA256 hash of this request's own
+	// "structural remainder" (see extractPromptText) — the exact-match
+	// requirement Index.Add/FindBest both key on alongside
+	// semanticFingerprint's approximate similarity. Empty exactly when
+	// semanticFingerprint is nil.
+	semanticRemainderHash string
+
+	// semanticTargetPartition is semanticPartitionTarget's output —
+	// targetLabel, partitionIdentity, and the resolved destination URL,
+	// NUL-separated — precomputed once in ServeHTTP where r is still
+	// available, since bufferResponse/streamResponse only ever see
+	// reqCtx, not the original request. Empty exactly when
+	// semanticFingerprint is nil.
+	semanticTargetPartition string
+
 	// tokenLimiter is the effective token-based rate limiter for this
 	// request (the authenticated key's own, else the resolved route's,
 	// else the server-wide one — see ServeHTTP), carried through to
@@ -259,12 +275,12 @@ const cacheClearPath = "/_aiproxy/cache/clear"
 // returns a small, self-contained HTML page that polls statsPath in
 // the browser and renders it as a live-updating table, for a
 // zero-setup visual glance at a running proxy without building any
-// separate tooling. Gated by IP allow/deny lists and proxy
-// authentication exactly like statsPath/metricsPath — no exception:
-// this page's own background fetch to statsPath from the browser is
-// subject to the exact same check, so in a proxy_api_key-gated setup a
-// browser (which can't attach a custom header to a plain navigation)
-// simply can't load usable data here — curl or the Prometheus endpoint
+// separate tooling. Gated by IP allow/deny lists and checkAdminAuth
+// exactly like statsPath/metricsPath — no exception: this page's own
+// background fetch to statsPath from the browser is subject to the
+// exact same check, so in an admin-key-gated setup a browser (which
+// can't attach a custom header to a plain navigation) simply can't
+// load usable data here — curl or the Prometheus endpoint
 // remain the answer for that case. Confirmed via a real browser
 // (Chromium): a 407 response is actually worse than "can't attach the
 // header" — the browser intercepts it at the network stack itself,
@@ -310,9 +326,9 @@ const healthzPath = "/_aiproxy/healthz"
 // actually in flight), so a deploy script can poll it until draining is
 // actually safe to act on instead of guessing a fixed grace period the
 // way a plain SIGTERM/http.Server.Shutdown grace window would otherwise
-// have to. Gated by IP allow/deny lists and proxy authentication
-// exactly like cacheClearPath — draining a proxy is exactly as
-// sensitive an operation as clearing its cache, and reporting whether
+// have to. Gated by IP allow/deny lists and checkAdminAuth exactly like
+// cacheClearPath — draining a proxy is exactly as sensitive an
+// operation as clearing its cache, and reporting whether
 // it's draining is exactly as sensitive as reading its stats. See
 // serveDrain.
 const drainPath = "/_aiproxy/drain"
@@ -642,7 +658,7 @@ type Server struct {
 	// ProxyAPIKeys identity, so a caller that never presents a key (or
 	// one aiproxy doesn't even require) still can't monopolize the
 	// proxy the way it could sharing one server-wide Limiter with every
-	// other unidentified caller. Checked in checkNetworkAndAuthAccess,
+	// other unidentified caller. Checked in checkNetworkAccess,
 	// the same network-layer point as IPAllowList/IPDenyList, before
 	// proxy authentication. nil (the default, whenever
 	// max_requests_per_minute_per_ip isn't configured) disables this
@@ -693,6 +709,20 @@ type Server struct {
 	// default) means ProxyAPIKey alone (if set) is the only key.
 	ProxyAPIKeys []ProxyKey
 
+	// AdminAPIKey, if set, is required to reach any of the five admin
+	// paths (stats, metrics, dashboard, cache-clear, drain) — checked by
+	// checkAdminAuth instead of checkProxyAuth, completely independent
+	// of ProxyAPIKey/ProxyAPIKeys. See config.Config.AdminAPIKey's own
+	// doc comment for the fail-closed behavior once this (or
+	// AdminAPIKeys) is set at all.
+	AdminAPIKey string
+
+	// AdminAPIKeys lists additional named admin keys beyond AdminAPIKey,
+	// the same relationship ProxyAPIKeys has to ProxyAPIKey. Reuses
+	// ProxyKey's shape as-is — see config.Config.AdminAPIKeys' own doc
+	// comment for why.
+	AdminAPIKeys []ProxyKey
+
 	// TLSCertFile and TLSKeyFile, if both set, make ListenAndServe
 	// terminate TLS itself — a PEM certificate and private key file,
 	// loaded once at startup — instead of listening on plain HTTP.
@@ -734,13 +764,14 @@ type Server struct {
 	ClientCAPool *x509.CertPool
 
 	// AdminAddr, if non-empty, moves the whole admin surface — statsPath,
-	// metricsPath, dashboardPath, cacheClearPath — onto a second listener
-	// bound to this address instead of Addr: ListenAndServe starts a
-	// second http.Server for it, serving nothing but that surface (see
-	// adminMux), gated by exactly the same IPAllowList/IPDenyList/
-	// CountryAllowList/CountryDenyList/ProxyAPIKey checks as ever —
-	// moving where the admin surface is reachable from doesn't change
-	// what's required to reach it. healthzPath is deliberately NOT moved:
+	// metricsPath, dashboardPath, cacheClearPath, drainPath — onto a
+	// second listener bound to this address instead of Addr:
+	// ListenAndServe starts a second http.Server for it, serving nothing
+	// but that surface (see adminMux), gated by exactly the same
+	// IPAllowList/IPDenyList/CountryAllowList/CountryDenyList/
+	// checkAdminAuth checks as ever — moving where the admin surface is
+	// reachable from doesn't change what's required to reach it.
+	// healthzPath is deliberately NOT moved:
 	// it stays reachable on Addr unconditionally (an orchestrator's
 	// liveness probe targets the same port the service actually listens
 	// on) and is additionally served on AdminAddr too, for an operator
@@ -1589,50 +1620,78 @@ type modelField struct {
 	Model string `json:"model"`
 }
 
-// promptFields is a shallow, best-effort decode of the request body
-// looking for text meaningful to semantic caching — the same
-// "recognize the common shape, don't guess at the rest" discipline
-// modelField already uses for the "model" field. Covers the two
-// dominant chat-message conventions (OpenAI/Anthropic-shaped
-// messages[].content) plus the legacy single-string prompt/input
-// fields. A body that matches none of these simply never participates
-// in semantic caching — the existing exact-match cache is unaffected
-// either way. Every field is left as json.RawMessage and decoded again,
-// individually, by extractPromptText: on real client-controlled
-// traffic a malformed or unexpected shape in one field (Messages not
-// being an array, say) must not prevent Prompt/Input — or vice versa —
-// from still being picked up.
-type promptFields struct {
-	Prompt   json.RawMessage `json:"prompt"`
-	Input    json.RawMessage `json:"input"`
-	Messages json.RawMessage `json:"messages"`
-}
-
-// contentBlock is one entry of a "content blocks" array, e.g.
-// [{"type":"text","text":"..."}] — the shape both OpenAI and Anthropic
-// use for multi-part (text + image, etc.) message content.
-type contentBlock struct {
-	Text string `json:"text"`
-}
-
 // extractPromptText returns the concatenated text aiproxy recognizes in
-// body for semantic caching, and whether any was found at all.
-// Decoding is defensive at every level, because on live, heterogeneous,
-// fully client-controlled traffic one malformed field or array element
-// must never discard real text found elsewhere in the same body:
+// body for semantic caching's approximate similarity check (messages[].
+// content, then prompt, then input, exactly as before this function
+// gained a third return value), and the "structural remainder": body
+// with just that free text blanked out to JSON null, leaving every
+// other field — model, stream, message roles, tools, response_format,
+// generation parameters, and anything else aiproxy doesn't specifically
+// recognize — canonicalized from the original (map key order is Go's
+// own deterministic sorted-key json.Marshal output, so two requests
+// that differ only in field order still produce identical remainders;
+// values are also compacted and HTML-escaped by json.Marshal, so two
+// differently-formatted-but-equivalent bodies canonicalize to the same
+// remainder rather than being preserved byte-for-byte). remainder is
+// intended to become a mandatory *exact*-match requirement semantic
+// caching checks before it ever consults approximate text similarity —
+// see docs/reviews/2026-09-12-v0.74.1-system-review.md finding #3:
+// without it, a request to a different model, or with streaming
+// toggled, could receive a cached answer generated under completely
+// different parameters just because its prompt text was similar (see
+// Task 5, which wires remainder into that check). ok is false, and
+// both other return values are zero, exactly when body isn't a JSON
+// object at all; a body that IS a JSON object but has no recognizable
+// prompt text still returns a real remainder (there is nothing to
+// blank, so it's just body's own canonicalized bytes) — the semantic
+// cache's own caller only ever consults remainder when text was
+// actually found, so this asymmetry is harmless.
+//
+// Decoding stays defensive at every level, same discipline as before:
 // messages is decoded as a raw array and each message decoded on its
-// own, messages[].content accepts either a plain JSON string or a JSON
-// array of content blocks, and within that array each block is decoded
-// individually — an unrecognized or malformed block (a
-// tool_use/tool_result/thinking block mixed into content, say, or one
-// with the wrong JSON type for "text") is simply skipped rather than
-// aborting the whole array or the whole body. Extraction concatenates,
-// in order, every message's content, then Prompt, then Input, joining
-// non-empty chunks with a single space.
-func extractPromptText(body []byte) (string, bool) {
-	var pf promptFields
-	if err := json.Unmarshal(body, &pf); err != nil {
-		return "", false
+// own, content accepts either a plain JSON string or a JSON array of
+// content blocks, and one malformed message or block is skipped (left
+// out of the extracted text, left unblanked in the remainder) rather
+// than aborting the whole body. Blanking only ever happens where text
+// was actually extracted — never merely because a field or key is
+// present — so a content-block array blanks only each block's own
+// "text" field (an image_url/tool_use/tool_result block with no "text"
+// key survives completely untouched, preserving whatever distinguishes
+// it, e.g. a different image), and a "prompt"/"input"/"content" value
+// with a shape this function doesn't recognize (not a string, not a
+// parseable block array) is left as its raw original value in
+// remainder rather than blanked. That raw-value case is fail-closed
+// from a matching-strictness standpoint — it can only make two
+// requests LESS likely to be treated as identical, never more — but it
+// does mean remainder must always be treated as potentially containing
+// raw user content: hash it, never log or persist it raw.
+//
+// Known residual gap: content is blanked into the approximately-matched
+// text regardless of the message's own role, so a "system"/"developer"
+// message's own instructions are matched approximately (via Jaccard
+// similarity on shingles) exactly like an ordinary user message, not
+// held to the exact-match remainder's own stricter standard — only the
+// role label itself (e.g. "system") survives into remainder, never its
+// content. A single caller varying its own system prompt (different
+// personas, a safety-instruction update, per-end-user customization
+// proxied through one credential) with a similar-enough user question
+// could still receive a response generated under a materially
+// different system instruction. This can only affect that one caller's
+// own traffic, never cross-caller — see semanticPartitionTarget and
+// partitionIdentity, which already scope the whole semantic index to
+// one authenticated caller/credential — so it isn't the cross-tenant
+// leak finding #3 targets, but it's real enough to document rather
+// than let README's "message roles... must agree" phrasing overstate
+// what's actually exact-matched. Moving system/developer content into
+// remainder instead of text would close this at the cost of *reducing*
+// legitimate cache hits for callers who vary formatting/wording of an
+// otherwise-stable system prompt — a real tradeoff, not an oversight,
+// left for a future task to make deliberately if it turns out to
+// matter in practice.
+func extractPromptText(body []byte) (text string, remainder []byte, ok bool) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return "", nil, false
 	}
 
 	var b strings.Builder
@@ -1646,45 +1705,111 @@ func extractPromptText(body []byte) (string, bool) {
 		b.WriteString(s)
 	}
 
-	var rawMessages []json.RawMessage
-	if err := json.Unmarshal(pf.Messages, &rawMessages); err == nil {
-		for _, rawMsg := range rawMessages {
-			var m struct {
-				Content json.RawMessage `json:"content"`
-			}
-			if err := json.Unmarshal(rawMsg, &m); err != nil || len(m.Content) == 0 {
-				continue
-			}
-			var asString string
-			if err := json.Unmarshal(m.Content, &asString); err == nil {
-				writeChunk(asString)
-				continue
-			}
-			var rawBlocks []json.RawMessage
-			if err := json.Unmarshal(m.Content, &rawBlocks); err == nil {
-				for _, rawBlock := range rawBlocks {
-					var blk contentBlock
-					if err := json.Unmarshal(rawBlock, &blk); err == nil {
-						writeChunk(blk.Text)
-					}
+	if rawMessages, hasMessages := top["messages"]; hasMessages {
+		var messages []json.RawMessage
+		if err := json.Unmarshal(rawMessages, &messages); err == nil {
+			blanked := make([]json.RawMessage, len(messages))
+			copy(blanked, messages)
+			for i, rawMsg := range messages {
+				var msg map[string]json.RawMessage
+				if err := json.Unmarshal(rawMsg, &msg); err != nil {
+					continue
 				}
+				rawContent, hasContent := msg["content"]
+				if !hasContent {
+					continue
+				}
+				var asString string
+				if err := json.Unmarshal(rawContent, &asString); err == nil {
+					// Plain string content: unambiguous, blank the whole thing.
+					writeChunk(asString)
+					msg["content"] = json.RawMessage("null")
+				} else {
+					var blocks []json.RawMessage
+					if err := json.Unmarshal(rawContent, &blocks); err == nil {
+						// Content-block array: blank only each block's own
+						// "text" field, when the block actually has one —
+						// an image_url/tool_use/tool_result/cache_control
+						// block (no "text" key) is left completely
+						// untouched, since blanking it would erase real
+						// distinguishing content (a different image, a
+						// different tool result) without capturing
+						// anything in the extracted text to compensate.
+						// This is what keeps the exact-match gate honest
+						// for multimodal/tool traffic instead of treating
+						// two different images as interchangeable.
+						blankedBlocks := make([]json.RawMessage, len(blocks))
+						copy(blankedBlocks, blocks)
+						for j, rawBlock := range blocks {
+							var blockMap map[string]json.RawMessage
+							if err := json.Unmarshal(rawBlock, &blockMap); err != nil {
+								continue
+							}
+							rawText, hasText := blockMap["text"]
+							if !hasText {
+								continue
+							}
+							var blockText string
+							if err := json.Unmarshal(rawText, &blockText); err != nil {
+								continue
+							}
+							writeChunk(blockText)
+							blockMap["text"] = json.RawMessage("null")
+							if reMarshaledBlock, err := json.Marshal(blockMap); err == nil {
+								blankedBlocks[j] = reMarshaledBlock
+							}
+						}
+						if reMarshaledBlocks, err := json.Marshal(blankedBlocks); err == nil {
+							msg["content"] = reMarshaledBlocks
+						}
+					}
+					// Content is neither a string nor a block array (an
+					// unrecognized shape): no text was extracted from it,
+					// so it's left completely untouched in msg["content"]
+					// (still holding rawContent from the initial decode)
+					// rather than blanked — an unrecognized shape must
+					// stay distinguishable from every other unrecognized
+					// shape, or the exact-match gate would silently treat
+					// genuinely different requests as identical.
+				}
+				if reMarshaled, err := json.Marshal(msg); err == nil {
+					blanked[i] = reMarshaled
+				}
+			}
+			if reMarshaled, err := json.Marshal(blanked); err == nil {
+				top["messages"] = reMarshaled
 			}
 		}
 	}
 
-	var prompt string
-	if err := json.Unmarshal(pf.Prompt, &prompt); err == nil {
-		writeChunk(prompt)
+	if rawPrompt, hasPrompt := top["prompt"]; hasPrompt {
+		var prompt string
+		if err := json.Unmarshal(rawPrompt, &prompt); err == nil {
+			writeChunk(prompt)
+			top["prompt"] = json.RawMessage("null")
+		}
+		// A non-string prompt (e.g. OpenAI's legacy token-array form) is
+		// left untouched — same "only blank what you actually extracted"
+		// discipline as content above.
 	}
-	var input string
-	if err := json.Unmarshal(pf.Input, &input); err == nil {
-		writeChunk(input)
+	if rawInput, hasInput := top["input"]; hasInput {
+		var input string
+		if err := json.Unmarshal(rawInput, &input); err == nil {
+			writeChunk(input)
+			top["input"] = json.RawMessage("null")
+		}
+		// A non-string input (e.g. an array-shaped batch input) is left
+		// untouched — same discipline as prompt and content above.
 	}
 
-	if b.Len() == 0 {
-		return "", false
+	remainder, err := json.Marshal(top)
+	if err != nil {
+		return "", nil, false
 	}
-	return b.String(), true
+	if b.Len() == 0 {
+		return "", remainder, false
+	}
+	return b.String(), remainder, true
 }
 
 // resolveModelRoute checks body's "model" field against every
@@ -1842,6 +1967,16 @@ func (s *Server) getProxyAPIKeys() (string, []ProxyKey) {
 	return s.ProxyAPIKey, s.ProxyAPIKeys
 }
 
+// getAdminAPIKeys returns Server.AdminAPIKey/AdminAPIKeys under the
+// same lock discipline getProxyAPIKeys already uses for their
+// proxy-key equivalents, since both are hot-reloadable via
+// ReloadConfig.
+func (s *Server) getAdminAPIKeys() (string, []ProxyKey) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.AdminAPIKey, s.AdminAPIKeys
+}
+
 // getIPLists returns both IPAllowList and IPDenyList under one lock,
 // for checkIPAccess.
 func (s *Server) getIPLists() ([]*net.IPNet, []*net.IPNet) {
@@ -1850,7 +1985,7 @@ func (s *Server) getIPLists() ([]*net.IPNet, []*net.IPNet) {
 	return s.IPAllowList, s.IPDenyList
 }
 
-// getIPLimiter returns IPLimiter under lock, for checkNetworkAndAuthAccess.
+// getIPLimiter returns IPLimiter under lock, for checkNetworkAccess.
 func (s *Server) getIPLimiter() *iplimiter.Registry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -2147,7 +2282,12 @@ type ModelRoute struct {
 // already-accumulated failure/ejection state. Pass nil to disable
 // target ejection entirely. Also appended at the very end, same
 // reasoning as every other field above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group, semanticIndex *semcache.Index, semanticCacheThreshold float64) {
+//
+// adminAPIKey/adminAPIKeys replace AdminAPIKey/AdminAPIKeys wholesale,
+// the same way proxyAPIKey/proxyAPIKeys replace ProxyAPIKey/
+// ProxyAPIKeys. Appended at the very end since they were added after
+// every other parameter above.
+func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group, semanticIndex *semcache.Index, semanticCacheThreshold float64, adminAPIKey string, adminAPIKeys []ProxyKey) {
 	newRoutes := make([]route, len(routes))
 	for i, r := range routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
@@ -2170,6 +2310,8 @@ func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *c
 	s.Webhooks = webhooks
 	s.ProxyAPIKey = proxyAPIKey
 	s.ProxyAPIKeys = proxyAPIKeys
+	s.AdminAPIKey = adminAPIKey
+	s.AdminAPIKeys = adminAPIKeys
 	s.LogFile = logFile
 	s.routes = newRoutes
 	s.modelRoutes = newModelRoutes
@@ -2320,6 +2462,126 @@ func (s *Server) checkProxyAuth(r *http.Request) (clientAuth, bool) {
 		}
 	}
 	return clientAuth{}, false
+}
+
+// checkAdminAuth reports whether r is allowed to reach the admin
+// surface, mirroring checkProxyAuth's constant-time comparison logic
+// exactly but against Server.AdminAPIKey/AdminAPIKeys instead of
+// ProxyAPIKey/ProxyAPIKeys — entirely independent credential sets, so
+// an ordinary client key never authenticates here and an admin key
+// never authenticates against checkProxyAuth. Backward compatible by
+// design: when neither AdminAPIKey nor AdminAPIKeys is configured, this
+// falls back to checkProxyAuth's own result unchanged — a deployment
+// that hasn't adopted admin_api_key/admin_api_keys yet keeps today's
+// behavior (any valid proxy key still reaches the admin surface) rather
+// than being locked out by a config it never opted into. Once either is
+// configured, that fallback stops: see config.Config.AdminAPIKey's own
+// doc comment for the fail-closed reasoning.
+func (s *Server) checkAdminAuth(r *http.Request) (clientAuth, bool) {
+	adminAPIKey, adminAPIKeys := s.getAdminAPIKeys()
+	if adminAPIKey == "" && len(adminAPIKeys) == 0 {
+		return s.checkProxyAuth(r)
+	}
+
+	got := r.Header.Get("Proxy-Authorization")
+	if !strings.HasPrefix(got, proxyAuthScheme) {
+		return clientAuth{}, false
+	}
+	got = strings.TrimPrefix(got, proxyAuthScheme)
+	gotBytes := []byte(got)
+
+	if adminAPIKey != "" && subtle.ConstantTimeCompare(gotBytes, []byte(adminAPIKey)) == 1 {
+		return clientAuth{label: "default"}, true
+	}
+	for _, k := range adminAPIKeys {
+		if subtle.ConstantTimeCompare(gotBytes, []byte(k.Key)) == 1 {
+			return clientAuth{label: k.Name}, true
+		}
+	}
+	return clientAuth{}, false
+}
+
+// partitionIdentity returns a SHA256 hash identifying which "identity"
+// auth/r represents, for use as part of the cache/coalescing key (see
+// the exact-match cache-key call site in ServeHTTP) — a later task
+// wires the semantic cache to this same identity too; see
+// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #1. Two
+// dimensions make two callers genuinely different: this proxy's own
+// notion of who's calling (auth.label, from
+// Server.ProxyAPIKey/ProxyAPIKeys) and the actual credential the caller
+// presents to authenticate to the *upstream* API — since Rewrite never
+// touches headers (see its own doc comment), aiproxy is a
+// bring-your-own-key passthrough, so two callers can share one proxy
+// key configuration yet carry two different personal upstream
+// credentials and still must never share a cached response.
+// Proxy-Authorization is folded in too even though checkProxyAuth
+// already consumed it into auth.label, purely so this function needs
+// no special-casing for the "auth disabled entirely" case (auth.label
+// == "") — the raw header value still differs per caller in the
+// disabled-auth case only if the caller happens to send one anyway,
+// which is harmless either way. The five headers hashed —
+// Authorization, X-Api-Key, Proxy-Authorization, Api-Key (Azure
+// OpenAI), and X-Goog-Api-Key (Google Vertex/Gemini) — are a curated
+// list of known upstream-auth conventions (OpenAI/Anthropic/generic
+// bearer, Azure OpenAI, Google Vertex/Gemini), not an exhaustive one: a
+// provider using some other header convention aiproxy doesn't yet know
+// about would still share a partition across callers using only that
+// unrecognized header. None of these header reads can carry a NUL
+// byte in the first place — Go's HTTP/1.1 server itself rejects any
+// header value containing one with a 400 before ServeHTTP ever runs —
+// so, unlike cache.Key's method/targetURL/body inputs, no boundary
+// reasoning is needed here for these five reads. Hashed, never stored
+// or logged in plaintext, exactly like idempotency's own bodyHash. The
+// result is always a 64-character lowercase hex digest — fixed-width
+// and structurally NUL-free — which matters because cache.Key hashes
+// this value adjacent to other fields with no length prefix of its own;
+// a NUL-bearing or unbounded partitionID would reopen exactly the kind
+// of cross-identity collision this function exists to prevent (see
+// cache.Key's own doc comment for the boundary reasoning). Never build
+// a composite identity string that embeds this function's own output
+// alongside a NUL byte or other untrusted content and pass THAT to
+// cache.Key's partitionID parameter — that trades this problem for the
+// same one at a different layer. (semanticPartitionTarget does safely
+// compose targetLabel, this function's output, and a resolved
+// destination URL — but passes that composite to semcache.Index's own
+// target parameter, never to cache.Key; semcache.Index and cache.Key
+// are different functions with different contracts, so that
+// composition does not contradict this warning.)
+func partitionIdentity(auth clientAuth, r *http.Request) string {
+	h := sha256.New()
+	h.Write([]byte(auth.label))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("Authorization")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("X-Api-Key")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("Proxy-Authorization")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("Api-Key")))
+	h.Write([]byte{0})
+	h.Write([]byte(r.Header.Get("X-Goog-Api-Key")))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// semanticPartitionTarget composes the opaque "target" string
+// semcache.Index partitions by: targetLabel, this caller's identity
+// (see partitionIdentity), and resolvedDestination — the exact
+// method-resolved destination URL cache.Key itself hashes (path and
+// query included). Folding in the destination, not just targetLabel,
+// matters because a single target/route can front multiple logically
+// distinct destinations that the body alone doesn't distinguish — the
+// clearest real case being Azure OpenAI, which selects the model by
+// deployment name in the URL path rather than in a body field, so two
+// different deployments behind one target would otherwise share a
+// remainder hash and a fingerprint despite being genuinely different
+// models. See docs/reviews/2026-09-12-v0.74.1-system-review.md finding
+// #3's own remediation text, which explicitly calls for exact
+// agreement on "route and endpoint" alongside model/streaming/etc.
+// Used for semcache.Index's target only, never for cache.Key's
+// partitionID — see partitionIdentity's own doc comment for why those
+// two contracts must not be conflated.
+func semanticPartitionTarget(targetLabel, resolvedDestination string, auth clientAuth, r *http.Request) string {
+	return targetLabel + "\x00" + partitionIdentity(auth, r) + "\x00" + resolvedDestination
 }
 
 // errorResponse is the JSON body writeError sends when the client's
@@ -2515,7 +2777,7 @@ func (c *CORSConfig) allowedOrigin(origin string) (string, bool) {
 // for the same response.
 //
 // Called exactly once per request, at the very top of
-// checkNetworkAndAuthAccess — before the IP/country/proxy-auth checks,
+// checkNetworkAccess — before the IP/country/proxy-auth checks,
 // same as healthzPath's own precedent, since a browser's CORS
 // preflight can never carry those credentials in the first place (see
 // corsPreflightRequest). That single call covers every response this
@@ -2596,7 +2858,7 @@ const maxRequestIDLen = 128
 // resolveRequestID returns r's own X-Request-Id header value when
 // it's present and safe to log and echo back verbatim, otherwise a
 // freshly generated one — always stamped on the response either way
-// (see checkNetworkAndAuthAccess), so a client that didn't send one
+// (see checkNetworkAccess), so a client that didn't send one
 // still gets told what aiproxy is calling this request, for its own
 // logs. "Safe" means non-empty, no longer than maxRequestIDLen, and
 // made up only of characters that can never break a log line (JSON or
@@ -2698,16 +2960,15 @@ func validIdempotencyKey(key string) bool {
 	return true
 }
 
-// checkNetworkAndAuthAccess runs the three independent gates every
-// request — whether ordinary proxy traffic or a request for the admin
-// surface — must pass before anything else happens: the IP allow/deny
-// list, the GeoIP country allow/deny list, and proxy_api_key
-// authentication, in that order, responding and returning ok=false at
-// the first one that rejects the request. Shared by ServeHTTP and
-// adminMux.ServeHTTP so a request for the admin surface is gated
-// identically whether it arrives on Addr (AdminAddr unset) or on
-// AdminAddr's own listener — moving where the admin surface is
-// reachable from was never meant to change what's required to reach it.
+// checkNetworkAccess runs the three independent network-level gates
+// every request — whether ordinary proxy traffic or a request for the
+// admin surface — must pass before any credential is even checked: the
+// IP allow/deny list, the GeoIP country allow/deny list, and the
+// per-IP rate limiter, in that order, responding and returning false at
+// the first one that rejects the request. No opinion on which
+// credential (if any) the caller must present — see
+// checkNetworkAndAuthAccess and checkNetworkAndAdminAuthAccess, its
+// only two callers, for that.
 //
 // CORS handling — applying Access-Control-Allow-Origin and friends,
 // and short-circuiting a preflight entirely — runs first, before any
@@ -2717,7 +2978,7 @@ func validIdempotencyKey(key string) bool {
 // resolveRequestID — already resolved and already stamped as the
 // X-Request-Id response header by the caller before this runs, so it's
 // available for every rejection this function can produce too.
-func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request, requestID string) (clientAuth, bool) {
+func (s *Server) checkNetworkAccess(w http.ResponseWriter, r *http.Request, requestID string) bool {
 	// Stamped first, unconditionally, exactly like applyCORSHeaders'
 	// own top-of-function stamp just below — a plain Set (not Add) on
 	// the ResponseWriter's own header map, so it's never touched by
@@ -2730,7 +2991,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		applyCORSHeaders(cors, w.Header(), r)
 		if corsPreflightRequest(r) {
 			handleCORSPreflight(cors, w, r)
-			return clientAuth{}, false
+			return false
 		}
 	}
 	if !s.checkIPAccess(r) {
@@ -2742,7 +3003,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 		writeError(w, r, http.StatusForbidden, "ip_denied", "access denied", "")
-		return clientAuth{}, false
+		return false
 	}
 	if allowed, country := s.checkCountryAccess(r); !allowed {
 		// Checked right after checkIPAccess, for the same reason — a
@@ -2754,15 +3015,15 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
 		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
 		writeError(w, r, http.StatusForbidden, "country_denied", "access denied", "")
-		return clientAuth{}, false
+		return false
 	}
 
 	if ipLimiter := s.getIPLimiter(); ipLimiter != nil {
 		// A third, independent network-layer gate, checked after
 		// checkIPAccess/checkCountryAccess (same "before any
 		// application-level credential check" reasoning) but still
-		// before checkProxyAuth: a caller's own IP-level budget applies
-		// whether or not it ever presents a valid proxy_api_key — the
+		// before any auth check: a caller's own IP-level budget applies
+		// whether or not it ever presents a valid credential — the
 		// whole point is protection for a caller with no identity of
 		// its own to be rate-limited by otherwise.
 		ip := clientIP(r)
@@ -2775,7 +3036,7 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 			s.logIPRateLimited(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
-			return clientAuth{}, false
+			return false
 		}
 		ipStr := ip.String()
 		allowed := ipLimiter.Allow(ipStr)
@@ -2787,10 +3048,20 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
 			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
-			return clientAuth{}, false
+			return false
 		}
 	}
+	return true
+}
 
+// checkNetworkAndAuthAccess runs checkNetworkAccess, then ordinary
+// proxy_api_key/proxy_api_keys authentication (checkProxyAuth) — used
+// for every request except the five admin paths; see
+// checkNetworkAndAdminAuthAccess for those.
+func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Request, requestID string) (clientAuth, bool) {
+	if !s.checkNetworkAccess(w, r, requestID) {
+		return clientAuth{}, false
+	}
 	auth, ok := s.checkProxyAuth(r)
 	if !ok {
 		// Checked before statsPath/metricsPath too — an API key, once
@@ -2806,12 +3077,35 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 	return auth, true
 }
 
+// checkNetworkAndAdminAuthAccess runs checkNetworkAccess, then
+// checkAdminAuth instead of checkProxyAuth — used for exactly the five
+// admin paths (statsPath, metricsPath, dashboardPath, cacheClearPath,
+// drainPath), in both ServeHTTP and adminMux.ServeHTTP, so the two
+// dispatch paths keep sharing identical network-level gating while
+// diverging only on which credential they require. See
+// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6.
+func (s *Server) checkNetworkAndAdminAuthAccess(w http.ResponseWriter, r *http.Request, requestID string) (clientAuth, bool) {
+	if !s.checkNetworkAccess(w, r, requestID) {
+		return clientAuth{}, false
+	}
+	auth, ok := s.checkAdminAuth(r)
+	if !ok {
+		s.Stats.RecordUnauthorized()
+		s.logUnauthorized(r.Method, r.URL.String(), requestID)
+		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "", requestID)
+		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
+		writeError(w, r, http.StatusProxyAuthRequired, "unauthorized", "proxy authentication required", "")
+		return clientAuth{}, false
+	}
+	return auth, true
+}
+
 // adminMux is AdminAddr's own http.Handler, when configured: it serves
 // nothing but healthzPath and the admin surface (statsPath, metricsPath,
-// dashboardPath, cacheClearPath), gated by exactly the same checks as
-// Addr applies to them (see checkNetworkAndAuthAccess) — it never
-// forwards to the upstream target, since that was never this listener's
-// job to begin with.
+// dashboardPath, cacheClearPath, drainPath), gated by exactly the same
+// checks as Addr applies to them (see checkNetworkAndAdminAuthAccess) —
+// it never forwards to the upstream target, since that was never this
+// listener's job to begin with.
 type adminMux struct {
 	server *Server
 }
@@ -2822,7 +3116,7 @@ func (h adminMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveHealthz(w, r)
 		return
 	}
-	if _, ok := s.checkNetworkAndAuthAccess(w, r, resolveRequestID(r)); !ok {
+	if _, ok := s.checkNetworkAndAdminAuthAccess(w, r, resolveRequestID(r)); !ok {
 		return
 	}
 	switch r.URL.Path {
@@ -2859,28 +3153,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestID := resolveRequestID(r)
+
+	if isReservedAdminPath(r.URL.Path) {
+		// Gated by checkAdminAuth (via checkNetworkAndAdminAuthAccess),
+		// not ordinary proxy_api_key/proxy_api_keys authentication —
+		// see checkAdminAuth's own doc comment. Dispatched before the
+		// checkNetworkAndAuthAccess call below runs at all, so an
+		// ordinary proxy key is never even consulted for one of these
+		// five paths once an admin key is configured. See
+		// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #6.
+		if _, ok := s.checkNetworkAndAdminAuthAccess(w, r, requestID); !ok {
+			return
+		}
+		switch r.URL.Path {
+		case statsPath:
+			s.serveStats(w, r)
+		case metricsPath:
+			s.serveMetrics(w, r)
+		case dashboardPath:
+			s.serveDashboard(w, r)
+		case cacheClearPath:
+			s.serveCacheClear(w, r)
+		case drainPath:
+			s.serveDrain(w, r)
+		default:
+			writeError(w, r, http.StatusNotFound, "not_found", "404 page not found", "")
+		}
+		return
+	}
+
 	auth, ok := s.checkNetworkAndAuthAccess(w, r, requestID)
 	if !ok {
-		return
-	}
-	if r.URL.Path == statsPath {
-		s.serveStats(w, r)
-		return
-	}
-	if r.URL.Path == metricsPath {
-		s.serveMetrics(w, r)
-		return
-	}
-	if r.URL.Path == dashboardPath {
-		s.serveDashboard(w, r)
-		return
-	}
-	if r.URL.Path == cacheClearPath {
-		s.serveCacheClear(w, r)
-		return
-	}
-	if r.URL.Path == drainPath {
-		s.serveDrain(w, r)
 		return
 	}
 
@@ -2930,10 +3233,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			bodyHash := sha256.Sum256(body)
 			switch resp, outcome := idem.Claim(auth.label, idempotencyKey, bodyHash); outcome {
 			case idempotency.Replay:
+				// targetLabel is "" here (idempotency is checked before
+				// route resolution) — a rule scoped to a specific target
+				// via Targets won't fire against an idempotency replay
+				// specifically. A rule with no Targets set (the common
+				// case, including every built-in secret/prompt-injection
+				// rule) is unaffected, since inScope treats an empty
+				// Targets list as matching every target.
+				//
+				// CRITICAL: an idempotency replay must never fall through
+				// to forwarding the request upstream on a block — that
+				// would re-execute a possibly side-effecting operation a
+				// second time, exactly what idempotency exists to
+				// prevent. The early return below on !allowed is the only
+				// path out of this case; there is no code after it that
+				// could still reach the forwarding logic further down in
+				// ServeHTTP.
+				servedBody, allowed := s.checkReplayPolicy(w, r, requestID, "", auth.label, r.Header, body, resp.Body)
+				if !allowed {
+					return
+				}
 				copyHeader(w.Header(), resp.Header)
+				w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
 				w.Header().Set("Idempotency-Replayed", "true")
 				w.WriteHeader(resp.StatusCode)
-				w.Write(resp.Body)
+				w.Write(servedBody)
 				s.Stats.RecordIdempotencyReplay()
 				s.logIdempotencyReplay(r.Method, r.URL.String(), requestID, idempotencyKey)
 				return
@@ -2994,45 +3318,58 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		effectiveTokenLimiter = auth.tokenLimiter
 	}
 
-	// The cache is checked before rules and the rate limiter: a cache hit
-	// never touches either, and never reaches the upstream target. The
-	// key is computed from the body as received, before any redaction —
-	// two different secrets that happen to redact to the same
-	// placeholder are still cached separately, which only ever costs an
-	// extra upstream call, never an incorrect one.
+	// The cache is checked before the rate limiter: a cache hit never
+	// reaches it, and never reaches the upstream target. It is still
+	// re-checked against the current rules engine before being served —
+	// see checkReplayPolicy. The key is computed from the body as
+	// received, before any redaction — two different secrets that
+	// happen to redact to the same placeholder are still cached
+	// separately, which only ever costs an extra upstream call, never
+	// an incorrect one.
 	var cacheKey string
 	var coalesceOwnedForReqCtx bool
 	var semanticFingerprintForReqCtx []uint64
+	var semanticRemainderHashForReqCtx string
+	var semanticTargetPartitionForReqCtx string
 	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
 		ttl := s.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
-		cacheKey = cache.Key(r.Method, targets[0].ResolveReference(destURL).String(), body)
+		resolvedDestination := targets[0].ResolveReference(destURL).String()
+		cacheKey = cache.Key(r.Method, resolvedDestination, partitionIdentity(auth, r), body)
 		if cached, hit, age, err := cch.Get(cacheKey, ttl); err == nil && hit {
 			defer cached.Body.Close()
+			cachedBody, readErr := io.ReadAll(cached.Body)
+			if readErr != nil {
+				writeError(w, r, http.StatusBadGateway, "cache_read_failed", "failed to read cached response", "")
+				return
+			}
+			// A cache hit never reaches bufferResponse/streamResponse, so
+			// the rule engine's own live check there never runs against
+			// it — checkReplayPolicy re-runs that same check now, against
+			// the CURRENT rules, before this stored response is ever
+			// written to the client. See its own doc comment.
+			servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
+			if !allowed {
+				return
+			}
 			copyHeader(w.Header(), cached.Header)
 			// Set after copyHeader, so this always wins over whatever
 			// Age (if any) the original upstream response itself might
 			// have carried — that value described a different cache's
 			// own staleness, not aiproxy's.
 			w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
+			w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
 			stale := cch.IsStale(age, ttl)
 			w.WriteHeader(cached.StatusCode)
+			w.Write(servedBody)
 			// A cache hit never reaches bufferResponse/streamResponse —
 			// the only two places that otherwise call Idempotency.Store
 			// — so an owned idempotency claim (idempotencyKey != "")
 			// must be completed right here instead, or the deferred
 			// Release above would incorrectly abandon a claim that was
-			// actually served just fine. The body needs to be buffered
-			// (rather than the plain io.Copy the no-idempotency case
-			// still uses below) purely so Store has real bytes to keep.
+			// actually served just fine.
 			if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-				cachedBody, readErr := io.ReadAll(cached.Body)
-				w.Write(cachedBody)
-				if readErr == nil {
-					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: cachedBody})
-				}
-			} else {
-				io.Copy(w, cached.Body)
+				idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 			}
 			s.Stats.RecordCacheHit(targetLabel)
 			if stale {
@@ -3051,34 +3388,47 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// doc comment for why this is a second, approximate layer
 		// checked only after the exact-match cache already missed.
 		if threshold := s.getSemanticCacheThreshold(); threshold > 0 {
-			if text, extracted := extractPromptText(body); extracted {
+			if text, remainder, extracted := extractPromptText(body); extracted {
 				semanticFingerprintForReqCtx = semcache.Fingerprint(text)
+				remainderSum := sha256.Sum256(remainder)
+				semanticRemainderHashForReqCtx = hex.EncodeToString(remainderSum[:])
+				semanticTargetPartitionForReqCtx = semanticPartitionTarget(targetLabel, resolvedDestination, auth, r)
 				if idx := s.getSemanticIndex(); idx != nil {
-					if candidateKey, similarity, found := idx.FindBest(targetLabel, semanticFingerprintForReqCtx, threshold); found {
+					if candidateKey, similarity, found := idx.FindBest(semanticTargetPartitionForReqCtx, semanticFingerprintForReqCtx, semanticRemainderHashForReqCtx, threshold); found {
 						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit {
 							defer cached.Body.Close()
+							cachedBody, readErr := io.ReadAll(cached.Body)
+							if readErr != nil {
+								writeError(w, r, http.StatusBadGateway, "cache_read_failed", "failed to read cached response", "")
+								return
+							}
+							// Same reasoning as the exact-cache-hit branch
+							// above: a semantic hit never reaches
+							// bufferResponse/streamResponse either, so its
+							// stored body must be re-checked against the
+							// CURRENT rules before being served.
+							servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
+							if !allowed {
+								return
+							}
 							copyHeader(w.Header(), cached.Header)
 							// Set after copyHeader, same reasoning as the
 							// exact-cache-hit branch above: this always
 							// wins over whatever Age the original response
 							// itself might have carried.
 							w.Header().Set("Age", strconv.Itoa(int(age.Seconds())))
+							w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
 							w.Header().Set("X-Semantic-Cache-Hit", "true")
 							w.Header().Set("X-Semantic-Cache-Similarity", strconv.FormatFloat(similarity, 'f', 2, 64))
 							w.WriteHeader(cached.StatusCode)
+							w.Write(servedBody)
 							// Same reasoning as the exact-cache-hit branch
 							// above: a semantic hit never reaches
 							// bufferResponse/streamResponse either, so an
 							// owned idempotency claim must be completed
 							// right here.
 							if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-								cachedBody, readErr := io.ReadAll(cached.Body)
-								w.Write(cachedBody)
-								if readErr == nil {
-									idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: cachedBody})
-								}
-							} else {
-								io.Copy(w, cached.Body)
+								idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 							}
 							s.Stats.RecordSemanticCacheHit(targetLabel)
 							s.logSemanticCacheHit(r.Method, r.URL.String(), requestID, similarity)
@@ -3099,14 +3449,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if coalescer := s.getCoalescer(); coalescer != nil {
 			switch resp, outcome := coalescer.Claim(cacheKey); outcome {
 			case coalesce.Replay:
-				copyHeader(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				w.Write(resp.Body)
 				// A coalesced replay never reaches bufferResponse/
-				// streamResponse either — same reasoning as the cache-hit
-				// branch above needing its own Idempotency.Store call.
+				// streamResponse either, so its stored body must be
+				// re-checked against the CURRENT rules before being
+				// served — see checkReplayPolicy's own doc comment.
+				servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, resp.Body)
+				if !allowed {
+					return
+				}
+				copyHeader(w.Header(), resp.Header)
+				w.Header().Set("Content-Length", strconv.Itoa(len(servedBody)))
+				w.WriteHeader(resp.StatusCode)
+				w.Write(servedBody)
+				// Same reasoning as the cache-hit branch above needing
+				// its own Idempotency.Store call.
 				if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: resp.Body})
+					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: servedBody})
 				}
 				s.Stats.RecordCoalescedRequest(targetLabel)
 				s.logCoalescedRequest(r.Method, r.URL.String(), requestID)
@@ -3304,6 +3662,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		idempotencyKey:          idempotencyKey,
 		coalesceOwned:           coalesceOwnedForReqCtx,
 		semanticFingerprint:     semanticFingerprintForReqCtx,
+		semanticRemainderHash:   semanticRemainderHashForReqCtx,
+		semanticTargetPartition: semanticTargetPartitionForReqCtx,
 		piiDetected:             piiDetected,
 		piiRedacted:             piiDetected,
 		requestPolicyRedacted:   action == rules.Redact,
@@ -3371,6 +3731,85 @@ func isEventStream(resp *http.Response) bool {
 	return mediaType == "text/event-stream"
 }
 
+// checkReplayPolicy re-evaluates a previously-produced response — about
+// to be served from the exact-match cache, request coalescing, the
+// semantic cache, or an idempotency replay — against the CURRENT rules
+// engine, on BOTH sides: the current incoming request (requestBody,
+// requestHeaders — exactly as a live, non-cached request would be
+// checked — except at the idempotency-replay site, where targetLabel
+// is "" (idempotency runs before route resolution), so a Targets-
+// scoped rule won't fire there the way it would on a live request; an
+// unscoped or Keys-scoped rule is unaffected) and the stored response
+// content itself (responseBody). Every one of ServeHTTP's replay paths
+// must call this before writing stored bytes to a client: a response
+// that was fine to store under an older policy — or before a rule
+// existed at all — must never bypass a
+// rule that would block or redact it today, and neither must a client
+// whose CURRENT permission to make this request at all has since been
+// revoked by a request-side rule (e.g. a Keys-scoped access-control
+// rule) added after the response was cached. See
+// docs/reviews/2026-09-12-v0.74.1-system-review.md finding #2, whose
+// own remediation text asks for exactly this: "kontrollera aktuell
+// klientbehörighet och requestpolicy före återanvändning" (check
+// current client authorization and request policy before reuse), not
+// just the response content.
+//
+// This function writes the block response itself (via writeError) when
+// either side blocks, using the same message/code a LIVE request would
+// get for whichever side actually matched — "blocked by aiproxy rules"
+// for a request-side match, "response blocked by aiproxy rules" for a
+// response-side match — so a caller only needs to check the returned
+// allowed bool and, if true, use resultBody. A request-side Redact
+// match is deliberately NOT applied to anything here: redaction exists
+// to keep sensitive request content from reaching the upstream target,
+// and a replay never forwards anything upstream, so there is nothing
+// left to protect by modifying the served response bytes over a
+// request-side-only redact match — only a request-side Block carries
+// forward to a replay.
+func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, requestID, targetLabel, clientLabel string, requestHeaders http.Header, requestBody, responseBody []byte) (resultBody []byte, allowed bool) {
+	reqAction, reqRuleName, _, _, reqDryRunHits, err := s.getEngine().Evaluate(rules.Request{
+		Method:  r.Method,
+		URL:     r.URL.String(),
+		Body:    requestBody,
+		Headers: filterHeadersForScanning(requestHeaders),
+		Target:  targetLabel,
+		Key:     clientLabel,
+	})
+	if err == nil {
+		s.handleRequestDryRunHits(reqDryRunHits, r.Method, r.URL.String(), requestID)
+		if reqAction == rules.Block {
+			if targetLabel != "" {
+				s.Stats.RecordBlock(targetLabel, reqRuleName)
+			}
+			s.Stats.RecordClientBlock(clientLabel)
+			s.logBlock(r.Method, r.URL.String(), reqRuleName, requestID)
+			s.notifyWebhook("block", r.Method, r.URL.String(), reqRuleName, requestID)
+			writeError(w, r, http.StatusForbidden, "block", "blocked by aiproxy rules", reqRuleName)
+			return nil, false
+		}
+	}
+
+	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(responseBody, targetLabel, clientLabel)
+	s.handleResponseDryRunHits(dryRunHits, r.Method, r.URL.String(), requestID)
+	switch action {
+	case rules.Block:
+		if targetLabel != "" {
+			s.Stats.RecordResponseBlock(targetLabel, ruleName)
+		}
+		s.logResponseBlock(r.Method, r.URL.String(), ruleName, requestID)
+		s.notifyWebhook("response_block", r.Method, r.URL.String(), ruleName, requestID)
+		writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
+		return nil, false
+	case rules.Redact:
+		s.Stats.RecordResponseRedact(targetLabel, ruleName)
+		s.logResponseRedact(r.Method, r.URL.String(), ruleName, requestID)
+		s.notifyWebhook("response_redact", r.Method, r.URL.String(), ruleName, requestID)
+		return scannedBody, true
+	default:
+		return responseBody, true
+	}
+}
+
 // bufferResponse reads the full response body into memory, scans it for
 // a leaked secret the same way an outgoing request is scanned (guarding
 // against the model echoing one back — a prompt injection, or an
@@ -3425,7 +3864,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		if err := cch.Set(reqCtx.cacheKey, resp); err != nil {
 			s.logError("aiproxy: cache: failed to store response: %v", err)
 		} else if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
-			idx.Add(reqCtx.targetLabel, reqCtx.semanticFingerprint, reqCtx.cacheKey)
+			idx.Add(reqCtx.semanticTargetPartition, reqCtx.semanticFingerprint, reqCtx.semanticRemainderHash, reqCtx.cacheKey)
 		}
 	}
 
@@ -3511,7 +3950,7 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
 			if s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data) {
 				if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
-					idx.Add(reqCtx.targetLabel, reqCtx.semanticFingerprint, reqCtx.cacheKey)
+					idx.Add(reqCtx.semanticTargetPartition, reqCtx.semanticFingerprint, reqCtx.semanticRemainderHash, reqCtx.cacheKey)
 				}
 			}
 		}

@@ -1,0 +1,51 @@
+package proxy
+
+import (
+	"io"
+	"regexp"
+	"strings"
+	"testing"
+
+	"aiproxy/internal/rules"
+)
+
+type reviewChunks struct {
+	chunks []string
+	reads  int
+}
+
+func (r *reviewChunks) Read(p []byte) (int, error) {
+	r.reads++
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[0])
+	r.chunks = r.chunks[1:]
+	return n, nil
+}
+func (r *reviewChunks) Close() error { return nil }
+
+func TestReview_StreamMustRecognizeCRLFBoundaries(t *testing.T) {
+	src := &reviewChunks{chunks: []string{"data: first\r\n\r\n", "data: second\r\n\r\n"}}
+	tee := &streamTee{src: src}
+	var p [4096]byte
+	n, err := tee.Read(p[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.reads != 1 {
+		t.Fatalf("first read consumed %d upstream reads including EOF instead of emitting first event: %q", src.reads, p[:n])
+	}
+}
+
+func TestReview_StreamMustScanReassembledText(t *testing.T) {
+	e := rules.NewEngine(rules.Allow)
+	e.AddBodyRegexRule(rules.BodyRegexRule{Name: "fake-secret", Pattern: regexp.MustCompile("SECRET_A"), Action: rules.Block})
+	src := &reviewChunks{chunks: []string{"data: {\"delta\":\"SECRET_\"}\n\n", "data: {\"delta\":\"A\"}\n\n"}}
+	tee := &streamTee{src: src, engine: e}
+	b, _ := io.ReadAll(tee)
+	tee.Close()
+	if !tee.blocked && strings.Contains(string(b), "SECRET_") && strings.Contains(string(b), `"A"`) {
+		t.Fatalf("client can assemble SECRET_A from unchecked deltas: %s", b)
+	}
+}

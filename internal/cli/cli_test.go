@@ -3815,3 +3815,35 @@ func TestExecute_Validate_InvalidBuiltinRuleAction_MentionsDryRunInMessage(t *te
 		t.Fatalf("stderr missing updated four-option message: %q", stderr.String())
 	}
 }
+
+func TestExecute_Validate_NoAdminKeyConfigured_WarnsAboutAdminPathExposure(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(configPath, []byte(`{"proxy_api_key":"secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", configPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d: stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "admin_api_key") {
+		t.Fatalf("expected a warning mentioning admin_api_key, got: %q", stdout.String())
+	}
+}
+
+func TestExecute_Validate_AdminKeyConfigured_NoWarning(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(configPath, []byte(`{"proxy_api_key":"secret","admin_api_key":"admin-secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", configPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d: stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "WARNING") {
+		t.Fatalf("expected no warning with admin_api_key configured, got: %q", stdout.String())
+	}
+}

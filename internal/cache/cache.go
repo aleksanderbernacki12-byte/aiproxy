@@ -131,14 +131,29 @@ func (c *Cache) loadExisting() error {
 }
 
 // Key computes the cache key for a request: the hex-encoded SHA256 hash
-// of the HTTP method, the fully-resolved target URL, and the entire
-// request body. NUL bytes separate the fields so that, for example,
-// method "GETX" + url "Y" cannot collide with method "GET" + url "XY".
-func Key(method, targetURL string, body []byte) string {
+// of the HTTP method, the fully-resolved target URL, partitionID, and
+// the entire request body — an opaque, caller-computed identity string
+// that must differ between two callers whenever their responses could
+// legitimately differ (different proxy client, different upstream
+// credential; see proxy.partitionIdentity, computed once per request in
+// ServeHTTP). Without partitionID, two different callers requesting the
+// exact same method/URL/body would share one cache entry regardless of
+// who they are or what credential they authenticate to the upstream
+// with — see docs/reviews/2026-09-12-v0.74.1-system-review.md finding
+// #1. NUL bytes separate every field, and body goes last because it is
+// the only field that can itself contain a NUL: in any other position a
+// body ending "\x00suffix" would hash identically to the same request
+// with "suffix\x00" moved onto the front of the next field. method and
+// targetURL can never contain a NUL themselves (Go's http/url parsing
+// rejects control bytes in both), so their own relative order needs no
+// such care.
+func Key(method, targetURL, partitionID string, body []byte) string {
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte{0})
 	h.Write([]byte(targetURL))
+	h.Write([]byte{0})
+	h.Write([]byte(partitionID))
 	h.Write([]byte{0})
 	h.Write(body)
 	return hex.EncodeToString(h.Sum(nil))

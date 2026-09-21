@@ -16,12 +16,13 @@ import (
 // diff still reports that one of these changed, just never to or from
 // what value. Every other field type either can't carry a secret on
 // its own (bool/int/float64) or is itself a slice/map of structs
-// (ProxyAPIKeys, Webhooks, CustomRules, ...), which formatConfigValue
-// already renders as an entry count rather than raw content for every
-// such field — so this list only needs the two plain-string fields
-// that are themselves a bare credential.
+// (ProxyAPIKeys, AdminAPIKeys, Webhooks, CustomRules, ...), which
+// formatConfigValue already renders as an entry count rather than raw
+// content for every such field — so this list only needs the three
+// plain-string fields that are themselves a bare credential.
 var sensitiveConfigFields = map[string]bool{
 	"ProxyAPIKey": true,
+	"AdminAPIKey": true,
 	"WebhookURL":  true,
 }
 

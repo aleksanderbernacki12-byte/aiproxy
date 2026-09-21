@@ -258,8 +258,9 @@ const dashboardHTML = `<!doctype html>
       .catch(function (err) {
         // A plain network-level failure here (not caught by the !resp.ok
         // branch above, which only runs once a Response is actually
-        // delivered to JS) is most likely proxy_api_key being set: browsers
-        // intercept an HTTP 407 response at the network stack itself,
+        // delivered to JS) is most likely proxy_api_key/proxy_api_keys or
+        // admin_api_key/admin_api_keys being set: browsers intercept an
+        // HTTP 407 response at the network stack itself,
         // since that status is conventionally reserved for the browser's
         // own configured forward proxy, not an origin server's response —
         // so fetch() never delivers a Response for it at all, just a
