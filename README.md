@@ -3040,6 +3040,116 @@ as everywhere else. The startup notice and `aiproxy validate`'s summary
 report only a count (`additional webhook destinations: 2`), never the
 destination URLs.
 
+## Local PII redaction
+
+Before an LLM request leaves the data plane, the built-in local filter
+checksum-validates and replaces Swedish personal and coordination numbers,
+IBANs, payment-card numbers, email addresses, Swedish mobile numbers, and
+Stockholm landline numbers. International Swedish telephone forms using `+46`
+or `0046` are normalized before validation. Swedish street addresses require a
+recognized street suffix and a house number; an optional postal code and city
+are removed with the address. Detection performs no network
+calls, and matches are replaced with typed markers such as `[REDACTED_SSN]` and
+`[REDACTED_PHONE]`. The original request remains available only to the
+customer-controlled encrypted Secure Vault flow.
+The authenticated stats endpoint exposes only the aggregate `pii_redacted`
+counter, and Prometheus exports `aiproxy_pii_redacted_total` per route. Neither
+metric contains matched values or request contents.
+
+## Compliance telemetry
+
+Compliance telemetry is opt-in. Generate an owner-only ECDSA P-256 key, set
+the organization's tenant credential in the environment, and pass the Control
+Plane ingest endpoint at startup:
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out telemetry-key.pem
+chmod 600 telemetry-key.pem
+export AIPROXY_TENANT_KEY='customer-issued-tenant-key'
+
+aiproxy start \
+  --target https://api.openai.com \
+  --telemetry-endpoint https://compliance.example/api/telemetry/ingest \
+  --telemetry-private-key ./telemetry-key.pem
+```
+
+The proxy queues and signs completed upstream exchanges without waiting for
+the Control Plane. Network failures and HTTP 401 responses are logged locally
+and retried from `.aiproxy_telemetry.sqlite`; LLM traffic remains fail-open.
+Use `--telemetry-db` and `--telemetry-salt` to move the durable queue and
+rotating HMAC salt to customer-controlled persistent storage.
+The SQLite database defaults to a 256 MiB limit, configurable with
+`--telemetry-max-db-bytes` (minimum 1 MiB). Reserve additional space for its
+rollback journal. If storage fills, existing evidence remains queued and new
+events that cannot be persisted are counted as lost; LLM traffic continues.
+Database capacity and storage-full failures are exposed in health metrics.
+See the [storage budget documentation](internal/telemetry/README.md#storage-budget)
+and [runbook](docs/operations/compliance-alerts.md#telemetry-storage-budget).
+Operational queue health is available under `compliance.telemetry` in the
+authenticated `GET /_aiproxy/stats` response. It reports pending and dropped
+events, persistence/delivery failures, delivered events, and latest outcome
+times without exposing event payloads or identifiers.
+
+Clients can send `X-Aiproxy-Client-Id` and `X-Aiproxy-Application-Id` for local
+attribution. Both headers are consumed by aiproxy and removed before the
+request reaches the LLM provider. The client identifier becomes a rotating
+HMAC-SHA256 pseudonym before persistence or transmission. When the headers are
+absent, aiproxy uses the authenticated proxy-key label and the application name
+`aiproxy`.
+
+Enable the customer-owned raw evidence vault with a KMS key, an S3 bucket that
+already has Object Lock enabled, and a stable 32-byte local spool key:
+
+```sh
+# Run once and store the output in the customer's secret manager:
+openssl rand -base64 32
+export AIPROXY_SECUREVAULT_SPOOL_KEY='<stable value from secret manager>'
+
+aiproxy start \
+  --target https://api.openai.com \
+  --secure-vault-kms-key-id alias/aiproxy-securevault \
+  --secure-vault-s3-bucket customer-compliance-vault \
+  --secure-vault-aws-region eu-north-1
+```
+
+AWS credentials use the standard SDK chain, including environment variables,
+shared AWS configuration, ECS task roles, and EC2 instance roles. Do not
+regenerate `AIPROXY_SECUREVAULT_SPOOL_KEY` while retry files exist: it encrypts
+the local `.aiproxy_securevault` queue during KMS or S3 outages. The key is
+accepted only through the environment. Use `--secure-vault-spool-dir` and
+`--secure-vault-s3-prefix` to override the local queue and object prefix.
+Run `aiproxy vault-check -kms-key-id <key> -s3-bucket <bucket>` before enabling
+production traffic to verify KMS `GenerateDataKey` and S3 Object Lock using the
+same AWS credential chain.
+
+Secure Vault and telemetry can be enabled together. The coordinator gives both
+destinations the same `event_id` and the same original request/response bytes,
+allowing a signed SaaS event to be correlated with the encrypted customer-owned
+record during an authorized investigation.
+Authorization credentials, API-key headers, and cookies are replaced with
+`[REDACTED_SECRET]` before the encrypted record is queued. Request and response
+bodies remain original, while reusable transport secrets are excluded from the
+evidence archive.
+Secure Vault health is reported under `compliance.secure_vault` in the same
+authenticated stats response, including encrypted spool backlog, quarantined
+entries, local failures, AWS upload failures, and completed uploads.
+The same operational values are exported at `GET /_aiproxy/metrics` as
+`aiproxy_telemetry_*` and `aiproxy_secure_vault_*` Prometheus series. Backlog
+and queue values are gauges; accepted, dropped, failure, and completion values
+are counters. Latest outcome times use Unix timestamp gauges.
+Ready-to-load alert rules are provided in
+[`deploy/prometheus/aiproxy-alerts.yml`](deploy/prometheus/aiproxy-alerts.yml),
+with investigation steps in the
+[`compliance alert runbook`](docs/operations/compliance-alerts.md).
+
+For an authorized customer-side investigation, `aiproxy vault-export` restores
+one record through the customer's own S3 credentials and KMS permissions. The
+command verifies the encrypted envelope and writes the raw JSON to a new local
+file with mode `0600` on Unix; it never overwrites an existing export.
+On Windows, restrict the destination directory's ACL to the authorized operator
+before exporting: Go's Unix mode bits do not establish owner-only Windows ACLs.
+The same requirement applies to local spool, telemetry, salt, and key directories.
+
 ## Validating a config file
 
 ```

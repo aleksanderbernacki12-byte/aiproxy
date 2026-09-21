@@ -1,0 +1,122 @@
+groups:
+  - name: aiproxy-data-plane-compliance
+    rules:
+      - alert: AiproxyTelemetryStorageNearLimit
+        expr: aiproxy_telemetry_database_used_bytes / aiproxy_telemetry_database_limit_bytes > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Aiproxy telemetry database is approaching its storage budget
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-storage-budget
+      - alert: AiproxyTelemetryStorageFull
+        expr: increase(aiproxy_telemetry_storage_full_failures_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: Aiproxy lost telemetry because its database budget or disk was full
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-storage-budget
+      - alert: AiproxyTelemetryDropped
+        expr: increase(aiproxy_telemetry_dropped_total[10m]) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Aiproxy dropped compliance telemetry
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-dropped-or-persistence-failed
+      - alert: AiproxyTelemetryPersistenceFailed
+        expr: increase(aiproxy_telemetry_persist_failures_total[10m]) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Aiproxy could not persist compliance telemetry
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-dropped-or-persistence-failed
+      - alert: AiproxyTelemetryBacklog
+        expr: aiproxy_telemetry_pending > 100
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Aiproxy telemetry backlog is growing
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-delivery-backlog
+      - alert: AiproxyTelemetryDeliveryFailing
+        expr: increase(aiproxy_telemetry_delivery_failures_total[15m]) > 2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Aiproxy cannot deliver telemetry to the Control Plane
+          runbook_url: docs/operations/compliance-alerts.md#telemetry-delivery-backlog
+      - alert: AiproxySecureVaultSpoolBacklog
+        expr: aiproxy_secure_vault_spool_pending > 10
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Secure Vault encrypted spool backlog is growing
+          runbook_url: docs/operations/compliance-alerts.md#secure-vault-backlog-or-upload-failure
+      - alert: AiproxySecureVaultUploadFailing
+        expr: increase(aiproxy_secure_vault_upload_failures_total[15m]) > 2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Secure Vault cannot archive evidence in AWS
+          runbook_url: docs/operations/compliance-alerts.md#secure-vault-backlog-or-upload-failure
+      - alert: AiproxySecureVaultLocalFailure
+        expr: increase(aiproxy_secure_vault_local_failures_total[10m]) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Secure Vault failed to capture or spool evidence locally
+          runbook_url: docs/operations/compliance-alerts.md#secure-vault-local-failure-or-quarantine
+      - alert: AiproxySecureVaultQuarantine
+        expr: aiproxy_secure_vault_quarantined > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Secure Vault has unreadable quarantined evidence
+          runbook_url: docs/operations/compliance-alerts.md#secure-vault-local-failure-or-quarantine
+      - alert: AiproxyPIIRedactionSpike
+        expr: |
+          sum by (target) (increase(aiproxy_pii_redacted_total[15m])) > 10
+          and
+          sum by (target) (increase(aiproxy_pii_redacted_total[15m]))
+            / clamp_min(sum by (target) (
+                increase(aiproxy_requests_allowed_total[15m])
+                + increase(aiproxy_requests_redacted_total[15m])
+              ), 1) > 0.20
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: Aiproxy is redacting PII from an unusual share of requests
+          runbook_url: docs/operations/compliance-alerts.md#pii-redaction-spike
+
+  - name: aiproxy-control-plane-compliance
+    rules:
+      - alert: AiproxyControlPlaneBufferDelayed
+        expr: aiproxy_control_plane_oldest_buffered_seconds > 300
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Control Plane telemetry verification is delayed
+          runbook_url: docs/operations/compliance-alerts.md#control-plane-buffer-delay
+      - alert: AiproxyCompromisedChainDetected
+        expr: increase(aiproxy_control_plane_compromised_events_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: Control Plane detected a broken telemetry chain
+          runbook_url: docs/operations/compliance-alerts.md#compromised-chain-or-invalid-signature
+      - alert: AiproxyInvalidSignatureDetected
+        expr: increase(aiproxy_control_plane_invalid_signature_events_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: Control Plane rejected invalid cryptographic evidence
+          runbook_url: docs/operations/compliance-alerts.md#compromised-chain-or-invalid-signature
+      - alert: AiproxyMerkleAnchoringDelayed
+        expr: aiproxy_control_plane_oldest_pending_anchor_seconds > 900
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Control Plane cannot externally anchor Merkle checkpoints
+          runbook_url: docs/operations/compliance-alerts.md#external-merkle-anchoring-delay
+      - alert: AiproxySecurityAuditChainBroken
+        expr: aiproxy_control_plane_broken_security_audit_chains > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Control Plane administrative audit chain failed verification
+          runbook_url: docs/operations/compliance-alerts.md#administrative-audit-chain-broken

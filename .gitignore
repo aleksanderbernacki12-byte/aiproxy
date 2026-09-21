@@ -1,2 +1,7 @@
 .aiproxy_cache/
+.aiproxy_salt
+.aiproxy_securevault/
+.aiproxy_telemetry.sqlite
+.aiproxy_telemetry.sqlite-shm
+.aiproxy_telemetry.sqlite-wal
 /bin/

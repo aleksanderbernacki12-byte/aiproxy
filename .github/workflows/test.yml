@@ -1,18 +1,20 @@
 name: Test
 
-# Runs on every push to main and every pull request, on all three target
-# OSes. Public repos get unlimited free Actions minutes on every runner
-# type, so there's no cost reason to test on Linux alone when the project
-# ships binaries for macOS and Windows too.
+# Shared verification for pushes, pull requests, and the exact release commit.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -42,3 +44,76 @@ jobs:
 
       - name: Test (race detector)
         run: go test ./... -race -count=1
+
+  control-plane:
+    name: Control Plane
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: control-plane
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      # Ephemeral CI service only; never a deployment credential.
+      TEST_DATABASE_URL: postgresql://aiproxy:ci-only-password@localhost:5432/aiproxy_test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: aiproxy
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: aiproxy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aiproxy -d aiproxy_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: control-plane/package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: PostgreSQL integration and backup recovery tests
+        env:
+          TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: npm run test:recovery
+
+      # Build generates Next.js route types required by the standalone check.
+      - name: Production build
+        run: npm run build
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser end-to-end tests
+        run: npm run test:e2e
+
+      - name: Upload browser test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-diagnostics
+          path: |
+            control-plane/playwright-report/
+            control-plane/test-results/
+          retention-days: 7

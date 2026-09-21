@@ -43,6 +43,7 @@ import (
 	"aiproxy/internal/idempotency"
 	"aiproxy/internal/iplimiter"
 	"aiproxy/internal/limiter"
+	"aiproxy/internal/piifilter"
 	"aiproxy/internal/rules"
 	"aiproxy/internal/semcache"
 	"aiproxy/internal/stats"
@@ -124,6 +125,19 @@ type requestContextInfo struct {
 	targets     []*url.URL
 	forwardPath string
 	targetLabel string
+	// Carried to the response lifecycle so telemetry emitted after a completed
+	// exchange can report the local PII decision without inspecting content.
+	piiDetected           bool
+	piiRedacted           bool
+	requestPolicyRedacted bool
+	// Compliance capture is populated only when a recorder is configured, so
+	// the normal proxy path pays no extra body/header copy cost.
+	complianceEventID       string
+	complianceTimestamp     time.Time
+	complianceClientID      string
+	complianceApplicationID string
+	complianceRequestHeader http.Header
+	complianceRequestBody   []byte
 
 	// clientLabel is the authenticated proxy key's attribution label —
 	// "default" for the anonymous Server.ProxyAPIKey, a named
@@ -378,6 +392,9 @@ type Server struct {
 	Target *url.URL
 	Logger *log.Logger
 	Stats  *stats.Stats // always present; counts every request outcome
+	// ComplianceRecorder receives completed upstream exchanges through a
+	// non-blocking interface. It is configured once before serving begins.
+	ComplianceRecorder ComplianceRecorder
 
 	// LogFormat selects how every log line below is rendered. The zero
 	// value behaves as LogFormatText, so existing callers that never set
@@ -3577,6 +3594,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Block above. Headers are merged back by name rather than replacing
 	// r.Header wholesale, since evaluatedHeaders only ever covers the
 	// subset filterHeadersForScanning handed to the engine.
+	// PII redaction happens only after routing, cache lookup, policy rules,
+	// and rate limiting have made their existing decisions from the original
+	// request. Only the body sent to the provider is changed.
+	var complianceEventID, complianceClientID, complianceApplicationID string
+	var complianceTimestamp time.Time
+	var complianceRequestHeader http.Header
+	var complianceRequestBody []byte
+	if s.ComplianceRecorder != nil {
+		complianceEventID = generateRequestID()
+		complianceTimestamp = time.Now().UTC()
+		complianceClientID, complianceApplicationID = complianceIdentity(r.Header, auth.label)
+		complianceRequestHeader = r.Header.Clone()
+		complianceRequestBody = append([]byte(nil), body...)
+	}
+	piiRedactedBody, piiDetected := piifilter.RedactPII(string(evaluatedBody))
+	if piiDetected {
+		evaluatedBody = []byte(piiRedactedBody)
+		s.Stats.RecordPIIRedact(targetLabel)
+	}
 	r.Body = io.NopCloser(bytes.NewReader(evaluatedBody))
 	r.ContentLength = int64(len(evaluatedBody))
 	// GetBody lets failoverTransport re-read the same already-buffered
@@ -3589,6 +3625,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for name, values := range evaluatedHeaders {
 		r.Header[name] = values
 	}
+	// These identify the local caller to aiproxy's compliance pipeline. Remove
+	// them after merging evaluated headers so a rule-engine copy cannot restore
+	// them before the request reaches the LLM provider.
+	r.Header.Del(complianceClientIDHeader)
+	r.Header.Del(complianceApplicationHeader)
 	if action == rules.Redact {
 		s.Stats.RecordRedact(targetLabel, ruleName)
 		s.Stats.RecordClientRedact(auth.label)
@@ -3623,6 +3664,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		semanticFingerprint:     semanticFingerprintForReqCtx,
 		semanticRemainderHash:   semanticRemainderHashForReqCtx,
 		semanticTargetPartition: semanticTargetPartitionForReqCtx,
+		piiDetected:             piiDetected,
+		piiRedacted:             piiDetected,
+		requestPolicyRedacted:   action == rules.Redact,
+		complianceEventID:       complianceEventID,
+		complianceTimestamp:     complianceTimestamp,
+		complianceClientID:      complianceClientID,
+		complianceApplicationID: complianceApplicationID,
+		complianceRequestHeader: complianceRequestHeader,
+		complianceRequestBody:   complianceRequestBody,
 	}
 	r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, reqCtx))
 
@@ -3776,6 +3826,9 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// ReverseProxy's normal error handling take over.
 		return err
 	}
+	rawResponseBody := append([]byte(nil), body...)
+	rawResponseHeader := resp.Header.Clone()
+	rawResponseStatus := resp.StatusCode
 
 	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, reqCtx.targetLabel, reqCtx.clientLabel)
 	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url, reqCtx.requestID)
@@ -3784,8 +3837,14 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		writeResponseBlockedBody(resp, "response blocked by aiproxy rules")
+		if reqCtx.complianceEventID != "" {
+			resp.Body = newComplianceReadCloser(resp.Body, func() {
+				s.completeCompliance(reqCtx, rawResponseStatus, rawResponseHeader, rawResponseBody, true, false, true)
+			})
+		}
 		return nil
 	}
+	responsePolicyRedacted := action == rules.Redact
 	if action == rules.Redact {
 		s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
 		s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
@@ -3835,6 +3894,11 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	}
 
 	s.logUsageFromBody(reqCtx, body)
+	if reqCtx.complianceEventID != "" {
+		resp.Body = newComplianceReadCloser(resp.Body, func() {
+			s.completeCompliance(reqCtx, rawResponseStatus, rawResponseHeader, rawResponseBody, true, responsePolicyRedacted, false)
+		})
+	}
 
 	return nil
 }
@@ -3851,18 +3915,24 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) {
 	statusCode := resp.StatusCode
 	header := resp.Header
+	rawResponseHeader := resp.Header.Clone()
+	responsePolicyRedacted := false
+	responsePolicyBlocked := false
 
 	tee := &streamTee{
-		src:    resp.Body,
-		engine: s.getEngine(),
-		target: reqCtx.targetLabel,
-		key:    reqCtx.clientLabel,
+		src:        resp.Body,
+		engine:     s.getEngine(),
+		target:     reqCtx.targetLabel,
+		key:        reqCtx.clientLabel,
+		captureRaw: reqCtx.complianceEventID != "",
 		onRedact: func(ruleName string) {
+			responsePolicyRedacted = true
 			s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
 			s.logResponseRedact(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 			s.notifyWebhook("response_redact", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 		},
 		onBlock: func(ruleName string) {
+			responsePolicyBlocked = true
 			s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
 			s.logResponseBlock(reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
 			s.notifyWebhook("response_block", reqCtx.method, reqCtx.url, ruleName, reqCtx.requestID)
@@ -3871,7 +3941,7 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 			s.handleResponseDryRunHits(hits, reqCtx.method, reqCtx.url, reqCtx.requestID)
 		},
 	}
-	tee.onComplete = func(data []byte, cleanEOF bool) {
+	tee.onComplete = func(data, rawData []byte, cleanEOF bool) {
 		// Cache first, log second: a caller that observes the log
 		// line (e.g. a test synchronizing on it) can then rely on the
 		// cache write having already landed. A stream a Block rule cut
@@ -3899,6 +3969,7 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 			}
 		}
 		s.logUsageFromBody(reqCtx, data)
+		s.completeCompliance(reqCtx, statusCode, rawResponseHeader, rawData, cleanEOF, responsePolicyRedacted, responsePolicyBlocked)
 	}
 	resp.Body = tee
 }
@@ -3961,17 +4032,19 @@ type streamTee struct {
 	target string
 	key    string
 
-	tmp     [32 * 1024]byte
-	pending bytes.Buffer // raw bytes read but not yet a complete batch
-	out     bytes.Buffer // processed bytes still owed to Read's caller
-	buf     bytes.Buffer // full accumulated (post-scan) data, for onComplete
+	tmp        [32 * 1024]byte
+	pending    bytes.Buffer // raw bytes read but not yet a complete batch
+	out        bytes.Buffer // processed bytes still owed to Read's caller
+	buf        bytes.Buffer // full accumulated (post-scan) data, for onComplete
+	raw        bytes.Buffer // full original upstream data, for compliance capture
+	captureRaw bool
 
 	blocked bool
 
 	onRedact   func(ruleName string)
 	onBlock    func(ruleName string)
 	onDryRun   func(hits []rules.DryRunMatch)
-	onComplete func(data []byte, cleanEOF bool)
+	onComplete func(data, rawData []byte, cleanEOF bool)
 	cleanEOF   bool
 	once       sync.Once
 }
@@ -3980,6 +4053,9 @@ func (t *streamTee) Read(p []byte) (int, error) {
 	for t.out.Len() == 0 && !t.blocked {
 		n, err := t.src.Read(t.tmp[:])
 		if n > 0 {
+			if t.captureRaw {
+				t.raw.Write(t.tmp[:n])
+			}
 			t.pending.Write(t.tmp[:n])
 			t.processCompleteBatch()
 		}
@@ -4080,7 +4156,7 @@ func (t *streamTee) Close() error {
 	err := t.src.Close()
 	t.once.Do(func() {
 		if t.onComplete != nil {
-			t.onComplete(t.buf.Bytes(), t.cleanEOF)
+			t.onComplete(t.buf.Bytes(), t.raw.Bytes(), t.cleanEOF)
 		}
 	})
 	return err
@@ -5097,6 +5173,7 @@ type statsSnapshotJSON struct {
 	TotalTokens      int64 `json:"total_tokens"`
 	ResponseBlocked  int64 `json:"response_blocked"`
 	ResponseRedacted int64 `json:"response_redacted"`
+	PIIRedacted      int64 `json:"pii_redacted"`
 
 	// Failover counts how many times this target's candidate list moved
 	// on to the next URL because an earlier one was unreachable — always
@@ -5187,7 +5264,8 @@ type statsSnapshotJSON struct {
 	// something each target has its own copy of — so toStatsSnapshotJSON
 	// never sets it; only the top-level caller (serveStats, logSummary)
 	// does, once, after building the rest of the payload.
-	CostBudget *float64 `json:"cost_budget,omitempty"`
+	CostBudget *float64          `json:"cost_budget,omitempty"`
+	Compliance *ComplianceStatus `json:"compliance,omitempty"`
 }
 
 // baseSnapshotJSON copies every plain counter field shared by the
@@ -5209,6 +5287,7 @@ func baseSnapshotJSON(snap stats.Snapshot) statsSnapshotJSON {
 		TotalTokens:            snap.TotalTokens,
 		ResponseBlocked:        snap.ResponseBlocked,
 		ResponseRedacted:       snap.ResponseRedacted,
+		PIIRedacted:            snap.PIIRedacted,
 		DryRunBlocked:          snap.DryRunBlocked,
 		DryRunRedacted:         snap.DryRunRedacted,
 		ResponseDryRunBlocked:  snap.ResponseDryRunBlocked,
@@ -5306,6 +5385,10 @@ func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload := withCostBudget(toStatsSnapshotJSON(s.Stats.Snapshot(), s.getCostRates()), s.getCostBudget())
+	if provider, ok := s.ComplianceRecorder.(ComplianceStatusProvider); ok {
+		status := provider.ComplianceStatus()
+		payload.Compliance = &status
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		s.logError("aiproxy: stats: failed to encode response: %v", err)
@@ -5449,6 +5532,7 @@ var promCounters = []struct {
 	{"aiproxy_tokens_used_total", "Total number of tokens reported in upstream response usage fields.", func(s stats.Snapshot) int64 { return s.TotalTokens }},
 	{"aiproxy_responses_blocked_total", "Total number of upstream responses withheld from the client by a rule.", func(s stats.Snapshot) int64 { return s.ResponseBlocked }},
 	{"aiproxy_responses_redacted_total", "Total number of upstream responses forwarded with a matched secret redacted.", func(s stats.Snapshot) int64 { return s.ResponseRedacted }},
+	{"aiproxy_pii_redacted_total", "Total number of request bodies locally scrubbed of PII before upstream delivery.", func(s stats.Snapshot) int64 { return s.PIIRedacted }},
 	{"aiproxy_failover_total", "Total number of times this target's candidate list moved on to the next URL because an earlier one was unreachable.", func(s stats.Snapshot) int64 { return s.Failover }},
 	{"aiproxy_shadow_sent_total", "Total number of requests mirrored to this target's own shadow destination.", func(s stats.Snapshot) int64 { return s.ShadowSent }},
 	{"aiproxy_shadow_error_total", "Total number of shadow-mirror attempts that never completed a round trip.", func(s stats.Snapshot) int64 { return s.ShadowError }},
@@ -5707,6 +5791,49 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	writePromMetrics(w, s.Stats.Snapshot(), s.getCostRates(), s.getCostBudget())
+	if provider, ok := s.ComplianceRecorder.(ComplianceStatusProvider); ok {
+		writeCompliancePromMetrics(w, provider.ComplianceStatus())
+	}
+}
+
+func writeCompliancePromMetrics(w io.Writer, status ComplianceStatus) {
+	if telemetry := status.Telemetry; telemetry != nil {
+		writePromValue(w, "aiproxy_telemetry_accepted_total", "counter", "Telemetry events accepted by the asynchronous pipeline.", telemetry.Accepted)
+		writePromValue(w, "aiproxy_telemetry_dropped_total", "counter", "Telemetry events rejected before durable persistence.", telemetry.Dropped)
+		writePromValue(w, "aiproxy_telemetry_persist_failures_total", "counter", "Telemetry events that failed local durable persistence.", telemetry.PersistFailures)
+		writePromValue(w, "aiproxy_telemetry_delivery_failures_total", "counter", "Failed Control Plane delivery attempts.", telemetry.DeliveryFailures)
+		writePromValue(w, "aiproxy_telemetry_delivered_events_total", "counter", "Telemetry events acknowledged by the Control Plane.", telemetry.DeliveredEvents)
+		writePromValue(w, "aiproxy_telemetry_pending", "gauge", "Telemetry events waiting in memory or durable storage.", telemetry.Pending)
+		writePromValue(w, "aiproxy_telemetry_storage_full_failures_total", "counter", "Telemetry events lost because SQLite reached its budget or the disk was full.", telemetry.StorageFullFailures)
+		writePromValue(w, "aiproxy_telemetry_database_bytes", "gauge", "Telemetry SQLite database size excluding its rollback journal.", telemetry.DatabaseBytes)
+		writePromValue(w, "aiproxy_telemetry_database_used_bytes", "gauge", "Telemetry SQLite bytes excluding reusable free pages and journal.", telemetry.DatabaseUsedBytes)
+		writePromValue(w, "aiproxy_telemetry_database_limit_bytes", "gauge", "Telemetry SQLite database size limit rounded down to whole pages.", telemetry.DatabaseLimitBytes)
+		writePromTime(w, "aiproxy_telemetry_last_delivered_timestamp_seconds", "Unix timestamp of the latest successful telemetry delivery.", telemetry.LastDeliveredAt)
+		writePromTime(w, "aiproxy_telemetry_last_failure_timestamp_seconds", "Unix timestamp of the latest telemetry pipeline failure.", telemetry.LastFailureAt)
+	}
+	if vault := status.SecureVault; vault != nil {
+		writePromValue(w, "aiproxy_secure_vault_accepted_total", "counter", "Evidence records accepted by Secure Vault.", vault.Accepted)
+		writePromValue(w, "aiproxy_secure_vault_dropped_total", "counter", "Evidence records rejected before processing.", vault.Dropped)
+		writePromValue(w, "aiproxy_secure_vault_queue_depth", "gauge", "Evidence records waiting in the in-memory queue.", vault.QueueDepth)
+		writePromValue(w, "aiproxy_secure_vault_spool_pending", "gauge", "Encrypted evidence records waiting on disk.", vault.SpoolPending)
+		writePromValue(w, "aiproxy_secure_vault_quarantined", "gauge", "Unreadable encrypted spool entries in quarantine.", vault.Quarantined)
+		writePromValue(w, "aiproxy_secure_vault_local_failures_total", "counter", "Secure Vault capture or local spool failures.", vault.LocalFailures)
+		writePromValue(w, "aiproxy_secure_vault_upload_failures_total", "counter", "Failed AWS KMS or S3 archive attempts.", vault.UploadFailures)
+		writePromValue(w, "aiproxy_secure_vault_uploaded_total", "counter", "Evidence records successfully archived in S3.", vault.Uploaded)
+		writePromTime(w, "aiproxy_secure_vault_last_uploaded_timestamp_seconds", "Unix timestamp of the latest successful S3 archive.", vault.LastUploadedAt)
+		writePromTime(w, "aiproxy_secure_vault_last_failure_timestamp_seconds", "Unix timestamp of the latest Secure Vault failure.", vault.LastFailureAt)
+	}
+}
+
+func writePromValue[T ~int | ~int64 | ~uint64](w io.Writer, name, metricType, help string, value T) {
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", name, help, name, metricType, name, value)
+}
+
+func writePromTime(w io.Writer, name, help string, value *time.Time) {
+	if value == nil {
+		return
+	}
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", name, help, name, name, value.Unix())
 }
 
 // Summary renders the current stats snapshot as the same block of text

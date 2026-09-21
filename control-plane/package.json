@@ -1,0 +1,55 @@
+{
+  "name": "control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build --webpack",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit --incremental false",
+    "test": "vitest run && node --test scripts/scheduler-config.node-test.mjs",
+    "test:integration": "node scripts/run-integration-tests.mjs",
+    "test:recovery": "node scripts/run-integration-tests.mjs --recovery",
+    "db:migrate": "node scripts/migrate.mjs",
+    "orgs:create": "node scripts/create-organization.mjs",
+    "tenant-keys:create": "node scripts/create-tenant-key.mjs",
+    "tenant-keys:revoke": "node scripts/revoke-tenant-key.mjs",
+    "keys:register": "node scripts/register-public-key.mjs",
+    "keys:retire": "node scripts/retire-public-key.mjs",
+    "keys:revoke": "node scripts/revoke-public-key.mjs",
+    "dpo:create": "node scripts/create-dpo-key.mjs",
+    "dpo:revoke": "node scripts/revoke-dpo-key.mjs",
+    "systems:upsert": "node scripts/upsert-ai-system.mjs",
+    "reports:keygen": "node scripts/generate-report-signing-key.mjs",
+    "reports:verify": "node scripts/verify-compliance-report.mjs",
+    "retention": "node scripts/retention-policy.mjs",
+    "test:e2e": "node scripts/run-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "canonicalize": "^5.0.0",
+    "drizzle-orm": "^0.45.2",
+    "next": "16.3.5",
+    "pg": "^8.23.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "^4.6.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^24.13.4",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.5",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5",
+    "vitest": "^4.1.11"
+  }
+}

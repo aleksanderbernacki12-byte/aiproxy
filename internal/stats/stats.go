@@ -40,6 +40,7 @@ type counters struct {
 	totalTokens       atomic.Int64
 	responseBlocked   atomic.Int64
 	responseRedacted  atomic.Int64
+	piiRedacted       atomic.Int64
 	failover          atomic.Int64
 	shadowSent        atomic.Int64
 	shadowError       atomic.Int64
@@ -63,6 +64,7 @@ func (c *counters) snapshot() Snapshot {
 		TotalTokens:       c.totalTokens.Load(),
 		ResponseBlocked:   c.responseBlocked.Load(),
 		ResponseRedacted:  c.responseRedacted.Load(),
+		PIIRedacted:       c.piiRedacted.Load(),
 		Failover:          c.failover.Load(),
 		ShadowSent:        c.shadowSent.Load(),
 		ShadowError:       c.shadowError.Load(),
@@ -375,6 +377,15 @@ func (s *Stats) RecordRedact(target, ruleName string) {
 	s.overall.redacted.Add(1)
 	s.counterFor(target).redacted.Add(1)
 	s.ruleCounterFor(ruleName).redacted.Add(1)
+}
+
+// RecordPIIRedact records one request whose body contained locally detected
+// PII and was masked before it was sent to the upstream provider. It is kept
+// separate from RecordRedact because the PII filter is mandatory and runs
+// independently of configured policy rules.
+func (s *Stats) RecordPIIRedact(target string) {
+	s.overall.piiRedacted.Add(1)
+	s.counterFor(target).piiRedacted.Add(1)
 }
 
 // RecordRateLimited records one request the circuit breaker rejected.
@@ -893,6 +904,10 @@ type Snapshot struct {
 	// back rather than going out.
 	ResponseBlocked  int64 `json:"response_blocked"`
 	ResponseRedacted int64 `json:"response_redacted"`
+
+	// PIIRedacted counts requests whose bodies were locally scrubbed before
+	// upstream delivery. It contains no information about the matched value.
+	PIIRedacted int64 `json:"pii_redacted"`
 
 	// DryRunBlocked, DryRunRedacted, ResponseDryRunBlocked, and
 	// ResponseDryRunRedacted count what a dry_run rule would have done
