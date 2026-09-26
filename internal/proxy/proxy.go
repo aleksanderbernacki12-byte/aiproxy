@@ -3239,7 +3239,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if idem := s.getIdempotency(); idem != nil {
 		if idempotencyKey = resolveIdempotencyKey(r); idempotencyKey != "" {
 			bodyHash := sha256.Sum256(body)
-			switch resp, outcome := idem.Claim(auth.label, idempotencyKey, bodyHash); outcome {
+			switch resp, outcome := idem.Claim(r.Context(), auth.label, idempotencyKey, bodyHash); outcome {
 			case idempotency.Replay:
 				// targetLabel is "" here (idempotency is checked before
 				// route resolution) — a rule scoped to a specific target
@@ -3276,6 +3276,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			case idempotency.Timeout:
 				writeError(w, r, http.StatusServiceUnavailable, "idempotency_key_in_progress", "an earlier request with this idempotency key is still in progress", "")
+				return
+			case idempotency.Canceled:
+				// The client disconnected while waiting; nobody is left to answer.
 				return
 			case idempotency.Own:
 				// Own means this goroutine must eventually call either

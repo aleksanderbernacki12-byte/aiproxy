@@ -1,6 +1,7 @@
 package idempotency
 
 import (
+	"context"
 	"crypto/sha256"
 	"net/http"
 	"sync"
@@ -14,7 +15,7 @@ func hashOf(s string) [32]byte {
 
 func TestRegistry_FirstClaimReturnsOwn(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
-	resp, outcome := r.Claim("client", "key1", hashOf("body"))
+	resp, outcome := r.Claim(context.Background(), "client", "key1", hashOf("body"))
 	if outcome != Own {
 		t.Fatalf("outcome = %v, want Own", outcome)
 	}
@@ -26,14 +27,14 @@ func TestRegistry_FirstClaimReturnsOwn(t *testing.T) {
 func TestRegistry_ReplayAfterStore(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
 	bodyHash := hashOf("body")
-	if _, outcome := r.Claim("client", "key1", bodyHash); outcome != Own {
+	if _, outcome := r.Claim(context.Background(), "client", "key1", bodyHash); outcome != Own {
 		t.Fatalf("first claim outcome = %v, want Own", outcome)
 	}
 
 	want := &Response{StatusCode: 200, Header: http.Header{"X-Test": {"1"}}, Body: []byte("hello")}
 	r.Store("client", "key1", want)
 
-	got, outcome := r.Claim("client", "key1", bodyHash)
+	got, outcome := r.Claim(context.Background(), "client", "key1", bodyHash)
 	if outcome != Replay {
 		t.Fatalf("second claim outcome = %v, want Replay", outcome)
 	}
@@ -44,14 +45,14 @@ func TestRegistry_ReplayAfterStore(t *testing.T) {
 
 func TestRegistry_ConflictOnDifferentBodyHash(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
-	if _, outcome := r.Claim("client", "key1", hashOf("body-a")); outcome != Own {
+	if _, outcome := r.Claim(context.Background(), "client", "key1", hashOf("body-a")); outcome != Own {
 		t.Fatalf("first claim outcome = %v, want Own", outcome)
 	}
 
 	// Still in flight (never Stored/Released) — a conflicting body hash
 	// must be detected immediately, without blocking at all.
 	start := time.Now()
-	_, outcome := r.Claim("client", "key1", hashOf("body-b"))
+	_, outcome := r.Claim(context.Background(), "client", "key1", hashOf("body-b"))
 	elapsed := time.Since(start)
 	if outcome != Conflict {
 		t.Fatalf("outcome = %v, want Conflict", outcome)
@@ -64,10 +65,10 @@ func TestRegistry_ConflictOnDifferentBodyHash(t *testing.T) {
 func TestRegistry_ConflictDetectedEvenAfterCompletion(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
 	bodyHash := hashOf("body-a")
-	r.Claim("client", "key1", bodyHash)
+	r.Claim(context.Background(), "client", "key1", bodyHash)
 	r.Store("client", "key1", &Response{StatusCode: 200})
 
-	if _, outcome := r.Claim("client", "key1", hashOf("body-b")); outcome != Conflict {
+	if _, outcome := r.Claim(context.Background(), "client", "key1", hashOf("body-b")); outcome != Conflict {
 		t.Fatalf("outcome = %v, want Conflict", outcome)
 	}
 }
@@ -76,13 +77,13 @@ func TestRegistry_DifferentClientsAreIndependent(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
 	bodyHash := hashOf("body")
 
-	if _, outcome := r.Claim("client-a", "shared-key", bodyHash); outcome != Own {
+	if _, outcome := r.Claim(context.Background(), "client-a", "shared-key", bodyHash); outcome != Own {
 		t.Fatalf("client-a claim outcome = %v, want Own", outcome)
 	}
 	// The exact same key value, but a different client — must be its
 	// own, independent Own, never a Conflict or a Replay of client-a's
 	// unrelated record.
-	if _, outcome := r.Claim("client-b", "shared-key", bodyHash); outcome != Own {
+	if _, outcome := r.Claim(context.Background(), "client-b", "shared-key", bodyHash); outcome != Own {
 		t.Fatalf("client-b claim outcome = %v, want Own (independent of client-a's own record)", outcome)
 	}
 }
@@ -90,7 +91,7 @@ func TestRegistry_DifferentClientsAreIndependent(t *testing.T) {
 func TestRegistry_ConcurrentWaiterBlocksThenReplays(t *testing.T) {
 	r := NewRegistry(time.Minute, 2*time.Second)
 	bodyHash := hashOf("body")
-	if _, outcome := r.Claim("client", "key1", bodyHash); outcome != Own {
+	if _, outcome := r.Claim(context.Background(), "client", "key1", bodyHash); outcome != Own {
 		t.Fatalf("first claim outcome = %v, want Own", outcome)
 	}
 
@@ -101,7 +102,7 @@ func TestRegistry_ConcurrentWaiterBlocksThenReplays(t *testing.T) {
 	}, 1)
 	go func() {
 		close(waiterStarted)
-		resp, outcome := r.Claim("client", "key1", bodyHash)
+		resp, outcome := r.Claim(context.Background(), "client", "key1", bodyHash)
 		waiterDone <- struct {
 			resp    *Response
 			outcome Outcome
@@ -135,11 +136,11 @@ func TestRegistry_ConcurrentWaiterBlocksThenReplays(t *testing.T) {
 func TestRegistry_ReleaseLetsWaiterReclaim(t *testing.T) {
 	r := NewRegistry(time.Minute, 2*time.Second)
 	bodyHash := hashOf("body")
-	r.Claim("client", "key1", bodyHash) // original owner
+	r.Claim(context.Background(), "client", "key1", bodyHash) // original owner
 
 	waiterDone := make(chan Outcome, 1)
 	go func() {
-		_, outcome := r.Claim("client", "key1", bodyHash)
+		_, outcome := r.Claim(context.Background(), "client", "key1", bodyHash)
 		waiterDone <- outcome
 	}()
 	time.Sleep(50 * time.Millisecond) // let the waiter actually start blocking
@@ -159,14 +160,14 @@ func TestRegistry_ReleaseLetsWaiterReclaim(t *testing.T) {
 func TestRegistry_ReleaseAfterStoreIsANoOp(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
 	bodyHash := hashOf("body")
-	r.Claim("client", "key1", bodyHash)
+	r.Claim(context.Background(), "client", "key1", bodyHash)
 	r.Store("client", "key1", &Response{StatusCode: 200})
 
 	// Must never panic (double-close) and must never disturb the
 	// already-stored record.
 	r.Release("client", "key1")
 
-	resp, outcome := r.Claim("client", "key1", bodyHash)
+	resp, outcome := r.Claim(context.Background(), "client", "key1", bodyHash)
 	if outcome != Replay {
 		t.Fatalf("outcome after a no-op Release = %v, want Replay (the stored record must survive)", outcome)
 	}
@@ -194,10 +195,10 @@ func TestRegistry_StoreOnUnknownKeyIsANoOp(t *testing.T) {
 func TestRegistry_WaitTimesOutIfOwnerNeverCompletes(t *testing.T) {
 	r := NewRegistry(time.Minute, 100*time.Millisecond)
 	bodyHash := hashOf("body")
-	r.Claim("client", "key1", bodyHash) // owner never Stores or Releases
+	r.Claim(context.Background(), "client", "key1", bodyHash) // owner never Stores or Releases
 
 	start := time.Now()
-	_, outcome := r.Claim("client", "key1", bodyHash)
+	_, outcome := r.Claim(context.Background(), "client", "key1", bodyHash)
 	elapsed := time.Since(start)
 	if outcome != Timeout {
 		t.Fatalf("outcome = %v, want Timeout", outcome)
@@ -209,7 +210,7 @@ func TestRegistry_WaitTimesOutIfOwnerNeverCompletes(t *testing.T) {
 
 func TestRegistry_SweepExpiresOnlyCompletedEntriesPastTTL(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
-	r.Claim("client", "key1", hashOf("body"))
+	r.Claim(context.Background(), "client", "key1", hashOf("body"))
 	r.Store("client", "key1", &Response{StatusCode: 200})
 
 	now := time.Now()
@@ -226,7 +227,7 @@ func TestRegistry_SweepExpiresOnlyCompletedEntriesPastTTL(t *testing.T) {
 
 func TestRegistry_SweepNeverRemovesInFlightEntry(t *testing.T) {
 	r := NewRegistry(time.Minute, time.Second)
-	r.Claim("client", "key1", hashOf("body")) // never Stored — still "in flight"
+	r.Claim(context.Background(), "client", "key1", hashOf("body")) // never Stored — still "in flight"
 
 	r.sweep(time.Now().Add(24 * time.Hour)) // arbitrarily far in the future
 	if got := r.Len(); got != 1 {
@@ -239,8 +240,8 @@ func TestRegistry_Len(t *testing.T) {
 	if got := r.Len(); got != 0 {
 		t.Fatalf("Len() on a fresh Registry = %d, want 0", got)
 	}
-	r.Claim("client-a", "key1", hashOf("body"))
-	r.Claim("client-b", "key1", hashOf("body"))
+	r.Claim(context.Background(), "client-a", "key1", hashOf("body"))
+	r.Claim(context.Background(), "client-b", "key1", hashOf("body"))
 	if got := r.Len(); got != 2 {
 		t.Fatalf("Len() = %d, want 2", got)
 	}
@@ -266,7 +267,7 @@ func TestRegistry_ConcurrentClaimsForTheSameKeyOnlyOneWinsOwn(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-ready
-			_, outcome := r.Claim("client", "key1", bodyHash)
+			_, outcome := r.Claim(context.Background(), "client", "key1", bodyHash)
 			outcomes[i] = outcome
 		}(i)
 	}
@@ -285,5 +286,22 @@ func TestRegistry_ConcurrentClaimsForTheSameKeyOnlyOneWinsOwn(t *testing.T) {
 	}
 	if ownCount != 1 {
 		t.Fatalf("Own count = %d, want exactly 1", ownCount)
+	}
+}
+
+func TestClaim_ReturnsCanceledWhenCallerContextEndsWhileWaiting(t *testing.T) {
+	r := NewRegistry(time.Minute, time.Minute)
+	if _, outcome := r.Claim(context.Background(), "client", "key1", hashOf("body")); outcome != Own {
+		t.Fatalf("first Claim outcome = %v, want Own", outcome)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	resp, outcome := r.Claim(ctx, "client", "key1", hashOf("body"))
+	if outcome != Canceled || resp != nil {
+		t.Fatalf("Claim = (%v, %v), want (nil, Canceled)", resp, outcome)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Claim kept waiting %v after the context ended", elapsed)
 	}
 }

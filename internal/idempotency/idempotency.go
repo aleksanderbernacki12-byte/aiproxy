@@ -17,6 +17,7 @@
 package idempotency
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -48,7 +49,7 @@ const (
 	Replay
 
 	// Conflict means a record exists for this (client, key) but its
-	// body hash differs from this request's own — the same idempotency
+	// operation hash differs from this request's own — the same idempotency
 	// key was reused for a genuinely different request. The caller
 	// should reject the request rather than either replaying the wrong
 	// response or silently forwarding a second, different one.
@@ -59,6 +60,9 @@ const (
 	// timeout. The caller should reject the request with a clear
 	// "still in progress" signal rather than risk a duplicate forward.
 	Timeout
+	// Canceled means the caller's context ended while waiting on an
+	// in-flight owner: the client is gone, so the caller writes nothing.
+	Canceled
 )
 
 // DefaultWaitTimeout is how long Claim blocks waiting for an in-flight
@@ -80,10 +84,10 @@ type recordKey struct {
 // done closed) — or, briefly, abandoned (done closed, response nil,
 // about to be removed) when its owner calls Release instead of Store.
 type entry struct {
-	bodyHash [32]byte
-	done     chan struct{}
-	response *Response
-	storedAt time.Time
+	operationHash [32]byte
+	done          chan struct{}
+	response      *Response
+	storedAt      time.Time
 }
 
 // Registry coordinates idempotency-key deduplication across concurrent
@@ -113,29 +117,30 @@ func NewRegistry(ttl, waitTimeout time.Duration) *Registry {
 // proxy_api_key/proxy_api_keys is configured at all — the same
 // collapsing-to-one-identity behavior every other per-client feature in
 // this codebase already has) and its own Idempotency-Key header value,
-// whose raw request body hashes to bodyHash.
+// whose whole operation (see the caller) hashes to operationHash. If ctx ends
+// while waiting on an in-flight owner, it returns (nil, Canceled).
 //
 // If no record exists yet, this atomically creates one and returns
 // (nil, Own) — the caller now owns it. If a record exists with a
-// matching bodyHash and is already complete, it returns the stored
-// Response immediately. If a record exists with a matching bodyHash but
+// matching operationHash and is already complete, it returns the stored
+// Response immediately. If a record exists with a matching operationHash but
 // is still in flight, this blocks (up to waitTimeout) until its owner
 // calls Store or Release; if the owner Releases (abandons) it, this
 // retries from scratch — trying to become the new owner itself — rather
 // than leaving the caller stuck behind a permanently failed attempt. If
-// a record exists with a *different* bodyHash, it returns (nil,
+// a record exists with a *different* operationHash, it returns (nil,
 // Conflict) without ever blocking.
-func (r *Registry) Claim(client, key string, bodyHash [32]byte) (*Response, Outcome) {
+func (r *Registry) Claim(ctx context.Context, client, key string, operationHash [32]byte) (*Response, Outcome) {
 	rk := recordKey{client: client, key: key}
 	for {
 		r.mu.Lock()
 		e, ok := r.entries[rk]
 		if !ok {
-			r.entries[rk] = &entry{bodyHash: bodyHash, done: make(chan struct{})}
+			r.entries[rk] = &entry{operationHash: operationHash, done: make(chan struct{})}
 			r.mu.Unlock()
 			return nil, Own
 		}
-		if e.bodyHash != bodyHash {
+		if e.operationHash != operationHash {
 			r.mu.Unlock()
 			return nil, Conflict
 		}
@@ -152,6 +157,8 @@ func (r *Registry) Claim(client, key string, bodyHash [32]byte) (*Response, Outc
 			return e.response, Replay
 		case <-time.After(r.waitTimeout):
 			return nil, Timeout
+		case <-ctx.Done():
+			return nil, Canceled
 		}
 	}
 }
