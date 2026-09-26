@@ -588,6 +588,14 @@ caught exactly the same way the request that provoked it would be.
 aiproxy start --target https://api.example.com --log-format json
 ```
 
+Request URLs in logs, webhook payloads and Secure Vault evidence are masked:
+URL userinfo and fragments are removed, every query value is replaced with
+`REDACTED` (parameter names are kept), and secrets in the path are masked
+with your configured secret rules. Rules and routing still see the full URL.
+
+Token usage reported by the upstream counts toward rate limits and cost
+budgets even when aiproxy blocks or redacts the response.
+
 With `--log-format json`, every event above is logged as one JSON object
 per line on stderr instead of a colored text line — safe to pipe into a
 log aggregator or `jq` without ever hitting a non-JSON line, including
