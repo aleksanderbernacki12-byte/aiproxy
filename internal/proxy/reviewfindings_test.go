@@ -18,8 +18,10 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"aiproxy/internal/cache"
+	"aiproxy/internal/idempotency"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
 	"aiproxy/internal/semcache"
@@ -125,5 +127,22 @@ func TestReview_BlockedResponseMustStillAccountForUsage(t *testing.T) {
 	}
 	if n := s.Stats.Snapshot().TotalTokens; n != 123 {
 		t.Fatalf("upstream used 123 tokens, but blocked response recorded %d", n)
+	}
+}
+
+func TestReview_IdempotencyMustRespectOperation(t *testing.T) {
+	s := reviewServer(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, r.Method+" "+r.URL.Path) })
+	s.Idempotency = idempotency.NewRegistry(time.Minute, time.Second)
+	call := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(`{}`))
+		req.Header.Set("Idempotency-Key", "same-key")
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		return rec
+	}
+	call("POST", "/operation-a")
+	got := call("DELETE", "/operation-b")
+	if got.Header().Get("Idempotency-Replayed") == "true" {
+		t.Fatalf("DELETE /operation-b received unrelated replay: %q", got.Body.String())
 	}
 }

@@ -2920,6 +2920,23 @@ func generateRequestID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// idempotencyOperationHash fingerprints the whole operation, so a reused
+// Idempotency-Key for a different method, path or query conflicts instead
+// of replaying another operation's response.
+func idempotencyOperationHash(r *http.Request, body []byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(r.Method))
+	h.Write([]byte{0})
+	h.Write([]byte(r.URL.EscapedPath()))
+	h.Write([]byte{0})
+	h.Write([]byte(r.URL.RawQuery))
+	h.Write([]byte{0})
+	h.Write(body)
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
 // idempotencyKeyHeader is the fixed header name a client sets to opt
 // one specific request into idempotency-key deduplication — the same
 // convention Stripe's and OpenAI's own APIs already use, so an existing
@@ -3235,11 +3252,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (a no-op everywhere else in this function) whenever idempotency
 	// isn't enabled, no header was sent, or the header value was
 	// invalid.
-	var idempotencyKey string
+	var idempotencyKey, idempotencyNamespace string
 	if idem := s.getIdempotency(); idem != nil {
 		if idempotencyKey = resolveIdempotencyKey(r); idempotencyKey != "" {
-			bodyHash := sha256.Sum256(body)
-			switch resp, outcome := idem.Claim(r.Context(), auth.label, idempotencyKey, bodyHash); outcome {
+			// Namespaced by caller credential, not just proxy key label:
+			// without proxy auth every caller shares label "", and one
+			// caller must never replay another's response.
+			idempotencyNamespace = partitionIdentity(auth, r)
+			operationHash := idempotencyOperationHash(r, body)
+			switch resp, outcome := idem.Claim(r.Context(), idempotencyNamespace, idempotencyKey, operationHash); outcome {
 			case idempotency.Replay:
 				// targetLabel is "" here (idempotency is checked before
 				// route resolution) — a rule scoped to a specific target
@@ -3272,7 +3293,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case idempotency.Conflict:
 				s.Stats.RecordIdempotencyConflict()
 				s.logIdempotencyConflict(r.Method, s.logSafeURL(r.URL), requestID, idempotencyKey)
-				writeError(w, r, http.StatusConflict, "idempotency_key_conflict", "idempotency key already used for a request with a different body", "")
+				writeError(w, r, http.StatusConflict, "idempotency_key_conflict", "idempotency key already used for a different request", "")
 				return
 			case idempotency.Timeout:
 				writeError(w, r, http.StatusServiceUnavailable, "idempotency_key_in_progress", "an earlier request with this idempotency key is still in progress", "")
@@ -3292,7 +3313,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// hard-stop, anomaly detection) without needing to touch
 				// each of those individually: Release is a safe no-op
 				// once Store has already run, see its own doc comment.
-				defer idem.Release(auth.label, idempotencyKey)
+				defer idem.Release(idempotencyNamespace, idempotencyKey)
 			}
 		}
 	}
@@ -3380,7 +3401,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Release above would incorrectly abandon a claim that was
 			// actually served just fine.
 			if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-				idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
+				idem.Store(idempotencyNamespace, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 			}
 			s.Stats.RecordCacheHit(targetLabel)
 			if stale {
@@ -3439,7 +3460,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							// owned idempotency claim must be completed
 							// right here.
 							if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-								idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
+								idem.Store(idempotencyNamespace, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 							}
 							s.Stats.RecordSemanticCacheHit(targetLabel)
 							s.logSemanticCacheHit(r.Method, s.logSafeURL(r.URL), requestID, similarity)
@@ -3475,7 +3496,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// Same reasoning as the cache-hit branch above needing
 				// its own Idempotency.Store call.
 				if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
-					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: servedBody})
+					idem.Store(idempotencyNamespace, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: servedBody})
 				}
 				s.Stats.RecordCoalescedRequest(targetLabel)
 				s.logCoalescedRequest(r.Method, s.logSafeURL(r.URL), requestID)
@@ -3669,7 +3690,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clientCostBudget:        auth.costBudget,
 		tokenLimiter:            effectiveTokenLimiter,
 		latency:                 new(time.Duration),
-		idempotencyClient:       auth.label,
+		idempotencyClient:       idempotencyNamespace,
 		idempotencyKey:          idempotencyKey,
 		coalesceOwned:           coalesceOwnedForReqCtx,
 		semanticFingerprint:     semanticFingerprintForReqCtx,
