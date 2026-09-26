@@ -220,6 +220,10 @@ type Stats struct {
 	idempotencyReplayed  atomic.Int64
 	idempotencyConflicts atomic.Int64
 
+	// upstreamOutcomeUnknown counts unsafe requests not failed over because
+	// the upstream may already have received them.
+	upstreamOutcomeUnknown atomic.Int64
+
 	mu        sync.Mutex
 	perTarget map[string]*counters
 	perRule   map[string]*ruleCounters
@@ -747,6 +751,13 @@ func (s *Stats) RecordIdempotencyConflict() {
 	s.idempotencyConflicts.Add(1)
 }
 
+// RecordUpstreamOutcomeUnknown records one request with side effects that
+// was not retried on another candidate because the failed upstream had
+// already received its headers.
+func (s *Stats) RecordUpstreamOutcomeUnknown() {
+	s.upstreamOutcomeUnknown.Add(1)
+}
+
 // ClientOverBudget is CrossedClientBudget's non-latching counterpart —
 // see OverBudget for the same reasoning, scoped to one client the same
 // way CrossedClientBudget itself is. client == "" is never over
@@ -954,6 +965,9 @@ type Snapshot struct {
 	IdempotencyReplayed  int64 `json:"idempotency_replayed"`
 	IdempotencyConflicts int64 `json:"idempotency_conflicts"`
 
+	// UpstreamOutcomeUnknown: see Stats.RecordUpstreamOutcomeUnknown.
+	UpstreamOutcomeUnknown int64 `json:"upstream_outcome_unknown"`
+
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
 	// IPDenied (a different rejection reason), never broken down per
@@ -1041,6 +1055,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.BudgetRejected = s.budgetRejected.Load()
 	snap.IdempotencyReplayed = s.idempotencyReplayed.Load()
 	snap.IdempotencyConflicts = s.idempotencyConflicts.Load()
+	snap.UpstreamOutcomeUnknown = s.upstreamOutcomeUnknown.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()

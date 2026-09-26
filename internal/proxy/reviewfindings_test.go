@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -144,5 +145,32 @@ func TestReview_IdempotencyMustRespectOperation(t *testing.T) {
 	got := call("DELETE", "/operation-b")
 	if got.Header().Get("Idempotency-Replayed") == "true" {
 		t.Fatalf("DELETE /operation-b received unrelated replay: %q", got.Body.String())
+	}
+}
+
+func TestReview_FailoverMustNotAssumeTransportErrorMeansUnprocessed(t *testing.T) {
+	var executions atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		executions.Add(1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		conn.Close()
+	}))
+	t.Cleanup(first.Close)
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { executions.Add(1); fmt.Fprint(w, "ok") }))
+	t.Cleanup(second.Close)
+	u1, _ := url.Parse(first.URL)
+	u2, _ := url.Parse(second.URL)
+	s := proxy.New("unused", u1, rules.NewEngine(rules.Allow))
+	s.Logger = log.New(io.Discard, "", 0)
+	s.AddRoute("/route", []*url.URL{u1, u2}, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest("POST", "/route/execute", strings.NewReader(`{"operation":"test"}`)))
+	if executions.Load() > 1 {
+		t.Fatalf("one POST executed by %d upstreams after connection closed post-processing, status=%d", executions.Load(), rec.Code)
 	}
 }

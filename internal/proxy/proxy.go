@@ -23,6 +23,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -980,6 +981,12 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 
 	s.reverseProxy = &httputil.ReverseProxy{
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, errUpstreamOutcomeUnknown) {
+				s.Stats.RecordUpstreamOutcomeUnknown()
+				s.logError("aiproxy: upstream: outcome unknown (not retried): %s", s.logSafeError(err))
+				writeError(w, r, http.StatusBadGateway, "upstream_outcome_unknown", "the upstream may have received this request before the connection failed; it was not retried", "")
+				return
+			}
 			// Replaces the default handler, which prints the full upstream
 			// URL (client query included) to the process-wide logger.
 			s.logError("aiproxy: upstream: %s", s.logSafeError(err))
@@ -1127,6 +1134,11 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			}
 		}
 
+		var wroteHeaders atomic.Bool
+		attempt = attempt.WithContext(httptrace.WithClientTrace(attempt.Context(), &httptrace.ClientTrace{
+			WroteHeaders: func() { wroteHeaders.Store(true) },
+		}))
+
 		resp, err := base.RoundTrip(attempt)
 		if err == nil {
 			if tb != nil {
@@ -1145,17 +1157,45 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 		lastErr = err
 
+		// A transport error only proves the request never arrived if its
+		// headers were never written. Past that point the upstream may
+		// have executed it, so a method with side effects is not sent to
+		// a second upstream; the client gets an explicit unknown outcome.
+		if req.Context().Err() != nil {
+			break
+		}
+		if wroteHeaders.Load() && !safeMethod(req.Method) {
+			lastErr = fmt.Errorf("%w: %w", errUpstreamOutcomeUnknown, err)
+			break
+		}
+
 		if i+1 < len(orderedCandidates) {
 			next := orderedCandidates[i+1]
 			t.server.Stats.RecordFailover(reqCtx.targetLabel)
 			t.server.logFailover(reqCtx.method, reqCtx.url, t.server.logSafeRawURL(candidate.String()), t.server.logSafeRawURL(next.String()), reqCtx.requestID)
-			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, candidate.String(), next.String(), reqCtx.requestID)
+			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, t.server.logSafeRawURL(candidate.String()), t.server.logSafeRawURL(next.String()), reqCtx.requestID)
 		}
 	}
 	if cancel != nil {
 		cancel()
 	}
 	return nil, lastErr
+}
+
+// errUpstreamOutcomeUnknown marks a transport failure after the request
+// headers reached the upstream, for a method with side effects: the
+// upstream may have executed it, so it is not retried elsewhere.
+var errUpstreamOutcomeUnknown = errors.New("upstream outcome unknown")
+
+// safeMethod reports whether re-sending method to another upstream can
+// have no side effects. PUT and DELETE are idempotent only per resource
+// on one server, not across two independent upstreams.
+func safeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	}
+	return false
 }
 
 // weightedOrdered returns candidates reordered so one, chosen at
@@ -5782,9 +5822,15 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 	fmt.Fprintln(w, "# HELP aiproxy_idempotency_replayed_total Total number of requests served by replaying an earlier response for the same Idempotency-Key.")
 	fmt.Fprintln(w, "# TYPE aiproxy_idempotency_replayed_total counter")
 	fmt.Fprintf(w, "aiproxy_idempotency_replayed_total %d\n", snap.IdempotencyReplayed)
-	fmt.Fprintln(w, "# HELP aiproxy_idempotency_conflicts_total Total number of requests rejected because their Idempotency-Key was already in use for a request with a different body.")
+	fmt.Fprintln(w, "# HELP aiproxy_idempotency_conflicts_total Total number of requests rejected because their Idempotency-Key was already in use for a different request.")
 	fmt.Fprintln(w, "# TYPE aiproxy_idempotency_conflicts_total counter")
 	fmt.Fprintf(w, "aiproxy_idempotency_conflicts_total %d\n", snap.IdempotencyConflicts)
+
+	// Unlabeled: the decision is about the request's method and what the
+	// failed candidate may have received, not about one target's health.
+	fmt.Fprintln(w, "# HELP aiproxy_upstream_outcome_unknown_total Total number of requests with side effects not retried because the failed upstream may already have received them.")
+	fmt.Fprintln(w, "# TYPE aiproxy_upstream_outcome_unknown_total counter")
+	fmt.Fprintf(w, "aiproxy_upstream_outcome_unknown_total %d\n", snap.UpstreamOutcomeUnknown)
 
 	// Unlabeled, same reasoning as aiproxy_ip_denied_total: a
 	// country-denied request never gets far enough to resolve a target.
