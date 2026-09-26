@@ -99,11 +99,23 @@ from `logSafeURL` too. Vault objects are WORM and cannot be deleted, so a
 credential written there is permanent. This mirrors the existing
 `sanitizeEvidenceHeaders` treatment of headers.
 
-**Webhook errors.** `postWebhook` currently logs `%v` of the HTTP client
-error, and `*url.Error` includes the full webhook URL. It will unwrap
-`*url.Error` and log only its `Op` and inner `Err` (the inner network error
-carries at most host:port, never path, query or userinfo). Any other error
-type is logged as before.
+**Errors that embed URLs.** Go's `*url.Error` (returned by every
+`http.Client`/`RoundTrip` failure) prints the full request URL, including the
+client's query string. A helper `logSafeError(err) string` renders a
+`*url.Error` as `Op + " " + logSafeRawURL(URL) + ": " + Err` and any other
+error unchanged. It is used for:
+
+- `postWebhook`: logs only `Op` and the inner `Err`, never even a masked URL,
+  because a webhook URL (Slack especially) carries its credential in the path.
+- `logShadowError`: the mirror request's URL includes the client's query.
+- Upstream proxy errors: `httputil.ReverseProxy` has no `ErrorHandler`, so
+  Go's default handler writes `http: proxy error: Get "<full upstream URL>"`
+  to the process-wide standard logger. A new `ErrorHandler` logs
+  `aiproxy: upstream: <logSafeError(err)>` through `s.logError` and replies
+  `502 Bad Gateway`, the same status the default handler uses.
+
+`logFailover`'s failed/next target URLs are passed through `logSafeRawURL`
+as well.
 
 ### 2. Usage on blocked responses (finding #10)
 
@@ -138,6 +150,9 @@ same `tokens_used` totals, limiters and budgets whether delivered or not.
 - JSON log format and file log contain no query value.
 - A webhook pointed at an unreachable URL with a query secret produces an
   error log line without the URL.
+- An unreachable upstream produces a 502 and a log line without the client's
+  query value.
+- A failing shadow mirror logs no query value.
 - A compliance event for `/chat?api_key=secret` carries the masked URL.
 - Redact rule matching inside the `usage` object still yields correct token
   accounting.
