@@ -14177,18 +14177,16 @@ func TestServer_ShadowTraffic_ClientResponseUnaffectedByAnUnreachableShadowTarge
 		t.Fatalf("status=%d body=%q, want 200 %q (an unreachable shadow target must never affect the real response)", resp.StatusCode, body, "real response")
 	}
 
+	// The counter is bumped before the log line is written, so wait for both.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if snap := srv.Stats.Snapshot(); snap.ShadowError == 1 {
+		if snap := srv.Stats.Snapshot(); snap.ShadowError == 1 && strings.Contains(logBuf.String(), "[SHADOW ERROR]") {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("Stats.ShadowError never reached 1; snapshot = %+v", srv.Stats.Snapshot())
+			t.Fatalf("Stats.ShadowError=%d, log=%q; want 1 and a [SHADOW ERROR] line", srv.Stats.Snapshot().ShadowError, logBuf.String())
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	if !strings.Contains(logBuf.String(), "[SHADOW ERROR]") {
-		t.Fatalf("log missing [SHADOW ERROR] line: %q", logBuf.String())
 	}
 }
 

@@ -111,3 +111,19 @@ func TestReview_QueryCredentialsMustNotEnterLogs(t *testing.T) {
 		t.Fatalf("query credential logged verbatim: %q", buf.String())
 	}
 }
+
+func TestReview_BlockedResponseMustStillAccountForUsage(t *testing.T) {
+	s := reviewServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"answer":"SECRET_A","usage":{"total_tokens":123}}`)
+	})
+	s.Engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "fake-secret", Pattern: regexp.MustCompile("SECRET_A"), Action: rules.Block})
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest("POST", "/chat", strings.NewReader(`{"prompt":"hello"}`)))
+	if rec.Code != 403 {
+		t.Fatalf("expected blocked response, got %d", rec.Code)
+	}
+	if n := s.Stats.Snapshot().TotalTokens; n != 123 {
+		t.Fatalf("upstream used 123 tokens, but blocked response recorded %d", n)
+	}
+}

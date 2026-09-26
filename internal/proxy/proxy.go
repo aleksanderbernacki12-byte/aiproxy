@@ -3837,6 +3837,9 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	rawResponseBody := append([]byte(nil), body...)
 	rawResponseHeader := resp.Header.Clone()
 	rawResponseStatus := resp.StatusCode
+	// Upstream spend happened whether or not the client gets this body,
+	// and a redaction must not be able to hide the usage object.
+	s.logUsageFromBody(reqCtx, rawResponseBody)
 
 	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, reqCtx.targetLabel, reqCtx.clientLabel)
 	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url, reqCtx.requestID)
@@ -3901,7 +3904,6 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 		}
 	}
 
-	s.logUsageFromBody(reqCtx, body)
 	if reqCtx.complianceEventID != "" {
 		resp.Body = newComplianceReadCloser(resp.Body, func() {
 			s.completeCompliance(reqCtx, rawResponseStatus, rawResponseHeader, rawResponseBody, true, responsePolicyRedacted, false)
@@ -3976,7 +3978,7 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 				coalescer.Store(reqCtx.cacheKey, &coalesce.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
 			}
 		}
-		s.logUsageFromBody(reqCtx, data)
+		s.recordUsage(reqCtx, tee.usage.total())
 		s.completeCompliance(reqCtx, statusCode, rawResponseHeader, rawData, cleanEOF, responsePolicyRedacted, responsePolicyBlocked)
 	}
 	resp.Body = tee
@@ -4046,6 +4048,10 @@ type streamTee struct {
 	buf        bytes.Buffer // full accumulated (post-scan) data, for onComplete
 	raw        bytes.Buffer // full original upstream data, for compliance capture
 	captureRaw bool
+
+	// usage is fed every raw batch, including a blocked one, so withheld
+	// output still counts toward limits and budgets.
+	usage usageTally
 
 	blocked bool
 
@@ -4132,6 +4138,7 @@ func (t *streamTee) scan(batch []byte) {
 	if t.blocked {
 		return
 	}
+	t.usage.addSSE(batch)
 	if t.engine == nil {
 		t.out.Write(batch)
 		t.buf.Write(batch)
@@ -4185,11 +4192,21 @@ func extractTotalTokens(body []byte) int {
 	if tokens, ok := tryUnmarshalUsage(body); ok {
 		return tokens
 	}
+	var tally usageTally
+	tally.addSSE(body)
+	return tally.total()
+}
 
-	var bestTotal, input, output int
-	sawTotal, sawInput, sawOutput := false, false, false
+// usageTally accumulates SSE usage counts batch by batch, so a stream's
+// usage can be tracked from every raw batch (including one a Block rule
+// withholds) without keeping the whole stream in memory.
+type usageTally struct {
+	bestTotal, input, output      int
+	sawTotal, sawInput, sawOutput bool
+}
 
-	for _, line := range bytes.Split(body, []byte("\n")) {
+func (u *usageTally) addSSE(data []byte) {
+	for _, line := range bytes.Split(data, []byte("\n")) {
 		payload, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
 		if !ok {
 			continue
@@ -4204,29 +4221,31 @@ func extractTotalTokens(body []byte) int {
 			continue
 		}
 		if chunk.Usage.TotalTokens > 0 {
-			bestTotal, sawTotal = chunk.Usage.TotalTokens, true
+			u.bestTotal, u.sawTotal = chunk.Usage.TotalTokens, true
 		}
 		if chunk.Usage.InputTokens > 0 {
-			input, sawInput = chunk.Usage.InputTokens, true
+			u.input, u.sawInput = chunk.Usage.InputTokens, true
 		}
 		if chunk.Usage.OutputTokens > 0 {
-			output, sawOutput = chunk.Usage.OutputTokens, true
+			u.output, u.sawOutput = chunk.Usage.OutputTokens, true
 		}
 		if chunk.Message != nil {
 			if chunk.Message.Usage.InputTokens > 0 {
-				input, sawInput = chunk.Message.Usage.InputTokens, true
+				u.input, u.sawInput = chunk.Message.Usage.InputTokens, true
 			}
 			if chunk.Message.Usage.OutputTokens > 0 {
-				output, sawOutput = chunk.Message.Usage.OutputTokens, true
+				u.output, u.sawOutput = chunk.Message.Usage.OutputTokens, true
 			}
 		}
 	}
+}
 
-	if sawTotal {
-		return bestTotal
+func (u *usageTally) total() int {
+	if u.sawTotal {
+		return u.bestTotal
 	}
-	if sawInput || sawOutput {
-		return input + output
+	if u.sawInput || u.sawOutput {
+		return u.input + u.output
 	}
 	return 0
 }
@@ -4240,7 +4259,11 @@ func tryUnmarshalUsage(data []byte) (int, bool) {
 }
 
 func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
-	if tokens := extractTotalTokens(body); tokens > 0 {
+	s.recordUsage(reqCtx, extractTotalTokens(body))
+}
+
+func (s *Server) recordUsage(reqCtx requestContextInfo, tokens int) {
+	if tokens > 0 {
 		// Records this request's actual cost against whatever token
 		// breaker applied to it — see effectiveTokenLimiter in ServeHTTP
 		// and limiter.TokenLimiter.Allow's own doc comment for why this

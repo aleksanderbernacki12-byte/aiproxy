@@ -126,11 +126,15 @@ in the redact/allow path. It runs exactly once per response. A redaction rule
 that happens to match inside the `usage` object can therefore no longer hide
 consumption either.
 
-**Streams (`streamTee.onComplete`).** `logUsageFromBody` receives `rawData`
-(everything read from upstream) instead of `data` (what was delivered). A
-stream cut short by a Block rule is accounted for with whatever usage the
-upstream had sent before the cut. If none had arrived, nothing is recorded,
-which is the current behavior and is documented as a known limitation.
+**Streams (`streamTee`).** The tee's raw bytes are only kept when compliance
+capture is on, and keeping every stream in memory would conflict with review
+#12. Instead the SSE usage logic in `extractTotalTokens` is extracted into a
+`usageTally` that `streamTee.scan` feeds with every raw batch *before*
+redaction or blocking, including the batch a Block rule withholds.
+`onComplete` records `tee.usage.total()`. A stream cut short by a Block rule
+is therefore accounted for with every usage event the upstream sent up to and
+including the blocked batch, at no extra memory cost. If none had arrived,
+nothing is recorded (unchanged, documented limitation).
 
 Stats counters are unchanged: tokens the upstream consumed count toward the
 same `tokens_used` totals, limiters and budgets whether delivered or not.
@@ -156,7 +160,8 @@ same `tokens_used` totals, limiters and budgets whether delivered or not.
 - A compliance event for `/chat?api_key=secret` carries the masked URL.
 - Redact rule matching inside the `usage` object still yields correct token
   accounting.
-- Streaming: a stream blocked after its usage event is accounted for.
+- Streaming: a stream blocked on the very event that carries usage still
+  accounts for it (the delivered-only data would miss it).
 - `go test ./... -race` and `go vet ./...` pass.
 
 ## Behavior changes (for release notes)
