@@ -2341,6 +2341,10 @@ func TestServer_StreamingResponse_DeliversChunksProgressively(t *testing.T) {
 	}
 
 	engine := rules.NewEngine(rules.Allow)
+	// This checks the transport path never buffers; the scanning
+	// hold-back window (which delays release by design) is covered in
+	// sse_internal_test.go.
+	engine.StreamHoldbackBytes = 0
 	srv := proxy.New("unused", targetURL, engine)
 
 	frontend := httptest.NewServer(srv)
@@ -2730,15 +2734,17 @@ func TestServer_ResponseSecretScanning_BlocksStreamOnSecretAndNeverCaches(t *tes
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
-	// The connection is expected to end abnormally right after the first
-	// chunk, the same way a genuinely aborted upstream would; capturing
-	// and ignoring that error is the point of this test — what matters is
-	// how much (and which) of the body was received before it happened.
+	// The connection is expected to end abnormally, the same way a
+	// genuinely aborted upstream would; capturing and ignoring that error
+	// is the point of this test — what matters is how much (and which) of
+	// the body was received before it happened. The first chunk is still
+	// inside the scanning hold-back window when the secret arrives, so it
+	// is dropped together with the blocked event rather than delivered.
 	gotBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	if string(gotBody) != firstChunk {
-		t.Fatalf("client received %q, want exactly the pre-block chunk %q and nothing else", gotBody, firstChunk)
+	if len(gotBody) != 0 {
+		t.Fatalf("client received %q, want nothing: the pre-block chunk was still held back", gotBody)
 	}
 	if strings.Contains(string(gotBody), secret) {
 		t.Fatalf("client received the raw secret: %q", gotBody)

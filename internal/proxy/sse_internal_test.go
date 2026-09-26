@@ -2,7 +2,11 @@ package proxy
 
 import (
 	"io"
+	"regexp"
+	"strings"
 	"testing"
+
+	"aiproxy/internal/rules"
 )
 
 type reviewChunks struct {
@@ -70,5 +74,114 @@ func TestStreamTee_CRLFSplitAcrossReadsIsOneBoundary(t *testing.T) {
 	}
 	if string(out) != "data: a\r\n\r\ndata: b\r\n\r\n" {
 		t.Fatalf("stream bytes changed: %q", out)
+	}
+}
+
+func holdbackEngine(holdback int, action rules.Action) *rules.Engine {
+	engine := rules.NewEngine(rules.Allow)
+	engine.StreamHoldbackBytes = holdback
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "fake-secret", Pattern: regexp.MustCompile("SECRET_A"), Action: action})
+	return engine
+}
+
+func TestReview_StreamMustScanReassembledText(t *testing.T) {
+	e := rules.NewEngine(rules.Allow)
+	e.AddBodyRegexRule(rules.BodyRegexRule{Name: "fake-secret", Pattern: regexp.MustCompile("SECRET_A"), Action: rules.Block})
+	src := &reviewChunks{chunks: []string{"data: {\"delta\":\"SECRET_\"}\n\n", "data: {\"delta\":\"A\"}\n\n"}}
+	tee := &streamTee{src: src, engine: e}
+	b, _ := io.ReadAll(tee)
+	tee.Close()
+	if !tee.blocked && strings.Contains(string(b), "SECRET_") && strings.Contains(string(b), `"A"`) {
+		t.Fatalf("client can assemble SECRET_A from unchecked deltas: %s", b)
+	}
+}
+
+func TestStreamTee_SplitSecretBlockedBeforeAnyPartIsDelivered(t *testing.T) {
+	streams := map[string][]string{
+		"openai chat": {
+			"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"key SECRET_\"}}]}\n\n",
+			"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"A done\"}}]}\n\n",
+			"data: [DONE]\n\n",
+		},
+		"anthropic": {
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"SECR\"}}\n\n",
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ET_A\"}}\n\n",
+		},
+	}
+	for name, chunks := range streams {
+		t.Run(name, func(t *testing.T) {
+			var blockedBy string
+			tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(64, rules.Block), onBlock: func(rule string) { blockedBy = rule }}
+			delivered, err := io.ReadAll(tee)
+			if err == nil || blockedBy != "fake-secret" {
+				t.Fatalf("stream not blocked: err=%v blockedBy=%q", err, blockedBy)
+			}
+			if len(delivered) != 0 {
+				t.Fatalf("client received part of the secret before the block: %q", delivered)
+			}
+		})
+	}
+}
+
+func TestStreamTee_RedactRuleSpanningEventsEndsStream(t *testing.T) {
+	chunks := []string{"data: {\"delta\":\"SECRET_\"}\n\n", "data: {\"delta\":\"A\"}\n\n"}
+	var blockedBy string
+	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(64, rules.Redact), onBlock: func(rule string) { blockedBy = rule }}
+	delivered, _ := io.ReadAll(tee)
+	if blockedBy != "fake-secret" || len(delivered) != 0 {
+		t.Fatalf("blockedBy=%q delivered=%q, want the stream ended with nothing delivered", blockedBy, delivered)
+	}
+}
+
+func TestStreamTee_HoldbackZeroReleasesEachEventImmediately(t *testing.T) {
+	chunks := []string{"data: {\"delta\":\"SECRET_\"}\n\n", "data: {\"delta\":\"A\"}\n\n"}
+	src := &reviewChunks{chunks: chunks}
+	tee := &streamTee{src: src, engine: holdbackEngine(0, rules.Block)}
+	var p [4096]byte
+	n, err := tee.Read(p[:])
+	if err != nil || string(p[:n]) != chunks[0] || src.reads != 1 {
+		t.Fatalf("first Read = %q, %v after %d upstream reads; want the first event immediately", p[:n], err, src.reads)
+	}
+}
+
+func TestStreamTee_ShortStreamIsDeliveredCompleteAtEOF(t *testing.T) {
+	chunks := []string{"data: {\"delta\":\"hello \"}\n\n", "data: {\"delta\":\"world\"}\n\n", "data: [DONE]\n\n"}
+	var completed []byte
+	var clean bool
+	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(256, rules.Block)}
+	tee.onComplete = func(data, _ []byte, cleanEOF bool) { completed, clean = append([]byte(nil), data...), cleanEOF }
+	delivered, err := io.ReadAll(tee)
+	tee.Close()
+	want := strings.Join(chunks, "")
+	if err != nil || string(delivered) != want || string(completed) != want || !clean {
+		t.Fatalf("delivered=%q err=%v completed=%q clean=%v", delivered, err, completed, clean)
+	}
+}
+
+func TestStreamTee_BlockInFinalEventIsNotACleanEOF(t *testing.T) {
+	chunks := []string{"data: {\"delta\":\"ok\"}\n\n", "data: {\"delta\":\"SECRET_A\"}"}
+	var clean = true
+	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(0, rules.Block)}
+	tee.onComplete = func(_, _ []byte, cleanEOF bool) { clean = cleanEOF }
+	io.ReadAll(tee)
+	tee.Close()
+	if clean {
+		t.Fatal("a stream blocked in its final event was reported as a clean EOF (it could be cached)")
+	}
+}
+
+func TestEventText(t *testing.T) {
+	cases := map[string]string{
+		"data: {\"id\":\"x1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n":                  "Hi",
+		"event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"Yo\"}}\n\n":               "Yo",
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hey\"}\r\n\r\n":                                 "Hey",
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"G\"}]}}]}\n\n":                                 "G",
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"k\\\":1}\"}}]}}]}\n\n": "{\"k\":1}",
+		"data: [DONE]\n\n": "",
+	}
+	for event, want := range cases {
+		if got := eventText([]byte(event)); got != want {
+			t.Errorf("eventText(%q) = %q, want %q", event, got, want)
+		}
 	}
 }

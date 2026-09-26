@@ -4133,6 +4133,14 @@ type streamTee struct {
 	// output still counts toward limits and budgets.
 	usage usageTally
 
+	// held are scanned events not yet released to the client, kept until
+	// engine.StreamHoldbackBytes of later generated text has arrived, so
+	// a secret split across events is checked whole (review finding #5).
+	// releasedTail is the end of the text already released, so a match
+	// that starts there and ends in a held event is still found.
+	held         []heldEvent
+	releasedTail string
+
 	blocked bool
 
 	onRedact   func(ruleName string)
@@ -4165,10 +4173,18 @@ func (t *streamTee) Read(p []byte) (int, error) {
 		}
 		if err != nil {
 			if err == io.EOF {
-				t.cleanEOF = true
 				t.processRemainder()
+				// A block in the final event is not a clean end: the
+				// stream must not be cached or replayed as complete.
+				t.cleanEOF = !t.blocked
+			}
+			if !t.blocked {
+				t.release(true)
 			}
 			if t.out.Len() == 0 {
+				if t.blocked {
+					return 0, errResponseBlocked
+				}
 				return 0, err
 			}
 			break
@@ -4231,19 +4247,76 @@ func (t *streamTee) scan(batch []byte) {
 	}
 	switch action {
 	case rules.Block:
-		t.blocked = true
-		if t.onBlock != nil {
-			t.onBlock(ruleName)
-		}
+		t.block(ruleName)
+		return
 	case rules.Redact:
-		t.out.Write(scanned)
-		t.buf.Write(scanned)
+		batch = scanned
 		if t.onRedact != nil {
 			t.onRedact(ruleName)
 		}
-	default:
-		t.out.Write(batch)
-		t.buf.Write(batch)
+	}
+
+	for _, event := range splitEvents(batch) {
+		// Copied: batch aliases t.pending, which the next Read reuses.
+		t.held = append(t.held, heldEvent{data: append([]byte(nil), event...), text: eventText(event)})
+	}
+	if ruleName, matched := t.engine.FirstTextMatch(t.releasedTail+t.heldText(), t.target, t.key); matched {
+		t.block(ruleName)
+		return
+	}
+	t.release(false)
+}
+
+// heldEvent is one scanned SSE event waiting for release, with the
+// generated text it carries (see eventText).
+type heldEvent struct {
+	data []byte
+	text string
+}
+
+func (t *streamTee) heldText() string {
+	var text strings.Builder
+	for _, event := range t.held {
+		text.WriteString(event.text)
+	}
+	return text.String()
+}
+
+// release hands held events to the client, oldest first, while at least
+// StreamHoldbackBytes of generated text follows each one; final releases
+// everything (the stream has ended, so no later text can complete a
+// match).
+func (t *streamTee) release(final bool) {
+	holdback := 0
+	if t.engine != nil {
+		holdback = t.engine.StreamHoldbackBytes
+	}
+	remaining := 0
+	for _, event := range t.held {
+		remaining += len(event.text)
+	}
+	for len(t.held) > 0 {
+		event := t.held[0]
+		if !final && remaining-len(event.text) < holdback {
+			return
+		}
+		t.held = t.held[1:]
+		remaining -= len(event.text)
+		t.out.Write(event.data)
+		t.buf.Write(event.data)
+		t.releasedTail += event.text
+		if len(t.releasedTail) > holdback {
+			t.releasedTail = t.releasedTail[len(t.releasedTail)-holdback:]
+		}
+	}
+}
+
+// block ends the stream: held events are dropped, never delivered.
+func (t *streamTee) block(ruleName string) {
+	t.blocked = true
+	t.held = nil
+	if t.onBlock != nil {
+		t.onBlock(ruleName)
 	}
 }
 

@@ -198,13 +198,46 @@ type Request struct {
 type Engine struct {
 	Default Action
 
+	// StreamHoldbackBytes is how many bytes of generated text a streamed
+	// response keeps back from the client, so a secret split across SSE
+	// events is seen whole before any part of it is released (review
+	// finding #5). 0 releases every event as soon as it is scanned.
+	StreamHoldbackBytes int
+
 	rules     []Rule
 	bodyRules []BodyRegexRule
 }
 
 // NewEngine creates an empty engine with the given default action.
 func NewEngine(defaultAction Action) *Engine {
-	return &Engine{Default: defaultAction}
+	return &Engine{Default: defaultAction, StreamHoldbackBytes: DefaultStreamHoldbackBytes}
+}
+
+// DefaultStreamHoldbackBytes covers the length of common API keys and
+// tokens while delaying a stream by only a few dozen generated tokens.
+const DefaultStreamHoldbackBytes = 256
+
+// FirstTextMatch reports the first enforced, in-scope body regex rule
+// that matches text, preferring a Block rule. It is for text reassembled
+// across streamed events, where any match (Block or Redact) must end the
+// stream: the matched text spans events or was only visible decoded, so
+// it cannot be redacted in place. A nil engine never matches.
+func (e *Engine) FirstTextMatch(text, target, key string) (ruleName string, matched bool) {
+	if e == nil {
+		return "", false
+	}
+	for _, r := range e.bodyRules {
+		if r.DryRun || !inScope(r.Targets, r.Keys, target, key) || !r.Pattern.MatchString(text) {
+			continue
+		}
+		if r.Action == Block {
+			return r.Name, true
+		}
+		if !matched {
+			ruleName, matched = r.Name, true
+		}
+	}
+	return ruleName, matched
 }
 
 // AddRule appends a path rule to the end of the evaluation order.
