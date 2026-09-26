@@ -9,6 +9,7 @@ package proxy_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -172,5 +173,25 @@ func TestReview_FailoverMustNotAssumeTransportErrorMeansUnprocessed(t *testing.T
 	s.ServeHTTP(rec, httptest.NewRequest("POST", "/route/execute", strings.NewReader(`{"operation":"test"}`)))
 	if executions.Load() > 1 {
 		t.Fatalf("one POST executed by %d upstreams after connection closed post-processing, status=%d", executions.Load(), rec.Code)
+	}
+}
+
+func TestReview_JSONEscapingMustNotBypassSecretRule(t *testing.T) {
+	var received string
+	s := reviewServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		received = body["prompt"]
+		fmt.Fprint(w, "ok")
+	})
+	s.Engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "fake-secret", Pattern: regexp.MustCompile("SECRET_A"), Action: rules.Block})
+	req := httptest.NewRequest("POST", "/chat", strings.NewReader(`{"prompt":"SECRET_\u0041"}`))
+	req.Header.Set("Content-Type", "application/json")
+	got := httptest.NewRecorder()
+	s.ServeHTTP(got, req)
+	if got.Code != 403 {
+		t.Fatalf("encoded secret passed rule: status=%d upstream decoded=%q", got.Code, received)
 	}
 }

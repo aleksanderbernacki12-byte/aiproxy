@@ -323,10 +323,11 @@ func (e *Engine) EvaluateResponse(body []byte, target, key string) (Action, stri
 // a redaction returns copies.
 func (e *Engine) evaluateContent(body []byte, headers map[string][]string, target, key string) (action Action, ruleName string, resultBody []byte, resultHeaders map[string][]string, dryRunHits []DryRunMatch, matched bool) {
 	resultBody, resultHeaders = body, headers
+	decoded, isJSON := decodedJSONStrings(body)
 	var blockName, redactName string
 	var redactRules []BodyRegexRule
 	for _, r := range e.bodyRules {
-		if !inScope(r.Targets, r.Keys, target, key) || !r.matchesContent(body, headers) {
+		if !inScope(r.Targets, r.Keys, target, key) || !(r.matchesContent(body, headers) || r.matchesAny(decoded)) {
 			continue
 		}
 		if r.DryRun {
@@ -355,7 +356,30 @@ func (e *Engine) evaluateContent(body []byte, headers map[string][]string, targe
 		resultBody = r.Pattern.ReplaceAll(resultBody, []byte("[REDACTED:"+r.Name+"]"))
 		resultHeaders = r.redactHeaders(resultHeaders)
 	}
+	if isJSON {
+		// A match only visible after unescaping is redacted inside the
+		// decoded string and the body re-encoded; a raw redaction that
+		// broke the JSON leaves the raw result in place.
+		rewritten, changed, err := rewriteJSONStrings(resultBody, func(value string) string {
+			for _, r := range redactRules {
+				value = r.Pattern.ReplaceAllString(value, "[REDACTED:"+r.Name+"]")
+			}
+			return value
+		})
+		if err == nil && changed {
+			resultBody = rewritten
+		}
+	}
 	return Redact, redactName, resultBody, resultHeaders, dryRunHits, true
+}
+
+func (r BodyRegexRule) matchesAny(values []string) bool {
+	for _, value := range values {
+		if r.Pattern.MatchString(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r BodyRegexRule) matchesContent(body []byte, headers map[string][]string) bool {
