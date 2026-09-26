@@ -65,11 +65,25 @@ The value that matched a rule is never written to the log — only the
 rule's name.
 
 Streaming responses (`Content-Type: text/event-stream`, the format LLM
-chat APIs use when `stream: true`) are relayed to the client chunk by
-chunk as they arrive, not buffered until the response finishes — usage
-extraction and caching still run once the stream completes, from an
-accumulated copy, without adding any delay to the streaming itself. A
-stream cut short by a dropped connection is never cached.
+chat APIs use when `stream: true`) are relayed to the client event by
+event, not buffered until the response finishes. To catch a secret that
+the model spreads across several events, aiproxy holds back the most
+recent 256 bytes of generated text and checks the text reassembled
+across events before releasing it. The stream therefore trails the
+upstream by that much text. A match ends the stream before any part of
+the secret reaches the client. Set `stream_scan_holdback_bytes` to
+change the window, or to `0` to release every event as soon as it has
+been scanned on its own. A secret longer than the window, split across
+events, can have its first part released before the rest arrives.
+Usage extraction and caching still run once the stream completes. A
+stream cut short by a dropped connection or a rule is never cached.
+
+Responses are always scanned decompressed: aiproxy does not pass the
+client's `Accept-Encoding` upstream, lets its own HTTP client negotiate
+and decompress gzip, and sends the client an uncompressed body. A gzip
+request body (`Content-Encoding: gzip`) is decompressed, scanned and
+forwarded uncompressed; any other request encoding is rejected with
+`415 unsupported_content_encoding`, because it cannot be scanned.
 
 Stopping the proxy (Ctrl+C) prints a session summary: how many requests
 were allowed, blocked, rate-limited, served from cache, and the total
@@ -545,6 +559,15 @@ to catch a *leaked* key would block all normal traffic, since a real
 credential is deliberately shaped exactly like what those patterns
 detect. A `redact` rule matched in a header masks only that header's
 value, the same way it masks a match in the body.
+
+Every enabled rule is evaluated, not just the first one that matches:
+if one rule redacts and another blocks, the request or response is
+blocked, and when only redaction rules match, all of them are applied.
+Logs and stats name the first matching blocking rule (or, if nothing
+blocks, the first redacting rule). JSON bodies are also checked after
+decoding every string, so a secret hidden behind JSON escapes
+(`\u0041` for `A`) is caught; a redaction found only in decoded text
+rewrites that JSON string and keeps the rest of the body intact.
 
 ## Built-in prompt-injection patterns
 
