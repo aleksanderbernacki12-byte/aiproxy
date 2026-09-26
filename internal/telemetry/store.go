@@ -98,7 +98,9 @@ func openStore(filename string, maxBytes int64) (*sql.DB, error) {
 	}
 	_ = db.Close()
 	pragmas := url.Values{}
-	for _, pragma := range []string{"busy_timeout(5000)", "journal_mode(DELETE)", "synchronous(FULL)", "foreign_keys(ON)", fmt.Sprintf("max_page_count(%d)", maxBytes/pageSize)} {
+	// TRUNCATE instead of DELETE: Windows antivirus/indexers can hold the
+	// journal open and fail its deletion with SQLITE_IOERR_DELETE, losing the event.
+	for _, pragma := range []string{"busy_timeout(5000)", "journal_mode(TRUNCATE)", "synchronous(FULL)", "foreign_keys(ON)", fmt.Sprintf("max_page_count(%d)", maxBytes/pageSize)} {
 		pragmas.Add("_pragma", pragma)
 	}
 	location.RawQuery = pragmas.Encode()

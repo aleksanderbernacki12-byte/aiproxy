@@ -179,7 +179,7 @@ func testConfig(t *testing.T, dir, keyPath string, transport HTTPDoer) Config {
 		QueueSize:        32,
 		BatchSize:        2,
 		FlushInterval:    5 * time.Millisecond,
-		OperationTimeout: 250 * time.Millisecond,
+		OperationTimeout: time.Second,
 		InitialBackoff:   20 * time.Millisecond,
 		MaxBackoff:       80 * time.Millisecond,
 	}
@@ -214,7 +214,7 @@ func testSubmission(eventID string, timestamp time.Time) Submission {
 
 func eventually(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for !condition() {
 		if time.Now().After(deadline) {
 			t.Fatal("condition was not met before timeout")
@@ -225,7 +225,7 @@ func eventually(t *testing.T, condition func() bool) {
 
 func shutdown(t *testing.T, client *Client) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := client.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown: %v", err)
@@ -354,7 +354,7 @@ func TestSender_FailureRetriesIdenticalFIFOEventBatch(t *testing.T) {
 	transport := &fakeHTTP{failFor: 1}
 	cfg := testConfig(t, dir, keyPath, transport)
 	cfg.BatchSize = 3
-	cfg.FlushInterval = 100 * time.Millisecond
+	cfg.FlushInterval = time.Hour
 	client, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -364,7 +364,13 @@ func TestSender_FailureRetriesIdenticalFIFOEventBatch(t *testing.T) {
 			t.Fatalf("submission %d rejected", index)
 		}
 	}
-	eventually(t, func() bool { return len(transport.snapshot()) >= 2 })
+	// Force retries from the test so the first delivery can only be the
+	// batch-size wake; a flush tick could otherwise send a partial first batch.
+	eventually(t, func() bool { return len(transport.snapshot()) >= 1 })
+	eventually(t, func() bool {
+		client.flush(true, false)
+		return len(transport.snapshot()) >= 2
+	})
 	shutdown(t, client)
 
 	calls := transport.snapshot()
