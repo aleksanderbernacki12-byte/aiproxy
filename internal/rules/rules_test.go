@@ -893,3 +893,27 @@ func TestEngine_EvaluateResponse_TargetScoping_OnlyMatchesConfiguredTarget(t *te
 		t.Fatalf("action for non-scoped target = %v, want %v", action, rules.Allow)
 	}
 }
+
+func TestEngine_MaskSecrets_MasksEveryBodyRuleRegardlessOfActionScopeOrDryRun(t *testing.T) {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "blocker", Pattern: regexp.MustCompile(`BLOCK_[0-9]+`), Action: rules.Block})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "redactor", Pattern: regexp.MustCompile(`REDACT_[0-9]+`), Action: rules.Redact})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "dry", Pattern: regexp.MustCompile(`DRY_[0-9]+`), Action: rules.Block, DryRun: true})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "scoped", Pattern: regexp.MustCompile(`SCOPED_[0-9]+`), Action: rules.Block, Targets: []string{"elsewhere"}})
+
+	got := engine.MaskSecrets("/v1/BLOCK_1/REDACT_2/DRY_3/SCOPED_4/plain")
+	want := "/v1/[REDACTED:blocker]/[REDACTED:redactor]/[REDACTED:dry]/[REDACTED:scoped]/plain"
+	if got != want {
+		t.Fatalf("MaskSecrets = %q, want %q", got, want)
+	}
+}
+
+func TestEngine_MaskSecrets_NoRulesAndNilEngineReturnInputUnchanged(t *testing.T) {
+	if got := rules.NewEngine(rules.Allow).MaskSecrets("/v1/chat"); got != "/v1/chat" {
+		t.Fatalf("empty engine changed input: %q", got)
+	}
+	var engine *rules.Engine
+	if got := engine.MaskSecrets("/v1/chat"); got != "/v1/chat" {
+		t.Fatalf("nil engine changed input: %q", got)
+	}
+}

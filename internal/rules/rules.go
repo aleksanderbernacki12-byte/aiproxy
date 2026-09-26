@@ -229,6 +229,24 @@ func (e *Engine) BodyRegexRules() []BodyRegexRule {
 	return append([]BodyRegexRule(nil), e.bodyRules...)
 }
 
+// MaskSecrets replaces every match of every body regex rule in s with
+// "[REDACTED:<rule name>]", regardless of the rule's action, dry-run flag,
+// or target/client scoping. It is for log output only and never affects
+// policy decisions: a log line must not carry a secret just because the
+// rule that recognizes it is scoped elsewhere or only in dry-run.
+func (e *Engine) MaskSecrets(s string) string {
+	if e == nil {
+		return s
+	}
+	for _, rule := range e.bodyRules {
+		if rule.Pattern == nil {
+			continue
+		}
+		s = rule.Pattern.ReplaceAllLiteralString(s, "[REDACTED:"+rule.Name+"]")
+	}
+	return s
+}
+
 // Evaluate returns the action for req, the name of the rule that
 // produced it (empty when the default action applied), the body the
 // caller should actually use going forward, the headers it should
