@@ -737,6 +737,13 @@ type Config struct {
 	// inspected must never expose an actually-unbounded size by default.
 	MaxBodyBytes int64 `json:"max_body_size_bytes,omitempty"`
 
+	// StreamScanHoldbackBytes is how many bytes of generated text a
+	// streamed response holds back from the client so a secret split
+	// across SSE events is checked whole before any part is released.
+	// Absent means rules.DefaultStreamHoldbackBytes; 0 disables hold-back
+	// (each event is released once scanned on its own).
+	StreamScanHoldbackBytes *int `json:"stream_scan_holdback_bytes,omitempty"`
+
 	// WebhookURL, if set, is an http or https endpoint aiproxy POSTs a
 	// JSON alert to every time a rule blocks or redacts a request, or the
 	// rate limiter rejects one — a Slack incoming webhook URL, or any

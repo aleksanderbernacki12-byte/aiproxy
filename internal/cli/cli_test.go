@@ -3847,3 +3847,21 @@ func TestExecute_Validate_AdminKeyConfigured_NoWarning(t *testing.T) {
 		t.Fatalf("expected no warning with admin_api_key configured, got: %q", stdout.String())
 	}
 }
+
+func TestExecute_Validate_NegativeStreamScanHoldbackBytes_ReportsProblem(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aiproxy.json")
+	if err := os.WriteFile(path, []byte(`{"stream_scan_holdback_bytes": -1}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute([]string{"validate", "-config", path}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "stream_scan_holdback_bytes") || !strings.Contains(stderr.String(), "must not be negative") {
+		t.Errorf("stderr missing the negative stream_scan_holdback_bytes problem: %q", stderr.String())
+	}
+}

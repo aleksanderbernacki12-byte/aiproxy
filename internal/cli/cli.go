@@ -1373,6 +1373,9 @@ func resolveBuiltinRuleActions(overrides map[string]string) (actions map[string]
 // case only the built-ins apply, all blocking.
 func buildEngine(cfg *config.Config) (*rules.Engine, []error) {
 	engine := rules.NewEngine(rules.Allow)
+	if cfg != nil && cfg.StreamScanHoldbackBytes != nil && *cfg.StreamScanHoldbackBytes >= 0 {
+		engine.StreamHoldbackBytes = *cfg.StreamScanHoldbackBytes
+	}
 
 	var overrides map[string]string
 	if cfg != nil {
@@ -1623,6 +1626,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	}
 	if cfg.MaxBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
+	}
+	if cfg.StreamScanHoldbackBytes != nil && *cfg.StreamScanHoldbackBytes < 0 {
+		problems = append(problems, fmt.Sprintf("stream_scan_holdback_bytes: %d must not be negative", *cfg.StreamScanHoldbackBytes))
 	}
 	if cfg.CacheTTLSeconds < 0 {
 		problems = append(problems, fmt.Sprintf("cache_ttl_seconds: %d must not be negative", cfg.CacheTTLSeconds))

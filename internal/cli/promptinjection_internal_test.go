@@ -12,6 +12,7 @@ import (
 
 	"aiproxy/internal/config"
 	"aiproxy/internal/proxy"
+	"aiproxy/internal/rules"
 )
 
 func TestPromptInjectionPatterns_IgnoreInstructions(t *testing.T) {
@@ -293,5 +294,30 @@ func TestPromptInjectionRules_CatchesInjectionInUpstreamResponseToo(t *testing.T
 	}
 	if string(body) != "response blocked by aiproxy rules" {
 		t.Fatalf("blocked response body = %q, want the standard response-block message (no leak of upstream content)", body)
+	}
+}
+
+func TestBuildEngine_StreamScanHoldbackBytes(t *testing.T) {
+	zero, custom := 0, 64
+	cases := []struct {
+		name string
+		cfg  *config.Config
+		want int
+	}{
+		{"no config file", nil, rules.DefaultStreamHoldbackBytes},
+		{"field absent", &config.Config{}, rules.DefaultStreamHoldbackBytes},
+		{"explicit zero disables", &config.Config{StreamScanHoldbackBytes: &zero}, 0},
+		{"custom", &config.Config{StreamScanHoldbackBytes: &custom}, 64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, errs := buildEngine(tc.cfg)
+			if len(errs) > 0 {
+				t.Fatalf("buildEngine errors: %v", errs)
+			}
+			if engine.StreamHoldbackBytes != tc.want {
+				t.Fatalf("StreamHoldbackBytes = %d, want %d", engine.StreamHoldbackBytes, tc.want)
+			}
+		})
 	}
 }
