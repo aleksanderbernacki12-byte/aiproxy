@@ -1008,6 +1008,10 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 			pr.Out.URL.Path = reqCtx.forwardPath
 			pr.Out.URL.RawPath = ""
 			pr.SetURL(target)
+			// Without the client's Accept-Encoding the transport requests
+			// gzip itself and decompresses transparently, so rules, usage,
+			// cache and compliance never see compressed bytes.
+			pr.Out.Header.Del("Accept-Encoding")
 		},
 		ModifyResponse: s.modifyResponse,
 		// Flush every write immediately instead of buffering. Without
@@ -3283,6 +3287,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "bad_request", err.Error(), "")
 		return
 	}
+	body, err = decodeRequestBody(r, body, s.getMaxBodyBytes())
+	if err != nil {
+		switch {
+		case errors.Is(err, errUnsupportedContentEncoding):
+			writeError(w, r, http.StatusUnsupportedMediaType, "unsupported_content_encoding", "request Content-Encoding cannot be scanned; send it uncompressed or gzip", "")
+		case errors.Is(err, errDecodedBodyTooLarge):
+			writeError(w, r, http.StatusRequestEntityTooLarge, "body_too_large", "request body too large", "")
+		default:
+			writeError(w, r, http.StatusBadRequest, "bad_request", "invalid gzip request body", "")
+		}
+		return
+	}
 
 	// Idempotency-Key handling, checked before route resolution or the
 	// cache lookup below — a replay or conflict is resolved purely from
@@ -3408,7 +3424,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
 		resolvedDestination := targets[0].ResolveReference(destURL).String()
 		cacheKey = cache.Key(r.Method, resolvedDestination, partitionIdentity(auth, r), body)
-		if cached, hit, age, err := cch.Get(cacheKey, ttl); err == nil && hit {
+		if cached, hit, age, err := cch.Get(cacheKey, ttl); err == nil && hit && identityEncoded(cached.Header) {
 			defer cached.Body.Close()
 			cachedBody, readErr := io.ReadAll(cached.Body)
 			if readErr != nil {
@@ -3467,7 +3483,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				semanticTargetPartitionForReqCtx = semanticPartitionTarget(targetLabel, resolvedDestination, auth, r)
 				if idx := s.getSemanticIndex(); idx != nil {
 					if candidateKey, similarity, found := idx.FindBest(semanticTargetPartitionForReqCtx, semanticFingerprintForReqCtx, semanticRemainderHashForReqCtx, threshold); found {
-						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit {
+						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit && identityEncoded(cached.Header) {
 							defer cached.Body.Close()
 							cachedBody, readErr := io.ReadAll(cached.Body)
 							if readErr != nil {
