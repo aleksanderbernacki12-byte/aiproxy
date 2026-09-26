@@ -8,6 +8,7 @@
 package proxy_test
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -97,5 +98,16 @@ func TestReview_ClientKeyMustNotControlDrain(t *testing.T) {
 	got := partitionCall(s, "POST", "/_aiproxy/drain", "", map[string]string{"Proxy-Authorization": "Bearer client-key"})
 	if got.Code == 200 {
 		t.Fatalf("ordinary proxy client can initiate global drain: %s", got.Body.String())
+	}
+}
+
+func TestReview_QueryCredentialsMustNotEnterLogs(t *testing.T) {
+	s := reviewServer(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
+	var buf bytes.Buffer
+	s.Logger = log.New(&buf, "", 0)
+	req := httptest.NewRequest("GET", "/chat?api_key=FAKE_PRIVATE_VALUE", nil)
+	s.ServeHTTP(httptest.NewRecorder(), req)
+	if strings.Contains(buf.String(), "FAKE_PRIVATE_VALUE") {
+		t.Fatalf("query credential logged verbatim: %q", buf.String())
 	}
 }

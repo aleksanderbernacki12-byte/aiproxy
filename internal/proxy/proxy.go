@@ -3000,8 +3000,8 @@ func (s *Server) checkNetworkAccess(w http.ResponseWriter, r *http.Request, requ
 		// credential check, and should reject a completely unknown
 		// source before it can so much as present a key.
 		s.Stats.RecordIPDenied()
-		s.logIPDenied(r.RemoteAddr, r.Method, r.URL.String(), requestID)
-		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+		s.logIPDenied(r.RemoteAddr, r.Method, s.logSafeURL(r.URL), requestID)
+		s.notifyIPDeniedWebhook(r.RemoteAddr, r.Method, s.logSafeURL(r.URL), requestID)
 		writeError(w, r, http.StatusForbidden, "ip_denied", "access denied", "")
 		return false
 	}
@@ -3012,8 +3012,8 @@ func (s *Server) checkNetworkAccess(w http.ResponseWriter, r *http.Request, requ
 		// this nor checkIPAccess is an exemption from the other, see
 		// CountryAllowList's doc comment.
 		s.Stats.RecordCountryDenied()
-		s.logCountryDenied(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
-		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, r.URL.String(), requestID)
+		s.logCountryDenied(r.RemoteAddr, country, r.Method, s.logSafeURL(r.URL), requestID)
+		s.notifyCountryDeniedWebhook(r.RemoteAddr, country, r.Method, s.logSafeURL(r.URL), requestID)
 		writeError(w, r, http.StatusForbidden, "country_denied", "access denied", "")
 		return false
 	}
@@ -3033,8 +3033,8 @@ func (s *Server) checkNetworkAccess(w http.ResponseWriter, r *http.Request, requ
 			// there's no way to attribute (or even look up) a per-IP
 			// budget for this caller at all.
 			s.Stats.RecordIPRateLimited()
-			s.logIPRateLimited(r.RemoteAddr, r.Method, r.URL.String(), requestID)
-			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+			s.logIPRateLimited(r.RemoteAddr, r.Method, s.logSafeURL(r.URL), requestID)
+			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, s.logSafeURL(r.URL), requestID)
 			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
 			return false
 		}
@@ -3044,8 +3044,8 @@ func (s *Server) checkNetworkAccess(w http.ResponseWriter, r *http.Request, requ
 		setRateLimitHeaders(w, "Ip", max, remaining, resetIn)
 		if !allowed {
 			s.Stats.RecordIPRateLimited()
-			s.logIPRateLimited(r.RemoteAddr, r.Method, r.URL.String(), requestID)
-			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+			s.logIPRateLimited(r.RemoteAddr, r.Method, s.logSafeURL(r.URL), requestID)
+			s.notifyIPRateLimitedWebhook(r.RemoteAddr, r.Method, s.logSafeURL(r.URL), requestID)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
 			writeError(w, r, http.StatusTooManyRequests, "ip_rate_limited", "rate limit exceeded", "")
 			return false
@@ -3068,8 +3068,8 @@ func (s *Server) checkNetworkAndAuthAccess(w http.ResponseWriter, r *http.Reques
 		// configured, gates the whole proxy, monitoring endpoints
 		// included, not just traffic actually forwarded upstream.
 		s.Stats.RecordUnauthorized()
-		s.logUnauthorized(r.Method, r.URL.String(), requestID)
-		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "", requestID)
+		s.logUnauthorized(r.Method, s.logSafeURL(r.URL), requestID)
+		s.notifyWebhook("unauthorized", r.Method, s.logSafeURL(r.URL), "", requestID)
 		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
 		writeError(w, r, http.StatusProxyAuthRequired, "unauthorized", "proxy authentication required", "")
 		return clientAuth{}, false
@@ -3091,8 +3091,8 @@ func (s *Server) checkNetworkAndAdminAuthAccess(w http.ResponseWriter, r *http.R
 	auth, ok := s.checkAdminAuth(r)
 	if !ok {
 		s.Stats.RecordUnauthorized()
-		s.logUnauthorized(r.Method, r.URL.String(), requestID)
-		s.notifyWebhook("unauthorized", r.Method, r.URL.String(), "", requestID)
+		s.logUnauthorized(r.Method, s.logSafeURL(r.URL), requestID)
+		s.notifyWebhook("unauthorized", r.Method, s.logSafeURL(r.URL), "", requestID)
 		w.Header().Set("Proxy-Authenticate", strings.TrimSpace(proxyAuthScheme))
 		writeError(w, r, http.StatusProxyAuthRequired, "unauthorized", "proxy authentication required", "")
 		return clientAuth{}, false
@@ -3199,7 +3199,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// is entirely unaffected: this only ever stops a NEW request
 		// from starting, see serveDrain's own doc comment.
 		s.Stats.RecordDrainRejected()
-		s.logDrainRejected(r.RemoteAddr, r.Method, r.URL.String(), requestID)
+		s.logDrainRejected(r.RemoteAddr, r.Method, s.logSafeURL(r.URL), requestID)
 		writeError(w, r, http.StatusServiceUnavailable, "draining", "server is draining, try another instance", "")
 		return
 	}
@@ -3259,11 +3259,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(resp.StatusCode)
 				w.Write(servedBody)
 				s.Stats.RecordIdempotencyReplay()
-				s.logIdempotencyReplay(r.Method, r.URL.String(), requestID, idempotencyKey)
+				s.logIdempotencyReplay(r.Method, s.logSafeURL(r.URL), requestID, idempotencyKey)
 				return
 			case idempotency.Conflict:
 				s.Stats.RecordIdempotencyConflict()
-				s.logIdempotencyConflict(r.Method, r.URL.String(), requestID, idempotencyKey)
+				s.logIdempotencyConflict(r.Method, s.logSafeURL(r.URL), requestID, idempotencyKey)
 				writeError(w, r, http.StatusConflict, "idempotency_key_conflict", "idempotency key already used for a request with a different body", "")
 				return
 			case idempotency.Timeout:
@@ -3375,7 +3375,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if stale {
 				s.Stats.RecordStaleCacheHit(targetLabel)
 			}
-			s.logCacheHit(r.Method, r.URL.String(), requestID, age, stale)
+			s.logCacheHit(r.Method, s.logSafeURL(r.URL), requestID, age, stale)
 			return
 		}
 
@@ -3431,7 +3431,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 								idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 							}
 							s.Stats.RecordSemanticCacheHit(targetLabel)
-							s.logSemanticCacheHit(r.Method, r.URL.String(), requestID, similarity)
+							s.logSemanticCacheHit(r.Method, s.logSafeURL(r.URL), requestID, similarity)
 							return
 						}
 					}
@@ -3467,7 +3467,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					idem.Store(auth.label, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: servedBody})
 				}
 				s.Stats.RecordCoalescedRequest(targetLabel)
-				s.logCoalescedRequest(r.Method, r.URL.String(), requestID)
+				s.logCoalescedRequest(r.Method, s.logSafeURL(r.URL), requestID)
 				return
 			case coalesce.Own:
 				coalesceOwnedForReqCtx = true
@@ -3492,14 +3492,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "bad_request", err.Error(), "")
 		return
 	}
-	s.handleRequestDryRunHits(dryRunHits, r.Method, r.URL.String(), requestID)
+	s.handleRequestDryRunHits(dryRunHits, r.Method, s.logSafeURL(r.URL), requestID)
 	if action == rules.Block {
 		// The matched secret itself must never reach the log, only the
 		// static rule name that identifies which pattern triggered it.
 		s.Stats.RecordBlock(targetLabel, ruleName)
 		s.Stats.RecordClientBlock(auth.label)
-		s.logBlock(r.Method, r.URL.String(), ruleName, requestID)
-		s.notifyWebhook("block", r.Method, r.URL.String(), ruleName, requestID)
+		s.logBlock(r.Method, s.logSafeURL(r.URL), ruleName, requestID)
+		s.notifyWebhook("block", r.Method, s.logSafeURL(r.URL), ruleName, requestID)
 		writeError(w, r, http.StatusForbidden, "block", "blocked by aiproxy rules", ruleName)
 		return
 	}
@@ -3511,8 +3511,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			s.Stats.RecordRateLimited(targetLabel)
 			s.Stats.RecordClientRateLimited(auth.label)
-			s.logRateLimited(r.Method, r.URL.String(), requestID)
-			s.notifyWebhook("rate_limited", r.Method, r.URL.String(), "", requestID)
+			s.logRateLimited(r.Method, s.logSafeURL(r.URL), requestID)
+			s.notifyWebhook("rate_limited", r.Method, s.logSafeURL(r.URL), "", requestID)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
 			writeError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded", "")
 			return
@@ -3533,8 +3533,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			s.Stats.RecordTokenRateLimited(targetLabel)
 			s.Stats.RecordClientTokenRateLimited(auth.label)
-			s.logTokenRateLimited(r.Method, r.URL.String(), requestID)
-			s.notifyWebhook("token_rate_limited", r.Method, r.URL.String(), "", requestID)
+			s.logTokenRateLimited(r.Method, s.logSafeURL(r.URL), requestID)
+			s.notifyWebhook("token_rate_limited", r.Method, s.logSafeURL(r.URL), "", requestID)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(resetIn)))
 			writeError(w, r, http.StatusTooManyRequests, "token_rate_limited", "token rate limit exceeded", "")
 			return
@@ -3554,7 +3554,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.getCostBudgetHardStop() {
 		if cost, over := s.Stats.OverBudget(s.getCostRates(), s.getCostBudget()); over {
 			s.Stats.RecordBudgetRejected()
-			s.logBudgetRejected(r.Method, r.URL.String(), requestID, cost, s.getCostBudget())
+			s.logBudgetRejected(r.Method, s.logSafeURL(r.URL), requestID, cost, s.getCostBudget())
 			writeError(w, r, http.StatusPaymentRequired, "cost_budget_exceeded", "cost budget exceeded", "")
 			return
 		}
@@ -3562,7 +3562,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if auth.costBudgetHardStop {
 		if cost, over := s.Stats.ClientOverBudget(auth.label, s.getCostPer1KTokens(), auth.costBudget); over {
 			s.Stats.RecordClientBudgetRejected(auth.label)
-			s.logClientBudgetRejected(r.Method, r.URL.String(), auth.label, requestID, cost, auth.costBudget)
+			s.logClientBudgetRejected(r.Method, s.logSafeURL(r.URL), auth.label, requestID, cost, auth.costBudget)
 			writeError(w, r, http.StatusPaymentRequired, "cost_budget_exceeded", "cost budget exceeded", "")
 			return
 		}
@@ -3578,8 +3578,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if anomalous, currentCount, baseline := anomalyDetector.Check(auth.label); anomalous {
 			s.Stats.RecordAnomalyDetected()
 			s.Stats.RecordClientAnomalyDetected(auth.label)
-			s.logAnomalyDetected(auth.label, r.Method, r.URL.String(), requestID, currentCount, baseline)
-			s.notifyAnomalyWebhook(auth.label, r.Method, r.URL.String(), requestID, currentCount, baseline)
+			s.logAnomalyDetected(auth.label, r.Method, s.logSafeURL(r.URL), requestID, currentCount, baseline)
+			s.notifyAnomalyWebhook(auth.label, r.Method, s.logSafeURL(r.URL), requestID, currentCount, baseline)
 			if !anomalyDryRun {
 				writeError(w, r, http.StatusTooManyRequests, "anomaly_detected", "anomalous traffic pattern detected", "")
 				return
@@ -3633,12 +3633,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if action == rules.Redact {
 		s.Stats.RecordRedact(targetLabel, ruleName)
 		s.Stats.RecordClientRedact(auth.label)
-		s.logRedact(r.Method, r.URL.String(), ruleName, requestID)
-		s.notifyWebhook("redact", r.Method, r.URL.String(), ruleName, requestID)
+		s.logRedact(r.Method, s.logSafeURL(r.URL), ruleName, requestID)
+		s.notifyWebhook("redact", r.Method, s.logSafeURL(r.URL), ruleName, requestID)
 	} else {
 		s.Stats.RecordAllow(targetLabel)
 		s.Stats.RecordClientAllow(auth.label)
-		s.logAllow(r.Method, r.URL.String(), requestID)
+		s.logAllow(r.Method, s.logSafeURL(r.URL), requestID)
 	}
 
 	// Carry the client-facing method/URL, the cache key, and the resolved
@@ -3648,7 +3648,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// same target/cache key ServeHTTP already resolved and checked.
 	reqCtx := requestContextInfo{
 		method:                  r.Method,
-		url:                     r.URL.String(),
+		url:                     s.logSafeURL(r.URL),
 		requestID:               requestID,
 		cacheKey:                cacheKey,
 		targets:                 targets,
@@ -3776,34 +3776,34 @@ func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, reque
 		Key:     clientLabel,
 	})
 	if err == nil {
-		s.handleRequestDryRunHits(reqDryRunHits, r.Method, r.URL.String(), requestID)
+		s.handleRequestDryRunHits(reqDryRunHits, r.Method, s.logSafeURL(r.URL), requestID)
 		if reqAction == rules.Block {
 			if targetLabel != "" {
 				s.Stats.RecordBlock(targetLabel, reqRuleName)
 			}
 			s.Stats.RecordClientBlock(clientLabel)
-			s.logBlock(r.Method, r.URL.String(), reqRuleName, requestID)
-			s.notifyWebhook("block", r.Method, r.URL.String(), reqRuleName, requestID)
+			s.logBlock(r.Method, s.logSafeURL(r.URL), reqRuleName, requestID)
+			s.notifyWebhook("block", r.Method, s.logSafeURL(r.URL), reqRuleName, requestID)
 			writeError(w, r, http.StatusForbidden, "block", "blocked by aiproxy rules", reqRuleName)
 			return nil, false
 		}
 	}
 
 	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(responseBody, targetLabel, clientLabel)
-	s.handleResponseDryRunHits(dryRunHits, r.Method, r.URL.String(), requestID)
+	s.handleResponseDryRunHits(dryRunHits, r.Method, s.logSafeURL(r.URL), requestID)
 	switch action {
 	case rules.Block:
 		if targetLabel != "" {
 			s.Stats.RecordResponseBlock(targetLabel, ruleName)
 		}
-		s.logResponseBlock(r.Method, r.URL.String(), ruleName, requestID)
-		s.notifyWebhook("response_block", r.Method, r.URL.String(), ruleName, requestID)
+		s.logResponseBlock(r.Method, s.logSafeURL(r.URL), ruleName, requestID)
+		s.notifyWebhook("response_block", r.Method, s.logSafeURL(r.URL), ruleName, requestID)
 		writeError(w, r, http.StatusForbidden, "response_block", "response blocked by aiproxy rules", ruleName)
 		return nil, false
 	case rules.Redact:
 		s.Stats.RecordResponseRedact(targetLabel, ruleName)
-		s.logResponseRedact(r.Method, r.URL.String(), ruleName, requestID)
-		s.notifyWebhook("response_redact", r.Method, r.URL.String(), ruleName, requestID)
+		s.logResponseRedact(r.Method, s.logSafeURL(r.URL), ruleName, requestID)
+		s.notifyWebhook("response_redact", r.Method, s.logSafeURL(r.URL), ruleName, requestID)
 		return scannedBody, true
 	default:
 		return responseBody, true
