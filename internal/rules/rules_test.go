@@ -917,3 +917,82 @@ func TestEngine_MaskSecrets_NoRulesAndNilEngineReturnInputUnchanged(t *testing.T
 		t.Fatalf("nil engine changed input: %q", got)
 	}
 }
+
+func completeEvalEngine() *rules.Engine {
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "mask-a", Pattern: regexp.MustCompile("SECRET_A"), Action: rules.Redact})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "block-b", Pattern: regexp.MustCompile("SECRET_B"), Action: rules.Block})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "mask-c", Pattern: regexp.MustCompile("SECRET_C"), Action: rules.Redact})
+	engine.AddBodyRegexRule(rules.BodyRegexRule{Name: "dry-d", Pattern: regexp.MustCompile("SECRET_D"), Action: rules.Block, DryRun: true})
+	return engine
+}
+
+func TestReview_RedactionMustContinueToLaterBlock(t *testing.T) {
+	e := rules.NewEngine(rules.Allow)
+	e.AddBodyRegexRule(rules.BodyRegexRule{Name: "mask-a", Pattern: regexp.MustCompile("SECRET_A"), Action: rules.Redact})
+	e.AddBodyRegexRule(rules.BodyRegexRule{Name: "block-b", Pattern: regexp.MustCompile("SECRET_B"), Action: rules.Block})
+	action, _, body, _, _, err := e.Evaluate(rules.Request{Method: "POST", URL: "/chat", Body: []byte("SECRET_A SECRET_B")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != rules.Block {
+		t.Fatalf("later block was skipped: action=%v forwarded=%q", action, string(body))
+	}
+}
+
+func TestEvaluate_AllRedactionsApplyAndFirstRedactNames(t *testing.T) {
+	action, name, body, _, _, err := completeEvalEngine().Evaluate(rules.Request{Method: "POST", URL: "/chat", Body: []byte("SECRET_C and SECRET_A")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != rules.Redact || name != "mask-a" || string(body) != "[REDACTED:mask-c] and [REDACTED:mask-a]" {
+		t.Fatalf("got action=%v name=%q body=%q", action, name, body)
+	}
+}
+
+func TestEvaluate_HeaderBlockWinsOverBodyRedact(t *testing.T) {
+	action, name, _, _, _, err := completeEvalEngine().Evaluate(rules.Request{
+		Method: "POST", URL: "/chat", Body: []byte("SECRET_A"),
+		Headers: map[string][]string{"X-Note": {"SECRET_B"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != rules.Block || name != "block-b" {
+		t.Fatalf("got action=%v name=%q, want Block block-b", action, name)
+	}
+}
+
+func TestEvaluate_BodyAndHeaderRedactionsBothApply(t *testing.T) {
+	action, _, body, headers, _, err := completeEvalEngine().Evaluate(rules.Request{
+		Method: "POST", URL: "/chat", Body: []byte("SECRET_A"),
+		Headers: map[string][]string{"X-Note": {"SECRET_C"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != rules.Redact || string(body) != "[REDACTED:mask-a]" || headers["X-Note"][0] != "[REDACTED:mask-c]" {
+		t.Fatalf("got action=%v body=%q headers=%v", action, body, headers)
+	}
+}
+
+func TestEvaluate_DryRunCollectedAlongsideEnforcedMatches(t *testing.T) {
+	_, _, _, _, dryRun, err := completeEvalEngine().Evaluate(rules.Request{Method: "POST", URL: "/chat", Body: []byte("SECRET_A SECRET_D")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dryRun) != 1 || dryRun[0].RuleName != "dry-d" {
+		t.Fatalf("dry-run hits = %+v, want dry-d", dryRun)
+	}
+}
+
+func TestEvaluateResponse_RedactThenBlockBlocks(t *testing.T) {
+	action, name, _, _ := completeEvalEngine().EvaluateResponse([]byte("SECRET_A SECRET_B"), "", "")
+	if action != rules.Block || name != "block-b" {
+		t.Fatalf("got action=%v name=%q, want Block block-b", action, name)
+	}
+	action, _, body, _ := completeEvalEngine().EvaluateResponse([]byte("SECRET_A SECRET_C"), "", "")
+	if action != rules.Redact || string(body) != "[REDACTED:mask-a] [REDACTED:mask-c]" {
+		t.Fatalf("got action=%v body=%q", action, body)
+	}
+}

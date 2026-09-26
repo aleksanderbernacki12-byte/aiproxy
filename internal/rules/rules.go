@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -127,8 +126,8 @@ func containsString(list []string, v string) bool {
 
 // DryRunMatch records one rule that matched during evaluation but was
 // marked DryRun: Action is what it would have done (Block or Redact)
-// had it not been in dry-run mode. Evaluate, EvaluateResponse, and
-// evaluateHeaders each report every distinct rule name that matched
+// had it not been in dry-run mode. Evaluate and EvaluateResponse each
+// report every distinct rule name that matched
 // this way, deduplicated — a rule that matched more than once (e.g. in
 // both the body and a header) is reported only once.
 type DryRunMatch struct {
@@ -192,10 +191,10 @@ type Request struct {
 // checked first: a match returns immediately, without ever touching
 // body or header content — Block rejects the whole endpoint outright,
 // Allow exempts it from every other rule entirely (see Rule). If
-// nothing there matches, body regex rules are checked next — against
-// the body, then, if nothing there matched, against every header value
-// in Request.Headers. Within each set the first match wins. When
-// nothing matches at all, the engine's Default action applies.
+// nothing there matches, every body regex rule is checked against the
+// body and every header value in Request.Headers: any Block match wins,
+// otherwise every matching Redact rule is applied. When nothing matches
+// at all, the engine's Default action applies.
 type Engine struct {
 	Default Action
 
@@ -251,17 +250,15 @@ func (e *Engine) MaskSecrets(s string) string {
 // produced it (empty when the default action applied), the body the
 // caller should actually use going forward, the headers it should
 // actually use going forward, and every DryRun rule that matched along
-// the way (nil if none). Body/headers are req.Body/req.Headers
-// unchanged, unless the matched rule's Action is Redact, in which case
-// every occurrence of its pattern — in the body, or in the one header
-// that matched, whichever it was — has been replaced with a
-// "[REDACTED:<rule name>]" placeholder; the other of the two always
-// comes back unchanged. Path rules are checked first and, on a match,
-// skip body/header scanning entirely (see Rule); otherwise body rules
-// are checked next (in registration order), then header values (by
-// header name in sorted order, then in registration order within each
-// header) — so a body match always wins over a header match when both
-// are present. Headers is scanned in whatever form req.Headers was
+// the way (nil if none). Path rules are checked first and, on a match,
+// skip body/header scanning entirely (see Rule). Otherwise every body
+// regex rule is checked against the original body and every header
+// value (see evaluateContent): a single Block match anywhere blocks the
+// request, named after the first matching Block rule in registration
+// order; with no Block match, every matching Redact rule's pattern is
+// replaced with "[REDACTED:<rule name>]" in the body and in every header
+// value, and the result is named after the first matching Redact rule.
+// Headers is scanned in whatever form req.Headers was
 // given; the caller decides which headers are worth scanning at all
 // (see Request.Headers). A rule marked DryRun never produces the
 // returned action or modifies the body/headers when it matches —
@@ -289,29 +286,11 @@ func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]str
 		}
 	}
 
-	for _, r := range e.bodyRules {
-		if !inScope(r.Targets, r.Keys, req.Target, req.Key) {
-			continue
-		}
-		if r.Pattern.Match(req.Body) {
-			if r.DryRun {
-				dryRunHits = append(dryRunHits, DryRunMatch{RuleName: r.Name, Action: r.Action})
-				continue
-			}
-			if r.Action == Redact {
-				placeholder := []byte("[REDACTED:" + r.Name + "]")
-				return Redact, r.Name, r.Pattern.ReplaceAll(req.Body, placeholder), req.Headers, dryRunHits, nil
-			}
-			return r.Action, r.Name, req.Body, req.Headers, dryRunHits, nil
-		}
-	}
-
-	action, ruleName, headers, matched, headerDryRunHits := e.evaluateHeaders(req.Headers, req.Target, req.Key)
-	dryRunHits = dedupeDryRunMatches(append(dryRunHits, headerDryRunHits...))
+	action, ruleName, body, headers, contentDryRunHits, matched := e.evaluateContent(req.Body, req.Headers, req.Target, req.Key)
+	dryRunHits = dedupeDryRunMatches(append(dryRunHits, contentDryRunHits...))
 	if matched {
-		return action, ruleName, req.Body, headers, dryRunHits, nil
+		return action, ruleName, body, headers, dryRunHits, nil
 	}
-
 	return e.Default, "", req.Body, req.Headers, dryRunHits, nil
 }
 
@@ -325,85 +304,103 @@ func (e *Engine) Evaluate(req Request) (Action, string, []byte, map[string][]str
 // response as it did to the request itself. It returns the action, the
 // name of the rule that produced it (empty when nothing matched, which
 // is always Allow here — there is no Default to fall back to the way
-// Evaluate has for an unmatched request), the body to actually forward
-// (body unchanged, unless the matched rule's Action is Redact, in which
-// case every occurrence of its pattern has been replaced with a
-// "[REDACTED:<rule name>]" placeholder, same convention as Evaluate),
-// and every DryRun rule that matched (nil if none) — see Evaluate for
-// what DryRun means.
+// Evaluate has for an unmatched request), the body to actually forward,
+// and every DryRun rule that matched (nil if none). Block beats Redact
+// and every matching Redact rule is applied, exactly as in Evaluate.
 func (e *Engine) EvaluateResponse(body []byte, target, key string) (Action, string, []byte, []DryRunMatch) {
-	var dryRunHits []DryRunMatch
-	for _, r := range e.bodyRules {
-		if !inScope(r.Targets, r.Keys, target, key) {
-			continue
-		}
-		if r.Pattern.Match(body) {
-			if r.DryRun {
-				dryRunHits = append(dryRunHits, DryRunMatch{RuleName: r.Name, Action: r.Action})
-				continue
-			}
-			if r.Action == Redact {
-				placeholder := []byte("[REDACTED:" + r.Name + "]")
-				return Redact, r.Name, r.Pattern.ReplaceAll(body, placeholder), dryRunHits
-			}
-			return r.Action, r.Name, body, dryRunHits
-		}
+	action, ruleName, result, _, dryRunHits, matched := e.evaluateContent(body, nil, target, key)
+	if !matched {
+		return Allow, "", body, dryRunHits
 	}
-	return Allow, "", body, dryRunHits
+	return action, ruleName, result, dryRunHits
 }
 
-// evaluateHeaders runs every body rule against each value of every
-// header in headers, in sorted header-name order, and reports whether
-// any of them matched, along with every DryRun rule matched along the
-// way (nil if none, not deduplicated — the caller merges and dedupes
-// against its own accumulated hits). A Redact match returns a copy of
-// headers with only that one header's values rewritten — every
-// occurrence of the pattern replaced across all of that header's
-// values, not just the one that matched — leaving every other header,
-// including other values of the same name, untouched. A DryRun rule
-// that matches a header value is recorded but never returned as the
-// actual action — scanning continues to the next rule/value exactly as
-// if it hadn't matched.
-func (e *Engine) evaluateHeaders(headers map[string][]string, reqTarget, reqKey string) (action Action, ruleName string, result map[string][]string, matched bool, dryRunHits []DryRunMatch) {
-	if len(headers) == 0 {
-		return Allow, "", headers, false, nil
-	}
-
-	names := make([]string, 0, len(headers))
-	for name := range headers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		for _, r := range e.bodyRules {
-			if !inScope(r.Targets, r.Keys, reqTarget, reqKey) {
-				continue
+// evaluateContent checks every in-scope body regex rule against the
+// original body and header values before deciding, so a Redact rule can
+// never hide a later Block rule's match (review finding #4). matched is
+// false when no enforced rule matched. Dry-run matches are collected
+// once per rule and never affect the result. headers is never mutated;
+// a redaction returns copies.
+func (e *Engine) evaluateContent(body []byte, headers map[string][]string, target, key string) (action Action, ruleName string, resultBody []byte, resultHeaders map[string][]string, dryRunHits []DryRunMatch, matched bool) {
+	resultBody, resultHeaders = body, headers
+	var blockName, redactName string
+	var redactRules []BodyRegexRule
+	for _, r := range e.bodyRules {
+		if !inScope(r.Targets, r.Keys, target, key) || !r.matchesContent(body, headers) {
+			continue
+		}
+		if r.DryRun {
+			dryRunHits = append(dryRunHits, DryRunMatch{RuleName: r.Name, Action: r.Action})
+			continue
+		}
+		switch r.Action {
+		case Block:
+			if blockName == "" {
+				blockName = r.Name
 			}
-			for _, v := range headers[name] {
-				if !r.Pattern.MatchString(v) {
-					continue
-				}
-				if r.DryRun {
-					dryRunHits = append(dryRunHits, DryRunMatch{RuleName: r.Name, Action: r.Action})
-					continue
-				}
-				if r.Action != Redact {
-					return r.Action, r.Name, headers, true, dryRunHits
-				}
-				placeholder := "[REDACTED:" + r.Name + "]"
-				redacted := make(map[string][]string, len(headers))
-				for k, vv := range headers {
-					redacted[k] = vv
-				}
-				newValues := make([]string, len(headers[name]))
-				for i, hv := range headers[name] {
-					newValues[i] = r.Pattern.ReplaceAllString(hv, placeholder)
-				}
-				redacted[name] = newValues
-				return Redact, r.Name, redacted, true, dryRunHits
+		case Redact:
+			if redactName == "" {
+				redactName = r.Name
+			}
+			redactRules = append(redactRules, r)
+		}
+	}
+	if blockName != "" {
+		return Block, blockName, body, headers, dryRunHits, true
+	}
+	if redactName == "" {
+		return Allow, "", body, headers, dryRunHits, false
+	}
+	for _, r := range redactRules {
+		resultBody = r.Pattern.ReplaceAll(resultBody, []byte("[REDACTED:"+r.Name+"]"))
+		resultHeaders = r.redactHeaders(resultHeaders)
+	}
+	return Redact, redactName, resultBody, resultHeaders, dryRunHits, true
+}
+
+func (r BodyRegexRule) matchesContent(body []byte, headers map[string][]string) bool {
+	if r.Pattern.Match(body) {
+		return true
+	}
+	for _, values := range headers {
+		for _, value := range values {
+			if r.Pattern.MatchString(value) {
+				return true
 			}
 		}
 	}
-	return Allow, "", headers, false, dryRunHits
+	return false
+}
+
+// redactHeaders returns headers with r's matches replaced, copying the map
+// and any changed value slice so the caller's headers are never mutated.
+func (r BodyRegexRule) redactHeaders(headers map[string][]string) map[string][]string {
+	placeholder := "[REDACTED:" + r.Name + "]"
+	var result map[string][]string
+	for name, values := range headers {
+		var redacted []string
+		for index, value := range values {
+			if !r.Pattern.MatchString(value) {
+				continue
+			}
+			if redacted == nil {
+				redacted = append([]string(nil), values...)
+			}
+			redacted[index] = r.Pattern.ReplaceAllString(value, placeholder)
+		}
+		if redacted == nil {
+			continue
+		}
+		if result == nil {
+			result = make(map[string][]string, len(headers))
+			for k, v := range headers {
+				result[k] = v
+			}
+		}
+		result[name] = redacted
+	}
+	if result == nil {
+		return headers
+	}
+	return result
 }

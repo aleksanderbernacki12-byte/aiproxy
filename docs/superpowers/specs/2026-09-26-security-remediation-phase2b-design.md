@@ -73,7 +73,7 @@ decompressed size), scanned, and forwarded decompressed without the
 - Every in-scope, non-dry-run body rule is checked against the body and every
   scanned header value, all against the **original** content.
 - If any Block rule matched anywhere → `Block`, rule name = first matching
-  Block rule in registration order (body before headers).
+  Block rule in registration order.
 - Otherwise every matching Redact rule is applied, in registration order, to
   the body and to each matching header value → `Redact`, rule name = first
   matching Redact rule.
