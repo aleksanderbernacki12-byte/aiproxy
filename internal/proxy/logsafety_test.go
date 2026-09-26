@@ -94,3 +94,52 @@ func TestLogSafety_ComplianceEventCarriesMaskedURL(t *testing.T) {
 		t.Fatal("no compliance event recorded")
 	}
 }
+
+func TestLogSafety_UnreachableUpstreamLogsNoQueryValueAndReturns502(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL, _ := url.Parse(dead.URL)
+	dead.Close()
+	s := proxy.New("unused", deadURL, rules.NewEngine(rules.Allow))
+	var buf bytes.Buffer
+	s.Logger = log.New(&buf, "", 0)
+	var stdBuf bytes.Buffer
+	log.SetOutput(&stdBuf)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, httptest.NewRequest("GET", "/chat?api_key="+leakedValue, nil))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	if strings.Contains(buf.String()+stdBuf.String(), leakedValue) {
+		t.Fatalf("upstream error leaked query value: server=%q std=%q", buf.String(), stdBuf.String())
+	}
+	if !strings.Contains(buf.String(), "aiproxy: upstream:") {
+		t.Fatalf("upstream error not logged through server logger: %q", buf.String())
+	}
+}
+
+func TestLogSafety_WebhookDeliveryErrorOmitsURL(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadHook, _ := url.Parse(dead.URL + "/services/T000/B000/" + leakedValue + "?token=" + leakedValue)
+	dead.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") }))
+	defer upstream.Close()
+	target, _ := url.Parse(upstream.URL)
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{Name: "deny-chat", PathPrefix: "/chat", Action: rules.Block})
+	s := proxy.New("unused", target, engine)
+	var buf syncBuffer
+	s.Logger = log.New(&buf, "", 0)
+	s.WebhookURL = deadHook
+	s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/chat", nil))
+	deadline := time.Now().Add(3 * time.Second)
+	for !strings.Contains(buf.String(), "delivery failed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no webhook delivery error logged: %q", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if strings.Contains(buf.String(), leakedValue) {
+		t.Fatalf("webhook error leaked its URL: %q", buf.String())
+	}
+}

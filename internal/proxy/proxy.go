@@ -979,6 +979,12 @@ func New(addr string, target *url.URL, engine *rules.Engine) *Server {
 	}
 
 	s.reverseProxy = &httputil.ReverseProxy{
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// Replaces the default handler, which prints the full upstream
+			// URL (client query included) to the process-wide logger.
+			s.logError("aiproxy: upstream: %s", s.logSafeError(err))
+			w.WriteHeader(http.StatusBadGateway)
+		},
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			// ServeHTTP already resolved routing once (to compute the
 			// cache key) and stashed the result in the context that
@@ -1142,7 +1148,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if i+1 < len(orderedCandidates) {
 			next := orderedCandidates[i+1]
 			t.server.Stats.RecordFailover(reqCtx.targetLabel)
-			t.server.logFailover(reqCtx.method, reqCtx.url, candidate.String(), next.String(), reqCtx.requestID)
+			t.server.logFailover(reqCtx.method, reqCtx.url, t.server.logSafeRawURL(candidate.String()), t.server.logSafeRawURL(next.String()), reqCtx.requestID)
 			t.server.notifyFailoverWebhook(reqCtx.method, reqCtx.url, candidate.String(), next.String(), reqCtx.requestID)
 		}
 	}
@@ -1472,7 +1478,7 @@ func (s *Server) mirrorToShadow(shadowURL *url.URL, method, forwardPath, rawQuer
 	req, err := http.NewRequestWithContext(ctx, method, dest.String(), bytes.NewReader(body))
 	if err != nil {
 		s.Stats.RecordShadowError(targetLabel)
-		s.logShadowError(targetLabel, shadowURL.String(), err, requestID)
+		s.logShadowError(targetLabel, s.logSafeURL(shadowURL), err, requestID)
 		return
 	}
 	req.Header = header
@@ -1482,7 +1488,7 @@ func (s *Server) mirrorToShadow(shadowURL *url.URL, method, forwardPath, rawQuer
 	resp, err := client.Do(req)
 	if err != nil {
 		s.Stats.RecordShadowError(targetLabel)
-		s.logShadowError(targetLabel, shadowURL.String(), err, requestID)
+		s.logShadowError(targetLabel, s.logSafeURL(shadowURL), err, requestID)
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
@@ -1503,8 +1509,9 @@ func (s *Server) mirrorToShadow(shadowURL *url.URL, method, forwardPath, rawQuer
 func (s *Server) recordBreakerFailure(tb *breaker.Registry, target string) {
 	if tb.RecordFailure(target) {
 		s.Stats.RecordTargetEjected()
-		s.logTargetEjected(target)
-		s.notifyTargetEjectedWebhook(target)
+		safeTarget := s.logSafeRawURL(target)
+		s.logTargetEjected(safeTarget)
+		s.notifyTargetEjectedWebhook(safeTarget)
 	}
 }
 
@@ -1513,8 +1520,9 @@ func (s *Server) recordBreakerFailure(tb *breaker.Registry, target string) {
 func (s *Server) recordBreakerSuccess(tb *breaker.Registry, target string) {
 	if tb.RecordSuccess(target) {
 		s.Stats.RecordTargetRecovered()
-		s.logTargetRecovered(target)
-		s.notifyTargetRecoveredWebhook(target)
+		safeTarget := s.logSafeRawURL(target)
+		s.logTargetRecovered(safeTarget)
+		s.notifyTargetRecoveredWebhook(safeTarget)
 	}
 }
 
@@ -4431,7 +4439,7 @@ func (s *Server) logFailover(method, reqURL, failedTarget, nextTarget, requestID
 // probeTarget), and logging it too would double the log stream's volume
 // for the expected, common case.
 func (s *Server) logShadowError(targetLabel, shadowURL string, err error, requestID string) {
-	msg := fmt.Sprintf("mirroring %s to %s: %v", targetLabel, shadowURL, err)
+	msg := fmt.Sprintf("mirroring %s to %s: %s", targetLabel, shadowURL, s.logSafeError(err))
 	ev := s.recordLogEvent(logEvent{Level: "shadow_error", RequestID: requestID, Target: shadowURL, Message: msg})
 	if s.LogFormat == LogFormatJSON {
 		s.logEventJSON(ev)
@@ -4829,6 +4837,12 @@ func (s *Server) postWebhook(label string, target *url.URL, data []byte) {
 	go func() {
 		resp, err := webhookClient.Post(target.String(), "application/json", bytes.NewReader(data))
 		if err != nil {
+			// Never the URL, not even masked: a webhook URL (Slack's
+			// especially) carries its credential in the path.
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				err = fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
+			}
 			s.logError("aiproxy: webhook (%s): delivery failed: %v", label, err)
 			return
 		}

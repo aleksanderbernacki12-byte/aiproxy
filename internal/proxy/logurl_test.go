@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"errors"
+	"log"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -70,5 +72,17 @@ func TestLogSafeError(t *testing.T) {
 	}
 	if got := s.logSafeError(nil); got != "" {
 		t.Fatalf("logSafeError(nil) = %q", got)
+	}
+}
+
+func TestLogSafety_BreakerAndShadowLogsMaskConfiguredURLs(t *testing.T) {
+	s := logURLTestServer()
+	var buf strings.Builder
+	s.Logger = log.New(&buf, "", 0)
+	s.logTargetEjected(s.logSafeRawURL("https://gen.example/v1?key=FAKE_PRIVATE_VALUE"))
+	shadow, _ := url.Parse("http://127.0.0.1:1")
+	s.mirrorToShadow(shadow, "POST", "/chat", "api_key=FAKE_PRIVATE_VALUE", http.Header{}, nil, "default", "req-1")
+	if strings.Contains(buf.String(), "FAKE_PRIVATE_VALUE") {
+		t.Fatalf("breaker/shadow log leaked: %q", buf.String())
 	}
 }
