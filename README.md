@@ -1444,15 +1444,18 @@ trigger for idempotency keys in practice (a client times out waiting on
 a slow completion and retries immediately, with the original call still
 running upstream). That retry waits for the first attempt to finish,
 then gets its exact response — it never triggers a second forward of
-its own. A retry that reuses the same key with a genuinely *different*
-body gets a `409 Conflict` instead of either replaying the wrong
-response or silently forwarding a second, different one. A replayed
+its own. A retry that reuses the same key for a genuinely *different*
+request (another method, path, query or body) gets a `409 Conflict`
+instead of either replaying the wrong response or silently forwarding a
+second, different one. A replayed
 response carries `Idempotency-Replayed: true` so the client can tell.
 
-Keys are scoped per authenticated caller (the same [`proxy_api_key`
-identity](#authenticating-requests-to-the-proxy) stats/rate limits
-already use) — two different callers using the exact same key value
-never collide. A request that never reaches a real answer (blocked by a
+Keys are scoped per caller: the [`proxy_api_key`
+identity](#authenticating-requests-to-the-proxy) plus the upstream
+credential the caller sends (`Authorization`, `X-Api-Key`, `Api-Key`,
+`X-Goog-Api-Key`). Two callers using the exact same key value never
+collide or see each other's responses, even with proxy authentication
+off. A request that never reaches a real answer (blocked by a
 rule, rate-limited, or rejected by [cost-budget hard-stop](#cost-budget-hard-stop)
 before ever forwarding) never claims its key permanently either — a
 retry with the same key and body is evaluated fresh instead of being
@@ -1752,7 +1755,16 @@ go down with its primary:
 
 A request tries the first URL, and only moves on to the next if that
 attempt never got a response at all — a dial, TLS, or timeout failure
-meaning the candidate was genuinely unreachable. It never retries a
+meaning the candidate was genuinely unreachable. For a method with side
+effects (`POST`, `PUT`, `PATCH`, `DELETE`) that is only certain if the
+connection failed before the request was sent. If the connection broke
+after the upstream received the request, it may already have acted on it,
+so aiproxy does not send it to the next candidate. The client gets
+`502` with error code `upstream_outcome_unknown` instead, counted as
+`upstream_outcome_unknown` in `GET /_aiproxy/stats` and
+`aiproxy_upstream_outcome_unknown_total` in Prometheus. `GET`, `HEAD`,
+`OPTIONS` and `TRACE` still fail over in that case. A request whose
+client has disconnected is never failed over. It never retries a
 *different* candidate just because one answered with an HTTP-level error
 (a 5xx): by the time a backend has responded at all, it may already have
 started acting on the request, and blindly replaying that against a
@@ -1764,7 +1776,8 @@ URL with no failover of its own.
 
 Each attempt is logged (`[FAILOVER]`, bright yellow;
 `"failover"` under `--log-format json`) and, if `webhook_url` is set,
-[alerted](#webhook-alerts) with the failed and next candidate URLs —
+[alerted](#webhook-alerts) with the failed and next candidate URLs
+(query values masked) —
 worth knowing about in real time, since it means a provider is down.
 It's also counted, broken down by target like most other counters (not
 global-only the way `unauthorized` and dry-run are — a failover is
