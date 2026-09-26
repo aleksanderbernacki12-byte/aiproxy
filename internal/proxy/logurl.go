@@ -25,9 +25,13 @@ func (s *Server) logSafeURL(u *url.URL) string {
 	// Mask the escaped form, since that is what String prints; RawPath
 	// keeps the placeholder's brackets from being percent-encoded.
 	masked.RawPath = s.getEngine().MaskSecrets(u.EscapedPath())
-	if unescaped, err := url.PathUnescape(masked.RawPath); err == nil {
-		masked.Path = unescaped
+	// Path must never keep the unmasked original: String falls back to it
+	// whenever RawPath is not a valid encoding of it.
+	unescaped, err := url.PathUnescape(masked.RawPath)
+	if err != nil {
+		unescaped = masked.RawPath
 	}
+	masked.Path = unescaped
 	return masked.String()
 }
 
