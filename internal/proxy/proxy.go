@@ -4182,15 +4182,15 @@ func (t *streamTee) Read(p []byte) (int, error) {
 }
 
 // processCompleteBatch scans t.pending up through its last SSE event
-// boundary, if any, and leaves whatever comes after that boundary (a
+// boundary (see lastEventBoundary: LF, CRLF or CR line endings), if any,
+// and leaves whatever comes after that boundary (a
 // still-incomplete trailing event) in t.pending for a future Read.
 func (t *streamTee) processCompleteBatch() {
 	data := t.pending.Bytes()
-	idx := bytes.LastIndex(data, []byte("\n\n"))
-	if idx == -1 {
+	boundary := lastEventBoundary(data, false)
+	if boundary == -1 {
 		return
 	}
-	boundary := idx + 2
 	t.scan(data[:boundary])
 	remainder := append([]byte(nil), data[boundary:]...)
 	t.pending.Reset()
