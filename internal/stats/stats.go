@@ -232,6 +232,10 @@ type Stats struct {
 	// registry was full of in-flight records.
 	idempotencyFull atomic.Int64
 
+	// webhookDropped counts webhook deliveries dropped because the
+	// delivery queue was full.
+	webhookDropped atomic.Int64
+
 	mu        sync.Mutex
 	perTarget map[string]*counters
 	perRule   map[string]*ruleCounters
@@ -778,6 +782,12 @@ func (s *Stats) RecordIdempotencyFull() {
 	s.idempotencyFull.Add(1)
 }
 
+// RecordWebhookDropped records one webhook delivery dropped because the
+// bounded delivery queue was full.
+func (s *Stats) RecordWebhookDropped() {
+	s.webhookDropped.Add(1)
+}
+
 // ClientOverBudget is CrossedClientBudget's non-latching counterpart —
 // see OverBudget for the same reasoning, scoped to one client the same
 // way CrossedClientBudget itself is. client == "" is never over
@@ -994,6 +1004,9 @@ type Snapshot struct {
 	// IdempotencyFull: see Stats.RecordIdempotencyFull.
 	IdempotencyFull int64 `json:"idempotency_full"`
 
+	// WebhookDropped: see Stats.RecordWebhookDropped.
+	WebhookDropped int64 `json:"webhook_dropped"`
+
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
 	// IPDenied (a different rejection reason), never broken down per
@@ -1084,6 +1097,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.UpstreamOutcomeUnknown = s.upstreamOutcomeUnknown.Load()
 	snap.UpstreamResponseTooLarge = s.upstreamResponseTooLarge.Load()
 	snap.IdempotencyFull = s.idempotencyFull.Load()
+	snap.WebhookDropped = s.webhookDropped.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()

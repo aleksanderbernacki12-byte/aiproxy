@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -86,5 +87,32 @@ func TestLimits_IdempotencyAtCapacityReturns503(t *testing.T) {
 	}
 	if n := s.Stats.Snapshot().IdempotencyFull; n != 1 {
 		t.Fatalf("IdempotencyFull = %d, want 1", n)
+	}
+}
+
+func TestLimits_WebhookDeliveriesUseABoundedQueue(t *testing.T) {
+	release := make(chan struct{})
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
+	defer hook.Close()
+	defer close(release)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
+	defer upstream.Close()
+	target, _ := url.Parse(upstream.URL)
+	engine := rules.NewEngine(rules.Allow)
+	engine.AddRule(rules.Rule{Name: "deny", PathPrefix: "/deny", Action: rules.Block})
+	s := proxy.New("unused", target, engine)
+	s.Logger = log.New(io.Discard, "", 0)
+	hookURL, _ := url.Parse(hook.URL)
+	s.WebhookURL = hookURL
+
+	before := runtime.NumGoroutine()
+	for i := 0; i < 400; i++ {
+		s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/deny", nil))
+	}
+	if n := s.Stats.Snapshot().WebhookDropped; n < 100 {
+		t.Fatalf("WebhookDropped = %d, want at least 100 of 400 with a queue of 256 and a stalled endpoint", n)
+	}
+	if grown := runtime.NumGoroutine() - before; grown > 50 {
+		t.Fatalf("goroutines grew by %d for 400 webhook deliveries, want a bounded worker pool", grown)
 	}
 }

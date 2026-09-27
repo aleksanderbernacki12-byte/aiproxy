@@ -852,6 +852,11 @@ type Server struct {
 	// grace period.
 	inFlight atomic.Int64
 
+	// webhookQueue feeds a fixed pool of delivery workers, started on
+	// first use, so a slow endpoint cannot grow goroutines without bound.
+	webhookQueue     chan webhookDelivery
+	webhookQueueOnce sync.Once
+
 	reverseProxy    *httputil.ReverseProxy
 	httpServer      *http.Server
 	adminHTTPServer *http.Server
@@ -5067,7 +5072,8 @@ func (s *Server) deliverWebhookPayload(payload webhookAlert) {
 	}
 }
 
-// postWebhook POSTs data to target on its own goroutine. A delivery
+// postWebhook queues data for delivery to target by a fixed pool of
+// workers; a full queue drops the delivery and counts it. A delivery
 // error is logged with label identifying which configured destination
 // failed (its position in Webhooks, or "webhook_url" for the top-level
 // one) — deliberately never the URL itself, even in an error message:
@@ -5075,8 +5081,34 @@ func (s *Server) deliverWebhookPayload(payload webhookAlert) {
 // a bearer credential directly in its path, so it gets the same
 // treatment as every other secret aiproxy handles.
 func (s *Server) postWebhook(label string, target *url.URL, data []byte) {
-	go func() {
-		resp, err := webhookClient.Post(target.String(), "application/json", bytes.NewReader(data))
+	s.webhookQueueOnce.Do(func() {
+		s.webhookQueue = make(chan webhookDelivery, webhookQueueSize)
+		for worker := 0; worker < webhookWorkers; worker++ {
+			go s.deliverWebhooks()
+		}
+	})
+	select {
+	case s.webhookQueue <- webhookDelivery{label: label, target: target, data: data}:
+	default:
+		s.Stats.RecordWebhookDropped()
+		s.logError("aiproxy: webhook (%s): queue full, dropped", label)
+	}
+}
+
+const (
+	webhookQueueSize = 256
+	webhookWorkers   = 4
+)
+
+type webhookDelivery struct {
+	label  string
+	target *url.URL
+	data   []byte
+}
+
+func (s *Server) deliverWebhooks() {
+	for delivery := range s.webhookQueue {
+		resp, err := webhookClient.Post(delivery.target.String(), "application/json", bytes.NewReader(delivery.data))
 		if err != nil {
 			// Never the URL, not even masked: a webhook URL (Slack's
 			// especially) carries its credential in the path.
@@ -5084,14 +5116,14 @@ func (s *Server) postWebhook(label string, target *url.URL, data []byte) {
 			if errors.As(err, &urlErr) {
 				err = fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
 			}
-			s.logError("aiproxy: webhook (%s): delivery failed: %v", label, err)
-			return
+			s.logError("aiproxy: webhook (%s): delivery failed: %v", delivery.label, err)
+			continue
 		}
 		resp.Body.Close()
 		if resp.StatusCode >= 300 {
-			s.logError("aiproxy: webhook (%s): endpoint returned status %d", label, resp.StatusCode)
+			s.logError("aiproxy: webhook (%s): endpoint returned status %d", delivery.label, resp.StatusCode)
 		}
-	}()
+	}
 }
 
 // notifyWebhook builds and delivers a webhookAlert for a block, redact,
@@ -5982,6 +6014,10 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 
 	// Unlabeled: the decision is about the request's method and what the
 	// failed candidate may have received, not about one target's health.
+	fmt.Fprintln(w, "# HELP aiproxy_webhook_dropped_total Total number of webhook deliveries dropped because the delivery queue was full.")
+	fmt.Fprintln(w, "# TYPE aiproxy_webhook_dropped_total counter")
+	fmt.Fprintf(w, "aiproxy_webhook_dropped_total %d\n", snap.WebhookDropped)
+
 	fmt.Fprintln(w, "# HELP aiproxy_idempotency_full_total Total number of requests rejected because every idempotency record was still in flight at the entry cap.")
 	fmt.Fprintln(w, "# TYPE aiproxy_idempotency_full_total counter")
 	fmt.Fprintf(w, "aiproxy_idempotency_full_total %d\n", snap.IdempotencyFull)
