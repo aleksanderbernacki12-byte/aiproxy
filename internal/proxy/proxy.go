@@ -4045,11 +4045,13 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 	responsePolicyBlocked := false
 
 	tee := &streamTee{
-		src:        resp.Body,
-		engine:     s.getEngine(),
-		target:     reqCtx.targetLabel,
-		key:        reqCtx.clientLabel,
-		captureRaw: reqCtx.complianceEventID != "",
+		src:             resp.Body,
+		engine:          s.getEngine(),
+		target:          reqCtx.targetLabel,
+		key:             reqCtx.clientLabel,
+		captureRaw:      reqCtx.complianceEventID != "",
+		accumulate:      reqCtx.cacheKey != "" || reqCtx.idempotencyKey != "" || reqCtx.coalesceOwned,
+		accumulateLimit: s.getMaxResponseBodyBytes(),
 		onRedact: func(ruleName string) {
 			responsePolicyRedacted = true
 			s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
@@ -4067,12 +4069,15 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		},
 	}
 	tee.onComplete = func(data, rawData []byte, cleanEOF bool) {
+		// A stream too large to keep was still delivered, so compliance
+		// sees it as complete, but it must not be replayed as complete.
+		replayable := cleanEOF && !tee.accumulationOverflowed
 		// Cache first, log second: a caller that observes the log
 		// line (e.g. a test synchronizing on it) can then rely on the
 		// cache write having already landed. A stream a Block rule cut
 		// short is never cached, same as any other incomplete stream:
 		// cleanEOF is false for it too (see streamTee.Read).
-		if cch := s.getCache(); cleanEOF && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
+		if cch := s.getCache(); replayable && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
 			if s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data) {
 				if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
 					idx.Add(reqCtx.semanticTargetPartition, reqCtx.semanticFingerprint, reqCtx.semanticRemainderHash, reqCtx.cacheKey)
@@ -4083,12 +4088,12 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// reasoning as bufferResponse's own Store call — see there for
 		// why this isn't restricted to a 200 the way the cache write
 		// above is.
-		if cleanEOF && reqCtx.idempotencyKey != "" {
+		if replayable && reqCtx.idempotencyKey != "" {
 			if idem := s.getIdempotency(); idem != nil {
 				idem.Store(reqCtx.idempotencyClient, reqCtx.idempotencyKey, &idempotency.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
 			}
 		}
-		if cleanEOF && reqCtx.coalesceOwned {
+		if replayable && reqCtx.coalesceOwned {
 			if coalescer := s.getCoalescer(); coalescer != nil {
 				coalescer.Store(reqCtx.cacheKey, &coalesce.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
 			}
@@ -4163,6 +4168,14 @@ type streamTee struct {
 	buf        bytes.Buffer // full accumulated (post-scan) data, for onComplete
 	raw        bytes.Buffer // full original upstream data, for compliance capture
 	captureRaw bool
+
+	// accumulate is set only when something replays the stream (cache,
+	// idempotency, coalescing); otherwise buf stays empty. Past
+	// accumulateLimit the copy is dropped and accumulationOverflowed set,
+	// so the stream is still delivered but never stored as complete.
+	accumulate             bool
+	accumulateLimit        int64
+	accumulationOverflowed bool
 
 	// usage is fed every raw batch, including a blocked one, so withheld
 	// output still counts toward limits and budgets.
@@ -4272,7 +4285,7 @@ func (t *streamTee) scan(batch []byte) {
 	t.usage.addSSE(batch)
 	if t.engine == nil {
 		t.out.Write(batch)
-		t.buf.Write(batch)
+		t.keep(batch)
 		return
 	}
 
@@ -4300,6 +4313,19 @@ func (t *streamTee) scan(batch []byte) {
 		return
 	}
 	t.release(false)
+}
+
+// keep appends delivered bytes to buf when a consumer needs the stream.
+func (t *streamTee) keep(data []byte) {
+	if !t.accumulate || t.accumulationOverflowed {
+		return
+	}
+	if t.accumulateLimit > 0 && int64(t.buf.Len()+len(data)) > t.accumulateLimit {
+		t.accumulationOverflowed = true
+		t.buf = bytes.Buffer{}
+		return
+	}
+	t.buf.Write(data)
 }
 
 // heldEvent is one scanned SSE event waiting for release, with the
@@ -4338,7 +4364,7 @@ func (t *streamTee) release(final bool) {
 		t.held = t.held[1:]
 		remaining -= len(event.text)
 		t.out.Write(event.data)
-		t.buf.Write(event.data)
+		t.keep(event.data)
 		t.releasedTail += event.text
 		if len(t.releasedTail) > holdback {
 			t.releasedTail = t.releasedTail[len(t.releasedTail)-holdback:]

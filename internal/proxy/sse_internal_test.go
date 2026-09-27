@@ -148,7 +148,7 @@ func TestStreamTee_ShortStreamIsDeliveredCompleteAtEOF(t *testing.T) {
 	chunks := []string{"data: {\"delta\":\"hello \"}\n\n", "data: {\"delta\":\"world\"}\n\n", "data: [DONE]\n\n"}
 	var completed []byte
 	var clean bool
-	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(256, rules.Block)}
+	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(256, rules.Block), accumulate: true}
 	tee.onComplete = func(data, _ []byte, cleanEOF bool) { completed, clean = append([]byte(nil), data...), cleanEOF }
 	delivered, err := io.ReadAll(tee)
 	tee.Close()
@@ -183,5 +183,33 @@ func TestEventText(t *testing.T) {
 		if got := eventText([]byte(event)); got != want {
 			t.Errorf("eventText(%q) = %q, want %q", event, got, want)
 		}
+	}
+}
+
+func TestStreamTee_DoesNotAccumulateWithoutAConsumer(t *testing.T) {
+	chunks := []string{"data: {\"delta\":\"a\"}\n\n", "data: {\"delta\":\"b\"}\n\n"}
+	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(0, rules.Block)}
+	delivered, err := io.ReadAll(tee)
+	if err != nil || string(delivered) != strings.Join(chunks, "") {
+		t.Fatalf("delivered=%q err=%v", delivered, err)
+	}
+	if tee.buf.Len() != 0 {
+		t.Fatalf("buf holds %d bytes with no cache/idempotency/coalescing consumer", tee.buf.Len())
+	}
+}
+
+func TestStreamTee_AccumulationPastLimitIsDroppedButStreamDelivered(t *testing.T) {
+	chunks := []string{"data: {\"delta\":\"" + strings.Repeat("a", 100) + "\"}\n\n", "data: {\"delta\":\"b\"}\n\n"}
+	var completedLen int
+	var complete bool
+	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(0, rules.Block), accumulate: true, accumulateLimit: 64}
+	tee.onComplete = func(data, _ []byte, cleanEOF bool) { completedLen, complete = len(data), cleanEOF && !tee.accumulationOverflowed }
+	delivered, err := io.ReadAll(tee)
+	tee.Close()
+	if err != nil || string(delivered) != strings.Join(chunks, "") {
+		t.Fatalf("stream not delivered in full: %q err=%v", delivered, err)
+	}
+	if completedLen != 0 || complete {
+		t.Fatalf("onComplete got %d bytes, complete=%v; want nothing retained and not complete", completedLen, complete)
 	}
 }
