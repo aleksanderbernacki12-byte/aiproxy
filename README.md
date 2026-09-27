@@ -1589,6 +1589,30 @@ actually unbounded. Set it explicitly if your traffic needs more:
 configured value, or the built-in default if the field is absent — not
 just the raw config.
 
+Other resource limits, all read when the proxy starts:
+
+- `max_response_body_bytes` (default 32 MiB) caps a non-streamed upstream
+  response held in memory. A larger response is not forwarded: the client
+  gets `502 upstream_response_too_large`. A streamed response is always
+  delivered in full, but past this size it is not kept for caching,
+  idempotency replay or request coalescing.
+- `max_concurrent_requests` (default: no cap) answers
+  `503 too_many_concurrent_requests` once that many proxied requests are
+  in flight. Admin endpoints are not counted. `aiproxy validate` warns while
+  it is unset.
+- Idempotency records are capped at 10,000 entries and 64 MiB of stored
+  responses. The oldest completed records are evicted first; if every
+  record is still in flight, a new key gets `503 idempotency_capacity`.
+- Webhook deliveries go through a queue of 256 with 4 workers. When the
+  queue is full, a delivery is dropped, logged and counted.
+- Both listeners close connections that take more than 10 seconds to send
+  their headers or sit idle for 120 seconds. There is no overall read or
+  write timeout, so long uploads and long streams keep working.
+
+Each limit has a counter in `GET /_aiproxy/stats` and Prometheus:
+`upstream_response_too_large`, `concurrency_rejected`, `idempotency_full`
+and `webhook_dropped`.
+
 ## Redacting instead of blocking
 
 A blocked request never reaches the upstream at all — sometimes that's
