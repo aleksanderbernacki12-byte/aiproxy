@@ -3868,7 +3868,7 @@ func TestExecute_Validate_NegativeStreamScanHoldbackBytes_ReportsProblem(t *test
 
 func TestExecute_Validate_UnboundedCacheWarns(t *testing.T) {
 	cases := []struct {
-		name, config string
+		name, config      string
 		wantTTL, wantSize bool
 	}{
 		{"no ttl and no size cap", `{"cache_enabled":true}`, true, true},
