@@ -3865,3 +3865,33 @@ func TestExecute_Validate_NegativeStreamScanHoldbackBytes_ReportsProblem(t *test
 		t.Errorf("stderr missing the negative stream_scan_holdback_bytes problem: %q", stderr.String())
 	}
 }
+
+func TestExecute_Validate_UnboundedCacheWarns(t *testing.T) {
+	cases := []struct {
+		name, config string
+		wantTTL, wantSize bool
+	}{
+		{"no ttl and no size cap", `{"cache_enabled":true}`, true, true},
+		{"ttl only", `{"cache_enabled":true,"cache_ttl_seconds":60}`, false, true},
+		{"both set", `{"cache_enabled":true,"cache_ttl_seconds":60,"cache_max_size_bytes":1048576}`, false, false},
+		{"cache off", `{}`, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "aiproxy.json")
+			if err := os.WriteFile(configPath, []byte(tc.config), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := cli.Execute([]string{"validate", "-config", configPath}, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit code %d: %q", code, stderr.String())
+			}
+			if got := strings.Contains(stdout.String(), "WARNING: cache_ttl_seconds"); got != tc.wantTTL {
+				t.Errorf("TTL warning present = %v, want %v: %q", got, tc.wantTTL, stdout.String())
+			}
+			if got := strings.Contains(stdout.String(), "WARNING: cache_max_size_bytes"); got != tc.wantSize {
+				t.Errorf("size warning present = %v, want %v: %q", got, tc.wantSize, stdout.String())
+			}
+		})
+	}
+}

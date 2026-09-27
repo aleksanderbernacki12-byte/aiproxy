@@ -70,7 +70,12 @@ type lruEntry struct {
 // from the very first Set even against a cache directory that already
 // existed before this process started.
 func New() (*Cache, error) {
-	if err := os.MkdirAll(DirName, 0o755); err != nil {
+	// 0700, and chmod as well: MkdirAll leaves a directory created by an
+	// older version (0755) readable by other local users.
+	if err := os.MkdirAll(DirName, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(DirName, 0o700); err != nil {
 		return nil, err
 	}
 	c := &Cache{
@@ -110,6 +115,12 @@ func (c *Cache) loadExisting() error {
 		if e.IsDir() {
 			continue
 		}
+		if strings.HasPrefix(e.Name(), tempPrefix) {
+			// Left behind by a Set interrupted before its rename.
+			os.Remove(filepath.Join(c.dir, e.Name()))
+			continue
+		}
+		os.Chmod(filepath.Join(c.dir, e.Name()), 0o600) // best-effort migration of entries written 0644 by older versions
 		info, err := e.Info()
 		if err != nil {
 			continue
@@ -190,8 +201,7 @@ func (c *Cache) Get(key string, ttl time.Duration) (*http.Response, bool, time.D
 	}
 	age := time.Since(info.ModTime())
 	if ttl > 0 && age > ttl {
-		os.Remove(path) // best-effort: a failed cleanup just leaves a stale, inert file behind
-		c.forget(key)
+		c.removeIfExpired(key, ttl)
 		return nil, false, 0, nil
 	}
 
@@ -247,14 +257,50 @@ func (c *Cache) Set(key string, resp *http.Response) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(c.path(key), dump, 0o644); err != nil {
+	// Write a private temp file and rename it into place, so a concurrent
+	// Get sees either the previous entry or this one, never a partial one.
+	temp, err := os.CreateTemp(c.dir, tempPrefix+"*")
+	if err != nil {
 		return err
 	}
-	c.touch(key, int64(len(dump)))
+	if _, err := temp.Write(dump); err != nil {
+		temp.Close()
+		os.Remove(temp.Name())
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		os.Remove(temp.Name())
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := os.Rename(temp.Name(), c.path(key)); err != nil {
+		os.Remove(temp.Name())
+		return err
+	}
+	c.touchLocked(key, int64(len(dump)))
 	if c.MaxSizeBytes > 0 {
-		c.evictUntilUnderBudget()
+		c.evictUntilUnderBudgetLocked()
 	}
 	return nil
+}
+
+// tempPrefix marks an entry still being written by Set.
+const tempPrefix = ".tmp-"
+
+// removeIfExpired deletes key's file and index entry only if the file is
+// still expired under the lock: a Set that renamed a fresh entry into
+// place after Get's unlocked stat must not be deleted.
+func (c *Cache) removeIfExpired(key string, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	info, err := os.Stat(c.path(key))
+	if err == nil && time.Since(info.ModTime()) <= ttl {
+		return
+	}
+	os.Remove(c.path(key)) // best-effort: a failed cleanup just leaves a stale, inert file behind
+	c.forgetLocked(key)
 }
 
 // touch marks key most-recently-used, inserting it into the LRU index
@@ -264,6 +310,10 @@ func (c *Cache) Set(key string, resp *http.Response) error {
 func (c *Cache) touch(key string, size int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.touchLocked(key, size)
+}
+
+func (c *Cache) touchLocked(key string, size int64) {
 	if el, ok := c.elements[key]; ok {
 		c.order.MoveToBack(el)
 		entry := el.Value.(*lruEntry)
@@ -276,15 +326,6 @@ func (c *Cache) touch(key string, size int64) {
 	c.totalSize += size
 }
 
-// forget removes key from the LRU index, if tracked at all — used when
-// an entry is deleted from disk outside of eviction (Get's own TTL
-// expiry).
-func (c *Cache) forget(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.forgetLocked(key)
-}
-
 func (c *Cache) forgetLocked(key string) {
 	el, ok := c.elements[key]
 	if !ok {
@@ -295,7 +336,7 @@ func (c *Cache) forgetLocked(key string) {
 	c.totalSize -= el.Value.(*lruEntry).size
 }
 
-// evictUntilUnderBudget removes the least-recently-used entries — the
+// evictUntilUnderBudgetLocked removes the least-recently-used entries — the
 // front of order — until the tracked total size is at or under
 // MaxSizeBytes, or only one entry (the one Set just wrote, always the
 // most-recently-used) is left. A single entry larger than MaxSizeBytes
@@ -303,9 +344,7 @@ func (c *Cache) forgetLocked(key string) {
 // written — there's nothing left to evict it in favor of, and a size
 // policy should never make Set itself fail or silently drop the very
 // response it was just asked to cache.
-func (c *Cache) evictUntilUnderBudget() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Cache) evictUntilUnderBudgetLocked() {
 	for c.totalSize > c.MaxSizeBytes && c.order.Len() > 1 {
 		front := c.order.Front()
 		entry := front.Value.(*lruEntry)
@@ -324,6 +363,8 @@ func (c *Cache) evictUntilUnderBudget() {
 // as already empty, not an error. The in-memory LRU index is reset
 // alongside the on-disk entries, so size accounting stays correct.
 func (c *Cache) Clear() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	entries, err := os.ReadDir(c.dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -336,10 +377,8 @@ func (c *Cache) Clear() error {
 			return err
 		}
 	}
-	c.mu.Lock()
 	c.order.Init()
 	c.elements = make(map[string]*list.Element)
 	c.totalSize = 0
-	c.mu.Unlock()
 	return nil
 }

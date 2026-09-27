@@ -1706,6 +1706,12 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.AdminAPIKey == "" && len(cfg.AdminAPIKeys) == 0 {
 		fmt.Fprintln(stdout, "WARNING: admin_api_key/admin_api_keys are not set — /_aiproxy/drain, /_aiproxy/cache/clear, /_aiproxy/stats, /_aiproxy/metrics, and /_aiproxy/dashboard currently accept any configured proxy_api_key/proxy_api_keys (or, if none are configured, anyone who can reach the proxy at all). Set admin_api_key or admin_api_keys to require a separate credential for these operations.")
 	}
+	if cfg.CacheEnabled && cfg.CacheTTLSeconds == 0 {
+		fmt.Fprintln(stdout, "WARNING: cache_ttl_seconds is not set — cached responses never expire. Set a TTL so stale or sensitive responses do not live on disk indefinitely.")
+	}
+	if cfg.CacheEnabled && cfg.CacheMaxSizeBytes == 0 {
+		fmt.Fprintln(stdout, "WARNING: cache_max_size_bytes is not set — the on-disk cache can grow without limit.")
+	}
 	fmt.Fprintf(stdout, "  custom rules:            %d\n", len(cfg.CustomRules))
 	fmt.Fprintf(stdout, "  target routes:           %d\n", len(cfg.Targets))
 	fmt.Fprintf(stdout, "  routes with failover:    %d\n", countFailoverTargets(cfg))
