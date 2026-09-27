@@ -643,6 +643,11 @@ type Server struct {
 	// DefaultMaxResponseBodyBytes. Set at start, not hot-reloaded.
 	MaxResponseBodyBytes int64
 
+	// MaxConcurrentRequests caps proxied requests in flight at once; above
+	// it a request is answered 503 too_many_concurrent_requests at once.
+	// Zero means no cap. Admin endpoints are not counted. Set at start.
+	MaxConcurrentRequests int64
+
 	// WebhookURL, if non-nil, is POSTed a JSON alert every time a rule
 	// blocks or redacts a request, or the rate limiter rejects one — see
 	// notifyWebhook. nil (the default) disables alerting entirely.
@@ -3300,8 +3305,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "draining", "server is draining, try another instance", "")
 		return
 	}
-	s.inFlight.Add(1)
+	inFlight := s.inFlight.Add(1)
 	defer s.inFlight.Add(-1)
+	if s.MaxConcurrentRequests > 0 && inFlight > s.MaxConcurrentRequests {
+		s.Stats.RecordConcurrencyRejected()
+		writeError(w, r, http.StatusServiceUnavailable, "too_many_concurrent_requests", "the proxy is at its concurrent request limit; retry shortly", "")
+		return
+	}
 
 	limitedBody := http.MaxBytesReader(w, r.Body, s.getMaxBodyBytes())
 	body, err := io.ReadAll(limitedBody)
@@ -6014,6 +6024,10 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 
 	// Unlabeled: the decision is about the request's method and what the
 	// failed candidate may have received, not about one target's health.
+	fmt.Fprintln(w, "# HELP aiproxy_concurrency_rejected_total Total number of requests rejected because the proxy was at max_concurrent_requests.")
+	fmt.Fprintln(w, "# TYPE aiproxy_concurrency_rejected_total counter")
+	fmt.Fprintf(w, "aiproxy_concurrency_rejected_total %d\n", snap.ConcurrencyRejected)
+
 	fmt.Fprintln(w, "# HELP aiproxy_webhook_dropped_total Total number of webhook deliveries dropped because the delivery queue was full.")
 	fmt.Fprintln(w, "# TYPE aiproxy_webhook_dropped_total counter")
 	fmt.Fprintf(w, "aiproxy_webhook_dropped_total %d\n", snap.WebhookDropped)

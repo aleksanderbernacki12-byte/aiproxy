@@ -749,6 +749,10 @@ type Config struct {
 	// Zero means proxy.DefaultMaxResponseBodyBytes. Read at start only.
 	MaxResponseBodyBytes int64 `json:"max_response_body_bytes,omitempty"`
 
+	// MaxConcurrentRequests caps proxied requests in flight at once (503
+	// above it). Zero means no cap. Read at start only.
+	MaxConcurrentRequests int64 `json:"max_concurrent_requests,omitempty"`
+
 	// WebhookURL, if set, is an http or https endpoint aiproxy POSTs a
 	// JSON alert to every time a rule blocks or redacts a request, or the
 	// rate limiter rejects one — a Slack incoming webhook URL, or any

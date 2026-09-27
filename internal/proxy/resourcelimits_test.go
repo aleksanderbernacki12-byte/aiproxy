@@ -116,3 +116,46 @@ func TestLimits_WebhookDeliveriesUseABoundedQueue(t *testing.T) {
 		t.Fatalf("goroutines grew by %d for 400 webhook deliveries, want a bounded worker pool", grown)
 	}
 }
+
+func TestLimits_ConcurrencyCapRejectsWithServiceUnavailable(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+	target, _ := url.Parse(upstream.URL)
+	s := proxy.New("unused", target, rules.NewEngine(rules.Allow))
+	s.Logger = log.New(io.Discard, "", 0)
+	s.MaxConcurrentRequests = 1
+
+	done := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest("GET", "/held", nil))
+		done <- rec.Code
+	}()
+	<-entered
+
+	req := httptest.NewRequest("GET", "/second", nil)
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "too_many_concurrent_requests") {
+		t.Fatalf("status=%d body=%q, want 503 too_many_concurrent_requests", rec.Code, rec.Body.String())
+	}
+	close(release)
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("held request status = %d, want 200", code)
+	}
+	if n := s.Stats.Snapshot().ConcurrencyRejected; n != 1 {
+		t.Fatalf("ConcurrencyRejected = %d, want 1", n)
+	}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest("GET", "/after", nil))
+	if rec.Code == http.StatusServiceUnavailable {
+		t.Fatal("a request after the held one finished was still rejected: the in-flight count leaked")
+	}
+}

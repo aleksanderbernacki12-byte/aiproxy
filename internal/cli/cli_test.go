@@ -3843,8 +3843,8 @@ func TestExecute_Validate_AdminKeyConfigured_NoWarning(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("expected exit code 0, got %d: stderr=%q", code, stderr.String())
 	}
-	if strings.Contains(stdout.String(), "WARNING") {
-		t.Fatalf("expected no warning with admin_api_key configured, got: %q", stdout.String())
+	if strings.Contains(stdout.String(), "WARNING: admin_api_key") {
+		t.Fatalf("expected no admin key warning with admin_api_key configured, got: %q", stdout.String())
 	}
 }
 
@@ -3907,5 +3907,32 @@ func TestExecute_Validate_NegativeMaxResponseBodyBytes_ReportsProblem(t *testing
 	}
 	if !strings.Contains(stderr.String(), "max_response_body_bytes") || !strings.Contains(stderr.String(), "must not be negative") {
 		t.Errorf("stderr missing the negative max_response_body_bytes problem: %q", stderr.String())
+	}
+}
+
+func TestExecute_Validate_MaxConcurrentRequests(t *testing.T) {
+	cases := []struct {
+		name, config string
+		wantCode     int
+		wantWarning  bool
+	}{
+		{"unset warns", `{}`, 0, true},
+		{"set does not warn", `{"max_concurrent_requests": 500}`, 0, false},
+		{"negative is a problem", `{"max_concurrent_requests": -1}`, 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "aiproxy.json")
+			if err := os.WriteFile(configPath, []byte(tc.config), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := cli.Execute([]string{"validate", "-config", configPath}, &stdout, &stderr); code != tc.wantCode {
+				t.Fatalf("exit code = %d, want %d: %q", code, tc.wantCode, stderr.String())
+			}
+			if got := strings.Contains(stdout.String(), "WARNING: max_concurrent_requests"); got != tc.wantWarning {
+				t.Errorf("warning present = %v, want %v: %q", got, tc.wantWarning, stdout.String())
+			}
+		})
 	}
 }

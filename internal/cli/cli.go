@@ -254,6 +254,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.SemanticCacheThreshold = lc.semanticCacheThreshold
 	server.MaxBodyBytes = lc.maxBodyBytes
 	server.MaxResponseBodyBytes = lc.maxResponseBodyBytes
+	server.MaxConcurrentRequests = lc.maxConcurrentRequests
 	server.WebhookURL = lc.webhookURL
 	server.Webhooks = lc.webhooks
 	server.ProxyAPIKey = lc.proxyAPIKey
@@ -803,6 +804,7 @@ type liveConfig struct {
 	semanticCacheThreshold float64
 	maxBodyBytes           int64
 	maxResponseBodyBytes   int64
+	maxConcurrentRequests  int64
 	webhookURL             *url.URL
 	webhooks               []proxy.WebhookTarget
 	proxyAPIKey            string
@@ -916,6 +918,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	lc.costBudgetHardStop = cfg.CostBudgetHardStop
 	lc.maxBodyBytes = cfg.MaxBodyBytes
 	lc.maxResponseBodyBytes = cfg.MaxResponseBodyBytes
+	lc.maxConcurrentRequests = cfg.MaxConcurrentRequests
 
 	if cfg.WebhookURL != "" {
 		webhookURL, err := parseWebhookURL(cfg.WebhookURL)
@@ -1630,6 +1633,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if cfg.MaxBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
 	}
+	if cfg.MaxConcurrentRequests < 0 {
+		problems = append(problems, fmt.Sprintf("max_concurrent_requests: %d must not be negative", cfg.MaxConcurrentRequests))
+	}
 	if cfg.MaxResponseBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_response_body_bytes: %d must not be negative", cfg.MaxResponseBodyBytes))
 	}
@@ -1711,6 +1717,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "%s is valid.\n", loadedFrom)
 	if cfg.AdminAPIKey == "" && len(cfg.AdminAPIKeys) == 0 {
 		fmt.Fprintln(stdout, "WARNING: admin_api_key/admin_api_keys are not set — /_aiproxy/drain, /_aiproxy/cache/clear, /_aiproxy/stats, /_aiproxy/metrics, and /_aiproxy/dashboard currently accept any configured proxy_api_key/proxy_api_keys (or, if none are configured, anyone who can reach the proxy at all). Set admin_api_key or admin_api_keys to require a separate credential for these operations.")
+	}
+	if cfg.MaxConcurrentRequests == 0 {
+		fmt.Fprintln(stdout, "WARNING: max_concurrent_requests is not set — there is no cap on requests in flight at once, so a burst can exhaust memory. Set it to what this host can serve.")
 	}
 	if cfg.CacheEnabled && cfg.CacheTTLSeconds == 0 {
 		fmt.Fprintln(stdout, "WARNING: cache_ttl_seconds is not set — cached responses never expire. Set a TTL so stale or sensitive responses do not live on disk indefinitely.")

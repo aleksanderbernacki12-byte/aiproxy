@@ -236,6 +236,10 @@ type Stats struct {
 	// delivery queue was full.
 	webhookDropped atomic.Int64
 
+	// concurrencyRejected counts requests rejected by the concurrent
+	// request cap.
+	concurrencyRejected atomic.Int64
+
 	mu        sync.Mutex
 	perTarget map[string]*counters
 	perRule   map[string]*ruleCounters
@@ -788,6 +792,12 @@ func (s *Stats) RecordWebhookDropped() {
 	s.webhookDropped.Add(1)
 }
 
+// RecordConcurrencyRejected records one request rejected because the
+// proxy was already at its concurrent request cap.
+func (s *Stats) RecordConcurrencyRejected() {
+	s.concurrencyRejected.Add(1)
+}
+
 // ClientOverBudget is CrossedClientBudget's non-latching counterpart —
 // see OverBudget for the same reasoning, scoped to one client the same
 // way CrossedClientBudget itself is. client == "" is never over
@@ -1007,6 +1017,9 @@ type Snapshot struct {
 	// WebhookDropped: see Stats.RecordWebhookDropped.
 	WebhookDropped int64 `json:"webhook_dropped"`
 
+	// ConcurrencyRejected: see Stats.RecordConcurrencyRejected.
+	ConcurrencyRejected int64 `json:"concurrency_rejected"`
+
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
 	// IPDenied (a different rejection reason), never broken down per
@@ -1098,6 +1111,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.UpstreamResponseTooLarge = s.upstreamResponseTooLarge.Load()
 	snap.IdempotencyFull = s.idempotencyFull.Load()
 	snap.WebhookDropped = s.webhookDropped.Load()
+	snap.ConcurrencyRejected = s.concurrencyRejected.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()
