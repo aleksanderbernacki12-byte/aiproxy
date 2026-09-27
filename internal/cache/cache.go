@@ -10,10 +10,13 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httputil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -279,7 +282,7 @@ func (c *Cache) Set(key string, resp *http.Response) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := os.Rename(temp.Name(), c.path(key)); err != nil {
+	if err := renameReplacing(temp.Name(), c.path(key)); err != nil {
 		os.Remove(temp.Name())
 		return err
 	}
@@ -288,6 +291,23 @@ func (c *Cache) Set(key string, resp *http.Response) error {
 		c.evictUntilUnderBudgetLocked()
 	}
 	return nil
+}
+
+// renameReplacing is os.Rename, retried briefly on Windows: there a
+// rename over a file fails with "Access is denied" while any other
+// handle has it open, including transient ones such as antivirus
+// scanners that c.mu cannot exclude (the same workaround as Go's
+// cmd/go/internal/robustio).
+func renameReplacing(from, to string) error {
+	err := os.Rename(from, to)
+	if runtime.GOOS != "windows" {
+		return err
+	}
+	for delay := time.Millisecond; err != nil && errors.Is(err, fs.ErrPermission) && delay <= 256*time.Millisecond; delay *= 2 {
+		time.Sleep(delay)
+		err = os.Rename(from, to)
+	}
+	return err
 }
 
 // tempPrefix marks an entry still being written by Set.
