@@ -3895,3 +3895,17 @@ func TestExecute_Validate_UnboundedCacheWarns(t *testing.T) {
 		})
 	}
 }
+
+func TestExecute_Validate_NegativeMaxResponseBodyBytes_ReportsProblem(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "aiproxy.json")
+	if err := os.WriteFile(configPath, []byte(`{"max_response_body_bytes": -1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := cli.Execute([]string{"validate", "-config", configPath}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "max_response_body_bytes") || !strings.Contains(stderr.String(), "must not be negative") {
+		t.Errorf("stderr missing the negative max_response_body_bytes problem: %q", stderr.String())
+	}
+}

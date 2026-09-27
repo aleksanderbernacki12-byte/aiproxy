@@ -253,6 +253,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	server.SemanticIndex = lc.semanticIndex
 	server.SemanticCacheThreshold = lc.semanticCacheThreshold
 	server.MaxBodyBytes = lc.maxBodyBytes
+	server.MaxResponseBodyBytes = lc.maxResponseBodyBytes
 	server.WebhookURL = lc.webhookURL
 	server.Webhooks = lc.webhooks
 	server.ProxyAPIKey = lc.proxyAPIKey
@@ -801,6 +802,7 @@ type liveConfig struct {
 	semanticIndex          *semcache.Index
 	semanticCacheThreshold float64
 	maxBodyBytes           int64
+	maxResponseBodyBytes   int64
 	webhookURL             *url.URL
 	webhooks               []proxy.WebhookTarget
 	proxyAPIKey            string
@@ -913,6 +915,7 @@ func buildLiveConfig(cfg *config.Config) (*liveConfig, []error) {
 	lc.costBudget = cfg.CostBudget
 	lc.costBudgetHardStop = cfg.CostBudgetHardStop
 	lc.maxBodyBytes = cfg.MaxBodyBytes
+	lc.maxResponseBodyBytes = cfg.MaxResponseBodyBytes
 
 	if cfg.WebhookURL != "" {
 		webhookURL, err := parseWebhookURL(cfg.WebhookURL)
@@ -1626,6 +1629,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	}
 	if cfg.MaxBodyBytes < 0 {
 		problems = append(problems, fmt.Sprintf("max_body_size_bytes: %d must not be negative", cfg.MaxBodyBytes))
+	}
+	if cfg.MaxResponseBodyBytes < 0 {
+		problems = append(problems, fmt.Sprintf("max_response_body_bytes: %d must not be negative", cfg.MaxResponseBodyBytes))
 	}
 	if cfg.StreamScanHoldbackBytes != nil && *cfg.StreamScanHoldbackBytes < 0 {
 		problems = append(problems, fmt.Sprintf("stream_scan_holdback_bytes: %d must not be negative", *cfg.StreamScanHoldbackBytes))

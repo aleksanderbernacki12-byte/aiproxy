@@ -374,6 +374,17 @@ func filterHeadersForScanning(header http.Header) map[string][]string {
 // untrusted client traffic.
 const DefaultMaxBodyBytes = 10 << 20 // 10 MiB
 
+// DefaultMaxResponseBodyBytes bounds a buffered upstream response. LLM
+// JSON responses are far smaller; large embedding batches still fit.
+const DefaultMaxResponseBodyBytes = 32 << 20 // 32 MiB
+
+func (s *Server) getMaxResponseBodyBytes() int64 {
+	if s.MaxResponseBodyBytes <= 0 {
+		return DefaultMaxResponseBodyBytes
+	}
+	return s.MaxResponseBodyBytes
+}
+
 // Server is a reverse proxy that evaluates every request's body against
 // a rules.Engine before forwarding it to Target over HTTPS. Additional
 // path-prefix routes (see AddRoute) can send matching requests to other
@@ -625,6 +636,12 @@ type Server struct {
 	// buffers every request body fully in memory before it can be
 	// inspected must never expose an actually-unbounded size by default.
 	MaxBodyBytes int64
+
+	// MaxResponseBodyBytes caps how large a non-streamed upstream response
+	// bufferResponse will hold in memory; a larger one is answered with 502
+	// upstream_response_too_large. Zero or negative means
+	// DefaultMaxResponseBodyBytes. Set at start, not hot-reloaded.
+	MaxResponseBodyBytes int64
 
 	// WebhookURL, if non-nil, is POSTed a JSON alert every time a rule
 	// blocks or redacts a request, or the rate limiter rejects one — see
@@ -2751,10 +2768,16 @@ func writeError(w http.ResponseWriter, r *http.Request, statusCode int, code, me
 // the real (now-replaced) upstream response body's Content-Type had
 // been.
 func writeResponseBlockedBody(resp *http.Response, message string) {
+	writeSyntheticResponse(resp, http.StatusForbidden, "response_block", message)
+}
+
+// writeSyntheticResponse replaces resp with a proxy-generated error, with
+// the same content negotiation as writeError.
+func writeSyntheticResponse(resp *http.Response, status int, code, message string) {
 	var body []byte
 	contentType := "text/plain; charset=utf-8"
 	if resp.Request != nil && acceptsJSON(resp.Request) {
-		encoded, err := json.Marshal(errorResponse{Error: "response_block", Message: message})
+		encoded, err := json.Marshal(errorResponse{Error: code, Message: message})
 		if err == nil {
 			body = encoded
 			contentType = "application/json; charset=utf-8"
@@ -2763,8 +2786,8 @@ func writeResponseBlockedBody(resp *http.Response, message string) {
 	if body == nil {
 		body = []byte(message)
 	}
-	resp.StatusCode = http.StatusForbidden
-	resp.Status = http.StatusText(http.StatusForbidden)
+	resp.StatusCode = status
+	resp.Status = http.StatusText(status)
 	resp.Header.Set("Content-Type", contentType)
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	resp.ContentLength = int64(len(body))
@@ -3906,8 +3929,20 @@ func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, reque
 // and, if caching is enabled, stores the response for future identical
 // requests.
 func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) error {
-	body, err := io.ReadAll(resp.Body)
+	limit := s.getMaxResponseBodyBytes()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	resp.Body.Close()
+	if err == nil && int64(len(body)) > limit {
+		// Never forwarded, cached, stored or recorded: only the first
+		// limit+1 bytes were read, so none of it is the real response.
+		s.Stats.RecordUpstreamResponseTooLarge()
+		s.logError("aiproxy: upstream response for %s %s exceeded %d bytes and was not forwarded", reqCtx.method, reqCtx.url, limit)
+		// Recorded as incomplete, like a cut-short stream: the evidence
+		// shows the exchange happened without holding the oversized body.
+		s.completeCompliance(reqCtx, resp.StatusCode, resp.Header.Clone(), nil, false, false, false)
+		writeSyntheticResponse(resp, http.StatusBadGateway, "upstream_response_too_large", "the upstream response exceeded the proxy's size limit")
+		return nil
+	}
 	if err != nil {
 		// Unlike a JSON parse failure, a body we couldn't even fully read
 		// means there is nothing intact left to hand the client; let
@@ -5917,6 +5952,10 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 
 	// Unlabeled: the decision is about the request's method and what the
 	// failed candidate may have received, not about one target's health.
+	fmt.Fprintln(w, "# HELP aiproxy_upstream_response_too_large_total Total number of buffered upstream responses not forwarded because they exceeded the size limit.")
+	fmt.Fprintln(w, "# TYPE aiproxy_upstream_response_too_large_total counter")
+	fmt.Fprintf(w, "aiproxy_upstream_response_too_large_total %d\n", snap.UpstreamResponseTooLarge)
+
 	fmt.Fprintln(w, "# HELP aiproxy_upstream_outcome_unknown_total Total number of requests with side effects not retried because the failed upstream may already have received them.")
 	fmt.Fprintln(w, "# TYPE aiproxy_upstream_outcome_unknown_total counter")
 	fmt.Fprintf(w, "aiproxy_upstream_outcome_unknown_total %d\n", snap.UpstreamOutcomeUnknown)

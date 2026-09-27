@@ -744,6 +744,11 @@ type Config struct {
 	// (each event is released once scanned on its own).
 	StreamScanHoldbackBytes *int `json:"stream_scan_holdback_bytes,omitempty"`
 
+	// MaxResponseBodyBytes caps a non-streamed upstream response held in
+	// memory; a larger one is answered 502 upstream_response_too_large.
+	// Zero means proxy.DefaultMaxResponseBodyBytes. Read at start only.
+	MaxResponseBodyBytes int64 `json:"max_response_body_bytes,omitempty"`
+
 	// WebhookURL, if set, is an http or https endpoint aiproxy POSTs a
 	// JSON alert to every time a rule blocks or redacts a request, or the
 	// rate limiter rejects one — a Slack incoming webhook URL, or any
