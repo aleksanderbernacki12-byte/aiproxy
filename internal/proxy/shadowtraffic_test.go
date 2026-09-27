@@ -51,7 +51,7 @@ func TestShouldMirror_RespectsTheBoundaryAgainstRandFloat64(t *testing.T) {
 
 func TestServer_GetShadowTarget_NoEntryMeansNotConfigured(t *testing.T) {
 	s := newDrainTestServer(t)
-	if _, _, ok := s.getShadowTarget("default"); ok {
+	if _, _, ok := s.snapshot().shadowTarget("default"); ok {
 		t.Fatalf("getShadowTarget on a Server with no TargetShadowURL at all = ok, want not ok")
 	}
 }
@@ -64,7 +64,7 @@ func TestServer_GetShadowTarget_DefaultsSampleRateToOne(t *testing.T) {
 	}
 	s.TargetShadowURL = map[string]*url.URL{"default": shadow}
 
-	gotURL, gotRate, ok := s.getShadowTarget("default")
+	gotURL, gotRate, ok := s.snapshot().shadowTarget("default")
 	if !ok {
 		t.Fatalf("getShadowTarget = not ok, want ok")
 	}
@@ -85,7 +85,7 @@ func TestServer_GetShadowTarget_UsesTheConfiguredSampleRateWhenPresent(t *testin
 	s.TargetShadowURL = map[string]*url.URL{"default": shadow}
 	s.TargetShadowSampleRate = map[string]float64{"default": 0.25}
 
-	_, gotRate, ok := s.getShadowTarget("default")
+	_, gotRate, ok := s.snapshot().shadowTarget("default")
 	if !ok {
 		t.Fatalf("getShadowTarget = not ok, want ok")
 	}

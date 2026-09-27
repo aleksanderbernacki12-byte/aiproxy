@@ -119,6 +119,11 @@ type llmUsageResponse struct {
 type requestContextKey struct{}
 
 type requestContextInfo struct {
+	// config is the request's configuration snapshot (see requestConfig),
+	// carried so the response lifecycle and failover transport use the
+	// same one ServeHTTP did.
+	config *requestConfig
+
 	method      string
 	url         string
 	requestID   string
@@ -1092,7 +1097,8 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	candidates := reqCtx.targets
 	start := time.Now()
 
-	base, totalTimeout := t.server.getUpstreamConfig()
+	cfg := t.server.configFor(reqCtx)
+	base, totalTimeout := cfg.upstreamTransport, cfg.upstreamTotalTimeout
 	var cancel context.CancelFunc
 	if totalTimeout > 0 {
 		var ctx context.Context
@@ -1110,7 +1116,7 @@ func (t *failoverTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return resp
 	}
 
-	tb := t.server.getTargetBreaker()
+	tb := cfg.targetBreaker
 
 	if len(candidates) <= 1 {
 		resp, err := base.RoundTrip(req)
@@ -1652,10 +1658,8 @@ func (s *Server) AddRoute(prefix string, targets []*url.URL, weights []int, lim 
 // happens right after this returns) varies request to request in
 // proportion to the configured weights, instead of always being
 // targets[0] the way a plain failover list's own primary always is.
-func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, r := range s.routes {
+func (s *Server) resolveRoute(cfg *requestConfig, path string) (targets []*url.URL, forwardPath string, targetLabel string, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter) {
+	for _, r := range cfg.routes {
 		if strings.HasPrefix(path, r.prefix) {
 			stripped := strings.TrimPrefix(path, r.prefix)
 			if !strings.HasPrefix(stripped, "/") {
@@ -1663,16 +1667,16 @@ func (s *Server) resolveRoute(path string) (targets []*url.URL, forwardPath stri
 			}
 			effectiveLimiter := r.limiter
 			if effectiveLimiter == nil {
-				effectiveLimiter = s.Limiter
+				effectiveLimiter = cfg.limiter
 			}
 			effectiveTokenLimiter := r.tokenLimiter
 			if effectiveTokenLimiter == nil {
-				effectiveTokenLimiter = s.TokenLimiter
+				effectiveTokenLimiter = cfg.tokenLimiter
 			}
 			return weightedOrdered(r.targets, r.weights), stripped, r.prefix, effectiveLimiter, effectiveTokenLimiter
 		}
 	}
-	return []*url.URL{s.Target}, path, "default", s.Limiter, s.TokenLimiter
+	return []*url.URL{s.Target}, path, "default", cfg.limiter, cfg.tokenLimiter
 }
 
 // AddModelRoute registers a content-based route: any request whose
@@ -1902,10 +1906,8 @@ func extractPromptText(body []byte) (text string, remainder []byte, ok bool) {
 // a model route represents a deliberate, explicit routing decision by
 // the operator, so when one is configured and matches, it takes
 // priority over whatever path the client happened to use.
-func (s *Server) resolveModelRoute(body []byte) (targets []*url.URL, label string, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter, matched bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.modelRoutes) == 0 {
+func (s *Server) resolveModelRoute(cfg *requestConfig, body []byte) (targets []*url.URL, label string, lim *limiter.Limiter, tokenLim *limiter.TokenLimiter, matched bool) {
+	if len(cfg.modelRoutes) == 0 {
 		return nil, "", nil, nil, false
 	}
 
@@ -1914,7 +1916,7 @@ func (s *Server) resolveModelRoute(body []byte) (targets []*url.URL, label strin
 		return nil, "", nil, nil, false
 	}
 
-	for _, r := range s.modelRoutes {
+	for _, r := range cfg.modelRoutes {
 		for _, pattern := range r.models {
 			if ok, err := path.Match(pattern, mf.Model); err == nil && ok {
 				return weightedOrdered(r.targets, r.weights), "model:" + r.name, r.limiter, r.tokenLimiter, true
@@ -1940,49 +1942,10 @@ func (s *Server) getCache() *cache.Cache {
 	return s.Cache
 }
 
-// cacheEnabledForTarget reports whether caching is actually active for
-// target — its own TargetCacheEnabled override if it has one,
-// otherwise simply whether Cache itself is non-nil. See
-// TargetCacheEnabled's own doc comment for why an override can only
-// ever narrow (disable one target), never widen (enable a target when
-// Cache is nil).
-func (s *Server) cacheEnabledForTarget(target string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if enabled, ok := s.TargetCacheEnabled[target]; ok {
-		return enabled && s.Cache != nil
-	}
-	return s.Cache != nil
-}
-
-// resolveCacheTTL returns target's own TargetCacheTTL override if it
-// has one, otherwise the server-wide CacheTTL default — see
-// TargetCacheTTL's own doc comment.
-func (s *Server) resolveCacheTTL(target string) time.Duration {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if ttl, ok := s.TargetCacheTTL[target]; ok {
-		return ttl
-	}
-	return s.CacheTTL
-}
-
-func (s *Server) getCostPer1KTokens() float64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.CostPer1KTokens
-}
-
 func (s *Server) getCostBudget() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.CostBudget
-}
-
-func (s *Server) getCostBudgetHardStop() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.CostBudgetHardStop
 }
 
 // getCostRates returns CostPer1KTokens and TargetCostRates combined
@@ -1994,36 +1957,6 @@ func (s *Server) getCostRates() stats.CostRates {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return stats.CostRates{Default: s.CostPer1KTokens, PerTarget: s.TargetCostRates}
-}
-
-// getShadowTarget returns target's own configured shadow destination
-// and sample rate, if any — see TargetShadowURL/TargetShadowSampleRate.
-// ok is false when target has no shadow entry at all, in which case
-// shadowURL/sampleRate are the zero value and must not be used. A
-// present TargetShadowURL entry with no matching TargetShadowSampleRate
-// entry defaults sampleRate to 1.0 — see config.Target.ShadowSampleRate
-// for why that's the right default rather than a config error.
-func (s *Server) getShadowTarget(target string) (shadowURL *url.URL, sampleRate float64, ok bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	u, ok := s.TargetShadowURL[target]
-	if !ok {
-		return nil, 0, false
-	}
-	rate, hasRate := s.TargetShadowSampleRate[target]
-	if !hasRate {
-		rate = 1.0
-	}
-	return u, rate, true
-}
-
-func (s *Server) getMaxBodyBytes() int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.MaxBodyBytes <= 0 {
-		return DefaultMaxBodyBytes
-	}
-	return s.MaxBodyBytes
 }
 
 func (s *Server) getWebhookURL() *url.URL {
@@ -2075,24 +2008,6 @@ func (s *Server) getIdempotency() *idempotency.Registry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Idempotency
-}
-
-func (s *Server) getCoalescer() *coalesce.Group {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.Coalescer
-}
-
-func (s *Server) getSemanticIndex() *semcache.Index {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.SemanticIndex
-}
-
-func (s *Server) getSemanticCacheThreshold() float64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.SemanticCacheThreshold
 }
 
 // clientIP extracts and parses the remote TCP peer's IP address from
@@ -2158,28 +2073,12 @@ func (s *Server) getGeoIPConfig() (*geoip.Table, []string, []string) {
 	return s.GeoIPTable, s.CountryAllowList, s.CountryDenyList
 }
 
-// getAnomalyConfig returns AnomalyDetector and AnomalyDryRun under one
-// lock, for ServeHTTP's anomaly check.
-func (s *Server) getAnomalyConfig() (*anomaly.Registry, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.AnomalyDetector, s.AnomalyDryRun
-}
-
 // getUpstreamConfig returns UpstreamTransport and UpstreamTotalTimeout
 // under one lock, for failoverTransport.RoundTrip.
 func (s *Server) getUpstreamConfig() (*http.Transport, time.Duration) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.UpstreamTransport, s.UpstreamTotalTimeout
-}
-
-// getTargetBreaker returns TargetBreaker under lock, for
-// failoverTransport.RoundTrip.
-func (s *Server) getTargetBreaker() *breaker.Registry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.TargetBreaker
 }
 
 // getCORSConfig returns CORS under lock, for ServeHTTP, adminMux, and
@@ -3314,7 +3213,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limitedBody := http.MaxBytesReader(w, r.Body, s.getMaxBodyBytes())
+	// One configuration for the whole request (see requestConfig).
+	cfg := s.snapshot()
+
+	limitedBody := http.MaxBytesReader(w, r.Body, cfg.maxBodyBytes)
 	body, err := io.ReadAll(limitedBody)
 	limitedBody.Close()
 	if err != nil {
@@ -3326,7 +3228,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "bad_request", err.Error(), "")
 		return
 	}
-	body, err = decodeRequestBody(r, body, s.getMaxBodyBytes())
+	body, err = decodeRequestBody(r, body, cfg.maxBodyBytes)
 	if err != nil {
 		switch {
 		case errors.Is(err, errUnsupportedContentEncoding):
@@ -3348,7 +3250,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// isn't enabled, no header was sent, or the header value was
 	// invalid.
 	var idempotencyKey, idempotencyNamespace string
-	if idem := s.getIdempotency(); idem != nil {
+	if idem := cfg.idempotency; idem != nil {
 		if idempotencyKey = resolveIdempotencyKey(r); idempotencyKey != "" {
 			// Namespaced by caller credential, not just proxy key label:
 			// without proxy auth every caller shares label "", and one
@@ -3373,7 +3275,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// path out of this case; there is no code after it that
 				// could still reach the forwarding logic further down in
 				// ServeHTTP.
-				servedBody, allowed := s.checkReplayPolicy(w, r, requestID, "", auth.label, r.Header, body, resp.Body)
+				servedBody, allowed := s.checkReplayPolicy(cfg, w, r, requestID, "", auth.label, r.Header, body, resp.Body)
 				if !allowed {
 					return
 				}
@@ -3433,10 +3335,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var forwardPath, targetLabel string
 	var effectiveLimiter *limiter.Limiter
 	var effectiveTokenLimiter *limiter.TokenLimiter
-	if mTargets, mLabel, mLimiter, mTokenLimiter, matched := s.resolveModelRoute(body); matched {
+	if mTargets, mLabel, mLimiter, mTokenLimiter, matched := s.resolveModelRoute(cfg, body); matched {
 		targets, forwardPath, targetLabel, effectiveLimiter, effectiveTokenLimiter = mTargets, r.URL.Path, mLabel, mLimiter, mTokenLimiter
 	} else {
-		targets, forwardPath, targetLabel, effectiveLimiter, effectiveTokenLimiter = s.resolveRoute(r.URL.Path)
+		targets, forwardPath, targetLabel, effectiveLimiter, effectiveTokenLimiter = s.resolveRoute(cfg, r.URL.Path)
 	}
 	if auth.limiter != nil {
 		// The authenticated key's own rate limit is authoritative for
@@ -3462,8 +3364,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var semanticFingerprintForReqCtx []uint64
 	var semanticRemainderHashForReqCtx string
 	var semanticTargetPartitionForReqCtx string
-	if cch := s.getCache(); cch != nil && s.cacheEnabledForTarget(targetLabel) {
-		ttl := s.resolveCacheTTL(targetLabel)
+	if cch := cfg.cache; cch != nil && cfg.cacheEnabledForTarget(targetLabel) {
+		ttl := cfg.resolveCacheTTL(targetLabel)
 		destURL := &url.URL{Path: forwardPath, RawQuery: r.URL.RawQuery}
 		resolvedDestination := targets[0].ResolveReference(destURL).String()
 		cacheKey = cache.Key(r.Method, resolvedDestination, partitionIdentity(auth, r), body)
@@ -3479,7 +3381,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// it — checkReplayPolicy re-runs that same check now, against
 			// the CURRENT rules, before this stored response is ever
 			// written to the client. See its own doc comment.
-			servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
+			servedBody, allowed := s.checkReplayPolicy(cfg, w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
 			if !allowed {
 				return
 			}
@@ -3499,7 +3401,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// must be completed right here instead, or the deferred
 			// Release above would incorrectly abandon a claim that was
 			// actually served just fine.
-			if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
+			if idem := cfg.idempotency; idem != nil && idempotencyKey != "" {
 				idem.Store(idempotencyNamespace, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 			}
 			s.Stats.RecordCacheHit(targetLabel)
@@ -3518,13 +3420,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// bufferResponse/streamResponse). See Server.SemanticIndex's own
 		// doc comment for why this is a second, approximate layer
 		// checked only after the exact-match cache already missed.
-		if threshold := s.getSemanticCacheThreshold(); threshold > 0 {
+		if threshold := cfg.semanticCacheThreshold; threshold > 0 {
 			if text, remainder, extracted := extractPromptText(body); extracted {
 				semanticFingerprintForReqCtx = semcache.Fingerprint(text)
 				remainderSum := sha256.Sum256(remainder)
 				semanticRemainderHashForReqCtx = hex.EncodeToString(remainderSum[:])
 				semanticTargetPartitionForReqCtx = semanticPartitionTarget(targetLabel, resolvedDestination, auth, r)
-				if idx := s.getSemanticIndex(); idx != nil {
+				if idx := cfg.semanticIndex; idx != nil {
 					if candidateKey, similarity, found := idx.FindBest(semanticTargetPartitionForReqCtx, semanticFingerprintForReqCtx, semanticRemainderHashForReqCtx, threshold); found {
 						if cached, hit, age, err := cch.Get(candidateKey, ttl); err == nil && hit && identityEncoded(cached.Header) {
 							defer cached.Body.Close()
@@ -3538,7 +3440,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							// bufferResponse/streamResponse either, so its
 							// stored body must be re-checked against the
 							// CURRENT rules before being served.
-							servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
+							servedBody, allowed := s.checkReplayPolicy(cfg, w, r, requestID, targetLabel, auth.label, r.Header, body, cachedBody)
 							if !allowed {
 								return
 							}
@@ -3558,7 +3460,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							// bufferResponse/streamResponse either, so an
 							// owned idempotency claim must be completed
 							// right here.
-							if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
+							if idem := cfg.idempotency; idem != nil && idempotencyKey != "" {
 								idem.Store(idempotencyNamespace, idempotencyKey, &idempotency.Response{StatusCode: cached.StatusCode, Header: cached.Header.Clone(), Body: servedBody})
 							}
 							s.Stats.RecordSemanticCacheHit(targetLabel)
@@ -3577,14 +3479,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// itself as the coalescing key, since it's already the same
 		// content-derived identity this section exists to deduplicate
 		// by.
-		if coalescer := s.getCoalescer(); coalescer != nil {
+		if coalescer := cfg.coalescer; coalescer != nil {
 			switch resp, outcome := coalescer.Claim(cacheKey); outcome {
 			case coalesce.Replay:
 				// A coalesced replay never reaches bufferResponse/
 				// streamResponse either, so its stored body must be
 				// re-checked against the CURRENT rules before being
 				// served — see checkReplayPolicy's own doc comment.
-				servedBody, allowed := s.checkReplayPolicy(w, r, requestID, targetLabel, auth.label, r.Header, body, resp.Body)
+				servedBody, allowed := s.checkReplayPolicy(cfg, w, r, requestID, targetLabel, auth.label, r.Header, body, resp.Body)
 				if !allowed {
 					return
 				}
@@ -3594,7 +3496,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.Write(servedBody)
 				// Same reasoning as the cache-hit branch above needing
 				// its own Idempotency.Store call.
-				if idem := s.getIdempotency(); idem != nil && idempotencyKey != "" {
+				if idem := cfg.idempotency; idem != nil && idempotencyKey != "" {
 					idem.Store(idempotencyNamespace, idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: servedBody})
 				}
 				s.Stats.RecordCoalescedRequest(targetLabel)
@@ -3611,7 +3513,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	action, ruleName, evaluatedBody, evaluatedHeaders, dryRunHits, err := s.getEngine().Evaluate(rules.Request{
+	action, ruleName, evaluatedBody, evaluatedHeaders, dryRunHits, err := cfg.engine.Evaluate(rules.Request{
 		Method:  r.Method,
 		URL:     r.URL.String(),
 		Body:    body,
@@ -3682,16 +3584,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// so the (fairly cheap, but non-zero) per-target cost walk
 	// OverBudget does is never paid at all for the overwhelmingly
 	// common case where hard-stop isn't configured.
-	if s.getCostBudgetHardStop() {
-		if cost, over := s.Stats.OverBudget(s.getCostRates(), s.getCostBudget()); over {
+	if cfg.costBudgetHardStop {
+		if cost, over := s.Stats.OverBudget(cfg.costRates(), cfg.costBudget); over {
 			s.Stats.RecordBudgetRejected()
-			s.logBudgetRejected(r.Method, s.logSafeURL(r.URL), requestID, cost, s.getCostBudget())
+			s.logBudgetRejected(r.Method, s.logSafeURL(r.URL), requestID, cost, cfg.costBudget)
 			writeError(w, r, http.StatusPaymentRequired, "cost_budget_exceeded", "cost budget exceeded", "")
 			return
 		}
 	}
 	if auth.costBudgetHardStop {
-		if cost, over := s.Stats.ClientOverBudget(auth.label, s.getCostPer1KTokens(), auth.costBudget); over {
+		if cost, over := s.Stats.ClientOverBudget(auth.label, cfg.costPer1KTokens, auth.costBudget); over {
 			s.Stats.RecordClientBudgetRejected(auth.label)
 			s.logClientBudgetRejected(r.Method, s.logSafeURL(r.URL), auth.label, requestID, cost, auth.costBudget)
 			writeError(w, r, http.StatusPaymentRequired, "cost_budget_exceeded", "cost budget exceeded", "")
@@ -3705,7 +3607,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// unidentified caller (auth.label == "" whenever no
 	// proxy_api_key/proxy_api_keys is configured at all), since
 	// there's no notion of "this caller's own baseline" without one.
-	if anomalyDetector, anomalyDryRun := s.getAnomalyConfig(); anomalyDetector != nil {
+	if anomalyDetector, anomalyDryRun := cfg.anomalyDetector, cfg.anomalyDryRun; anomalyDetector != nil {
 		if anomalous, currentCount, baseline := anomalyDetector.Check(auth.label); anomalous {
 			s.Stats.RecordAnomalyDetected()
 			s.Stats.RecordClientAnomalyDetected(auth.label)
@@ -3778,6 +3680,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rewritten to the absolute upstream URL, and they need the exact
 	// same target/cache key ServeHTTP already resolved and checked.
 	reqCtx := requestContextInfo{
+		config:                  cfg,
 		method:                  r.Method,
 		url:                     s.logSafeURL(r.URL),
 		requestID:               requestID,
@@ -3818,7 +3721,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// goroutine and sharing the same map would be a data race. Fired
 	// entirely in the background: nothing here can delay or otherwise
 	// affect the real response about to be served just below.
-	if shadowURL, sampleRate, ok := s.getShadowTarget(targetLabel); ok && shouldMirrorNow(sampleRate) {
+	if shadowURL, sampleRate, ok := cfg.shadowTarget(targetLabel); ok && shouldMirrorNow(sampleRate) {
 		go s.mirrorToShadow(shadowURL, r.Method, forwardPath, r.URL.RawQuery, r.Header.Clone(), evaluatedBody, targetLabel, requestID)
 	}
 
@@ -3897,8 +3800,8 @@ func isEventStream(resp *http.Response) bool {
 // left to protect by modifying the served response bytes over a
 // request-side-only redact match — only a request-side Block carries
 // forward to a replay.
-func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, requestID, targetLabel, clientLabel string, requestHeaders http.Header, requestBody, responseBody []byte) (resultBody []byte, allowed bool) {
-	reqAction, reqRuleName, _, _, reqDryRunHits, err := s.getEngine().Evaluate(rules.Request{
+func (s *Server) checkReplayPolicy(cfg *requestConfig, w http.ResponseWriter, r *http.Request, requestID, targetLabel, clientLabel string, requestHeaders http.Header, requestBody, responseBody []byte) (resultBody []byte, allowed bool) {
+	reqAction, reqRuleName, _, _, reqDryRunHits, err := cfg.engine.Evaluate(rules.Request{
 		Method:  r.Method,
 		URL:     r.URL.String(),
 		Body:    requestBody,
@@ -3920,7 +3823,7 @@ func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, reque
 		}
 	}
 
-	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(responseBody, targetLabel, clientLabel)
+	action, ruleName, scannedBody, dryRunHits := cfg.engine.EvaluateResponse(responseBody, targetLabel, clientLabel)
 	s.handleResponseDryRunHits(dryRunHits, r.Method, s.logSafeURL(r.URL), requestID)
 	switch action {
 	case rules.Block:
@@ -3949,7 +3852,8 @@ func (s *Server) checkReplayPolicy(w http.ResponseWriter, r *http.Request, reque
 // and, if caching is enabled, stores the response for future identical
 // requests.
 func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) error {
-	limit := s.getMaxResponseBodyBytes()
+	cfg := s.configFor(reqCtx)
+	limit := cfg.maxResponseBodyBytes
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	resp.Body.Close()
 	if err == nil && int64(len(body)) > limit {
@@ -3976,7 +3880,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	// and a redaction must not be able to hide the usage object.
 	s.logUsageFromBody(reqCtx, rawResponseBody)
 
-	action, ruleName, scannedBody, dryRunHits := s.getEngine().EvaluateResponse(body, reqCtx.targetLabel, reqCtx.clientLabel)
+	action, ruleName, scannedBody, dryRunHits := cfg.engine.EvaluateResponse(body, reqCtx.targetLabel, reqCtx.clientLabel)
 	s.handleResponseDryRunHits(dryRunHits, reqCtx.method, reqCtx.url, reqCtx.requestID)
 	if action == rules.Block {
 		s.Stats.RecordResponseBlock(reqCtx.targetLabel, ruleName)
@@ -4002,14 +3906,14 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 
-	if cch := s.getCache(); cch != nil && resp.StatusCode == http.StatusOK && reqCtx.cacheKey != "" {
+	if cch := cfg.cache; cch != nil && resp.StatusCode == http.StatusOK && reqCtx.cacheKey != "" {
 		// httputil.DumpResponse drains and then restores resp.Body itself,
 		// so the client still receives the body intact afterwards. This
 		// runs before the usage log line so a durable cache write is
 		// never left pending behind an already-visible log line.
 		if err := cch.Set(reqCtx.cacheKey, resp); err != nil {
 			s.logError("aiproxy: cache: failed to store response: %v", err)
-		} else if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
+		} else if idx := cfg.semanticIndex; idx != nil && reqCtx.semanticFingerprint != nil {
 			idx.Add(reqCtx.semanticTargetPartition, reqCtx.semanticFingerprint, reqCtx.semanticRemainderHash, reqCtx.cacheKey)
 		}
 	}
@@ -4024,7 +3928,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	// block, the same reasoning a rate-limited/rejected REQUEST already
 	// gets via the deferred Release in ServeHTTP.
 	if reqCtx.idempotencyKey != "" {
-		if idem := s.getIdempotency(); idem != nil {
+		if idem := cfg.idempotency; idem != nil {
 			idem.Store(reqCtx.idempotencyClient, reqCtx.idempotencyKey, &idempotency.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body})
 		}
 	}
@@ -4034,7 +3938,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 	// a concurrent identical request waiting on this exact content
 	// deserves the same real answer, whatever it turned out to be.
 	if reqCtx.coalesceOwned {
-		if coalescer := s.getCoalescer(); coalescer != nil {
+		if coalescer := cfg.coalescer; coalescer != nil {
 			coalescer.Store(reqCtx.cacheKey, &coalesce.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body})
 		}
 	}
@@ -4058,6 +3962,7 @@ func (s *Server) bufferResponse(resp *http.Response, reqCtx requestContextInfo) 
 // for a clean, complete stream on a 200 response — a cache write, both
 // from the accumulated copy.
 func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) {
+	cfg := s.configFor(reqCtx)
 	statusCode := resp.StatusCode
 	header := resp.Header
 	rawResponseHeader := resp.Header.Clone()
@@ -4066,12 +3971,12 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 
 	tee := &streamTee{
 		src:             resp.Body,
-		engine:          s.getEngine(),
+		engine:          cfg.engine,
 		target:          reqCtx.targetLabel,
 		key:             reqCtx.clientLabel,
 		captureRaw:      reqCtx.complianceEventID != "",
 		accumulate:      reqCtx.cacheKey != "" || reqCtx.idempotencyKey != "" || reqCtx.coalesceOwned,
-		accumulateLimit: s.getMaxResponseBodyBytes(),
+		accumulateLimit: cfg.maxResponseBodyBytes,
 		onRedact: func(ruleName string) {
 			responsePolicyRedacted = true
 			s.Stats.RecordResponseRedact(reqCtx.targetLabel, ruleName)
@@ -4097,9 +4002,9 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// cache write having already landed. A stream a Block rule cut
 		// short is never cached, same as any other incomplete stream:
 		// cleanEOF is false for it too (see streamTee.Read).
-		if cch := s.getCache(); replayable && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
+		if cch := cfg.cache; replayable && cch != nil && statusCode == http.StatusOK && reqCtx.cacheKey != "" {
 			if s.writeStreamToCache(cch, reqCtx.cacheKey, statusCode, header, data) {
-				if idx := s.getSemanticIndex(); idx != nil && reqCtx.semanticFingerprint != nil {
+				if idx := cfg.semanticIndex; idx != nil && reqCtx.semanticFingerprint != nil {
 					idx.Add(reqCtx.semanticTargetPartition, reqCtx.semanticFingerprint, reqCtx.semanticRemainderHash, reqCtx.cacheKey)
 				}
 			}
@@ -4109,12 +4014,12 @@ func (s *Server) streamResponse(resp *http.Response, reqCtx requestContextInfo) 
 		// why this isn't restricted to a 200 the way the cache write
 		// above is.
 		if replayable && reqCtx.idempotencyKey != "" {
-			if idem := s.getIdempotency(); idem != nil {
+			if idem := cfg.idempotency; idem != nil {
 				idem.Store(reqCtx.idempotencyClient, reqCtx.idempotencyKey, &idempotency.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
 			}
 		}
 		if replayable && reqCtx.coalesceOwned {
-			if coalescer := s.getCoalescer(); coalescer != nil {
+			if coalescer := cfg.coalescer; coalescer != nil {
 				coalescer.Store(reqCtx.cacheKey, &coalesce.Response{StatusCode: statusCode, Header: header.Clone(), Body: data})
 			}
 		}
@@ -4497,6 +4402,7 @@ func (s *Server) logUsageFromBody(reqCtx requestContextInfo, body []byte) {
 }
 
 func (s *Server) recordUsage(reqCtx requestContextInfo, tokens int) {
+	cfg := s.configFor(reqCtx)
 	if tokens > 0 {
 		// Records this request's actual cost against whatever token
 		// breaker applied to it — see effectiveTokenLimiter in ServeHTTP
@@ -4508,11 +4414,11 @@ func (s *Server) recordUsage(reqCtx requestContextInfo, tokens int) {
 		s.Stats.RecordTokensUsed(reqCtx.targetLabel, tokens)
 		s.Stats.RecordClientTokensUsed(reqCtx.clientLabel, tokens)
 		s.logUsage(reqCtx.method, reqCtx.url, reqCtx.requestID, tokens)
-		if cost, crossed := s.Stats.CrossedBudget(s.getCostRates(), s.getCostBudget()); crossed {
-			s.logBudgetExceeded(reqCtx.method, reqCtx.url, reqCtx.requestID, cost, s.getCostBudget())
-			s.notifyBudgetWebhook(reqCtx.method, reqCtx.url, reqCtx.requestID, cost, s.getCostBudget())
+		if cost, crossed := s.Stats.CrossedBudget(cfg.costRates(), cfg.costBudget); crossed {
+			s.logBudgetExceeded(reqCtx.method, reqCtx.url, reqCtx.requestID, cost, cfg.costBudget)
+			s.notifyBudgetWebhook(reqCtx.method, reqCtx.url, reqCtx.requestID, cost, cfg.costBudget)
 		}
-		if cost, crossed := s.Stats.CrossedClientBudget(reqCtx.clientLabel, s.getCostPer1KTokens(), reqCtx.clientCostBudget); crossed {
+		if cost, crossed := s.Stats.CrossedClientBudget(reqCtx.clientLabel, cfg.costPer1KTokens, reqCtx.clientCostBudget); crossed {
 			s.logClientBudgetExceeded(reqCtx.method, reqCtx.url, reqCtx.clientLabel, reqCtx.requestID, cost, reqCtx.clientCostBudget)
 			s.notifyClientBudgetWebhook(reqCtx.method, reqCtx.url, reqCtx.clientLabel, reqCtx.requestID, cost, reqCtx.clientCostBudget)
 		}

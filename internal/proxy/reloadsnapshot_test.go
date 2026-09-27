@@ -2,14 +2,19 @@ package proxy_test
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"aiproxy/internal/idempotency"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
 )
@@ -63,5 +68,84 @@ func TestReload_LogWritesNeverHitAClosedFile(t *testing.T) {
 	}
 	if total != writers*writesEach {
 		t.Errorf("log lines across all files = %d, want %d", total, writers*writesEach)
+	}
+}
+
+// TestReload_InFlightRequestKeepsItsConfig reloads while a request is
+// waiting on the upstream: the in-flight request must finish on the
+// engine and idempotency registry it started with (review finding #14),
+// while the next request sees the new configuration.
+func TestReload_InFlightRequestKeepsItsConfig(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(entered) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+	targetURL, _ := url.Parse(upstream.URL)
+
+	registryA := idempotency.NewRegistry(time.Minute, time.Second)
+	registryB := idempotency.NewRegistry(time.Minute, time.Second)
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Idempotency = registryA
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	post := func() (int, string, string) {
+		req, _ := http.NewRequest(http.MethodPost, frontend.URL+"/v1/x", strings.NewReader(`{"n":1}`))
+		req.Header.Set("Idempotency-Key", "k1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Errorf("post: %v", err)
+			return 0, "", ""
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body), resp.Header.Get("Idempotency-Replayed")
+	}
+
+	type result struct {
+		status int
+		body   string
+	}
+	inFlight := make(chan result, 1)
+	go func() {
+		status, body, _ := post()
+		inFlight <- result{status, body}
+	}()
+	<-entered
+
+	srv.ReloadConfig(proxy.RuntimeConfig{
+		Engine:            rules.NewEngine(rules.Block),
+		Idempotency:       registryB,
+		UpstreamTransport: proxy.NewUpstreamTransport(0),
+	})
+	close(release)
+
+	got := <-inFlight
+	if got.status != http.StatusOK || got.body != `{"ok":true}` {
+		t.Fatalf("in-flight request = %d %q, want 200 {\"ok\":true} from the pre-reload config", got.status, got.body)
+	}
+	if n := registryB.Len(); n != 0 {
+		t.Errorf("new registry has %d entries, want 0: the in-flight request leaked into it", n)
+	}
+
+	if status, _, _ := post(); status != http.StatusForbidden {
+		t.Errorf("request after reload = %d, want 403 from the new Block engine", status)
+	}
+
+	srv.ReloadConfig(proxy.RuntimeConfig{
+		Engine:            rules.NewEngine(rules.Allow),
+		Idempotency:       registryA,
+		UpstreamTransport: proxy.NewUpstreamTransport(0),
+	})
+	status, body, replayed := post()
+	if status != http.StatusOK || body != `{"ok":true}` || replayed != "true" {
+		t.Errorf("replay from the original registry = %d %q replayed=%q, want the stored response: the in-flight request must complete its entry in the registry it claimed", status, body, replayed)
 	}
 }

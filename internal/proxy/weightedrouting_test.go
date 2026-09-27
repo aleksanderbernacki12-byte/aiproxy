@@ -127,7 +127,7 @@ func TestResolveRoute_WeightedRouteVariesTargetsAcrossCalls(t *testing.T) {
 
 	seenA, seenB := false, false
 	for i := 0; i < 200 && !(seenA && seenB); i++ {
-		targets, _, _, _, _ := s.resolveRoute("/split/v1")
+		targets, _, _, _, _ := s.resolveRoute(s.snapshot(), "/split/v1")
 		if len(targets) != 2 {
 			t.Fatalf("resolveRoute returned %d targets, want 2", len(targets))
 		}

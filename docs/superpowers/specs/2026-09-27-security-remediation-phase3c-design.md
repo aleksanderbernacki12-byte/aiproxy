@@ -26,11 +26,13 @@ not enforced.
 2. **One snapshot per request.** `ServeHTTP` calls `s.snapshot()` once: a
    single `s.mu.RLock` section copies every reloadable field (including the
    internal `routes`/`modelRoutes`) into an immutable `*requestConfig`, which
-   is stored in the request context. Every request-path read (routing,
-   rules, cache, idempotency, coalescing, semantic cache, cost/budget, usage,
-   shadow, webhooks fired by the request, upstream transport and timeout,
-   breaker, CORS, API keys, IP/geo lists, anomaly, body limits) goes through
-   that snapshot, including the `ReverseProxy` callbacks (`Rewrite`,
+   is stored in the request context. It is taken right after admission
+   (IP/geo lists, CORS, IP limiter, API keys, drain, concurrency cap), which
+   still reads the current configuration: those checks are shared with the
+   admin surface and hold nothing a request later depends on. Every read
+   after that (routing, rules, cache, idempotency, coalescing, semantic
+   cache, cost/budget, usage, shadow selection, upstream transport and
+   timeout, breaker, anomaly, body limits) goes through the snapshot, including the `ReverseProxy` callbacks (`Rewrite`,
    `ModifyResponse`, `ErrorHandler`) and the failover transport, which read it
    from the outgoing request's context. `requestConfigFrom(ctx)` falls back to
    a fresh snapshot when none is attached, so internal helpers stay callable
