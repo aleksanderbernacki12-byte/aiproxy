@@ -121,6 +121,7 @@ func (d *Detector) rollWindowLocked() {
 type Registry struct {
 	multiplier float64
 	window     time.Duration
+	now        func() time.Time
 
 	mu        sync.Mutex
 	detectors map[string]*Detector
@@ -131,7 +132,14 @@ type Registry struct {
 // measured in buckets of the given window duration (DefaultWindow in
 // production).
 func NewRegistry(multiplier float64, window time.Duration) *Registry {
-	return &Registry{multiplier: multiplier, window: window, detectors: make(map[string]*Detector)}
+	return NewRegistryWithClock(multiplier, window, time.Now)
+}
+
+// NewRegistryWithClock is NewRegistry with an injected clock, so callers
+// outside this package (the proxy's integration tests) can drive windows
+// deterministically instead of racing wall-clock time.
+func NewRegistryWithClock(multiplier float64, window time.Duration, now func() time.Time) *Registry {
+	return &Registry{multiplier: multiplier, window: window, now: now, detectors: make(map[string]*Detector)}
 }
 
 // Check records one request for client and reports whether it's
@@ -144,7 +152,7 @@ func (r *Registry) Check(client string) (anomalous bool, currentCount int, basel
 	if client == "" {
 		return false, 0, 0
 	}
-	return r.detectorFor(client).Check()
+	return r.detectorFor(client).check(r.now())
 }
 
 func (r *Registry) detectorFor(client string) *Detector {

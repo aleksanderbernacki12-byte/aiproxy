@@ -487,10 +487,33 @@ func TestServer_TokenRateLimit_RejectedRequestNeverCountsAsPlainRateLimited(t *t
 	}
 }
 
-// shortAnomalyWindow lets these tests establish a baseline and trigger
-// a spike in real wall-clock milliseconds instead of the production
-// anomaly.DefaultWindow's real 60 seconds.
+// shortAnomalyWindow is the anomaly bucket size these tests use. Windows
+// are advanced with anomalyClock rather than slept through: a spike must
+// land inside one window, and under -race or a loaded machine a hundred
+// real HTTP round trips can outlast any short wall-clock window.
 const shortAnomalyWindow = 300 * time.Millisecond
+
+// anomalyClock is a manually advanced clock for anomaly.NewRegistryWithClock.
+type anomalyClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newAnomalyClock() *anomalyClock {
+	return &anomalyClock{now: time.Unix(1_700_000_000, 0)}
+}
+
+func (c *anomalyClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *anomalyClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
 
 // getWithProxyAuth issues a GET to url with the given
 // Proxy-Authorization bearer key set, failing the test on any
@@ -544,6 +567,7 @@ func TestServer_AnomalyDetection_UnconfiguredNeverBlocks(t *testing.T) {
 // never affected — there's no notion of "this caller's own baseline"
 // without an identified caller.
 func TestServer_AnomalyDetection_UnidentifiedCallerNeverBlocks(t *testing.T) {
+	clock := newAnomalyClock()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -554,7 +578,7 @@ func TestServer_AnomalyDetection_UnidentifiedCallerNeverBlocks(t *testing.T) {
 	}
 
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
-	srv.AnomalyDetector = anomaly.NewRegistry(2, shortAnomalyWindow)
+	srv.AnomalyDetector = anomaly.NewRegistryWithClock(2, shortAnomalyWindow, clock.Now)
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
@@ -577,6 +601,7 @@ func TestServer_AnomalyDetection_UnidentifiedCallerNeverBlocks(t *testing.T) {
 // multiplier, and only then gets a 429 — never before the baseline was
 // even established.
 func TestServer_AnomalyDetection_BlocksOnceClientSpikesPastOwnBaseline(t *testing.T) {
+	clock := newAnomalyClock()
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
@@ -591,14 +616,14 @@ func TestServer_AnomalyDetection_BlocksOnceClientSpikesPastOwnBaseline(t *testin
 	var logBuf syncBuffer
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.ProxyAPIKey = "the-key"
-	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow) // 5x baseline trips
+	srv.AnomalyDetector = anomaly.NewRegistryWithClock(5, shortAnomalyWindow, clock.Now) // 5x baseline trips
 	srv.Logger = log.New(&logBuf, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
 	// Establish a steady baseline of 10 requests/window.
 	for w := 0; w < 5; w++ {
-		time.Sleep(shortAnomalyWindow)
+		clock.Advance(shortAnomalyWindow)
 		for i := 0; i < 10; i++ {
 			resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
 			resp.Body.Close()
@@ -609,7 +634,7 @@ func TestServer_AnomalyDetection_BlocksOnceClientSpikesPastOwnBaseline(t *testin
 	}
 
 	// Now a sudden spike, well past 5x the established baseline of 10.
-	time.Sleep(shortAnomalyWindow)
+	clock.Advance(shortAnomalyWindow)
 	var sawBlock bool
 	for i := 0; i < 100 && !sawBlock; i++ {
 		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
@@ -651,6 +676,7 @@ func TestServer_AnomalyDetection_BlocksOnceClientSpikesPastOwnBaseline(t *testin
 // otherwise trip a 429 is instead logged/counted but the request still
 // goes through, forwarded exactly as if nothing had matched.
 func TestServer_AnomalyDetection_DryRunNeverBlocksButStillRecords(t *testing.T) {
+	clock := newAnomalyClock()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -662,21 +688,21 @@ func TestServer_AnomalyDetection_DryRunNeverBlocksButStillRecords(t *testing.T) 
 
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.ProxyAPIKey = "the-key"
-	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow)
+	srv.AnomalyDetector = anomaly.NewRegistryWithClock(5, shortAnomalyWindow, clock.Now)
 	srv.AnomalyDryRun = true
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
 	for w := 0; w < 5; w++ {
-		time.Sleep(shortAnomalyWindow)
+		clock.Advance(shortAnomalyWindow)
 		for i := 0; i < 10; i++ {
 			resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
 			resp.Body.Close()
 		}
 	}
 
-	time.Sleep(shortAnomalyWindow)
+	clock.Advance(shortAnomalyWindow)
 	for i := 0; i < 100; i++ {
 		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")
 		resp.Body.Close()
@@ -695,6 +721,7 @@ func TestServer_AnomalyDetection_DryRunNeverBlocksButStillRecords(t *testing.T) 
 // proves one named key's spike never affects another's — each client
 // gets its own Detector, keyed by auth.label.
 func TestServer_AnomalyDetection_DistinctClientsHaveIndependentBaselines(t *testing.T) {
+	clock := newAnomalyClock()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -709,14 +736,14 @@ func TestServer_AnomalyDetection_DistinctClientsHaveIndependentBaselines(t *test
 		{Name: "spiky", Key: "spiky-key"},
 		{Name: "steady", Key: "steady-key"},
 	}
-	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow)
+	srv.AnomalyDetector = anomaly.NewRegistryWithClock(5, shortAnomalyWindow, clock.Now)
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
 	// Both clients establish the same steady baseline.
 	for w := 0; w < 5; w++ {
-		time.Sleep(shortAnomalyWindow)
+		clock.Advance(shortAnomalyWindow)
 		for i := 0; i < 10; i++ {
 			getWithProxyAuth(t, frontend.URL+"/x", "spiky-key").Body.Close()
 			getWithProxyAuth(t, frontend.URL+"/x", "steady-key").Body.Close()
@@ -724,7 +751,7 @@ func TestServer_AnomalyDetection_DistinctClientsHaveIndependentBaselines(t *test
 	}
 
 	// Only "spiky" spikes; "steady" keeps its normal rate.
-	time.Sleep(shortAnomalyWindow)
+	clock.Advance(shortAnomalyWindow)
 	var spikyBlocked bool
 	for i := 0; i < 100; i++ {
 		resp := getWithProxyAuth(t, frontend.URL+"/x", "spiky-key")
@@ -756,6 +783,7 @@ func TestServer_AnomalyDetection_DistinctClientsHaveIndependentBaselines(t *test
 // current rate, and the baseline it was compared against, and an empty
 // rule.
 func TestServer_Webhook_FiresOnAnomalyDetectedWithExpectedPayload(t *testing.T) {
+	clock := newAnomalyClock()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -785,19 +813,19 @@ func TestServer_Webhook_FiresOnAnomalyDetectedWithExpectedPayload(t *testing.T) 
 
 	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
 	srv.ProxyAPIKey = "the-key"
-	srv.AnomalyDetector = anomaly.NewRegistry(5, shortAnomalyWindow)
+	srv.AnomalyDetector = anomaly.NewRegistryWithClock(5, shortAnomalyWindow, clock.Now)
 	srv.WebhookURL = webhookURL
 	srv.Logger = log.New(io.Discard, "", 0)
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
 	for w := 0; w < 5; w++ {
-		time.Sleep(shortAnomalyWindow)
+		clock.Advance(shortAnomalyWindow)
 		for i := 0; i < 10; i++ {
 			getWithProxyAuth(t, frontend.URL+"/chat", "the-key").Body.Close()
 		}
 	}
-	time.Sleep(shortAnomalyWindow)
+	clock.Advance(shortAnomalyWindow)
 	for i := 0; i < 100; i++ {
 		getWithProxyAuth(t, frontend.URL+"/chat", "the-key").Body.Close()
 	}
@@ -834,6 +862,7 @@ func TestServer_Webhook_FiresOnAnomalyDetectedWithExpectedPayload(t *testing.T) 
 // ReloadConfig can add an AnomalyDetector to a server that started
 // with none, live.
 func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
+	clock := newAnomalyClock()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -858,7 +887,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 		}
 	}
 
-	registry := anomaly.NewRegistry(5, shortAnomalyWindow)
+	registry := anomaly.NewRegistryWithClock(5, shortAnomalyWindow, clock.Now)
 	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
 
 	// The freshly reloaded Registry starts cold — no baseline exists
@@ -867,13 +896,13 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	// the swap. Establish a real baseline against the *new* registry
 	// first, then spike.
 	for w := 0; w < 5; w++ {
-		time.Sleep(shortAnomalyWindow)
+		clock.Advance(shortAnomalyWindow)
 		for i := 0; i < 10; i++ {
 			getWithProxyAuth(t, frontend.URL+"/x", "the-key").Body.Close()
 		}
 	}
 
-	time.Sleep(shortAnomalyWindow)
+	clock.Advance(shortAnomalyWindow)
 	var sawBlock bool
 	for i := 0; i < 100 && !sawBlock; i++ {
 		resp := getWithProxyAuth(t, frontend.URL+"/x", "the-key")

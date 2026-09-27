@@ -259,3 +259,23 @@ func TestRegistry_ConcurrentAccessNeverRaces(t *testing.T) {
 		t.Errorf("detectors map has %d entries, want %d", len(r.detectors), len(clients))
 	}
 }
+
+func TestRegistry_WithClockUsesInjectedTime(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	registry := NewRegistryWithClock(5, time.Minute, func() time.Time { return now })
+	for window := 0; window < 3; window++ {
+		for i := 0; i < 10; i++ {
+			if anomalous, _, _ := registry.Check("client"); anomalous {
+				t.Fatalf("window %d request %d flagged during a steady baseline", window, i)
+			}
+		}
+		now = now.Add(time.Minute)
+	}
+	var flagged bool
+	for i := 0; i < 50 && !flagged; i++ {
+		flagged, _, _ = registry.Check("client")
+	}
+	if !flagged {
+		t.Fatal("50 requests in one window against a baseline of 10 were never flagged")
+	}
+}
