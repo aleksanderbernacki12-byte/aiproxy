@@ -2374,6 +2374,9 @@ func (s *Server) ReloadConfig(cfg RuntimeConfig) {
 		newModelRoutes[i] = modelRoute{name: r.Name, models: r.Models, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
 	}
 
+	// Lock order: logFileMu, then mu (see appendToLogFile).
+	s.logFileMu.Lock()
+	defer s.logFileMu.Unlock()
 	s.mu.Lock()
 	oldLogFile := s.LogFile
 	s.Engine = cfg.Engine
@@ -5371,12 +5374,14 @@ func (s *Server) logEventJSON(ev logEvent) {
 // in one order but write in another, corrupting the chain without any
 // real tampering ever happening.
 func (s *Server) appendToLogFile(data []byte) {
+	// The file is read inside logFileMu, the same lock ReloadConfig swaps
+	// and closes it under, so a write never lands on a closed handle.
+	s.logFileMu.Lock()
 	f := s.getLogFile()
 	if f == nil {
+		s.logFileMu.Unlock()
 		return
 	}
-
-	s.logFileMu.Lock()
 	if s.AuditChain != nil {
 		wrapped, err := s.AuditChain.Wrap(data)
 		if err != nil {
