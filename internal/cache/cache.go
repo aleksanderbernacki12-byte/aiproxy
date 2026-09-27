@@ -10,13 +10,10 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
-	"io/fs"
 	"net/http"
 	"net/http/httputil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -195,23 +192,16 @@ func (c *Cache) path(key string) string {
 func (c *Cache) Get(key string, ttl time.Duration) (*http.Response, bool, time.Duration, error) {
 	path := c.path(key)
 
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, 0, nil
-		}
-		return nil, false, 0, err
-	}
-	age := time.Since(info.ModTime())
-	if ttl > 0 && age > ttl {
-		c.removeIfExpired(key, ttl)
-		return nil, false, 0, nil
-	}
-
-	// Held so Set's rename never replaces a file that is open here:
-	// Windows refuses to rename over an open file.
+	// Both the stat and the read happen under the read lock so Set's
+	// rename never meets an open handle: on Windows a rename over a file
+	// fails while any handle is open, and os.Stat briefly opens one too.
 	c.mu.RLock()
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
+	var data []byte
+	expired := err == nil && ttl > 0 && time.Since(info.ModTime()) > ttl
+	if err == nil && !expired {
+		data, err = os.ReadFile(path)
+	}
 	c.mu.RUnlock()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -219,6 +209,11 @@ func (c *Cache) Get(key string, ttl time.Duration) (*http.Response, bool, time.D
 		}
 		return nil, false, 0, err
 	}
+	if expired {
+		c.removeIfExpired(key, ttl)
+		return nil, false, 0, nil
+	}
+	age := time.Since(info.ModTime())
 
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(data)), nil)
 	if err != nil {
@@ -282,7 +277,7 @@ func (c *Cache) Set(key string, resp *http.Response) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := renameReplacing(temp.Name(), c.path(key)); err != nil {
+	if err := os.Rename(temp.Name(), c.path(key)); err != nil {
 		os.Remove(temp.Name())
 		return err
 	}
@@ -291,23 +286,6 @@ func (c *Cache) Set(key string, resp *http.Response) error {
 		c.evictUntilUnderBudgetLocked()
 	}
 	return nil
-}
-
-// renameReplacing is os.Rename, retried briefly on Windows: there a
-// rename over a file fails with "Access is denied" while any other
-// handle has it open, including transient ones such as antivirus
-// scanners that c.mu cannot exclude (the same workaround as Go's
-// cmd/go/internal/robustio).
-func renameReplacing(from, to string) error {
-	err := os.Rename(from, to)
-	if runtime.GOOS != "windows" {
-		return err
-	}
-	for delay := time.Millisecond; err != nil && errors.Is(err, fs.ErrPermission) && delay <= 256*time.Millisecond; delay *= 2 {
-		time.Sleep(delay)
-		err = os.Rename(from, to)
-	}
-	return err
 }
 
 // tempPrefix marks an entry still being written by Set.
