@@ -228,6 +228,10 @@ type Stats struct {
 	// exceeding the proxy's response size limit.
 	upstreamResponseTooLarge atomic.Int64
 
+	// idempotencyFull counts requests rejected because the idempotency
+	// registry was full of in-flight records.
+	idempotencyFull atomic.Int64
+
 	mu        sync.Mutex
 	perTarget map[string]*counters
 	perRule   map[string]*ruleCounters
@@ -768,6 +772,12 @@ func (s *Stats) RecordUpstreamResponseTooLarge() {
 	s.upstreamResponseTooLarge.Add(1)
 }
 
+// RecordIdempotencyFull records one request rejected because every
+// idempotency record was still in flight at the registry's entry cap.
+func (s *Stats) RecordIdempotencyFull() {
+	s.idempotencyFull.Add(1)
+}
+
 // ClientOverBudget is CrossedClientBudget's non-latching counterpart —
 // see OverBudget for the same reasoning, scoped to one client the same
 // way CrossedClientBudget itself is. client == "" is never over
@@ -981,6 +991,9 @@ type Snapshot struct {
 	// UpstreamResponseTooLarge: see Stats.RecordUpstreamResponseTooLarge.
 	UpstreamResponseTooLarge int64 `json:"upstream_response_too_large"`
 
+	// IdempotencyFull: see Stats.RecordIdempotencyFull.
+	IdempotencyFull int64 `json:"idempotency_full"`
+
 	// CountryDenied counts requests rejected by the GeoIP country
 	// allow/deny list — see Stats.RecordCountryDenied. Distinct from
 	// IPDenied (a different rejection reason), never broken down per
@@ -1070,6 +1083,7 @@ func (s *Stats) Snapshot() Snapshot {
 	snap.IdempotencyConflicts = s.idempotencyConflicts.Load()
 	snap.UpstreamOutcomeUnknown = s.upstreamOutcomeUnknown.Load()
 	snap.UpstreamResponseTooLarge = s.upstreamResponseTooLarge.Load()
+	snap.IdempotencyFull = s.idempotencyFull.Load()
 	snap.CountryDenied = s.countryDenied.Load()
 	snap.AnomalyDetected = s.anomalyDetected.Load()
 	snap.TargetsEjected = s.targetsEjected.Load()

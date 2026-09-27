@@ -203,7 +203,9 @@ func TestStreamTee_AccumulationPastLimitIsDroppedButStreamDelivered(t *testing.T
 	var completedLen int
 	var complete bool
 	tee := &streamTee{src: &reviewChunks{chunks: chunks}, engine: holdbackEngine(0, rules.Block), accumulate: true, accumulateLimit: 64}
-	tee.onComplete = func(data, _ []byte, cleanEOF bool) { completedLen, complete = len(data), cleanEOF && !tee.accumulationOverflowed }
+	tee.onComplete = func(data, _ []byte, cleanEOF bool) {
+		completedLen, complete = len(data), cleanEOF && !tee.accumulationOverflowed
+	}
 	delivered, err := io.ReadAll(tee)
 	tee.Close()
 	if err != nil || string(delivered) != strings.Join(chunks, "") {

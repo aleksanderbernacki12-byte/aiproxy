@@ -9,8 +9,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"aiproxy/internal/cache"
+	"aiproxy/internal/idempotency"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
 )
@@ -48,5 +50,41 @@ func TestLimits_OversizedBufferedResponseIsRejectedAndNotCached(t *testing.T) {
 	}
 	if n := s.Stats.Snapshot().UpstreamResponseTooLarge; n != 2 {
 		t.Fatalf("UpstreamResponseTooLarge = %d, want 2", n)
+	}
+}
+
+func TestLimits_IdempotencyAtCapacityReturns503(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+	defer close(release)
+	target, _ := url.Parse(upstream.URL)
+	s := proxy.New("unused", target, rules.NewEngine(rules.Allow))
+	s.Logger = log.New(io.Discard, "", 0)
+	s.Idempotency = idempotency.NewRegistry(time.Minute, time.Second)
+	s.Idempotency.MaxEntries = 1
+
+	go func() {
+		req := httptest.NewRequest("POST", "/a", strings.NewReader(`{}`))
+		req.Header.Set("Idempotency-Key", "first")
+		s.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-entered
+
+	req := httptest.NewRequest("POST", "/a", strings.NewReader(`{}`))
+	req.Header.Set("Idempotency-Key", "second")
+	req.Header.Set("Accept", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "idempotency_capacity") {
+		t.Fatalf("status=%d body=%q, want 503 idempotency_capacity", rec.Code, rec.Body.String())
+	}
+	if n := s.Stats.Snapshot().IdempotencyFull; n != 1 {
+		t.Fatalf("IdempotencyFull = %d, want 1", n)
 	}
 }

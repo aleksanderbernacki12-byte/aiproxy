@@ -3380,6 +3380,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case idempotency.Canceled:
 				// The client disconnected while waiting; nobody is left to answer.
 				return
+			case idempotency.Full:
+				s.Stats.RecordIdempotencyFull()
+				writeError(w, r, http.StatusServiceUnavailable, "idempotency_capacity", "too many idempotent requests are in flight; retry shortly", "")
+				return
 			case idempotency.Own:
 				// Own means this goroutine must eventually call either
 				// Store (a real response was produced — see
@@ -5978,6 +5982,10 @@ func writePromMetrics(w io.Writer, snap stats.Snapshot, rates stats.CostRates, c
 
 	// Unlabeled: the decision is about the request's method and what the
 	// failed candidate may have received, not about one target's health.
+	fmt.Fprintln(w, "# HELP aiproxy_idempotency_full_total Total number of requests rejected because every idempotency record was still in flight at the entry cap.")
+	fmt.Fprintln(w, "# TYPE aiproxy_idempotency_full_total counter")
+	fmt.Fprintf(w, "aiproxy_idempotency_full_total %d\n", snap.IdempotencyFull)
+
 	fmt.Fprintln(w, "# HELP aiproxy_upstream_response_too_large_total Total number of buffered upstream responses not forwarded because they exceeded the size limit.")
 	fmt.Fprintln(w, "# TYPE aiproxy_upstream_response_too_large_total counter")
 	fmt.Fprintf(w, "aiproxy_upstream_response_too_large_total %d\n", snap.UpstreamResponseTooLarge)

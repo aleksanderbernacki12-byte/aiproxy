@@ -63,6 +63,16 @@ const (
 	// Canceled means the caller's context ended while waiting on an
 	// in-flight owner: the client is gone, so the caller writes nothing.
 	Canceled
+	// Full means the registry is at MaxEntries and every entry is still
+	// in flight, so nothing can be evicted to make room. The caller
+	// should reject the request rather than forward it untracked.
+	Full
+)
+
+// DefaultMaxEntries and DefaultMaxBytes bound memory within one TTL.
+const (
+	DefaultMaxEntries = 10_000
+	DefaultMaxBytes   = 64 << 20
 )
 
 // DefaultWaitTimeout is how long Claim blocks waiting for an in-flight
@@ -97,6 +107,13 @@ type Registry struct {
 	ttl         time.Duration
 	waitTimeout time.Duration
 
+	// MaxEntries and MaxBytes cap the records kept within the TTL; when
+	// full, the oldest completed records are evicted first. In-flight
+	// records are never evicted.
+	MaxEntries  int
+	MaxBytes    int64
+	storedBytes int64
+
 	mu      sync.Mutex
 	entries map[recordKey]*entry
 }
@@ -108,6 +125,8 @@ func NewRegistry(ttl, waitTimeout time.Duration) *Registry {
 	return &Registry{
 		ttl:         ttl,
 		waitTimeout: waitTimeout,
+		MaxEntries:  DefaultMaxEntries,
+		MaxBytes:    DefaultMaxBytes,
 		entries:     make(map[recordKey]*entry),
 	}
 }
@@ -136,6 +155,10 @@ func (r *Registry) Claim(ctx context.Context, client, key string, operationHash 
 		r.mu.Lock()
 		e, ok := r.entries[rk]
 		if !ok {
+			if !r.makeRoomLocked(1, 0) {
+				r.mu.Unlock()
+				return nil, Full
+			}
 			r.entries[rk] = &entry{operationHash: operationHash, done: make(chan struct{})}
 			r.mu.Unlock()
 			return nil, Own
@@ -172,13 +195,48 @@ func (r *Registry) Claim(ctx context.Context, client, key string, operationHash 
 func (r *Registry) Store(client, key string, resp *Response) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.entries[recordKey{client: client, key: key}]
+	rk := recordKey{client: client, key: key}
+	e, ok := r.entries[rk]
 	if !ok || e.response != nil {
 		return
 	}
 	e.response = resp
 	e.storedAt = time.Now()
 	close(e.done)
+	size := int64(len(resp.Body))
+	if size > r.MaxBytes || !r.makeRoomLocked(0, size) {
+		// Too large to keep: requests already waiting still get this
+		// response (done is closed), but the record is dropped, so a
+		// later retry is processed fresh instead of holding the memory.
+		delete(r.entries, rk)
+		return
+	}
+	r.storedBytes += size
+}
+
+// makeRoomLocked evicts the oldest completed records until one more
+// record (newEntries) and bytes more stored bytes fit. It reports false
+// when only in-flight records remain and there is still no room.
+func (r *Registry) makeRoomLocked(newEntries int, bytes int64) bool {
+	for len(r.entries)+newEntries > r.MaxEntries || r.storedBytes+bytes > r.MaxBytes {
+		var oldestKey recordKey
+		var oldest *entry
+		for k, e := range r.entries {
+			if e.response != nil && (oldest == nil || e.storedAt.Before(oldest.storedAt)) {
+				oldestKey, oldest = k, e
+			}
+		}
+		if oldest == nil {
+			return false
+		}
+		r.deleteCompletedLocked(oldestKey, oldest)
+	}
+	return true
+}
+
+func (r *Registry) deleteCompletedLocked(k recordKey, e *entry) {
+	delete(r.entries, k)
+	r.storedBytes -= int64(len(e.response.Body))
 }
 
 // Release abandons an owned claim for (client, key) without storing a
@@ -222,7 +280,7 @@ func (r *Registry) sweep(now time.Time) {
 			continue // still in flight; never swept regardless of age
 		}
 		if e.storedAt.Before(cutoff) {
-			delete(r.entries, k)
+			r.deleteCompletedLocked(k, e)
 		}
 	}
 }

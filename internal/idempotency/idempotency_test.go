@@ -305,3 +305,64 @@ func TestClaim_ReturnsCanceledWhenCallerContextEndsWhileWaiting(t *testing.T) {
 		t.Fatalf("Claim kept waiting %v after the context ended", elapsed)
 	}
 }
+
+func storeFor(r *Registry, key string, body string) {
+	if _, outcome := r.Claim(context.Background(), "client", key, hashOf(key)); outcome != Own {
+		panic("expected Own for " + key)
+	}
+	r.Store("client", key, &Response{StatusCode: 200, Body: []byte(body)})
+}
+
+func TestRegistry_EntryCapEvictsOldestCompleted(t *testing.T) {
+	r := NewRegistry(time.Hour, time.Second)
+	r.MaxEntries = 2
+	storeFor(r, "a", "1")
+	time.Sleep(time.Millisecond)
+	storeFor(r, "b", "2")
+	storeFor(r, "c", "3")
+	if r.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", r.Len())
+	}
+	if _, outcome := r.Claim(context.Background(), "client", "a", hashOf("a")); outcome != Own {
+		t.Fatalf("oldest entry a was not evicted: outcome %v", outcome)
+	}
+}
+
+func TestRegistry_AllInFlightAtCapacityReturnsFull(t *testing.T) {
+	r := NewRegistry(time.Hour, time.Second)
+	r.MaxEntries = 1
+	if _, outcome := r.Claim(context.Background(), "client", "a", hashOf("a")); outcome != Own {
+		t.Fatal("first claim not Own")
+	}
+	if _, outcome := r.Claim(context.Background(), "client", "b", hashOf("b")); outcome != Full {
+		t.Fatalf("outcome = %v, want Full while the only slot is in flight", outcome)
+	}
+}
+
+func TestRegistry_ByteCapEvictsAndOversizedBodyIsNotKept(t *testing.T) {
+	r := NewRegistry(time.Hour, time.Second)
+	r.MaxBytes = 10
+	storeFor(r, "a", "123456")
+	storeFor(r, "b", "123456")
+	if _, outcome := r.Claim(context.Background(), "client", "a", hashOf("a")); outcome != Own {
+		t.Fatal("a should have been evicted to make room for b")
+	}
+	r.Release("client", "a")
+
+	if _, outcome := r.Claim(context.Background(), "client", "big", hashOf("big")); outcome != Own {
+		t.Fatal("claim big not Own")
+	}
+	waiter := make(chan Outcome, 1)
+	go func() {
+		_, outcome := r.Claim(context.Background(), "client", "big", hashOf("big"))
+		waiter <- outcome
+	}()
+	time.Sleep(20 * time.Millisecond)
+	r.Store("client", "big", &Response{StatusCode: 200, Body: []byte("far more than ten bytes")})
+	if outcome := <-waiter; outcome != Replay {
+		t.Fatalf("a waiter got %v, want Replay (it must not re-execute the operation)", outcome)
+	}
+	if _, outcome := r.Claim(context.Background(), "client", "big", hashOf("big")); outcome != Own {
+		t.Fatalf("oversized body was kept: later claim got %v, want Own", outcome)
+	}
+}
