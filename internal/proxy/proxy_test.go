@@ -888,7 +888,7 @@ func TestServer_ReloadConfig_UpdatesAnomalyDetector(t *testing.T) {
 	}
 
 	registry := anomaly.NewRegistryWithClock(5, shortAnomalyWindow, clock.Now)
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "the-key", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, registry, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, ProxyAPIKey: "the-key", AnomalyDetector: registry, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	// The freshly reloaded Registry starts cold — no baseline exists
 	// for this client yet, so (correctly, per Detector's own cold-start
@@ -4868,9 +4868,9 @@ func TestServer_ReloadConfig_SwapsEngineLimiterCacheCostAndRoutes(t *testing.T) 
 
 	allowAll := rules.NewEngine(rules.Allow)
 	strictLimiter := limiter.New(1, time.Minute)
-	srv.ReloadConfig(allowAll, nil, nil, 0.05, 0, 0, nil, nil, "", nil, nil, []proxy.Route{
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: allowAll, CostPer1KTokens: 0.05, Routes: []proxy.Route{
 		{Prefix: "/other", Targets: []*url.URL{otherURL}, Limiter: strictLimiter},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	}, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	if got := get("/x"); got != http.StatusOK {
 		t.Fatalf("after reload: status = %d, want %d (allowAll engine)", got, http.StatusOK)
@@ -4932,7 +4932,7 @@ func TestServer_ReloadConfig_ConcurrentWithRequests_NeverRaces(t *testing.T) {
 			if i%2 == 0 {
 				action = rules.Block
 			}
-			srv.ReloadConfig(rules.NewEngine(action), limiter.New(1000, time.Minute), nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+			srv.ReloadConfig(proxy.RuntimeConfig{Engine: rules.NewEngine(action), Limiter: limiter.New(1000, time.Minute), UpstreamTransport: proxy.NewUpstreamTransport(0)})
 		}
 	}()
 
@@ -5941,7 +5941,7 @@ func TestServer_Webhooks_ReloadConfigSwapsThemLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, []proxy.WebhookTarget{{URL: webhookURL}}, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, Webhooks: []proxy.WebhookTarget{{URL: webhookURL}}, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	resp, err := http.Post(frontend.URL+"/upload", "text/plain", strings.NewReader("token=AKIAABCDEFGHIJKLMNOP"))
 	if err != nil {
@@ -7214,7 +7214,7 @@ func TestServer_ReloadConfig_SwapsProxyAPIKeysLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, ProxyAPIKeys: []proxy.ProxyKey{{Name: "new-team", Key: "new-key"}}, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	do := func(key string) int {
 		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/x", nil)
@@ -7263,7 +7263,7 @@ func TestServer_ReloadConfig_SwapsAdminAPIKeyLive(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "new-admin-key", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, UpstreamTransport: proxy.NewUpstreamTransport(0), AdminAPIKey: "new-admin-key"})
 
 	if srv.AdminAPIKey != "new-admin-key" {
 		t.Fatalf("AdminAPIKey after reload = %q, want %q", srv.AdminAPIKey, "new-admin-key")
@@ -7578,7 +7578,7 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKey(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no key required yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "new-key-after-reload", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: rules.NewEngine(rules.Allow), ProxyAPIKey: "new-key-after-reload", UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	if got := get(); got != http.StatusProxyAuthRequired {
 		t.Fatalf("after reload: status = %d, want %d (key now required)", got, http.StatusProxyAuthRequired)
@@ -7940,7 +7940,7 @@ func TestServer_ReloadConfig_UpdatesCostBudgetHardStop(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want 200", before.StatusCode)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 1.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, true, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: rules.NewEngine(rules.Allow), CostPer1KTokens: 1.0, CostBudget: 1.0, UpstreamTransport: proxy.NewUpstreamTransport(0), CostBudgetHardStop: true})
 
 	after := post()
 	after.Body.Close()
@@ -8263,7 +8263,7 @@ func TestServer_ReloadConfig_UpdatesCostBudget(t *testing.T) {
 		t.Fatalf("summary has a cost budget line before any budget was configured: %q", got)
 	}
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 1.0, 50.0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: rules.NewEngine(rules.Allow), CostPer1KTokens: 1.0, CostBudget: 50.0, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	if got := srv.Summary(); !strings.Contains(got, "Cost budget:         50") {
 		t.Fatalf("summary missing cost budget line after reload: %q", got)
@@ -8723,7 +8723,7 @@ func TestServer_ReloadConfig_UpdatesTargetBreaker(t *testing.T) {
 
 	tb := breaker.NewRegistry(1, time.Hour)
 	reloadedRoutes := []proxy.Route{{Prefix: "/openai", Targets: []*url.URL{brokenURL, healthyURL}}}
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, reloadedRoutes, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, tb, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, Routes: reloadedRoutes, UpstreamTransport: proxy.NewUpstreamTransport(0), TargetBreaker: tb})
 
 	get := func() {
 		resp, err := http.Get(frontend.URL + "/openai/v1/chat")
@@ -9606,7 +9606,7 @@ func TestServer_ReloadConfig_ReopensLogFileAndClosesOldHandle(t *testing.T) {
 
 	srv.LogEvent("before_reload", "first event, goes to the old file")
 
-	srv.ReloadConfig(rules.NewEngine(rules.Allow), nil, nil, 0, 0, 0, nil, nil, "", nil, newFile, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: rules.NewEngine(rules.Allow), LogFile: newFile, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	srv.LogEvent("after_reload", "second event, goes to the new file")
 
@@ -10426,9 +10426,9 @@ func TestServer_ReloadConfig_SwapsModelRoutesLive(t *testing.T) {
 		t.Fatalf("before reload: body = %q, want default (no model route registered yet)", got)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, []proxy.ModelRoute{
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, ModelRoutes: []proxy.ModelRoute{
 		{Name: "anthropic", Models: []string{"claude-*"}, Targets: []*url.URL{upstreamURL}},
-	}, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	}, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	if got := post(); got != "routed" {
 		t.Fatalf("after reload: body = %q, want routed (the model route added via ReloadConfig should now match)", got)
@@ -10742,9 +10742,9 @@ func TestServer_ReloadConfig_UpdatesProxyAPIKeyCostBudget(t *testing.T) {
 		t.Fatalf("webhook called %d times before reload, want 0 (no budget configured yet)", got)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 1.0, 0, 0, webhookURL, nil, "", []proxy.ProxyKey{
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, CostPer1KTokens: 1.0, WebhookURL: webhookURL, ProxyAPIKeys: []proxy.ProxyKey{
 		{Name: "team-a", Key: "key-a", CostBudget: 5.0},
-	}, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	}, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	post()
 	time.Sleep(200 * time.Millisecond)
@@ -11097,9 +11097,9 @@ func TestServer_ReloadConfig_UpdatesIPLists(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no deny list configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, []*net.IPNet{
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, IPDenyList: []*net.IPNet{
 		mustCIDR(t, "127.0.0.0/8"),
-	}, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	}, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured deny list should now reject this IP)", got, http.StatusForbidden)
@@ -11539,8 +11539,7 @@ func TestServer_ReloadConfig_UpdatesCountryLists(t *testing.T) {
 	}
 
 	table := mustGeoIPTable(t, "127.0.0.0/8,SE\n")
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil,
-		table, nil, []string{"SE"}, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, GeoIPTable: table, CountryDenyList: []string{"SE"}, UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	if got := get(); got != http.StatusForbidden {
 		t.Fatalf("after reload: status = %d, want %d (the newly configured country deny list should now reject this IP)", got, http.StatusForbidden)
@@ -11579,7 +11578,7 @@ func TestServer_ReloadConfig_UpdatesTokenLimiter(t *testing.T) {
 		t.Fatalf("before reload: status = %d, want %d (no token breaker configured yet)", got, http.StatusOK)
 	}
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, limiter.NewTokenLimiter(50, time.Minute), nil, nil, nil, nil, false, proxy.NewUpstreamTransport(0), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, TokenLimiter: limiter.NewTokenLimiter(50, time.Minute), UpstreamTransport: proxy.NewUpstreamTransport(0)})
 
 	if got := get(); got != http.StatusOK {
 		t.Fatalf("first request after reload: status = %d, want %d (window starts empty)", got, http.StatusOK)
@@ -12498,7 +12497,7 @@ func TestServer_ReloadConfig_UpdatesUpstreamTimeouts(t *testing.T) {
 	frontend := httptest.NewServer(srv)
 	defer frontend.Close()
 
-	srv.ReloadConfig(engine, nil, nil, 0, 0, 0, nil, nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, proxy.NewUpstreamTransport(150*time.Millisecond), 0, nil, nil, 0, "", nil, nil, 0, nil, nil, nil, nil, false, nil, nil, nil, 0, "", nil)
+	srv.ReloadConfig(proxy.RuntimeConfig{Engine: engine, UpstreamTransport: proxy.NewUpstreamTransport(150 * time.Millisecond)})
 
 	start := time.Now()
 	resp, err := http.Get(frontend.URL + "/v1/chat")

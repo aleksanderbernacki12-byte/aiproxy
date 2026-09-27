@@ -2304,121 +2304,119 @@ type ModelRoute struct {
 	TokenLimiter *limiter.TokenLimiter
 }
 
-// ReloadConfig atomically replaces the engine, rate limiter, cache,
-// cost-per-1K-tokens rate, cost budget, max request body size, webhook
-// alert URL, additional webhook destinations, proxy API key, additional
-// named proxy keys, log file, path-prefix routes, model routes, and IP
-// allow/deny lists — e.g. after re-reading aiproxy.json on SIGHUP. All
-// of them change together under one lock,
-// so a request in flight never observes a torn mix of old and new
-// configuration; a request takes effect from the moment it's accepted,
-// so anything already being handled keeps running against whatever
-// configuration it started with. Pass nil for
-// limiter/cache/webhookURL/webhooks/proxyAPIKeys/logFile to disable
-// them, matching how the corresponding field would be set at startup;
-// pass "" for proxyAPIKey to disable the anonymous key; pass zero for
-// costBudget to disable the budget check, or maxBodyBytes to fall back
-// to DefaultMaxBodyBytes, same as leaving Server.MaxBodyBytes unset.
+// RuntimeConfig is everything ReloadConfig replaces. Each field sets the
+// Server field of the same name; Routes and ModelRoutes replace the
+// routing tables. A zero field means that setting is unset, exactly as
+// if the Server field had been left unset at startup.
+type RuntimeConfig struct {
+	Engine                 *rules.Engine
+	Limiter                *limiter.Limiter
+	TokenLimiter           *limiter.TokenLimiter
+	Cache                  *cache.Cache
+	CostPer1KTokens        float64
+	CostBudget             float64
+	CostBudgetHardStop     bool
+	MaxBodyBytes           int64
+	WebhookURL             *url.URL
+	Webhooks               []WebhookTarget
+	ProxyAPIKey            string
+	ProxyAPIKeys           []ProxyKey
+	AdminAPIKey            string
+	AdminAPIKeys           []ProxyKey
+	LogFile                *os.File
+	Routes                 []Route
+	ModelRoutes            []ModelRoute
+	IPAllowList            []*net.IPNet
+	IPDenyList             []*net.IPNet
+	GeoIPTable             *geoip.Table
+	CountryAllowList       []string
+	CountryDenyList        []string
+	AnomalyDetector        *anomaly.Registry
+	AnomalyDryRun          bool
+	UpstreamTransport      *http.Transport
+	UpstreamTotalTimeout   time.Duration
+	TargetBreaker          *breaker.Registry
+	CORS                   *CORSConfig
+	HealthCheckInterval    time.Duration
+	HealthCheckPath        string
+	TargetCostRates        map[string]float64
+	IPLimiter              *iplimiter.Registry
+	CacheTTL               time.Duration
+	TargetCacheTTL         map[string]time.Duration
+	TargetCacheEnabled     map[string]bool
+	TargetShadowURL        map[string]*url.URL
+	TargetShadowSampleRate map[string]float64
+	Idempotency            *idempotency.Registry
+	Coalescer              *coalesce.Group
+	SemanticIndex          *semcache.Index
+	SemanticCacheThreshold float64
+}
+
+// ReloadConfig atomically replaces the reloadable configuration, e.g.
+// after re-reading aiproxy.json on SIGHUP. All fields change together
+// under one lock; a request already in flight keeps the snapshot it took
+// when it was accepted (see requestConfig).
 //
-// logFile is always swapped in, even if the caller reopened the exact
-// same path — the caller (the cli package's reloadConfig) is expected
-// to open a fresh handle on every call regardless, which is exactly
-// what makes SIGHUP-driven log rotation work: a tool like logrotate
-// renames the current file out of the way and signals the process, and
-// the next reload's fresh handle creates a new file at that same path.
-// The old handle, if any, is closed after the swap — never left open —
-// so a long-running proxy reloaded repeatedly never leaks descriptors.
-//
-// tokenLim replaces the server-wide TokenLimiter the same way lim
-// replaces Limiter; pass nil to disable it. Appended as the last
-// parameter, after every field that existed before the token-based
-// breaker did, rather than alongside lim, purely to keep every existing
-// positional call site's argument order intact.
-//
-// geoIPTable/countryAllowList/countryDenyList replace GeoIPTable/
-// CountryAllowList/CountryDenyList the same way ipAllowList/ipDenyList
-// replace IPAllowList/IPDenyList; pass nil for geoIPTable and
-// nil/empty for the two lists to disable country-based access control
-// entirely. Also appended at the very end, same reasoning as tokenLim.
-//
-// anomalyDetector/anomalyDryRun replace AnomalyDetector/AnomalyDryRun
-// wholesale — like lim/tokenLim, a reload always swaps in a brand new
-// *anomaly.Registry (see cli.buildLiveConfig) rather than trying to
-// preserve any client's already-accumulated baseline, the same
-// cold-state-on-reload behavior Limiter/TokenLimiter already have.
-// Pass nil for anomalyDetector to disable the breaker entirely. Also
-// appended at the very end, same reasoning as tokenLim/geoIPTable.
-//
-// upstreamTransport/upstreamTotalTimeout replace UpstreamTransport/
-// UpstreamTotalTimeout wholesale — upstreamTransport must never be nil
-// (see NewUpstreamTransport; cli.buildLiveConfig always builds one, even
-// when upstream_response_timeout_seconds is absent). Also appended at
-// the very end, same reasoning as tokenLim/geoIPTable/anomalyDetector.
-//
-// targetBreaker replaces TargetBreaker wholesale — like anomalyDetector,
-// a reload always swaps in a brand new *breaker.Registry (see
-// cli.buildLiveConfig) rather than trying to preserve any target's
-// already-accumulated failure/ejection state. Pass nil to disable
-// target ejection entirely. Also appended at the very end, same
-// reasoning as every other field above.
-//
-// adminAPIKey/adminAPIKeys replace AdminAPIKey/AdminAPIKeys wholesale,
-// the same way proxyAPIKey/proxyAPIKeys replace ProxyAPIKey/
-// ProxyAPIKeys. Appended at the very end since they were added after
-// every other parameter above.
-func (s *Server) ReloadConfig(engine *rules.Engine, lim *limiter.Limiter, cch *cache.Cache, costPer1KTokens, costBudget float64, maxBodyBytes int64, webhookURL *url.URL, webhooks []WebhookTarget, proxyAPIKey string, proxyAPIKeys []ProxyKey, logFile *os.File, routes []Route, modelRoutes []ModelRoute, ipAllowList, ipDenyList []*net.IPNet, tokenLim *limiter.TokenLimiter, geoIPTable *geoip.Table, countryAllowList, countryDenyList []string, anomalyDetector *anomaly.Registry, anomalyDryRun bool, upstreamTransport *http.Transport, upstreamTotalTimeout time.Duration, targetBreaker *breaker.Registry, cors *CORSConfig, healthCheckInterval time.Duration, healthCheckPath string, targetCostRates map[string]float64, ipLimiter *iplimiter.Registry, cacheTTL time.Duration, targetCacheTTL map[string]time.Duration, targetCacheEnabled map[string]bool, targetShadowURL map[string]*url.URL, targetShadowSampleRate map[string]float64, costBudgetHardStop bool, idempotencyRegistry *idempotency.Registry, coalescer *coalesce.Group, semanticIndex *semcache.Index, semanticCacheThreshold float64, adminAPIKey string, adminAPIKeys []ProxyKey) {
-	newRoutes := make([]route, len(routes))
-	for i, r := range routes {
+// cfg.LogFile is always swapped in, even if the caller reopened the
+// exact same path — the caller (the cli package's reloadConfig) opens a
+// fresh handle on every call, which is what makes SIGHUP-driven log
+// rotation work: logrotate renames the current file away and signals
+// the process, and the next reload's fresh handle creates a new file at
+// that same path. The old handle, if any, is closed after the swap so a
+// proxy reloaded repeatedly never leaks descriptors.
+func (s *Server) ReloadConfig(cfg RuntimeConfig) {
+	newRoutes := make([]route, len(cfg.Routes))
+	for i, r := range cfg.Routes {
 		newRoutes[i] = route{prefix: r.Prefix, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
 	}
-	newModelRoutes := make([]modelRoute, len(modelRoutes))
-	for i, r := range modelRoutes {
+	newModelRoutes := make([]modelRoute, len(cfg.ModelRoutes))
+	for i, r := range cfg.ModelRoutes {
 		newModelRoutes[i] = modelRoute{name: r.Name, models: r.Models, targets: r.Targets, weights: r.Weights, limiter: r.Limiter, tokenLimiter: r.TokenLimiter}
 	}
 
 	s.mu.Lock()
 	oldLogFile := s.LogFile
-	s.Engine = engine
-	s.Limiter = lim
-	s.TokenLimiter = tokenLim
-	s.Cache = cch
-	s.CostPer1KTokens = costPer1KTokens
-	s.CostBudget = costBudget
-	s.MaxBodyBytes = maxBodyBytes
-	s.WebhookURL = webhookURL
-	s.Webhooks = webhooks
-	s.ProxyAPIKey = proxyAPIKey
-	s.ProxyAPIKeys = proxyAPIKeys
-	s.AdminAPIKey = adminAPIKey
-	s.AdminAPIKeys = adminAPIKeys
-	s.LogFile = logFile
+	s.Engine = cfg.Engine
+	s.Limiter = cfg.Limiter
+	s.TokenLimiter = cfg.TokenLimiter
+	s.Cache = cfg.Cache
+	s.CostPer1KTokens = cfg.CostPer1KTokens
+	s.CostBudget = cfg.CostBudget
+	s.CostBudgetHardStop = cfg.CostBudgetHardStop
+	s.MaxBodyBytes = cfg.MaxBodyBytes
+	s.WebhookURL = cfg.WebhookURL
+	s.Webhooks = cfg.Webhooks
+	s.ProxyAPIKey = cfg.ProxyAPIKey
+	s.ProxyAPIKeys = cfg.ProxyAPIKeys
+	s.AdminAPIKey = cfg.AdminAPIKey
+	s.AdminAPIKeys = cfg.AdminAPIKeys
+	s.LogFile = cfg.LogFile
+	s.IPAllowList = cfg.IPAllowList
+	s.IPDenyList = cfg.IPDenyList
+	s.GeoIPTable = cfg.GeoIPTable
+	s.CountryAllowList = cfg.CountryAllowList
+	s.CountryDenyList = cfg.CountryDenyList
+	s.AnomalyDetector = cfg.AnomalyDetector
+	s.AnomalyDryRun = cfg.AnomalyDryRun
+	s.UpstreamTransport = cfg.UpstreamTransport
+	s.UpstreamTotalTimeout = cfg.UpstreamTotalTimeout
+	s.TargetBreaker = cfg.TargetBreaker
+	s.CORS = cfg.CORS
+	s.HealthCheckInterval = cfg.HealthCheckInterval
+	s.HealthCheckPath = cfg.HealthCheckPath
+	s.TargetCostRates = cfg.TargetCostRates
+	s.IPLimiter = cfg.IPLimiter
+	s.CacheTTL = cfg.CacheTTL
+	s.TargetCacheTTL = cfg.TargetCacheTTL
+	s.TargetCacheEnabled = cfg.TargetCacheEnabled
+	s.TargetShadowURL = cfg.TargetShadowURL
+	s.TargetShadowSampleRate = cfg.TargetShadowSampleRate
+	s.Idempotency = cfg.Idempotency
+	s.Coalescer = cfg.Coalescer
+	s.SemanticIndex = cfg.SemanticIndex
+	s.SemanticCacheThreshold = cfg.SemanticCacheThreshold
 	s.routes = newRoutes
 	s.modelRoutes = newModelRoutes
-	s.IPAllowList = ipAllowList
-	s.IPDenyList = ipDenyList
-	s.GeoIPTable = geoIPTable
-	s.CountryAllowList = countryAllowList
-	s.CountryDenyList = countryDenyList
-	s.AnomalyDetector = anomalyDetector
-	s.AnomalyDryRun = anomalyDryRun
-	s.UpstreamTransport = upstreamTransport
-	s.UpstreamTotalTimeout = upstreamTotalTimeout
-	s.TargetBreaker = targetBreaker
-	s.CORS = cors
-	s.HealthCheckInterval = healthCheckInterval
-	s.HealthCheckPath = healthCheckPath
-	s.TargetCostRates = targetCostRates
-	s.IPLimiter = ipLimiter
-	s.CacheTTL = cacheTTL
-	s.TargetCacheTTL = targetCacheTTL
-	s.TargetCacheEnabled = targetCacheEnabled
-	s.TargetShadowURL = targetShadowURL
-	s.TargetShadowSampleRate = targetShadowSampleRate
-	s.CostBudgetHardStop = costBudgetHardStop
-	s.Idempotency = idempotencyRegistry
-	s.Coalescer = coalescer
-	s.SemanticIndex = semanticIndex
-	s.SemanticCacheThreshold = semanticCacheThreshold
 	s.mu.Unlock()
 
 	if oldLogFile != nil {

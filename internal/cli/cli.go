@@ -769,7 +769,49 @@ func reloadConfig(server *proxy.Server, configPath string, prevCfg *config.Confi
 	for i, r := range lc.modelRoutes {
 		modelRoutes[i] = proxy.ModelRoute{Name: r.name, Models: r.models, Targets: r.targets, Weights: r.weights, Limiter: r.limiter, TokenLimiter: r.tokenLimiter}
 	}
-	server.ReloadConfig(lc.engine, lc.limiter, lc.cache, lc.cost, lc.costBudget, lc.maxBodyBytes, lc.webhookURL, lc.webhooks, lc.proxyAPIKey, lc.proxyAPIKeys, lc.logFile, routes, modelRoutes, lc.ipAllowList, lc.ipDenyList, lc.tokenLimiter, lc.geoIPTable, lc.countryAllowList, lc.countryDenyList, lc.anomalyDetector, lc.anomalyDryRun, lc.upstreamTransport, lc.upstreamTotalTimeout, lc.targetBreaker, lc.cors, lc.healthCheckInterval, lc.healthCheckPath, lc.targetCostRates, lc.ipLimiter, lc.cacheTTL, lc.targetCacheTTL, lc.targetCacheEnabled, lc.targetShadowURL, lc.targetShadowSampleRate, lc.costBudgetHardStop, lc.idempotency, lc.coalescer, lc.semanticIndex, lc.semanticCacheThreshold, lc.adminAPIKey, lc.adminAPIKeys)
+	server.ReloadConfig(proxy.RuntimeConfig{
+		Engine:                 lc.engine,
+		Limiter:                lc.limiter,
+		Cache:                  lc.cache,
+		CostPer1KTokens:        lc.cost,
+		CostBudget:             lc.costBudget,
+		MaxBodyBytes:           lc.maxBodyBytes,
+		WebhookURL:             lc.webhookURL,
+		Webhooks:               lc.webhooks,
+		ProxyAPIKey:            lc.proxyAPIKey,
+		ProxyAPIKeys:           lc.proxyAPIKeys,
+		LogFile:                lc.logFile,
+		Routes:                 routes,
+		ModelRoutes:            modelRoutes,
+		IPAllowList:            lc.ipAllowList,
+		IPDenyList:             lc.ipDenyList,
+		TokenLimiter:           lc.tokenLimiter,
+		GeoIPTable:             lc.geoIPTable,
+		CountryAllowList:       lc.countryAllowList,
+		CountryDenyList:        lc.countryDenyList,
+		AnomalyDetector:        lc.anomalyDetector,
+		AnomalyDryRun:          lc.anomalyDryRun,
+		UpstreamTransport:      lc.upstreamTransport,
+		UpstreamTotalTimeout:   lc.upstreamTotalTimeout,
+		TargetBreaker:          lc.targetBreaker,
+		CORS:                   lc.cors,
+		HealthCheckInterval:    lc.healthCheckInterval,
+		HealthCheckPath:        lc.healthCheckPath,
+		TargetCostRates:        lc.targetCostRates,
+		IPLimiter:              lc.ipLimiter,
+		CacheTTL:               lc.cacheTTL,
+		TargetCacheTTL:         lc.targetCacheTTL,
+		TargetCacheEnabled:     lc.targetCacheEnabled,
+		TargetShadowURL:        lc.targetShadowURL,
+		TargetShadowSampleRate: lc.targetShadowSampleRate,
+		CostBudgetHardStop:     lc.costBudgetHardStop,
+		Idempotency:            lc.idempotency,
+		Coalescer:              lc.coalescer,
+		SemanticIndex:          lc.semanticIndex,
+		SemanticCacheThreshold: lc.semanticCacheThreshold,
+		AdminAPIKey:            lc.adminAPIKey,
+		AdminAPIKeys:           lc.adminAPIKeys,
+	})
 
 	label := loadedFrom
 	if label == "" {
