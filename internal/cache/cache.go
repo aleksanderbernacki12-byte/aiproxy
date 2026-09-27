@@ -51,7 +51,7 @@ type Cache struct {
 	// existed.
 	MaxSizeBytes int64
 
-	mu        sync.Mutex
+	mu        sync.RWMutex
 	order     *list.List               // front = least recently used, back = most recently used
 	elements  map[string]*list.Element // key -> its node in order
 	totalSize int64
@@ -205,7 +205,11 @@ func (c *Cache) Get(key string, ttl time.Duration) (*http.Response, bool, time.D
 		return nil, false, 0, nil
 	}
 
+	// Held so Set's rename never replaces a file that is open here:
+	// Windows refuses to rename over an open file.
+	c.mu.RLock()
 	data, err := os.ReadFile(path)
+	c.mu.RUnlock()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, 0, nil
