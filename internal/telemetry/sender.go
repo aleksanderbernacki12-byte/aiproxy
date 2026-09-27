@@ -71,8 +71,9 @@ func (c *Client) flush(force, shuttingDown bool) {
 		}
 		c.durablePending.Add(-int64(len(events)))
 		c.refreshStorage()
-		c.deliveredEvents.Add(uint64(len(events)))
+		// Timestamp first: a Snapshot that sees the delivered count must also see when.
 		c.lastDeliveredUnix.Store(c.now().UTC().Unix())
+		c.deliveredEvents.Add(uint64(len(events)))
 		if shuttingDown {
 			// Continue flushing all immediately deliverable shutdown work. A
 			// failed batch remains in SQLite for the next process start.

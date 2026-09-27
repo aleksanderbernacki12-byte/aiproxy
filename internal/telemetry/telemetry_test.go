@@ -618,7 +618,12 @@ func TestSnapshotTracksDeliveryWithoutReadingPayloads(t *testing.T) {
 	if !client.SubmitAsync(testSubmission(eventOne, time.Now())) {
 		t.Fatal("submission rejected")
 	}
-	eventually(t, func() bool { return client.Snapshot().DeliveredEvents == 1 })
+	// Pending can briefly read -1 when a flush tick delivers the row before the
+	// sequencer counts it, so wait for the settled state rather than one field.
+	eventually(t, func() bool {
+		snapshot := client.Snapshot()
+		return snapshot.DeliveredEvents == 1 && snapshot.Pending == 0
+	})
 	snapshot := client.Snapshot()
 	if snapshot.Accepted != 1 || snapshot.Dropped != 0 || snapshot.Pending != 0 || snapshot.DeliveryFailures != 0 || snapshot.LastDeliveredAt == nil {
 		t.Fatalf("Snapshot() = %#v", snapshot)
