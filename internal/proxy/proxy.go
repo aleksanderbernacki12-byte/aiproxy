@@ -6096,6 +6096,23 @@ func (s *Server) logSummary() {
 	s.logf("%s", s.Summary())
 }
 
+// newListenerServer builds the proxy and admin listeners with the same
+// limits. ReadHeaderTimeout stops a client from holding a connection open
+// by trickling headers; IdleTimeout reclaims idle keep-alive connections.
+// There is deliberately no ReadTimeout or WriteTimeout: long uploads and
+// long streams are legitimate, and the upstream side is bounded by
+// UpstreamTotalTimeout.
+func newListenerServer(s *Server, addr string, handler http.Handler, tlsConfig *tls.Config) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ErrorLog:          log.New(errorLogWriter{server: s}, "", 0),
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 // errorLogWriter adapts http.Server.ErrorLog's *log.Logger-based output
 // into this package's own LogEvent-based event stream. Without this,
 // Go's internal server errors — most commonly a TLS handshake failure,
@@ -6140,12 +6157,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		tlsConfig = &tls.Config{ClientCAs: s.ClientCAPool, ClientAuth: tls.RequireAndVerifyClientCert}
 	}
 
-	s.httpServer = &http.Server{
-		Addr:      s.Addr,
-		Handler:   s,
-		ErrorLog:  log.New(errorLogWriter{server: s}, "", 0),
-		TLSConfig: tlsConfig,
-	}
+	s.httpServer = newListenerServer(s, s.Addr, s, tlsConfig)
 
 	errCh := make(chan error, 2)
 	serve := func(srv *http.Server) {
@@ -6162,12 +6174,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	go serve(s.httpServer)
 
 	if s.AdminAddr != "" {
-		s.adminHTTPServer = &http.Server{
-			Addr:      s.AdminAddr,
-			Handler:   adminMux{server: s},
-			ErrorLog:  log.New(errorLogWriter{server: s}, "", 0),
-			TLSConfig: tlsConfig.Clone(),
-		}
+		s.adminHTTPServer = newListenerServer(s, s.AdminAddr, adminMux{server: s}, tlsConfig.Clone())
 		go serve(s.adminHTTPServer)
 	}
 
