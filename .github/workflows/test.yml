@@ -45,6 +45,31 @@ jobs:
       - name: Test (race detector)
         run: go test ./... -race -count=1
 
+  # The image is otherwise only built when a release is tagged, which is
+  # how a Dockerfile missing go.sum went unnoticed until v0.76.0.
+  docker-image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: aiproxy:ci
+
+      - name: Smoke test
+        run: docker run --rm aiproxy:ci help
+
   control-plane:
     name: Control Plane
     runs-on: ubuntu-latest
