@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"aiproxy/internal/cache"
 	"aiproxy/internal/idempotency"
 	"aiproxy/internal/proxy"
 	"aiproxy/internal/rules"
@@ -148,4 +149,85 @@ func TestReload_InFlightRequestKeepsItsConfig(t *testing.T) {
 	if status != http.StatusOK || body != `{"ok":true}` || replayed != "true" {
 		t.Errorf("replay from the original registry = %d %q replayed=%q, want the stored response: the in-flight request must complete its entry in the registry it claimed", status, body, replayed)
 	}
+}
+
+// TestReload_ConcurrentWithTrafficAndCacheClear reloads with a fresh
+// cache and idempotency registry while requests and admin cache clears
+// run concurrently; under -race this proves the snapshot hand-over has
+// no data races and never breaks a request.
+func TestReload_ConcurrentWithTrafficAndCacheClear(t *testing.T) {
+	t.Chdir(t.TempDir())
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+	targetURL, _ := url.Parse(upstream.URL)
+
+	newCache := func() *cache.Cache {
+		c, err := cache.New()
+		if err != nil {
+			t.Fatalf("cache.New: %v", err)
+		}
+		return c
+	}
+	srv := proxy.New("unused", targetURL, rules.NewEngine(rules.Allow))
+	srv.Cache = newCache()
+	srv.Idempotency = idempotency.NewRegistry(time.Minute, time.Second)
+	srv.Logger = log.New(io.Discard, "", 0)
+	frontend := httptest.NewServer(srv)
+	defer frontend.Close()
+
+	const clients, requestsEach, reloads = 8, 100, 50
+	var wg sync.WaitGroup
+	for c := 0; c < clients; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < requestsEach; i++ {
+				var req *http.Request
+				if i%2 == 0 {
+					req, _ = http.NewRequest(http.MethodGet, frontend.URL+"/v1/models", nil)
+				} else {
+					req, _ = http.NewRequest(http.MethodPost, frontend.URL+"/v1/x", strings.NewReader(fmt.Sprintf(`{"c":%d,"i":%d}`, c, i)))
+					req.Header.Set("Idempotency-Key", fmt.Sprintf("k-%d-%d", c, i))
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Errorf("request: %v", err)
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Errorf("status = %d, want 200", resp.StatusCode)
+				}
+			}
+		}()
+	}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < reloads; i++ {
+			srv.ReloadConfig(proxy.RuntimeConfig{
+				Engine:            rules.NewEngine(rules.Allow),
+				Cache:             newCache(),
+				Idempotency:       idempotency.NewRegistry(time.Minute, time.Second),
+				UpstreamTransport: proxy.NewUpstreamTransport(0),
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < reloads; i++ {
+			resp, err := http.Post(frontend.URL+"/_aiproxy/cache/clear", "", nil)
+			if err != nil {
+				t.Errorf("cache clear: %v", err)
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	wg.Wait()
 }
