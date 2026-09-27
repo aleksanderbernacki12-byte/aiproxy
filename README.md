@@ -877,6 +877,14 @@ with no dropped connections and no restart. Every one of these is logged
 (as `reload` on success, or `reload_error` on failure, under
 `--log-format json`).
 
+A request already in flight is unaffected: once it has passed the
+network and API-key checks, it takes one snapshot of the configuration
+and finishes on it — the same rules evaluate its request and its
+response, its idempotency key is completed in the registry it was
+claimed in, and its cache entry goes to the cache it was looked up in.
+Log lines switch to the new `log_file` atomically, so none is written to
+the old, closed handle.
+
 If the reloaded file has any problem — a bad regex, a bad target, a
 cache directory that can't be created — the reload is refused and the
 proxy keeps running on its last-known-good configuration; it never
