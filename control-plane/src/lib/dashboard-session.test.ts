@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("server-only", () => ({}));
 import { createDashboardSession, verifyDashboardSession } from "./dashboard-session";
 
-const identity = { credentialId: "key-1", organizationId: "org-1", role: "DPO" as const };
+const identity = { credentialId: "key-1", organizationId: "org-1", role: "DPO" as const, sessionVersion: 3 };
 
 describe("dashboard session", () => {
   it("round-trips a signed organization scope", () => {
@@ -16,6 +16,12 @@ describe("dashboard session", () => {
     expect(verifyDashboardSession(`${token}x`, "secret", 1_001_000)).toBeNull();
     expect(verifyDashboardSession(token, "wrong", 1_001_000)).toBeNull();
     expect(verifyDashboardSession(token, "secret", 30_000_000)).toBeNull();
+  });
+
+  it("treats a session issued before versioning as version 0", () => {
+    const { sessionVersion: _unused, ...unversioned } = identity;
+    const token = createDashboardSession(unversioned as typeof identity, "secret", 1_000_000);
+    expect(verifyDashboardSession(token, "secret", 1_001_000)?.sessionVersion).toBe(0);
   });
 
 });

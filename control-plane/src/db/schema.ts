@@ -86,6 +86,7 @@ export const dpoAccessKeys = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    sessionVersion: integer("session_version").default(0).notNull(),
   },
   (table) => [index("dpo_access_keys_organization_idx").on(table.organizationId, table.revokedAt)],
 );
