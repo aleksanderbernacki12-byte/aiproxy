@@ -29,13 +29,16 @@ export DASHBOARD_SESSION_SECRET='<random-session-secret>'
 export CRON_SECRET='<different-random-worker-secret>'
 export MERKLE_ANCHOR_TOKEN='<different-random-anchor-secret>'
 export POSTGRES_PASSWORD='<random-hex-database-password>'
+export APP_DATABASE_PASSWORD='<different-random-hex-password-of-32+-characters>'
 # Also set the anchor URL/public key and report-signing private key.
 docker compose up --build -d
 ```
 
-Compose refuses to render or start without `POSTGRES_PASSWORD`. Use the same
-random hexadecimal value in `DATABASE_URL`, because Compose also places it in
-the internal PostgreSQL URL; no shared password is committed. `POSTGRES_USER` and
+Compose refuses to render or start without `POSTGRES_PASSWORD` and
+`APP_DATABASE_PASSWORD`. Use random hexadecimal values, because Compose places
+them in PostgreSQL URLs; no shared password is committed. The migration service
+connects as the owner and creates the login role the application uses (see
+[Tenant isolation](#tenant-isolation)). `POSTGRES_USER` and
 `POSTGRES_DB` remain configurable and default to `aiproxy` and
 `aiproxy_control`.
 
@@ -63,7 +66,9 @@ Attempt rows expire opportunistically after 24 hours.
 
 The runtime requires:
 
-- `DATABASE_URL`: PostgreSQL connection string.
+- `DATABASE_URL`: PostgreSQL connection string. In production, connect as the
+  login role `<database>_login` (see [Tenant isolation](#tenant-isolation));
+  migrations and the CLI scripts use the owner's connection string.
 - `DASHBOARD_SESSION_SECRET`: at least 32 random characters used to sign the
   eight-hour HttpOnly DPO session cookie.
 - `CRON_SECRET`: bearer token used by the internal worker route. Vercel adds
@@ -326,6 +331,25 @@ default owner on managed PostgreSQL such as Neon, Supabase and RDS), because
 migration 0019 creates and grants the role. Readiness reports `NOT_READY` when
 the application is not running as that role, since row-level security would
 then not apply.
+
+Run the application as the dedicated login role rather than the owner. When
+`APP_DATABASE_PASSWORD` (at least 32 printable ASCII characters; use hex so it
+fits in a URL) is set, `npm run db:migrate` creates or updates the role
+`<database name>_login`, for example `aiproxy_control_login`, and prints its
+name. The role has no privileges of its own (`NOINHERIT`) and can only switch
+to the application role, so if that switch ever fails every query is denied
+instead of running without row-level security. Point the application's
+`DATABASE_URL` at it:
+
+```sh
+DATABASE_URL=postgresql://owner:...@host/aiproxy_control \
+APP_DATABASE_PASSWORD='<random-hex>' npm run db:migrate
+# application: postgresql://aiproxy_control_login:<random-hex>@host/aiproxy_control
+```
+
+Run the migration again with a new password to rotate it. The password is sent
+as a SCRAM-SHA-256 verifier, so it does not appear in PostgreSQL statement
+logs. A connection as the owner still works, but loses this protection.
 
 ## Ingestion
 

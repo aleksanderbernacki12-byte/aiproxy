@@ -21,6 +21,7 @@ services:
       target: migrations
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-aiproxy}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-aiproxy_control}
+      APP_DATABASE_PASSWORD: ${APP_DATABASE_PASSWORD:?APP_DATABASE_PASSWORD must be set}
     depends_on:
       postgres:
         condition: service_healthy
@@ -31,7 +32,8 @@ services:
       context: .
       target: runtime
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-aiproxy}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-aiproxy_control}
+      # The login role the migrate service created; it has no privileges of its own.
+      DATABASE_URL: postgresql://${POSTGRES_DB:-aiproxy_control}_login:${APP_DATABASE_PASSWORD:?APP_DATABASE_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-aiproxy_control}
       DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:-}
       CRON_SECRET: ${CRON_SECRET:-}
       TELEMETRY_REORDER_WINDOW_SECONDS: ${TELEMETRY_REORDER_WINDOW_SECONDS:-30}
