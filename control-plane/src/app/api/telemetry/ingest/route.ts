@@ -1,5 +1,5 @@
 import { bufferTelemetryEvents } from "@/lib/telemetry/ingest";
-import { telemetryBatchSchema } from "@/lib/telemetry/schema";
+import { exceedsJsonDepth, telemetryBatchSchema } from "@/lib/telemetry/schema";
 import { authenticateTenant } from "@/lib/tenant-auth";
 import { readBoundedTextBody, RequestBodyTooLargeError } from "@/lib/request-body";
 
@@ -26,6 +26,9 @@ export async function POST(request: Request) {
       return Response.json({ error: "Payload too large" }, { status: 413 });
     }
     return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+  }
+  if (exceedsJsonDepth(input)) {
+    return Response.json({ error: "Telemetry payload is nested too deeply" }, { status: 400 });
   }
   const parsed = telemetryBatchSchema.safeParse(input);
   if (!parsed.success) {

@@ -5,6 +5,22 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const RAW_BASE64 = /^[A-Za-z0-9+/]+$/;
 const MAX_BATCH_SIZE = 500;
 
+export const MAX_JSON_DEPTH = 32;
+
+// jsonValueSchema recurses once per nesting level, so input deep enough to
+// overflow the stack must be rejected before it reaches the schema. This
+// check is iterative for the same reason.
+export function exceedsJsonDepth(value: unknown, maxDepth = MAX_JSON_DEPTH) {
+  const pending: Array<[unknown, number]> = [[value, 0]];
+  while (pending.length > 0) {
+    const [current, depth] = pending.pop()!;
+    if (current === null || typeof current !== "object") continue;
+    if (depth >= maxDepth) return true;
+    for (const child of Object.values(current)) pending.push([child, depth + 1]);
+  }
+  return false;
+}
+
 const jsonPrimitive = z.union([z.string(), z.number().finite(), z.boolean(), z.null()]);
 export const jsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
   z.union([

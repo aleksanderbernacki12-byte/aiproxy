@@ -97,6 +97,19 @@ describe("POST /api/telemetry/ingest", () => {
     expect(mocks.bufferTelemetryEvents).not.toHaveBeenCalled();
   });
 
+  it("rejects deeply nested metadata before schema validation", async () => {
+    const { event } = createSignedFixture();
+    const body = JSON.stringify({ ...event, metrics: { nested: 0 } })
+      .replace('{"nested":0}', `{"nested":${"[".repeat(10_000)}${"]".repeat(10_000)}}`);
+    const response = await POST(new Request("https://control.example/api/telemetry/ingest", {
+      method: "POST",
+      headers: { authorization: "Bearer tenant-secret", "content-type": "application/json" },
+      body,
+    }));
+    expect(response.status).toBe(400);
+    expect(mocks.bufferTelemetryEvents).not.toHaveBeenCalled();
+  });
+
   it("returns 503 without acknowledging an event when Postgres is unavailable", async () => {
     const { event } = createSignedFixture();
     mocks.bufferTelemetryEvents.mockRejectedValueOnce(new Error("database offline"));
