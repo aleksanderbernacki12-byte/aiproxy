@@ -53,6 +53,12 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
     next_attempt_at INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(event_id) REFERENCES telemetry_event_ids(event_id)
 );
+CREATE TABLE IF NOT EXISTS telemetry_rejected (
+    event_id TEXT PRIMARY KEY,
+    payload BLOB NOT NULL,
+    status INTEGER NOT NULL,
+    rejected_at TEXT NOT NULL
+);
 `
 
 func openStore(filename string, maxBytes int64) (*sql.DB, error) {
@@ -262,6 +268,28 @@ func (c *Client) markDelivered(ctx context.Context, events []queuedEvent) error 
 		if _, err := tx.ExecContext(ctx, `DELETE FROM telemetry_events WHERE sequence = ?`, event.sequence); err != nil {
 			return err
 		}
+	}
+	return tx.Commit()
+}
+
+// quarantine moves an event the control plane permanently rejected out of
+// the delivery queue, keeping it for inspection, so it cannot block the
+// events behind it.
+func (c *Client) quarantine(ctx context.Context, event queuedEvent, status int) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR REPLACE INTO telemetry_rejected(event_id, payload, status, rejected_at)
+		 SELECT event_id, payload, ?, ? FROM telemetry_events WHERE sequence = ?`,
+		status, c.now().UTC().Format(time.RFC3339Nano), event.sequence,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM telemetry_events WHERE sequence = ?`, event.sequence); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

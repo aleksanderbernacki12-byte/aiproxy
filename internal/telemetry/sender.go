@@ -50,7 +50,17 @@ func (c *Client) flush(force, shuttingDown bool) {
 		if len(events) == 0 {
 			return
 		}
-		if err := c.deliverSafely(events); err != nil {
+		err = c.deliverSafely(events)
+		var rejected *rejectedError
+		if errors.As(err, &rejected) {
+			// One event in the batch is refused for good; send them one at a
+			// time so only that event is set aside.
+			if !c.deliverIndividually(events) {
+				return
+			}
+			continue
+		}
+		if err != nil {
 			c.deliveryFailures.Add(1)
 			c.lastFailureUnix.Store(c.now().UTC().Unix())
 			c.report(err)
@@ -69,17 +79,78 @@ func (c *Client) flush(force, shuttingDown bool) {
 			c.report(fmt.Errorf("telemetry: remove delivered batch: %w", err))
 			return
 		}
-		c.durablePending.Add(-int64(len(events)))
-		c.refreshStorage()
-		// Timestamp first: a Snapshot that sees the delivered count must also see when.
-		c.lastDeliveredUnix.Store(c.now().UTC().Unix())
-		c.deliveredEvents.Add(uint64(len(events)))
+		c.recordDelivered(len(events))
 		if shuttingDown {
 			// Continue flushing all immediately deliverable shutdown work. A
 			// failed batch remains in SQLite for the next process start.
 			force = true
 		}
 	}
+}
+
+func (c *Client) recordDelivered(count int) {
+	c.durablePending.Add(-int64(count))
+	c.refreshStorage()
+	// Timestamp first: a Snapshot that sees the delivered count must also see when.
+	c.lastDeliveredUnix.Store(c.now().UTC().Unix())
+	c.deliveredEvents.Add(uint64(count))
+}
+
+// deliverIndividually sends a rejected batch one event at a time, in queue
+// order, quarantining each event the control plane still rejects. It stops
+// at the first transient failure, leaving that event and the rest queued
+// with backoff, and reports whether the flush may continue.
+func (c *Client) deliverIndividually(events []queuedEvent) bool {
+	for index, event := range events {
+		err := c.deliverSafely([]queuedEvent{event})
+		var rejected *rejectedError
+		ctx, cancel := context.WithTimeout(context.Background(), c.operationTimeout)
+		switch {
+		case err == nil:
+			err = c.markDelivered(ctx, []queuedEvent{event})
+			cancel()
+			if err != nil {
+				c.report(fmt.Errorf("telemetry: remove delivered event: %w", err))
+				return false
+			}
+			c.recordDelivered(1)
+		case errors.As(err, &rejected):
+			c.report(err)
+			err = c.quarantine(ctx, event, rejected.status)
+			cancel()
+			if err != nil {
+				c.report(fmt.Errorf("telemetry: quarantine rejected event: %w", err))
+				return false
+			}
+			c.durablePending.Add(-1)
+			c.refreshStorage()
+			c.rejectedEvents.Add(1)
+		default:
+			c.deliveryFailures.Add(1)
+			c.lastFailureUnix.Store(c.now().UTC().Unix())
+			c.report(err)
+			markErr := c.markFailed(ctx, events[index:])
+			cancel()
+			if markErr != nil {
+				c.report(fmt.Errorf("telemetry: save retry state: %w", markErr))
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// rejectedError is a response that retrying the same payload cannot fix.
+type rejectedError struct {
+	status int
+}
+
+func (e *rejectedError) Error() string {
+	return fmt.Sprintf("telemetry: control plane rejected the batch with HTTP %d", e.status)
+}
+
+func permanentRejection(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge || status == http.StatusUnprocessableEntity
 }
 
 func (c *Client) deliverSafely(events []queuedEvent) (err error) {
@@ -138,6 +209,9 @@ func (c *Client) deliver(events []queuedEvent) error {
 	if response.Body != nil {
 		defer response.Body.Close()
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+	}
+	if permanentRejection(response.StatusCode) {
+		return &rejectedError{status: response.StatusCode}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("telemetry: control plane returned HTTP %d", response.StatusCode)

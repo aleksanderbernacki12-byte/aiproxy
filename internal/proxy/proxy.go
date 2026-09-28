@@ -6031,6 +6031,7 @@ func writeCompliancePromMetrics(w io.Writer, status ComplianceStatus) {
 		writePromValue(w, "aiproxy_telemetry_persist_failures_total", "counter", "Telemetry events that failed local durable persistence.", telemetry.PersistFailures)
 		writePromValue(w, "aiproxy_telemetry_delivery_failures_total", "counter", "Failed Control Plane delivery attempts.", telemetry.DeliveryFailures)
 		writePromValue(w, "aiproxy_telemetry_delivered_events_total", "counter", "Telemetry events acknowledged by the Control Plane.", telemetry.DeliveredEvents)
+		writePromValue(w, "aiproxy_telemetry_rejected_events_total", "counter", "Telemetry events the Control Plane rejected permanently, kept in telemetry_rejected.", telemetry.RejectedEvents)
 		writePromValue(w, "aiproxy_telemetry_pending", "gauge", "Telemetry events waiting in memory or durable storage.", telemetry.Pending)
 		writePromValue(w, "aiproxy_telemetry_storage_full_failures_total", "counter", "Telemetry events lost because SQLite reached its budget or the disk was full.", telemetry.StorageFullFailures)
 		writePromValue(w, "aiproxy_telemetry_database_bytes", "gauge", "Telemetry SQLite database size excluding its rollback journal.", telemetry.DatabaseBytes)

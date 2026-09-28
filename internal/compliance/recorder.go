@@ -142,7 +142,7 @@ func (r *Recorder) ComplianceStatus() proxy.ComplianceStatus {
 		status.Telemetry = &proxy.TelemetryStatus{
 			Accepted: snapshot.Accepted, Dropped: snapshot.Dropped,
 			PersistFailures: snapshot.PersistFailures, DeliveryFailures: snapshot.DeliveryFailures,
-			DeliveredEvents: snapshot.DeliveredEvents, Pending: snapshot.Pending,
+			DeliveredEvents: snapshot.DeliveredEvents, RejectedEvents: snapshot.RejectedEvents, Pending: snapshot.Pending,
 			StorageFullFailures: snapshot.StorageFullFailures, DatabaseBytes: snapshot.DatabaseBytes,
 			DatabaseUsedBytes: snapshot.DatabaseUsedBytes, DatabaseLimitBytes: snapshot.DatabaseLimitBytes,
 			LastDeliveredAt: snapshot.LastDeliveredAt, LastFailureAt: snapshot.LastFailureAt,

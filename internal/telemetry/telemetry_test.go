@@ -722,3 +722,81 @@ func slicesSort(values []string) {
 		}
 	}
 }
+
+// rejectingHTTP answers 400 to any batch that contains rejectedID and 200
+// otherwise, like a control plane rejecting one malformed event.
+type rejectingHTTP struct {
+	mu         sync.Mutex
+	rejectedID string
+	delivered  []string
+}
+
+func (r *rejectingHTTP) Do(request *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+	var events []struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(body, &events); err != nil {
+		return nil, err
+	}
+	status := http.StatusAccepted
+	for _, event := range events {
+		if event.EventID == r.rejectedID {
+			status = http.StatusBadRequest
+		}
+	}
+	if status == http.StatusAccepted {
+		r.mu.Lock()
+		for _, event := range events {
+			r.delivered = append(r.delivered, event.EventID)
+		}
+		r.mu.Unlock()
+	}
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+}
+
+func TestDelivery_QuarantinesAPermanentlyRejectedEventAndDeliversTheRest(t *testing.T) {
+	dir := t.TempDir()
+	_, keyPath := writePrivateKey(t, dir)
+	ids := []string{"550e8400-e29b-41d4-a716-" + uuidTail(1), "550e8400-e29b-41d4-a716-" + uuidTail(2), "550e8400-e29b-41d4-a716-" + uuidTail(3)}
+	transport := &rejectingHTTP{rejectedID: ids[1]}
+	cfg := testConfig(t, dir, keyPath, transport)
+	cfg.BatchSize = 3
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if !client.SubmitAsync(testSubmission(id, time.Now())) {
+			t.Fatalf("submission %s rejected", id)
+		}
+	}
+	eventually(t, func() bool {
+		snapshot := client.Snapshot()
+		return snapshot.DeliveredEvents == 2 && snapshot.RejectedEvents == 1 && snapshot.Pending == 0
+	})
+	shutdown(t, client)
+
+	transport.mu.Lock()
+	delivered := append([]string(nil), transport.delivered...)
+	transport.mu.Unlock()
+	if len(delivered) != 2 || delivered[0] != ids[0] || delivered[1] != ids[2] {
+		t.Fatalf("delivered = %v, want [%s %s] in order", delivered, ids[0], ids[2])
+	}
+	db, err := openStore(cfg.DatabasePath, cfg.MaxDatabaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var rejectedID string
+	var status int
+	if err := db.QueryRow(`SELECT event_id, status FROM telemetry_rejected`).Scan(&rejectedID, &status); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedID != ids[1] || status != http.StatusBadRequest {
+		t.Fatalf("telemetry_rejected = (%s, %d), want (%s, 400)", rejectedID, status, ids[1])
+	}
+}

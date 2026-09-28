@@ -105,6 +105,7 @@ type Client struct {
 	persistFailures     atomic.Uint64
 	deliveryFailures    atomic.Uint64
 	deliveredEvents     atomic.Uint64
+	rejectedEvents      atomic.Uint64
 	durablePending      atomic.Int64
 	storageFullFailures atomic.Uint64
 	databaseBytes       atomic.Int64
@@ -394,7 +395,7 @@ func (c *Client) Snapshot() Snapshot {
 	return Snapshot{
 		Accepted: c.accepted.Load(), Dropped: c.dropped.Load(),
 		PersistFailures: c.persistFailures.Load(), DeliveryFailures: c.deliveryFailures.Load(),
-		DeliveredEvents: c.deliveredEvents.Load(), Pending: c.durablePending.Load() + int64(len(c.jobs)),
+		DeliveredEvents: c.deliveredEvents.Load(), RejectedEvents: c.rejectedEvents.Load(), Pending: c.durablePending.Load() + int64(len(c.jobs)),
 		StorageFullFailures: c.storageFullFailures.Load(), DatabaseBytes: c.databaseBytes.Load(),
 		DatabaseUsedBytes: c.databaseUsedBytes.Load(), DatabaseLimitBytes: c.databaseLimitBytes.Load(),
 		LastDeliveredAt: unixTime(c.lastDeliveredUnix.Load()), LastFailureAt: unixTime(c.lastFailureUnix.Load()),

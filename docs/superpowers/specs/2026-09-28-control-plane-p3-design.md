@@ -40,8 +40,9 @@ stops validating after logout; logout without a valid cookie still clears it.
 
 The Go sender retries every non-2xx response, so one event the control plane
 rejects with 400 blocks the queue forever. Now a 400, 413 or 422 response for
-a batch of more than one event re-sends it as two halves; a single event that
-is still rejected is moved to a `telemetry_rejected` table (payload, status,
+a batch re-sends it one event at a time in queue order (simpler than bisecting
+and keeps chain order; rejections are rare); a single event that is still
+rejected is moved to a `telemetry_rejected` table (payload, status,
 time) and removed from the queue, and a `rejected` counter is exposed next to
 the existing delivery counters. Other statuses (401, 403, 408, 429, 5xx) are
 retried as today. The control plane classifies the resulting gap in the chain

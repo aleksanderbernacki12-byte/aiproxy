@@ -108,7 +108,13 @@ new chain head in one SQLite transaction. This serializes concurrent LLM
 completions and preserves the chain over restarts. A separate sender reads the
 oldest events first and only deletes a batch after a successful 2xx response.
 Failures and HTTP-client panics retain the exact signed bytes and use capped
-exponential backoff.
+exponential backoff. A 400, 413 or 422 response cannot be fixed by retrying the
+same bytes, so the sender then retries that batch one event at a time, in queue
+order: each event the control plane still rejects moves to the local
+`telemetry_rejected` table (payload, status, time) and out of the queue, so it
+cannot block the events behind it. `Snapshot().RejectedEvents` and
+`aiproxy_telemetry_rejected_events_total` count them; the control plane records
+the resulting hole in the chain as a declared gap.
 
 The SQLite file is created with mode `0600`; it contains anonymous telemetry,
 signatures, and chain state. The P-256 private-key file must also be a regular

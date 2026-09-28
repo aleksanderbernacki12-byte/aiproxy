@@ -71,6 +71,7 @@ type TelemetryStatus struct {
 	PersistFailures     uint64     `json:"persist_failures"`
 	DeliveryFailures    uint64     `json:"delivery_failures"`
 	DeliveredEvents     uint64     `json:"delivered_events"`
+	RejectedEvents      uint64     `json:"rejected_events"`
 	Pending             int64      `json:"pending"`
 	StorageFullFailures uint64     `json:"storage_full_failures"`
 	DatabaseBytes       int64      `json:"database_bytes"`
