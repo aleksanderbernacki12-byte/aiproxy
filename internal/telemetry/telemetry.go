@@ -209,6 +209,9 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	headers := cfg.Headers.Clone()
+	if headers == nil {
+		headers = http.Header{}
+	}
 	headers.Set("Authorization", "Bearer "+tenantKey)
 	c := &Client{
 		endpoint:         endpoint,

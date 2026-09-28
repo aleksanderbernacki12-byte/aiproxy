@@ -192,6 +192,27 @@ func TestNewRequiresTenantKeyEnvironment(t *testing.T) {
 	}
 }
 
+// The CLI passes no extra headers; New must still set the tenant credential.
+func TestNewWithoutExtraHeadersSendsTenantAuthorization(t *testing.T) {
+	dir := t.TempDir()
+	_, keyPath := writePrivateKey(t, dir)
+	transport := &fakeHTTP{}
+	cfg := testConfig(t, dir, keyPath, transport)
+	cfg.Headers = nil
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !client.SubmitAsync(testSubmission(eventOne, time.Now())) {
+		t.Fatal("valid submission was rejected")
+	}
+	eventually(t, func() bool { return len(transport.snapshot()) == 1 })
+	shutdown(t, client)
+	if got := transport.snapshot()[0].header.Get("Authorization"); got != "Bearer tenant-secret" {
+		t.Fatalf("Authorization = %q", got)
+	}
+}
+
 func testSubmission(eventID string, timestamp time.Time) Submission {
 	return Submission{
 		EventID:       eventID,
