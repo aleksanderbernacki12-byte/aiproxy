@@ -5,7 +5,7 @@ import {
   telemetryEvents,
   telemetryPublicKeys,
 } from "@/db/schema";
-import { getDatabase } from "@/db/client";
+import { getCrossTenantDatabase } from "@/db/client";
 import { telemetryEventSchema, type TelemetryEvent } from "./schema";
 import { verifyTelemetryCryptography } from "./cryptography";
 import { findExtendingEventIndex } from "./ordering";
@@ -71,7 +71,7 @@ function mainTableValues(
 }
 
 async function processKeyChain(organizationId: string, keyId: string, now: Date) {
-  const database = getDatabase();
+  const database = getCrossTenantDatabase();
   return database.transaction(async (transaction) => {
     await transaction.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${organizationId + ":" + keyId}, 0))`,
@@ -240,7 +240,7 @@ async function processKeyChain(organizationId: string, keyId: string, now: Date)
 }
 
 export async function processBufferedTelemetry(now = new Date()) {
-  const database = getDatabase();
+  const database = getCrossTenantDatabase();
   const chains = await database
     .selectDistinct({
       organizationId: telemetryBuffer.organizationId,

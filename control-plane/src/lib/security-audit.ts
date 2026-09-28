@@ -1,7 +1,7 @@
 import "server-only";
 
 import { and, desc, eq, lt, sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { withOrganization } from "@/db/client";
 import { securityAuditEvents } from "@/db/schema";
 
 export type SecurityAuditEvidence = {
@@ -21,15 +21,15 @@ export async function appendSecurityAuditEvent(input: {
   resourceId: string;
   metadata?: Record<string, unknown>;
 }) {
-  await getDatabase().execute(sql`SELECT append_security_audit_event(
+  await withOrganization(input.organizationId, (transaction) => transaction.execute(sql`SELECT append_security_audit_event(
     ${input.organizationId}::uuid, 'DPO_CREDENTIAL', ${input.actorId},
     ${input.action}, ${input.resourceType}, ${input.resourceId},
     ${JSON.stringify(input.metadata ?? {})}::jsonb
-  )`);
+  )`));
 }
 
 export async function getSecurityAuditEvidence(organizationId: string): Promise<SecurityAuditEvidence> {
-  const result = await getDatabase().execute<{
+  const result = await withOrganization(organizationId, (transaction) => transaction.execute<{
     valid: boolean;
     event_count: number;
     latest_sequence: string;
@@ -51,7 +51,7 @@ export async function getSecurityAuditEvidence(organizationId: string): Promise<
       (SELECT anchored_at FROM security_audit_checkpoints WHERE organization_id = ${organizationId}::uuid ORDER BY created_at DESC, id DESC LIMIT 1) AS anchored_at
     FROM security_audit_events
     WHERE organization_id = ${organizationId}::uuid
-  `);
+  `));
   const row = result.rows[0];
   const eventCount = row?.event_count ?? 0;
   return {
@@ -68,10 +68,9 @@ export async function getSecurityAuditEvidence(organizationId: string): Promise<
 }
 
 export async function getSecurityAuditLedger(organizationId: string, before?: bigint) {
-  const database = getDatabase();
   const [evidence, events] = await Promise.all([
     getSecurityAuditEvidence(organizationId),
-    database.select({
+    withOrganization(organizationId, (transaction) => transaction.select({
       eventId: securityAuditEvents.eventId,
       sequence: securityAuditEvents.sequence,
       eventHash: securityAuditEvents.eventHash,
@@ -80,7 +79,7 @@ export async function getSecurityAuditLedger(organizationId: string, before?: bi
     }).from(securityAuditEvents)
       .where(and(eq(securityAuditEvents.organizationId, organizationId),
         before === undefined ? undefined : lt(securityAuditEvents.sequence, before)))
-      .orderBy(desc(securityAuditEvents.sequence)).limit(201),
+      .orderBy(desc(securityAuditEvents.sequence)).limit(201)),
   ]);
   const page = events.slice(0, 200);
   return { valid: evidence.status !== "ATTENTION_REQUIRED", evidence, events: page,

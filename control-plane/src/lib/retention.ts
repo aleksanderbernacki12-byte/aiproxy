@@ -1,13 +1,13 @@
 import "server-only";
 
 import { eq, sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { getCrossTenantDatabase, withOrganization } from "@/db/client";
 import { organizationRetentionPolicies } from "@/db/schema";
 
 const BATCH_SIZE = 500;
 
 async function purgeOrganization(organizationId: string, now: Date) {
-  return getDatabase().transaction(async (transaction) => {
+  return getCrossTenantDatabase().transaction(async (transaction) => {
     await transaction.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"retention:" + organizationId}, 0))`);
     // Read the current policy under a row lock. Policy updates (including CLI
     // legal holds) must finish before this read or wait until this purge commits.
@@ -64,7 +64,7 @@ async function purgeOrganization(organizationId: string, now: Date) {
 }
 
 export async function enforceRetentionPolicies(now = new Date()) {
-  const policies = await getDatabase().select({ organizationId: organizationRetentionPolicies.organizationId }).from(organizationRetentionPolicies);
+  const policies = await getCrossTenantDatabase().select({ organizationId: organizationRetentionPolicies.organizationId }).from(organizationRetentionPolicies);
   let purged = 0;
   let held = 0;
   for (const policy of policies) {
@@ -76,7 +76,8 @@ export async function enforceRetentionPolicies(now = new Date()) {
 }
 
 export async function getRetentionPolicy(organizationId: string) {
-  const [policy] = await getDatabase().select().from(organizationRetentionPolicies)
-    .where(eq(organizationRetentionPolicies.organizationId, organizationId)).limit(1);
+  const [policy] = await withOrganization(organizationId, (transaction) => transaction.select()
+    .from(organizationRetentionPolicies)
+    .where(eq(organizationRetentionPolicies.organizationId, organizationId)).limit(1));
   return policy ?? null;
 }

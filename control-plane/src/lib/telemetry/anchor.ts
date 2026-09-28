@@ -4,7 +4,7 @@ import { createPublicKey, verify } from "node:crypto";
 import canonicalize from "canonicalize";
 import { asc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
-import { getDatabase } from "@/db/client";
+import { getCrossTenantDatabase } from "@/db/client";
 import { securityAuditCheckpoints, telemetryMerkleCheckpoints } from "@/db/schema";
 
 const MAX_BATCH = 5;
@@ -56,7 +56,7 @@ function anchorConfig() {
 export async function anchorPendingCheckpoints(fetcher: typeof fetch = fetch) {
   const config = anchorConfig();
   if (!config) return { configured: false, attempted: 0, anchored: 0, failed: 0 };
-  const database = getDatabase();
+  const database = getCrossTenantDatabase();
   const [telemetry, audit] = await Promise.all([
     database.select({
       id: telemetryMerkleCheckpoints.id, rootHash: telemetryMerkleCheckpoints.rootHash,

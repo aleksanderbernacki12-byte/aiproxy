@@ -2,7 +2,7 @@ import "server-only";
 
 import canonicalize from "canonicalize";
 import { and, eq, sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { getCrossTenantDatabase } from "@/db/client";
 import {
   telemetryChainHeads,
   telemetryPublicKeys,
@@ -105,7 +105,7 @@ function payloadMismatch(row: StoredEvent, payload: TelemetryEvent) {
 }
 
 async function latestAnchoredCheckpoint(organizationId: string) {
-  const result = await getDatabase().execute<AnchoredCheckpoint>(sql`
+  const result = await getCrossTenantDatabase().execute<AnchoredCheckpoint>(sql`
     SELECT id::text AS id, root_hash, chain_heads, anchor_receipt FROM telemetry_merkle_checkpoints
     WHERE organization_id = ${organizationId}::uuid AND anchor_status = 'ANCHORED'
     ORDER BY created_at DESC, id DESC LIMIT 1
@@ -132,7 +132,7 @@ async function verifyChain(
   deadline: Date,
   findings: Findings,
 ) {
-  const database = getDatabase();
+  const database = getCrossTenantDatabase();
   let expectedSequence = 1n;
   let priorHash = "";
   let last: ChainItem | null = null;
@@ -193,7 +193,7 @@ async function verifyChain(
 }
 
 async function verifyPayloads(organizationId: string, keyId: string, deadline: Date, findings: Findings) {
-  const database = getDatabase();
+  const database = getCrossTenantDatabase();
   const [registered] = await database.select({ publicKeyPem: telemetryPublicKeys.publicKeyPem }).from(telemetryPublicKeys)
     .where(and(eq(telemetryPublicKeys.organizationId, organizationId), eq(telemetryPublicKeys.keyId, keyId))).limit(1);
   let cursor = "0";
@@ -256,7 +256,7 @@ export async function verifyOrganization(organizationId: string, deadline: Date)
 
   const checkpoint = await latestAnchoredCheckpoint(organizationId);
   if (checkpoint) verifyCheckpoint(organizationId, checkpoint, findings);
-  const keys = await getDatabase().execute<{ key_id: string }>(sql`
+  const keys = await getCrossTenantDatabase().execute<{ key_id: string }>(sql`
     SELECT key_id FROM telemetry_events WHERE organization_id = ${organizationId}::uuid
     UNION SELECT key_id FROM telemetry_tombstones WHERE organization_id = ${organizationId}::uuid
     ORDER BY key_id
@@ -282,7 +282,7 @@ export async function verifyOrganization(organizationId: string, deadline: Date)
     startedAt, completedAt: new Date(), complete, eventsChecked, legacyEvents,
     failures: findings.failures, failureSamples: findings.samples,
   };
-  await getDatabase().insert(telemetryVerificationRuns).values({ organizationId, ...run });
+  await getCrossTenantDatabase().insert(telemetryVerificationRuns).values({ organizationId, ...run });
   return run;
 }
 
@@ -291,7 +291,7 @@ export async function verifyOrganization(organizationId: string, deadline: Date)
 // the rest.
 export async function verifyStoredTelemetry(budgetMs = DEFAULT_BUDGET_MS) {
   const deadline = new Date(Date.now() + budgetMs);
-  const candidates = await getDatabase().execute<{ organization_id: string }>(sql`
+  const candidates = await getCrossTenantDatabase().execute<{ organization_id: string }>(sql`
     SELECT organization.organization_id FROM (
       SELECT organization_id FROM telemetry_events UNION SELECT organization_id FROM telemetry_tombstones
     ) organization

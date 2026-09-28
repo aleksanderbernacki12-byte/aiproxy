@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 import { and, eq, gt, isNull, or } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { getCrossTenantDatabase, withOrganization } from "@/db/client";
 import { dpoAccessKeys } from "@/db/schema";
 
 export type DPOIdentity = {
@@ -18,7 +18,8 @@ export function hashDPOAccessKey(key: string) {
 
 export async function authenticateDPOAccessKey(key: string, now = new Date()): Promise<DPOIdentity | null> {
   if (key.length < 32 || /\s/.test(key)) return null;
-  const [identity] = await getDatabase()
+  // The organization is not known until the key is found.
+  const [identity] = await getCrossTenantDatabase()
     .select({ credentialId: dpoAccessKeys.id, organizationId: dpoAccessKeys.organizationId, role: dpoAccessKeys.role, label: dpoAccessKeys.label })
     .from(dpoAccessKeys)
     .where(and(
@@ -31,7 +32,7 @@ export async function authenticateDPOAccessKey(key: string, now = new Date()): P
 }
 
 export async function validateDPOIdentity(identity: Pick<DPOIdentity, "credentialId" | "organizationId" | "role">, now = new Date()) {
-  const [active] = await getDatabase()
+  const [active] = await withOrganization(identity.organizationId, (transaction) => transaction
     .select({ id: dpoAccessKeys.id })
     .from(dpoAccessKeys)
     .where(and(
@@ -41,6 +42,6 @@ export async function validateDPOIdentity(identity: Pick<DPOIdentity, "credentia
       isNull(dpoAccessKeys.revokedAt),
       or(isNull(dpoAccessKeys.expiresAt), gt(dpoAccessKeys.expiresAt, now)),
     ))
-    .limit(1);
+    .limit(1));
   return Boolean(active);
 }

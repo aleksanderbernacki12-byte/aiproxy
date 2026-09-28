@@ -1,16 +1,16 @@
 import "server-only";
 import { asc, eq, sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { withOrganization } from "@/db/client";
 import { aiSystems } from "@/db/schema";
 import type { AISystemProfile } from "./ai-system-profile";
 
 export async function listAISystems(organizationId: string) {
-  return getDatabase().select().from(aiSystems).where(eq(aiSystems.organizationId, organizationId))
-    .orderBy(asc(aiSystems.name), asc(aiSystems.id));
+  return withOrganization(organizationId, (transaction) => transaction.select().from(aiSystems)
+    .where(eq(aiSystems.organizationId, organizationId)).orderBy(asc(aiSystems.name), asc(aiSystems.id)));
 }
 
 export async function saveAISystem(identity: { organizationId: string; credentialId: string }, profile: AISystemProfile) {
-  return getDatabase().transaction(async (tx) => {
+  return withOrganization(identity.organizationId, async (tx) => {
     const values = {
       organizationId: identity.organizationId, applicationId: profile.application_id,
       model: profile.model, name: profile.name, provider: profile.provider || null,

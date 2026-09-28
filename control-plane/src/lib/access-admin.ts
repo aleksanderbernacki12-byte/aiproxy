@@ -1,7 +1,7 @@
 import "server-only";
 import { createHash, randomBytes } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { withOrganization } from "@/db/client";
 import type { AccessCommand } from "./access-command";
 
 export class AccessDeniedError extends Error {}
@@ -15,18 +15,18 @@ export type AccessCredential = {
 
 export async function listAccessCredentials(identity: Identity) {
   if (identity.role !== "ADMIN") throw new AccessDeniedError();
-  const result = await getDatabase().execute<AccessCredential>(sql`
+  const result = await withOrganization(identity.organizationId, (transaction) => transaction.execute<AccessCredential>(sql`
     SELECT id, label, role, created_at, expires_at, revoked_at,
       coalesce(expires_at <= clock_timestamp(), false) AS expired FROM dpo_access_keys
     WHERE organization_id=${identity.organizationId}::uuid ORDER BY created_at DESC, id DESC
-  `);
+  `));
   return result.rows;
 }
 
 export async function changeAccessCredential(identity: Identity, input: AccessCommand) {
   if (identity.role !== "ADMIN") throw new AccessDeniedError();
   if (input.command === "revoke" && input.credential_id.toLowerCase() === identity.credentialId.toLowerCase()) throw new AccessConflictError();
-  return getDatabase().transaction(async (tx) => {
+  return withOrganization(identity.organizationId, async (tx) => {
     // Serialize portal administrators so two admins cannot revoke each other
     // after both passed session validation. Recheck the actor under a row lock.
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"access:" + identity.organizationId}, 0))`);

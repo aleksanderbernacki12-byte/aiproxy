@@ -1,7 +1,7 @@
 import "server-only";
 
 import { sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { getCrossTenantDatabase } from "@/db/client";
 import { securityAuditCheckpoints, telemetryBuffer, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
 
 export type ControlPlaneMetrics = {
@@ -16,7 +16,7 @@ export type ControlPlaneMetrics = {
 };
 
 export async function getControlPlaneMetrics(now = new Date()): Promise<ControlPlaneMetrics> {
-  const database = getDatabase();
+  const database = getCrossTenantDatabase();
   const [[buffer], [events], [anchors], [auditAnchors], auditChains] = await Promise.all([
     database.select({
       pending: sql<number>`count(*)::integer`.mapWith(Number),

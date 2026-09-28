@@ -1,12 +1,12 @@
 import "server-only";
 import { sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { withOrganization } from "@/db/client";
 import type { RetentionCommand } from "./retention-command";
 
 export class RetentionConflictError extends Error {}
 
 export async function updateRetentionPolicy(identity: { organizationId: string; credentialId: string }, input: RetentionCommand) {
-  return getDatabase().transaction(async (tx) => {
+  return withOrganization(identity.organizationId, async (tx) => {
     const organizationId = identity.organizationId;
     let action: string;
     let metadata: Record<string, unknown>;

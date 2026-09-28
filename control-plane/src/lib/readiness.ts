@@ -4,7 +4,7 @@ import { createPrivateKey, createPublicKey } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
 
-export const expectedMigration = "0016_telemetry_reverification.sql";
+export const expectedMigration = "0017_tenant_row_level_security.sql";
 
 type ReadinessEnvironment = Partial<Record<
   "DASHBOARD_SESSION_SECRET" | "CRON_SECRET" | "REPORT_SIGNING_PRIVATE_KEY" |

@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 import { asc, desc, eq, sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { getCrossTenantDatabase } from "@/db/client";
 import { telemetryChainHeads, telemetryMerkleCheckpoints, type MerkleCheckpointHead } from "@/db/schema";
 
 const LEAF_DOMAIN = Buffer.from("aiproxy-merkle-leaf-v1\0");
@@ -37,7 +37,7 @@ export function calculateMerkleRoot(organizationId: string, input: MerkleCheckpo
 }
 
 async function checkpointOrganization(organizationId: string) {
-  return getDatabase().transaction(async (transaction) => {
+  return getCrossTenantDatabase().transaction(async (transaction) => {
     await transaction.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"merkle:" + organizationId}, 0))`);
     const rows = await transaction.select({
       keyId: telemetryChainHeads.keyId,
@@ -63,7 +63,7 @@ async function checkpointOrganization(organizationId: string) {
 }
 
 export async function createMerkleCheckpoints() {
-  const organizations = await getDatabase().selectDistinct({ organizationId: telemetryChainHeads.organizationId }).from(telemetryChainHeads);
+  const organizations = await getCrossTenantDatabase().selectDistinct({ organizationId: telemetryChainHeads.organizationId }).from(telemetryChainHeads);
   let created = 0;
   for (const { organizationId } of organizations) if (await checkpointOrganization(organizationId)) created += 1;
   return { organizations: organizations.length, created };

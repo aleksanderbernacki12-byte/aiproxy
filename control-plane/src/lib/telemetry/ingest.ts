@@ -1,10 +1,9 @@
 import { telemetryBuffer, telemetryEventIds } from "@/db/schema";
-import { getDatabase } from "@/db/client";
+import { withOrganization } from "@/db/client";
 import type { TelemetryEvent } from "./schema";
 
 export async function bufferTelemetryEvents(organizationId: string, events: TelemetryEvent[]) {
-  const database = getDatabase();
-  return database.transaction(async (transaction) => {
+  return withOrganization(organizationId, async (transaction) => {
     const newIds = await transaction
       .insert(telemetryEventIds)
       .values(events.map((event) => ({ eventId: event.event_id, organizationId })))

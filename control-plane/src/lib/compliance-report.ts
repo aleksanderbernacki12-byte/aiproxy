@@ -3,7 +3,7 @@ import "server-only";
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 import canonicalize from "canonicalize";
 import { and, desc, eq, sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { withOrganization } from "@/db/client";
 import { complianceReports, dpoAccessKeys, reportSigningKeys } from "@/db/schema";
 import { getDashboardData } from "@/lib/dashboard";
 import { getSecurityAuditEvidence } from "@/lib/security-audit";
@@ -63,7 +63,7 @@ export async function sealComplianceReport(identity: { credentialId: string; org
   const payloadHash = createHash("sha256").update(canonical).digest("hex");
   const { privateKey, publicKeyPem, keyId } = reportSigningKey();
   const signature = sign(null, Buffer.concat([SIGNATURE_DOMAIN, canonical]), privateKey).toString("base64");
-  const [stored] = await getDatabase().transaction(async (transaction) => {
+  const [stored] = await withOrganization(identity.organizationId, async (transaction) => {
     await transaction.insert(reportSigningKeys).values({
       keyId, publicKeyPem, firstUsedAt: now, lastUsedAt: now,
     }).onConflictDoUpdate({
@@ -93,9 +93,9 @@ export async function sealComplianceReport(identity: { credentialId: string; org
 }
 
 export async function getSealedReport(reportId: string, organizationId: string): Promise<SealedReport | null> {
-  const [report] = await getDatabase().select().from(complianceReports).where(and(
+  const [report] = await withOrganization(organizationId, (transaction) => transaction.select().from(complianceReports).where(and(
     eq(complianceReports.id, reportId), eq(complianceReports.organizationId, organizationId),
-  )).limit(1);
+  )).limit(1));
   return report ? {
     report_id: report.id,
     payload: report.payload,
@@ -108,7 +108,7 @@ export async function getSealedReport(reportId: string, organizationId: string):
 }
 
 export async function listSealedReports(organizationId: string, limit = 100) {
-  return getDatabase().select({
+  return withOrganization(organizationId, (transaction) => transaction.select({
     id: complianceReports.id,
     createdAt: complianceReports.createdAt,
     payloadHash: complianceReports.payloadHash,
@@ -119,14 +119,14 @@ export async function listSealedReports(organizationId: string, limit = 100) {
     .innerJoin(dpoAccessKeys, eq(dpoAccessKeys.id, complianceReports.generatedBy))
     .where(eq(complianceReports.organizationId, organizationId))
     .orderBy(desc(complianceReports.createdAt), desc(complianceReports.id))
-    .limit(Math.min(Math.max(limit, 1), 100));
+    .limit(Math.min(Math.max(limit, 1), 100)));
 }
 
 export async function getReportVerificationKey(keyId: string, organizationId: string) {
-  const [key] = await getDatabase().select({ publicKeyPem: reportSigningKeys.publicKeyPem })
+  const [key] = await withOrganization(organizationId, (transaction) => transaction.select({ publicKeyPem: reportSigningKeys.publicKeyPem })
     .from(reportSigningKeys)
     .innerJoin(complianceReports, eq(complianceReports.signingKeyId, reportSigningKeys.keyId))
     .where(and(eq(reportSigningKeys.keyId, keyId), eq(complianceReports.organizationId, organizationId)))
-    .limit(1);
+    .limit(1));
   return key?.publicKeyPem ?? null;
 }
