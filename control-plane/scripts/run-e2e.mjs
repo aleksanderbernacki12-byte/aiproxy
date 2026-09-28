@@ -24,5 +24,8 @@ try {
   await run(["node_modules/@playwright/test/cli.js", "test"]);
 } finally {
   await admin.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+  // Migration 0019 created a cluster-wide role for the throwaway database.
+  const { rows: [{ role }] } = await admin.query(`SELECT 'aiproxy_app_' || left(md5($1::text), 12) AS role`, [name]);
+  await admin.query(`DROP ROLE IF EXISTS "${role}"`);
   await admin.end();
 }

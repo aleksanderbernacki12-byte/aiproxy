@@ -4,7 +4,7 @@ import { createPrivateKey, createPublicKey } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { getDatabase } from "@/db/client";
 
-export const expectedMigration = "0018_dpo_session_versions.sql";
+export const expectedMigration = "0019_per_database_app_role.sql";
 
 type ReadinessEnvironment = Partial<Record<
   "DASHBOARD_SESSION_SECRET" | "CRON_SECRET" | "REPORT_SIGNING_PRIVATE_KEY" |
@@ -43,8 +43,18 @@ export function configurationFailures(environment: ReadinessEnvironment = proces
   return [...new Set(failures)];
 }
 
+// Row-level security only holds while the application runs as the
+// per-database role from migration 0019.
+export async function applicationRoleActive() {
+  const result = await getDatabase().execute<{ role_active: boolean }>(sql`
+    SELECT current_user = 'aiproxy_app_' || left(md5(current_database()), 12) AS role_active
+  `);
+  return result.rows[0]?.role_active === true;
+}
+
 export async function checkControlPlaneReadiness() {
   if (configurationFailures().length > 0) return false;
+  if (!await applicationRoleActive()) return false;
   const result = await getDatabase().execute<{ migration_ready: boolean }>(sql`
     SELECT EXISTS (
       SELECT 1 FROM control_plane_migrations WHERE filename = ${expectedMigration}

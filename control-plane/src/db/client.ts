@@ -10,6 +10,11 @@ const globalDatabase = globalThis as typeof globalThis & {
   aiproxyCrossTenantPool?: Pool;
 };
 
+// The role 0019 created for this database.
+function selectAppRole(local: boolean) {
+  return `set_config('role', 'aiproxy_app_' || left(md5(current_database()), 12), ${local})`;
+}
+
 function createPool(max: number, crossTenant: boolean) {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
@@ -23,11 +28,14 @@ function createPool(max: number, crossTenant: boolean) {
   });
   // Row-level security (0017) does not apply to superusers, and the
   // deployment may connect as one, so every connection drops to the
-  // restricted role first.
+  // restricted per-database role (0019) first.
   pool.on("connect", (connection) => {
-    void connection.query(crossTenant
-      ? "SET ROLE aiproxy_app; SET aiproxy.cross_tenant = 'on'"
-      : "SET ROLE aiproxy_app");
+    // A failure here leaves the connection on the deployment's own user;
+    // readiness (applicationRoleActive) turns that into NOT_READY.
+    connection.query(crossTenant
+      ? `SELECT ${selectAppRole(false)}, set_config('aiproxy.cross_tenant', 'on', false)`
+      : `SELECT ${selectAppRole(false)}`)
+      .catch((error: unknown) => console.error("Could not switch to the application database role", error));
   });
   return pool;
 }
@@ -55,7 +63,7 @@ export type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 // connection pooler (pgbouncer) does not keep the session-level SET ROLE.
 export async function withOrganization<T>(organizationId: string, work: (transaction: Transaction) => Promise<T>) {
   return getDatabase().transaction(async (transaction) => {
-    await transaction.execute(sql`SELECT set_config('role', 'aiproxy_app', true),
+    await transaction.execute(sql`SELECT ${sql.raw(selectAppRole(true))},
       set_config('aiproxy.organization_id', ${organizationId}, true)`);
     return work(transaction);
   });
