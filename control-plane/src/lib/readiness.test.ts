@@ -15,6 +15,7 @@ function validEnvironment() {
     MERKLE_ANCHOR_PUBLIC_KEY: anchor.publicKey.export({ type: "spki", format: "pem" }).toString(),
     REPORT_SIGNING_PRIVATE_KEY: report.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
     TELEMETRY_REORDER_WINDOW_SECONDS: "30",
+    TRUSTED_PROXY_HOPS: "1",
   };
 }
 
@@ -30,8 +31,9 @@ describe("Control Plane readiness configuration", () => {
     environment.MERKLE_ANCHOR_PUBLIC_KEY = "invalid";
     environment.REPORT_SIGNING_PRIVATE_KEY = "invalid";
     environment.TELEMETRY_REORDER_WINDOW_SECONDS = "0";
+    environment.TRUSTED_PROXY_HOPS = "0";
     expect(configurationFailures(environment)).toEqual(expect.arrayContaining([
-      "secret_reuse", "anchor_https", "anchor_public_key", "report_private_key", "reorder_window",
+      "secret_reuse", "anchor_https", "anchor_public_key", "report_private_key", "reorder_window", "trusted_proxy_hops",
     ]));
   });
 });

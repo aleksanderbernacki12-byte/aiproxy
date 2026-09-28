@@ -9,7 +9,7 @@ export const expectedMigration = "0016_telemetry_reverification.sql";
 type ReadinessEnvironment = Partial<Record<
   "DASHBOARD_SESSION_SECRET" | "CRON_SECRET" | "REPORT_SIGNING_PRIVATE_KEY" |
   "MERKLE_ANCHOR_URL" | "MERKLE_ANCHOR_TOKEN" | "MERKLE_ANCHOR_PUBLIC_KEY" |
-  "TELEMETRY_REORDER_WINDOW_SECONDS" | "NODE_ENV", string
+  "TELEMETRY_REORDER_WINDOW_SECONDS" | "TRUSTED_PROXY_HOPS" | "NODE_ENV", string
 >>;
 
 export function configurationFailures(environment: ReadinessEnvironment = process.env) {
@@ -38,6 +38,8 @@ export function configurationFailures(environment: ReadinessEnvironment = proces
   } catch { failures.push("report_private_key"); }
   const reorderWindow = Number(environment.TELEMETRY_REORDER_WINDOW_SECONDS ?? "30");
   if (!Number.isInteger(reorderWindow) || reorderWindow < 1 || reorderWindow > 3600) failures.push("reorder_window");
+  const proxyHops = Number(environment.TRUSTED_PROXY_HOPS ?? "1");
+  if (!Number.isInteger(proxyHops) || proxyHops < 1 || proxyHops > 10) failures.push("trusted_proxy_hops");
   return [...new Set(failures)];
 }
 

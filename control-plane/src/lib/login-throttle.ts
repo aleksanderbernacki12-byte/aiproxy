@@ -7,16 +7,27 @@ import { getDatabase } from "@/db/client";
 const WINDOW_MINUTES = 15;
 const MAX_FAILURES = 5;
 
-function requestSource(request: Request) {
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim();
-  const source = forwarded || request.headers.get("x-real-ip")?.trim() || "unknown";
+export function trustedProxyHops(value = process.env.TRUSTED_PROXY_HOPS) {
+  const hops = Number(value ?? "1");
+  return Number.isInteger(hops) && hops >= 1 && hops <= 10 ? hops : 1;
+}
+
+// Proxies append to X-Forwarded-For, so everything left of the entries our
+// own trusted proxies added is client-controlled. Take the address the
+// outermost trusted proxy appended: `hops` positions from the right.
+function requestSource(request: Request, hops: number) {
+  const forwarded = (request.headers.get("x-forwarded-for") ?? "")
+    .split(",").map((entry) => entry.trim()).filter(Boolean);
+  const source = forwarded.length > 0
+    ? forwarded[Math.max(0, forwarded.length - hops)]
+    : request.headers.get("x-real-ip")?.trim() || "unknown";
   return source.slice(0, 256);
 }
 
-export function hashLoginSource(request: Request, secret: string) {
+export function hashLoginSource(request: Request, secret: string, hops = trustedProxyHops()) {
   return createHmac("sha256", secret)
     .update("aiproxy-dashboard-login-source-v1\0")
-    .update(requestSource(request), "utf8")
+    .update(requestSource(request, hops), "utf8")
     .digest("hex");
 }
 

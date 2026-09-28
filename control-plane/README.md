@@ -54,9 +54,12 @@ Secure session cookies are effective.
 The dashboard login limiter allows five failed attempts per pseudonymous source
 in 15 minutes and works across application instances through PostgreSQL. Source
 addresses are HMAC-SHA256 hashed with the session secret and never stored. The
-TLS reverse proxy must remove client-supplied forwarding headers and set a
-trusted `X-Forwarded-For` or `X-Real-IP`; otherwise clients can evade source
-throttling. Attempt rows expire opportunistically after 24 hours.
+source is the `X-Forwarded-For` entry appended by the outermost trusted proxy:
+`TRUSTED_PROXY_HOPS` positions from the right (default 1, one TLS reverse
+proxy), so addresses a client adds itself are ignored. Without
+`X-Forwarded-For` the limiter falls back to `X-Real-IP`, and without either all
+attempts share one bucket, so always run behind a proxy that sets the header.
+Attempt rows expire opportunistically after 24 hours.
 
 The runtime requires:
 
@@ -68,6 +71,8 @@ The runtime requires:
 - `SCHEDULER_REQUEST_TIMEOUT_MS`: timeout for each self-hosted scheduler call;
   defaults to 70 seconds and must be between 5 and 300 seconds. A timed-out
   call is released so a later interval can retry it.
+- `TRUSTED_PROXY_HOPS`: number of trusted proxies in front of the service that
+  append to `X-Forwarded-For`; 1 to 10, defaults to 1.
 - `TELEMETRY_REORDER_WINDOW_SECONDS`: how long a chain gap remains buffered
   before it is classified as compromised; defaults to 30 seconds.
 - `MERKLE_ANCHOR_URL`: HTTPS endpoint for an independent append-only anchor.

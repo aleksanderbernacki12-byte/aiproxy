@@ -61,6 +61,8 @@ Kod: [0001_telemetry.sql](../../control-plane/db/migrations/0001_telemetry.sql),
 
 DPO-nycklarna har 256 bitar, så brute force är inte realistiskt. Den verkliga risken är utlåsning. README kräver att proxyn tar bort headern, men koden kan inte kontrollera det. Inför en konfigurerbar parameter för antal betrodda proxyled och ta adressen närmast den betrodda proxyn. Om ingen betrodd adress finns bör spärren bara gälla nyckeln, inte alla. Kod: [login-throttle.ts](../../control-plane/src/lib/login-throttle.ts).
 
+*Åtgärdat 2026-09-28:* `TRUSTED_PROXY_HOPS` (standard 1) anger antal betrodda proxyled, och adressen tas så många steg från höger i `X-Forwarded-For`. Utan headern delar alla anrop fortfarande en hink; README kräver en proxy som sätter den.
+
 **5. Tenant-isolering finns bara i applikationen.** Ingen tabell har row-level security. Alla granskade frågor filtrerar korrekt på `organization_id`, men en enda framtida fråga utan filter läcker mellan kunder. Som försvar på djupet: inför RLS med `set_config('aiproxy.organization_id', …, true)` per transaktion och en applikationsroll som inte äger tabellerna. Interna jobb som går över alla organisationer (worker, gallring, checkpoints, metrics) kör då med en separat roll.
 
 **Prioritet P3**
