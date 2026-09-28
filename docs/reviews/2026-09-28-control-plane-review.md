@@ -69,13 +69,13 @@ DPO-nycklarna har 256 bitar, så brute force är inte realistiskt. Den verkliga 
 
 **Prioritet P3**
 
-**6. Utloggning ogiltigförklarar inte sessionen.** Sessionen är en signerad cookie som gäller i 8 timmar. Utloggning tar bara bort cookien i webbläsaren, så en kopierad cookie gäller tills den löper ut eller nyckeln återkallas. En sessionsversion per nyckel, som räknas upp vid utloggning och kontrolleras i `validateDPOIdentity`, stänger detta.
+**6. Utloggning ogiltigförklarar inte sessionen.** Sessionen är en signerad cookie som gäller i 8 timmar. Utloggning tar bara bort cookien i webbläsaren, så en kopierad cookie gäller tills den löper ut eller nyckeln återkallas. En sessionsversion per nyckel, som räknas upp vid utloggning och kontrolleras i `validateDPOIdentity`, stänger detta. *Åtgärdat 2026-09-28:* migrering 0018 och `endDPOSessions`; utloggning avslutar nyckelns alla sessioner.
 
-**7. Förankringskön kan fastna.** De fem äldsta `PENDING`-checkpointsen försöks igen först varje gång. Om de misslyckas permanent, till exempel för att kvittot aldrig matchar, förankras inga nyare. Gallringen kräver `ANCHORED` och stannar därför också. Markera en checkpoint som permanent misslyckad efter ett antal försök, eller sortera på antal försök.
+**7. Förankringskön kan fastna.** De fem äldsta `PENDING`-checkpointsen försöks igen först varje gång. Om de misslyckas permanent, till exempel för att kvittot aldrig matchar, förankras inga nyare. Gallringen kräver `ANCHORED` och stannar därför också. Markera en checkpoint som permanent misslyckad efter ett antal försök, eller sortera på antal försök. *Åtgärdat 2026-09-28:* väntande checkpoints sorteras på antal försök och sedan ålder.
 
-**8. Dataplanet försöker igen vid alla felsvar, även 400.** En batch som Control Plane avvisar med 400 blockerar hela kön för alltid. Proxyn validerar själv `application_id` och bygger `routing`/`metrics`, så det går inte att utlösa i dag. En framtida skillnad i schemat mellan dataplanet och Control Plane skulle dock stoppa all telemetri. Lägg händelser som får 4xx i karantän i stället för att försöka igen.
+**8. Dataplanet försöker igen vid alla felsvar, även 400.** En batch som Control Plane avvisar med 400 blockerar hela kön för alltid. Proxyn validerar själv `application_id` och bygger `routing`/`metrics`, så det går inte att utlösa i dag. En framtida skillnad i schemat mellan dataplanet och Control Plane skulle dock stoppa all telemetri. Lägg händelser som får 4xx i karantän i stället för att försöka igen. *Åtgärdat 2026-09-28:* vid 400/413/422 skickas batchen event för event, och event som fortfarande avvisas flyttas till `telemetry_rejected`.
 
-**9. Obegränsat nästlingsdjup i ingestschemat.** `jsonValueSchema` är rekursivt utan gräns för djupet. Djupt nästlad JSON inom 1 MiB kan spränga anropsstacken i valideringen och ge 500 för det anropet. Begränsa djupet, till exempel till 16 nivåer.
+**9. Obegränsat nästlingsdjup i ingestschemat.** `jsonValueSchema` är rekursivt utan gräns för djupet. Djupt nästlad JSON inom 1 MiB kan spränga anropsstacken i valideringen och ge 500 för det anropet. Begränsa djupet, till exempel till 16 nivåer. *Åtgärdat 2026-09-28:* ingest avvisar JSON djupare än 32 nivåer med 400 före schemavalideringen.
 
 **Styrkor som bör behållas**
 

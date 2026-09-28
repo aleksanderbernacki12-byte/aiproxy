@@ -43,7 +43,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0017_tenant_row_level_security.sql`. It also validates every required secret,
+`0018_dpo_session_versions.sql`. It also validates every required secret,
 the report and anchor Ed25519 keys, the production anchor HTTPS URL, and the
 telemetry reorder window. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently. Every
@@ -141,6 +141,9 @@ npm run dpo:revoke -- <organization-id> <credential-id>
 
 Only the SHA-256 digest is stored. An optional ISO expiry can be passed after
 the role. Revocation invalidates existing sessions on their next request.
+Logout also ends the access key's sessions on the server: each session carries
+the key's `session_version`, which logout advances, so a copied cookie stops
+working immediately. It signs out every session of that key, on every device.
 
 ## AI system governance inventory
 
@@ -423,7 +426,7 @@ chain sequence and checks:
   verifies against `MERKLE_ANCHOR_PUBLIC_KEY`, and each anchored head matches
   the stored event at that sequence.
 
-Events stored before `0017_tenant_row_level_security.sql` have no signed
+Events stored before `0018_dpo_session_versions.sql` have no signed
 payload; they are reported as legacy and checked for linkage and sequence
 only. A run that runs out of time is recorded as incomplete. The dashboard
 and sealed reports show the latest run, and the chain only counts as intact
