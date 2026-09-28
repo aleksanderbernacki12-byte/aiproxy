@@ -1,20 +1,8 @@
 -- Tenant isolation as defence in depth against a query that forgets its
--- organization filter. The application switches to aiproxy_app on every
--- connection (superusers bypass row-level security), so policies apply
--- whatever user the deployment connects with. Not FORCE: the owner, which
--- runs migrations and the operator CLI scripts, is unaffected.
-
-DO $$ BEGIN
-  CREATE ROLE aiproxy_app NOLOGIN NOSUPERUSER NOBYPASSRLS;
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-GRANT aiproxy_app TO CURRENT_USER;
-GRANT USAGE ON SCHEMA public TO aiproxy_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO aiproxy_app;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO aiproxy_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO aiproxy_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO aiproxy_app;
+-- organization filter. Not FORCE: the owner, which runs migrations and the
+-- operator CLI scripts, is unaffected. The restricted role the application
+-- runs as is created per database by 0019 (roles are cluster-wide, so a
+-- shared role cannot be granted by a second database's owner).
 
 CREATE OR REPLACE FUNCTION aiproxy_tenant_visible(organization uuid) RETURNS boolean
 LANGUAGE sql STABLE AS $$

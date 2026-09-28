@@ -90,7 +90,10 @@ describe("tenant row-level security", () => {
     const { getDatabase } = await import("@/db/client");
     const database = getDatabase();
     const role = await database.execute<{ current_user: string }>(sql`SELECT current_user`);
-    expect(role.rows[0].current_user).toBe("aiproxy_app");
+    const expected = await client.query<{ role: string }>(`SELECT 'aiproxy_app_' || left(md5(current_database()), 12) AS role`);
+    expect(role.rows[0].current_user).toBe(expected.rows[0].role);
+    const { applicationRoleActive } = await import("@/lib/readiness");
+    expect(await applicationRoleActive()).toBe(true);
     expect(await databaseError(database.execute(sql`TRUNCATE ai_systems`))).toMatch(/permission denied/);
   });
 });

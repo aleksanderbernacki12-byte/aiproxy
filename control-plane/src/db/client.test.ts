@@ -18,7 +18,7 @@ afterEach(() => {
 });
 
 function connectQuery(index: number) {
-  const query = vi.fn();
+  const query = vi.fn().mockResolvedValue(undefined);
   mocks.connect[index]({ query });
   return query.mock.calls[0][0];
 }
@@ -37,6 +37,7 @@ it("drops every connection to the row-level-security role", () => {
   getDatabase();
   getCrossTenantDatabase();
   expect(mocks.pool).toHaveBeenCalledTimes(2);
-  expect(connectQuery(0)).toBe("SET ROLE aiproxy_app");
-  expect(connectQuery(1)).toBe("SET ROLE aiproxy_app; SET aiproxy.cross_tenant = 'on'");
+  const selectRole = "set_config('role', 'aiproxy_app_' || left(md5(current_database()), 12), false)";
+  expect(connectQuery(0)).toBe(`SELECT ${selectRole}`);
+  expect(connectQuery(1)).toBe(`SELECT ${selectRole}, set_config('aiproxy.cross_tenant', 'on', false)`);
 });

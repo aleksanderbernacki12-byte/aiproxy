@@ -43,7 +43,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0018_dpo_session_versions.sql`. It also validates every required secret,
+`0019_per_database_app_role.sql`. It also validates every required secret,
 the report and anchor Ed25519 keys, the production anchor HTTPS URL, and the
 telemetry reorder window. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently. Every
@@ -308,8 +308,10 @@ Every table that holds tenant data (and `organizations` itself) has a
 PostgreSQL row-level security policy: a row is visible and writable only when
 its organization equals the transaction's `aiproxy.organization_id`, or when
 the connection is in explicit cross-tenant mode. The application pools switch
-every connection to the non-superuser role `aiproxy_app` (created by migration
-0017; superusers bypass row-level security), and request-driven code runs
+every connection to a non-superuser role of this database,
+`aiproxy_app_<first 12 hex of md5(database name)>` (created by migration 0019;
+superusers bypass row-level security, and roles are cluster-wide, so each
+database gets its own), and request-driven code runs
 inside `withOrganization`, which also sets the role for its transaction so the
 policy holds behind a transaction-mode pooler such as pgbouncer. A query that
 forgets its organization filter therefore sees only its own tenant, and a
@@ -318,6 +320,12 @@ key lookups (before the organization is known) and the internal jobs use the
 cross-tenant pool. The policies are not forced, so the owner role that runs
 migrations and the CLI scripts is unaffected. This guards against code
 mistakes, not against an attacker who can run arbitrary SQL.
+
+The user that runs migrations must be a superuser or hold `CREATEROLE` (the
+default owner on managed PostgreSQL such as Neon, Supabase and RDS), because
+migration 0019 creates and grants the role. Readiness reports `NOT_READY` when
+the application is not running as that role, since row-level security would
+then not apply.
 
 ## Ingestion
 
@@ -426,7 +434,7 @@ chain sequence and checks:
   verifies against `MERKLE_ANCHOR_PUBLIC_KEY`, and each anchored head matches
   the stored event at that sequence.
 
-Events stored before `0018_dpo_session_versions.sql` have no signed
+Events stored before `0016_telemetry_reverification.sql` have no signed
 payload; they are reported as legacy and checked for linkage and sequence
 only. A run that runs out of time is recorded as incomplete. The dashboard
 and sealed reports show the latest run, and the chain only counts as intact
