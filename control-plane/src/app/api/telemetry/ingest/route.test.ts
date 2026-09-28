@@ -72,6 +72,31 @@ describe("POST /api/telemetry/ingest", () => {
     expect(mocks.bufferTelemetryEvents).not.toHaveBeenCalled();
   });
 
+  it("stops reading an oversized body that declares no Content-Length", async () => {
+    const chunk = new Uint8Array(64 * 1024).fill(0x20);
+    const totalChunks = 64;
+    let pulledChunks = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulledChunks === totalChunks) {
+          controller.close();
+          return;
+        }
+        pulledChunks += 1;
+        controller.enqueue(chunk);
+      },
+    });
+    const response = await POST(new Request("https://control.example/api/telemetry/ingest", {
+      method: "POST",
+      headers: { authorization: "Bearer tenant-secret", "content-type": "application/json" },
+      body,
+      duplex: "half",
+    } as RequestInit));
+    expect(response.status).toBe(413);
+    expect(pulledChunks).toBeLessThan(totalChunks / 2);
+    expect(mocks.bufferTelemetryEvents).not.toHaveBeenCalled();
+  });
+
   it("returns 503 without acknowledging an event when Postgres is unavailable", async () => {
     const { event } = createSignedFixture();
     mocks.bufferTelemetryEvents.mockRejectedValueOnce(new Error("database offline"));

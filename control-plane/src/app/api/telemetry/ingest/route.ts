@@ -1,6 +1,7 @@
 import { bufferTelemetryEvents } from "@/lib/telemetry/ingest";
 import { telemetryBatchSchema } from "@/lib/telemetry/schema";
 import { authenticateTenant } from "@/lib/tenant-auth";
+import { readBoundedTextBody, RequestBodyTooLargeError } from "@/lib/request-body";
 
 export const runtime = "nodejs";
 
@@ -17,19 +18,13 @@ export async function POST(request: Request) {
   if (!organization) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
-  const contentLength = Number(request.headers.get("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
-    return Response.json({ error: "Payload too large" }, { status: 413 });
-  }
-
   let input: unknown;
   try {
-    const body = await request.text();
-    if (Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
+    input = JSON.parse(await readBoundedTextBody(request, MAX_BODY_BYTES));
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
       return Response.json({ error: "Payload too large" }, { status: 413 });
     }
-    input = JSON.parse(body);
-  } catch {
     return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
   }
   const parsed = telemetryBatchSchema.safeParse(input);

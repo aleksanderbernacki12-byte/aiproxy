@@ -52,6 +52,8 @@ Kod: [0001_telemetry.sql](../../control-plane/db/migrations/0001_telemetry.sql),
 
 **3. Ingest läser hela bodyn innan storleken kontrolleras.** `POST /api/telemetry/ingest` avvisar en för stor `Content-Length`, men utan den headern, till exempel vid chunked-överföring, läser `request.text()` hela bodyn innan storleken kontrolleras. Ett ogiltigt `Content-Length` hoppar också förbi kontrollen. Det kräver en giltig tenant-nyckel men kan tömma minnet. Använd den befintliga `readBoundedTextBody`, som övriga routes redan använder. Kod: [ingest/route.ts](../../control-plane/src/app/api/telemetry/ingest/route.ts).
 
+*Åtgärdat 2026-09-28:* ingest läser bodyn med `readBoundedTextBody` och slutar läsa vid 1 MiB, oavsett `Content-Length`.
+
 **4. Inloggningsspärren använder den första adressen i `X-Forwarded-For`.** De vanligaste proxykonfigurationerna lägger till klientens adress sist i headern i stället för att ersätta den. Då styr klienten själv den första adressen. Det ger två problem:
 
 - En angripare kan kringgå spärren genom att byta adress, eller låsa ute en annan användares adress genom att förfalska den.
