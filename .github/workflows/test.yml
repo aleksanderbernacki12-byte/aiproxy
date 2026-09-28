@@ -120,6 +120,9 @@ jobs:
           TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: npm run test:recovery
 
+      - name: Migrations as two non-superuser owners in one cluster
+        run: npm run test:shared-cluster
+
       # Build generates Next.js route types required by the standalone check.
       - name: Production build
         run: npm run build
