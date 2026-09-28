@@ -29,6 +29,8 @@ Förslag:
 
 Kod: [processKeyChain](../../control-plane/src/lib/telemetry/worker.ts), [findExtendingEventIndex](../../control-plane/src/lib/telemetry/ordering.ts), [persist](../../internal/telemetry/store.go).
 
+*Åtgärdat 2026-09-28:* en lucka flaggas en gång och kedjan fortsätter därefter; sena events flaggas utan att dela kedjan; gallringen omfattar flaggade luckor. Se [specen](../superpowers/specs/2026-09-28-telemetry-chain-recovery-design.md). Dataplanets del (kedjetillstånd tillsammans med nyckeln) är inte ändrad, eftersom Control Plane nu hanterar en omstart.
+
 **2. Lagrad bevisning kan ändras utan att det upptäcks.**
 
 `security_audit_events` och `telemetry_tombstones` skyddas av triggers mot ändring. `telemetry_events`, `compliance_reports`, `telemetry_merkle_checkpoints` och `telemetry_chain_heads` saknar sådant skydd. Signatur och kedja kontrolleras bara vid mottagningen. Ingen kod verifierar lagrade events mot de förankrade kedjehuvudena i efterhand. Dashboardens siffror och de förseglade rapporterna räknas fram ur kolumner som går att ändra, till exempel `compliance_flags` och `status`. Den som har skrivrätt i databasen kan alltså ändra en händelse från `pii_detected: true` till `false`. Nästa rapport blir då signerad och förseglad med den ändrade siffran, trots att den lagrade signaturen inte längre stämmer. Det är just den aktören som ett löfte om manipuleringssäker lagring (WORM) ska skydda mot.

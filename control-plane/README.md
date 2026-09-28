@@ -224,13 +224,14 @@ npm run retention -- release <organization-id> "CASE-2026-17 closed"
 
 The daily worker at `GET /api/internal/retention/run` requires `CRON_SECRET`.
 It never purges a tenant without an explicit policy, and an active legal hold
-stops all of that tenant's purging. Only `VERIFIED` events older than the policy
-period and covered by an externally anchored chain head are eligible. Each run
+stops all of that tenant's purging. Only events with a chain sequence (verified
+events and flagged gaps, see below) older than the policy period and covered by
+an externally anchored chain head are eligible. Each run
 moves at most 500 events per tenant into append-only tombstones containing only
 event identity, timestamp, chain hashes, key ID, sequence, and purge metadata.
 Deduplication IDs, chain heads, Merkle checkpoints, administrative audit events,
-and sealed reports remain intact. Invalid-signature and compromised-chain rows
-are retained for investigation. Policy changes, legal holds, releases, and
+and sealed reports remain intact. Invalid-signature rows and late events
+without a chain sequence are retained for investigation. Policy changes, legal holds, releases, and
 completed purge batches are recorded in the administrative audit chain. Use a
 case reference rather than personal data in legal-hold reasons.
 
@@ -325,10 +326,17 @@ For each candidate, the worker:
 7. Moves the row to `telemetry_events` and advances the head in the same
    transaction.
 
-Cryptographically valid rows with a stale or unknown predecessor become
-`COMPROMISED_CHAIN` after the reorder window. Invalid hashes, signatures,
-revoked keys, or key fingerprints become `INVALID_SIGNATURE`. Neither status
-advances the verified chain head.
+A cryptographically valid row with an unknown predecessor becomes
+`COMPROMISED_CHAIN` after the reorder window: it marks a gap, receives the
+next sequence, and becomes the chain head, so the events after it verify
+again and one gap counts once. Its `status_reason` names a data-plane restart
+(`chain restarted at genesis`) separately from a missing predecessor. A valid
+row older than the head arrives after the chain continued past it; it is also
+`COMPROMISED_CHAIN` but gets no sequence and does not move the head. Invalid
+hashes, signatures, revoked keys, or key fingerprints become
+`INVALID_SIGNATURE` and never move the head. Walking a key's events and
+tombstones by sequence, every `previous_event_hash` matches the prior event
+except at a `COMPROMISED_CHAIN` event, a declared gap.
 
 ## Merkle checkpoints
 
