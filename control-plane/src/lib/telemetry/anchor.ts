@@ -61,18 +61,24 @@ export async function anchorPendingCheckpoints(fetcher: typeof fetch = fetch) {
     database.select({
       id: telemetryMerkleCheckpoints.id, rootHash: telemetryMerkleCheckpoints.rootHash,
       leafCount: telemetryMerkleCheckpoints.leafCount, createdAt: telemetryMerkleCheckpoints.createdAt,
+      anchorAttempts: telemetryMerkleCheckpoints.anchorAttempts,
     }).from(telemetryMerkleCheckpoints).where(eq(telemetryMerkleCheckpoints.anchorStatus, "PENDING"))
-      .orderBy(asc(telemetryMerkleCheckpoints.createdAt), asc(telemetryMerkleCheckpoints.id)).limit(MAX_BATCH),
+      .orderBy(asc(telemetryMerkleCheckpoints.anchorAttempts), asc(telemetryMerkleCheckpoints.createdAt), asc(telemetryMerkleCheckpoints.id))
+      .limit(MAX_BATCH),
     database.select({
       id: securityAuditCheckpoints.id, rootHash: securityAuditCheckpoints.rootHash,
-      createdAt: securityAuditCheckpoints.createdAt,
+      createdAt: securityAuditCheckpoints.createdAt, anchorAttempts: securityAuditCheckpoints.anchorAttempts,
     }).from(securityAuditCheckpoints).where(eq(securityAuditCheckpoints.anchorStatus, "PENDING"))
-      .orderBy(asc(securityAuditCheckpoints.createdAt), asc(securityAuditCheckpoints.id)).limit(MAX_BATCH),
+      .orderBy(asc(securityAuditCheckpoints.anchorAttempts), asc(securityAuditCheckpoints.createdAt), asc(securityAuditCheckpoints.id))
+      .limit(MAX_BATCH),
   ]);
   const checkpoints = [
     ...telemetry.map((checkpoint) => ({ ...checkpoint, kind: "telemetry" as const })),
     ...audit.map((checkpoint) => ({ ...checkpoint, leafCount: 1, kind: "security_audit" as const })),
-  ].sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || Number(left.id - right.id)).slice(0, MAX_BATCH);
+  // Fewest attempts first: a checkpoint the anchor keeps rejecting is still
+  // retried, but never keeps newer checkpoints from being anchored.
+  ].sort((left, right) => left.anchorAttempts - right.anchorAttempts
+    || left.createdAt.getTime() - right.createdAt.getTime() || Number(left.id - right.id)).slice(0, MAX_BATCH);
   let anchored = 0;
   let failed = 0;
   for (const checkpoint of checkpoints) {
