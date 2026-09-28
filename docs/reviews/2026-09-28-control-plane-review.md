@@ -65,6 +65,8 @@ DPO-nycklarna har 256 bitar, så brute force är inte realistiskt. Den verkliga 
 
 **5. Tenant-isolering finns bara i applikationen.** Ingen tabell har row-level security. Alla granskade frågor filtrerar korrekt på `organization_id`, men en enda framtida fråga utan filter läcker mellan kunder. Som försvar på djupet: inför RLS med `set_config('aiproxy.organization_id', …, true)` per transaktion och en applikationsroll som inte äger tabellerna. Interna jobb som går över alla organisationer (worker, gallring, checkpoints, metrics) kör då med en separat roll.
 
+*Åtgärdat 2026-09-28:* migrering `0017_tenant_row_level_security.sql` inför RLS på alla tenant-tabeller. Applikationen kör som rollen `aiproxy_app`, anropsflöden sätter organisationen per transaktion via `withOrganization`, och bara nyckeluppslag och interna jobb använder ett uttryckligt cross-tenant-läge. Valt skydd mot kodmisstag; separata inloggningsroller mot injicerad SQL är inte införda.
+
 **Prioritet P3**
 
 **6. Utloggning ogiltigförklarar inte sessionen.** Sessionen är en signerad cookie som gäller i 8 timmar. Utloggning tar bara bort cookien i webbläsaren, så en kopierad cookie gäller tills den löper ut eller nyckeln återkallas. En sessionsversion per nyckel, som räknas upp vid utloggning och kontrolleras i `validateDPOIdentity`, stänger detta.
