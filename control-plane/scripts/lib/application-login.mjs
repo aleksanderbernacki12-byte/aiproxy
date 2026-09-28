@@ -38,10 +38,17 @@ export async function ensureApplicationLogin(client, password) {
     FROM pg_roles login WHERE login.rolname = $1`, [loginRole, appRole]);
   if (existing && !existing.ours) throw new Error(`Role ${loginRole} exists and is not this database's login role`);
   const login = client.escapeIdentifier(loginRole);
-  const verifier = client.escapeLiteral(scramVerifier(password));
-  await client.query(existing
-    ? `ALTER ROLE ${login} PASSWORD ${verifier}`
-    : `CREATE ROLE ${login} LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD ${verifier}`);
+  const setPassword = (literal) => client.query(existing
+    ? `ALTER ROLE ${login} PASSWORD ${literal}`
+    : `CREATE ROLE ${login} LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD ${literal}`);
+  try {
+    await setPassword(client.escapeLiteral(scramVerifier(password)));
+  } catch (error) {
+    // Neon forwards role changes to its own control plane, which rejects
+    // verifiers; the server then hashes the plaintext itself.
+    if (!/only supports being given plaintext passwords/.test(error?.message ?? "")) throw error;
+    await setPassword(client.escapeLiteral(password));
+  }
   await client.query(`GRANT ${client.escapeIdentifier(appRole)} TO ${login}`);
   return loginRole;
 }

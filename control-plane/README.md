@@ -349,7 +349,8 @@ APP_DATABASE_PASSWORD='<random-hex>' npm run db:migrate
 
 Run the migration again with a new password to rotate it. The password is sent
 as a SCRAM-SHA-256 verifier, so it does not appear in PostgreSQL statement
-logs. A connection as the owner still works, but loses this protection.
+logs; providers that only accept plaintext passwords, such as Neon, get the
+plaintext instead and hash it themselves. A connection as the owner still works, but loses this protection.
 
 ## Ingestion
 
