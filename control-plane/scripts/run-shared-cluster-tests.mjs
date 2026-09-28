@@ -16,7 +16,8 @@ const owners = ["a", "b"].map((label) => ({
 }));
 
 async function run(args, databaseUrl) {
-  const child = spawn(process.execPath, args, { env: { ...process.env, DATABASE_URL: databaseUrl }, stdio: "inherit" });
+  const child = spawn(process.execPath, args, { env: { ...process.env, DATABASE_URL: databaseUrl,
+    APP_DATABASE_PASSWORD: randomUUID().replaceAll("-", "") }, stdio: "inherit" });
   const code = await new Promise((resolve, reject) => { child.on("error", reject); child.on("exit", resolve); });
   if (code !== 0) throw new Error(`Shared-cluster command failed (${code})`);
 }
@@ -40,6 +41,7 @@ try {
   for (const owner of owners) {
     await admin.query(`DROP DATABASE IF EXISTS "${owner.database}" WITH (FORCE)`);
     const { rows: [{ role }] } = await admin.query(`SELECT 'aiproxy_app_' || left(md5($1::text), 12) AS role`, [owner.database]);
+    await admin.query(`DROP ROLE IF EXISTS "${owner.database}_login"`);
     await admin.query(`DROP ROLE IF EXISTS "${role}"`);
     await admin.query(`DROP ROLE IF EXISTS "${owner.role}"`);
   }

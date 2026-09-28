@@ -2,6 +2,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import process from "node:process";
 import pg from "pg";
+import { ensureApplicationLogin } from "./lib/application-login.mjs";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -40,6 +41,9 @@ try {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     }
+  }
+  if (process.env.APP_DATABASE_PASSWORD) {
+    console.log(`Application login role ${await ensureApplicationLogin(client, process.env.APP_DATABASE_PASSWORD)} is ready`);
   }
 } finally {
   await client.end();

@@ -11,6 +11,7 @@ RUN npm run build
 FROM dependencies AS migrations
 COPY db ./db
 COPY scripts/migrate.mjs ./scripts/migrate.mjs
+COPY scripts/lib/application-login.mjs ./scripts/lib/application-login.mjs
 CMD ["node", "scripts/migrate.mjs"]
 
 FROM node:24-alpine AS runtime
