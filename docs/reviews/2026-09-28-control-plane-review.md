@@ -44,6 +44,8 @@ Förslag:
 
 Kod: [0001_telemetry.sql](../../control-plane/db/migrations/0001_telemetry.sql), [0008_signed_compliance_reports.sql](../../control-plane/db/migrations/0008_signed_compliance_reports.sql), [getDashboardData](../../control-plane/src/lib/dashboard.ts).
 
+*Delvis åtgärdat 2026-09-28 (2A):* migrering `0015_evidence_immutability.sql` gör telemetri, rapporter och checkpoints skrivskyddade och stoppar `TRUNCATE` på alla bevistabeller; gallringen är enda undantaget. Kvar: verifiering av lagrade events i efterhand (2B).
+
 **Prioritet P2**
 
 **3. Ingest läser hela bodyn innan storleken kontrolleras.** `POST /api/telemetry/ingest` avvisar en för stor `Content-Length`, men utan den headern, till exempel vid chunked-överföring, läser `request.text()` hela bodyn innan storleken kontrolleras. Ett ogiltigt `Content-Length` hoppar också förbi kontrollen. Det kräver en giltig tenant-nyckel men kan tömma minnet. Använd den befintliga `readBoundedTextBody`, som övriga routes redan använder. Kod: [ingest/route.ts](../../control-plane/src/app/api/telemetry/ingest/route.ts).

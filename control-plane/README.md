@@ -43,7 +43,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0014_retention_and_legal_hold.sql`. It also validates every required secret,
+`0015_evidence_immutability.sql`. It also validates every required secret,
 the report and anchor Ed25519 keys, the production anchor HTTPS URL, and the
 telemetry reorder window. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently. Every
@@ -234,6 +234,16 @@ and sealed reports remain intact. Invalid-signature rows and late events
 without a chain sequence are retained for investigation. Policy changes, legal holds, releases, and
 completed purge batches are recorded in the administrative audit chain. Use a
 case reference rather than personal data in legal-hold reasons.
+
+Stored evidence is append-only in PostgreSQL. `telemetry_events`,
+`compliance_reports`, `security_audit_events` and `telemetry_tombstones` reject
+`UPDATE` and `DELETE`; both checkpoint tables reject `DELETE` and allow updates
+only to the anchor fields of a checkpoint that is still `PENDING`. All six
+reject `TRUNCATE`. The single escape hatch is the transaction-scoped setting
+`aiproxy.audit_maintenance = 'on'`; the retention purge sets it for its own
+transaction only. Triggers do not stop a database administrator who disables
+them, so treat externally anchored checkpoints as the authority for tampering
+by that role.
 
 Retention workers re-read and lock each organization’s policy inside the purge
 transaction. A legal hold or longer retention period committed before that lock
