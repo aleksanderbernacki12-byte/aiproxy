@@ -21,7 +21,6 @@ async function purgeOrganization(organizationId: string, now: Date) {
         SELECT event.id
         FROM telemetry_events event
         WHERE event.organization_id = ${organizationId}::uuid
-          AND event.status = 'VERIFIED'
           AND event.chain_sequence IS NOT NULL
           AND event.event_timestamp < ${now}::timestamptz - (${retentionDays}::integer * interval '1 day')
           AND EXISTS (

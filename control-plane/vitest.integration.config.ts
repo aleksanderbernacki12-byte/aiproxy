@@ -10,5 +10,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/integration/**/*.integration.test.ts"],
+    // Every file applies the migrations to the same database; running them
+    // concurrently races the DDL.
+    fileParallelism: false,
   },
 });

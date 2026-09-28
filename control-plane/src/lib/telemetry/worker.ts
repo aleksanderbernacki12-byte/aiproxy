@@ -136,6 +136,7 @@ async function processKeyChain(organizationId: string, keyId: string, now: Date)
     const remaining = [...rows];
     const result = { verified: 0, compromised: 0, invalid: 0, deferred: 0 };
     const cutoff = now.getTime() - reorderWindowMilliseconds();
+    let headMoved = false;
 
     while (remaining.length > 0) {
       let rowIndex = findExtendingEventIndex(remaining, latestEventHash);
@@ -174,10 +175,25 @@ async function processKeyChain(organizationId: string, keyId: string, now: Date)
         status = "INVALID_SIGNATURE";
         reason = verification.reason;
         result.invalid += 1;
-      } else if (chainBroken) {
+      } else if (chainBroken && lastEventTimestamp && new Date(payload.timestamp) <= lastEventTimestamp) {
+        // The chain already continued past this event's place, so joining it
+        // would fork the chain; record it without moving the head.
         status = "COMPROMISED_CHAIN";
-        reason = `previous_event_hash ${payload.cryptography.previous_event_hash || "<genesis>"} does not match chain head ${latestEventHash || "<genesis>"}`;
+        reason = `arrived after the chain continued past it (head ${latestEventHash || "<genesis>"})`;
         result.compromised += 1;
+      } else if (chainBroken) {
+        // Flag the gap once, then continue the chain from this event so the
+        // events after it can be verified and aged out again.
+        status = "COMPROMISED_CHAIN";
+        reason = payload.cryptography.previous_event_hash === "" && latestEventHash !== ""
+          ? `chain restarted at genesis (expected ${latestEventHash})`
+          : `previous_event_hash ${payload.cryptography.previous_event_hash || "<genesis>"} does not match chain head ${latestEventHash || "<genesis>"}`;
+        result.compromised += 1;
+        sequence += 1n;
+        eventSequence = sequence;
+        latestEventHash = payload.cryptography.event_hash;
+        lastEventTimestamp = new Date(payload.timestamp);
+        headMoved = true;
       } else {
         status = "VERIFIED";
         reason = null;
@@ -185,6 +201,7 @@ async function processKeyChain(organizationId: string, keyId: string, now: Date)
         eventSequence = sequence;
         latestEventHash = payload.cryptography.event_hash;
         lastEventTimestamp = new Date(payload.timestamp);
+        headMoved = true;
         result.verified += 1;
       }
 
@@ -196,7 +213,7 @@ async function processKeyChain(organizationId: string, keyId: string, now: Date)
         .where(and(eq(telemetryBuffer.id, row.id), eq(telemetryBuffer.eventId, row.eventId)));
     }
 
-    if (result.verified > 0 && lastEventTimestamp) {
+    if (headMoved && lastEventTimestamp) {
       await transaction
         .insert(telemetryChainHeads)
         .values({
