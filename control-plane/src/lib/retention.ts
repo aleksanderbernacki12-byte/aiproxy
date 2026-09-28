@@ -16,6 +16,9 @@ async function purgeOrganization(organizationId: string, now: Date) {
     if (!policy) return { held: 0, purged: 0 };
     if (policy.legalHold) return { held: 1, purged: 0 };
     const retentionDays = policy.telemetryRetentionDays;
+    // telemetry_events is append-only; this transaction is the one place
+    // allowed to remove rows from it (see 0015_evidence_immutability.sql).
+    await transaction.execute(sql`SELECT set_config('aiproxy.audit_maintenance', 'on', true)`);
     const result = await transaction.execute<{ purged: number }>(sql`
       WITH candidates AS (
         SELECT event.id

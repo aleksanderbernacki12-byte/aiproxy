@@ -91,6 +91,7 @@ describe("telemetry control-plane flow", () => {
       await client.end();
       return;
     }
+    await client.query(`SELECT set_config('aiproxy.audit_maintenance', 'on', false)`);
     await client.query(`DELETE FROM dashboard_login_attempts WHERE source_hash = $1`, [loginSourceHash]);
     await client.query(`DELETE FROM ai_systems WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM compliance_reports WHERE organization_id = $1`, [organizationId]);

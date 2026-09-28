@@ -94,6 +94,7 @@ describe("telemetry chain recovery after a gap", () => {
 
   afterAll(async () => {
     if (organizationCreated) {
+      await client.query(`SELECT set_config('aiproxy.audit_maintenance', 'on', false)`);
       for (const table of ["telemetry_merkle_checkpoints", "telemetry_events", "telemetry_buffer", "telemetry_chain_heads", "telemetry_public_keys"]) {
         await client.query(`DELETE FROM ${table} WHERE organization_id = $1`, [organizationId]);
       }
