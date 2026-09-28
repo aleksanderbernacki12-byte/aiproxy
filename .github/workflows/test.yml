@@ -123,6 +123,12 @@ jobs:
       - name: Migrations as two non-superuser owners in one cluster
         run: npm run test:shared-cluster
 
+      # The shallow checkout has no tags; the upgrade starts from the latest release.
+      - name: Upgrade from the previous release
+        run: |
+          git fetch --tags --force --depth=1 origin
+          npm run test:upgrade
+
       # Build generates Next.js route types required by the standalone check.
       - name: Production build
         run: npm run build

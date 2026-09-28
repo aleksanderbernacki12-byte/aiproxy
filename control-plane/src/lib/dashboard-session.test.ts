@@ -19,7 +19,7 @@ describe("dashboard session", () => {
   });
 
   it("treats a session issued before versioning as version 0", () => {
-    const { sessionVersion: _unused, ...unversioned } = identity;
+    const unversioned = { credentialId: identity.credentialId, organizationId: identity.organizationId, role: identity.role };
     const token = createDashboardSession(unversioned as typeof identity, "secret", 1_000_000);
     expect(verifyDashboardSession(token, "secret", 1_001_000)?.sessionVersion).toBe(0);
   });

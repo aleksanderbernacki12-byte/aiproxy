@@ -13,6 +13,7 @@
     "test:integration": "node scripts/run-integration-tests.mjs",
     "test:recovery": "node scripts/run-integration-tests.mjs --recovery",
     "test:shared-cluster": "node scripts/run-shared-cluster-tests.mjs",
+    "test:upgrade": "node scripts/run-upgrade-tests.mjs",
     "db:migrate": "node scripts/migrate.mjs",
     "orgs:create": "node scripts/create-organization.mjs",
     "tenant-keys:create": "node scripts/create-tenant-key.mjs",
