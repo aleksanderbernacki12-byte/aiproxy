@@ -64,6 +64,7 @@ function mainTableValues(
     signature: payload.cryptography.signature,
     status,
     statusReason,
+    signedPayload: payload,
     chainSequence,
     receivedAt: row.receivedAt,
   };

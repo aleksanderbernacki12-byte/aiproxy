@@ -40,11 +40,11 @@ async function purgeOrganization(organizationId: string, now: Date) {
       ), archived AS (
         INSERT INTO telemetry_tombstones (
           organization_id, event_id, event_timestamp, event_hash,
-          previous_event_hash, key_id, chain_sequence, purged_at, retention_days
+          previous_event_hash, key_id, chain_sequence, purged_at, retention_days, status
         )
         SELECT event.organization_id, event.event_id, event.event_timestamp,
           event.event_hash, event.previous_event_hash, event.key_id,
-          event.chain_sequence, ${now}, ${retentionDays}
+          event.chain_sequence, ${now}, ${retentionDays}, event.status
         FROM telemetry_events event JOIN candidates ON candidates.id = event.id
         ON CONFLICT DO NOTHING
       ), deleted AS (

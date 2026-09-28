@@ -117,6 +117,7 @@ export const telemetryTombstones = pgTable("telemetry_tombstones", {
   chainSequence: bigint("chain_sequence", { mode: "bigint" }).notNull(),
   purgedAt: timestamp("purged_at", { withTimezone: true }).notNull(),
   retentionDays: integer("retention_days").notNull(),
+  status: telemetryVerificationStatus("status"),
 }, (table) => [
   primaryKey({ columns: [table.organizationId, table.eventId] }),
   index("telemetry_tombstones_org_time_idx").on(table.organizationId, table.eventTimestamp),
@@ -307,6 +308,7 @@ export const telemetryEvents = pgTable(
     signature: text("signature").notNull(),
     status: telemetryVerificationStatus("status").notNull(),
     statusReason: text("status_reason"),
+    signedPayload: jsonb("signed_payload").$type<Record<string, unknown>>(),
     chainSequence: bigint("chain_sequence", { mode: "bigint" }),
     receivedAt: timestamp("received_at", { withTimezone: true }).notNull(),
     processedAt: timestamp("processed_at", { withTimezone: true }).defaultNow().notNull(),
@@ -327,4 +329,28 @@ export const telemetryEvents = pgTable(
       table.eventTimestamp,
     ),
   ],
+);
+
+export type VerificationFailureSample = {
+  kind: string;
+  key_id: string;
+  sequence: string | null;
+  event_id: string | null;
+  detail: string;
+};
+
+export const telemetryVerificationRuns = pgTable(
+  "telemetry_verification_runs",
+  {
+    id: bigserial("id", { mode: "bigint" }).primaryKey(),
+    organizationId: uuid("organization_id").notNull().references(() => organizations.id),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }).notNull(),
+    complete: boolean("complete").notNull(),
+    eventsChecked: integer("events_checked").notNull(),
+    legacyEvents: integer("legacy_events").notNull(),
+    failures: integer("failures").notNull(),
+    failureSamples: jsonb("failure_samples").$type<VerificationFailureSample[]>().notNull(),
+  },
+  (table) => [index("telemetry_verification_runs_latest_idx").on(table.organizationId, table.completedAt, table.id)],
 );
