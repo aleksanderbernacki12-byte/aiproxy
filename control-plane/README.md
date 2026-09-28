@@ -43,7 +43,7 @@ Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
 process; `/api/health/ready` also requires PostgreSQL and migration
-`0015_evidence_immutability.sql`. It also validates every required secret,
+`0016_telemetry_reverification.sql`. It also validates every required secret,
 the report and anchor Ed25519 keys, the production anchor HTTPS URL, and the
 telemetry reorder window. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently. Every
@@ -381,6 +381,31 @@ the receipt only when its checkpoint ID and root match and its Ed25519
 signature verifies. Failures remain `PENDING`, record a bounded local error,
 and retry on the next schedule. An idempotency key prevents duplicate external
 records during retries.
+
+## Re-verification of stored telemetry
+
+`GET /api/internal/telemetry/verify` runs hourly (scheduler and `vercel.json`)
+with `CRON_SECRET`. It re-verifies organizations least recently verified first
+within a 45-second budget and records one append-only row per organization in
+`telemetry_verification_runs`. For each key it walks events and tombstones by
+chain sequence and checks:
+
+- sequences have no holes or duplicates;
+- every `previous_event_hash` links to the prior event, except at a declared
+  gap (`COMPROMISED_CHAIN`);
+- every stored column still equals the signed payload kept at ingest
+  (`signed_payload`), the payload still hashes to its `event_hash`, and its
+  signature verifies with the registered key;
+- `telemetry_chain_heads` matches the last event;
+- the latest anchored checkpoint still produces its root hash, its receipt
+  verifies against `MERKLE_ANCHOR_PUBLIC_KEY`, and each anchored head matches
+  the stored event at that sequence.
+
+Events stored before `0016_telemetry_reverification.sql` have no signed
+payload; they are reported as legacy and checked for linkage and sequence
+only. A run that runs out of time is recorded as incomplete. The dashboard
+and sealed reports show the latest run, and the chain only counts as intact
+after a complete run without deviations within the last 48 hours.
 
 ## Operations metrics
 

@@ -44,7 +44,9 @@ Förslag:
 
 Kod: [0001_telemetry.sql](../../control-plane/db/migrations/0001_telemetry.sql), [0008_signed_compliance_reports.sql](../../control-plane/db/migrations/0008_signed_compliance_reports.sql), [getDashboardData](../../control-plane/src/lib/dashboard.ts).
 
-*Delvis åtgärdat 2026-09-28 (2A):* migrering `0015_evidence_immutability.sql` gör telemetri, rapporter och checkpoints skrivskyddade och stoppar `TRUNCATE` på alla bevistabeller; gallringen är enda undantaget. Kvar: verifiering av lagrade events i efterhand (2B).
+*Delvis åtgärdat 2026-09-28 (2A):* migrering `0015_evidence_immutability.sql` gör telemetri, rapporter och checkpoints skrivskyddade och stoppar `TRUNCATE` på alla bevistabeller; gallringen är enda undantaget. Kvar: verifiering av lagrade events i efterhand (2B) — se nedan.
+
+*Åtgärdat 2026-09-28 (2B):* workern sparar den signerade payloaden, och ett timjobb verifierar lagrade events och tombstones mot payload, signatur, kedja och senaste förankrade checkpoint. Resultatet ingår i dashboard och förseglad rapport, och kedjan räknas bara som intakt efter en fullständig körning utan avvikelser de senaste 48 timmarna. Se [specen](../superpowers/specs/2026-09-28-telemetry-reverification-design.md).
 
 **Prioritet P2**
 
