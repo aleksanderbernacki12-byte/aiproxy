@@ -67,6 +67,8 @@ DPO-nycklarna har 256 bitar, så brute force är inte realistiskt. Den verkliga 
 
 *Åtgärdat 2026-09-28:* migrering `0017_tenant_row_level_security.sql` inför RLS på alla tenant-tabeller. Applikationen kör som rollen `aiproxy_app`, anropsflöden sätter organisationen per transaktion via `withOrganization`, och bara nyckeluppslag och interna jobb använder ett uttryckligt cross-tenant-läge. Valt skydd mot kodmisstag; separata inloggningsroller mot injicerad SQL är inte införda.
 
+*Rättat 2026-09-28 efter v0.77.0:* rollen är nu per databas (`0019_per_database_app_role.sql`). Den delade rollen `aiproxy_app` gjorde att en andra databas med annan ägare i samma kluster inte kunde migreras, och readiness kräver nu att appen faktiskt kör som rollen.
+
 **Prioritet P3**
 
 **6. Utloggning ogiltigförklarar inte sessionen.** Sessionen är en signerad cookie som gäller i 8 timmar. Utloggning tar bara bort cookien i webbläsaren, så en kopierad cookie gäller tills den löper ut eller nyckeln återkallas. En sessionsversion per nyckel, som räknas upp vid utloggning och kontrolleras i `validateDPOIdentity`, stänger detta. *Åtgärdat 2026-09-28:* migrering 0018 och `endDPOSessions`; utloggning avslutar nyckelns alla sessioner.
