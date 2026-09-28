@@ -142,9 +142,11 @@ export default async function DashboardPage() {
         <EvidenceCard
           title="Kedjeintegritet"
           value={chainIntact ? "Verifierad och sammanhängande" : "Avvikelse registrerad"}
-          description={data.checkpoint
+          description={`${data.checkpoint
             ? `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle ${data.checkpoint.anchorStatus === "ANCHORED" ? "externt förankrad" : "väntar på extern förankring"}`
-            : `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle-checkpoint inväntas`}
+            : `${number.format(data.summary.compromisedEvents)} kedjebrott · Merkle-checkpoint inväntas`} · ${data.verification
+            ? `verifierad i efterhand ${date.format(data.verification.lastRunAt)}: ${number.format(data.verification.failures)} avvikelser${data.verification.complete ? "" : " (ofullständig)"}`
+            : "efterhandsverifiering inväntas"}`}
           warning={!chainIntact && data.summary.chainStatus !== "NO_EVIDENCE"}
         />
       </div>

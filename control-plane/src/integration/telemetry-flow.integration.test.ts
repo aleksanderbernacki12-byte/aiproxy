@@ -96,6 +96,7 @@ describe("telemetry control-plane flow", () => {
     await client.query(`DELETE FROM ai_systems WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM compliance_reports WHERE organization_id = $1`, [organizationId]);
     if (createdReportSigningKeyId) await client.query(`DELETE FROM report_signing_keys WHERE key_id = $1`, [createdReportSigningKeyId]);
+    await client.query(`DELETE FROM telemetry_verification_runs WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_merkle_checkpoints WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_events WHERE organization_id = $1`, [organizationId]);
     await client.query(`DELETE FROM telemetry_buffer WHERE organization_id = $1`, [organizationId]);
@@ -182,6 +183,11 @@ describe("telemetry control-plane flow", () => {
       [organizationId, "integration-test", "gpt-enterprise", "Legal assistant", "test-provider",
         "Assist legal reviewers", "HIGH", "Legal Operations", "Legitimate interest", "Mandatory reviewer approval"],
     );
+
+    const { verifyOrganization } = await import("@/lib/telemetry/verification");
+    expect(await verifyOrganization(organizationId, new Date(Date.now() + 60_000))).toMatchObject({
+      complete: true, eventsChecked: 2, legacyEvents: 0, failures: 0,
+    });
 
     const { getDashboardData } = await import("@/lib/dashboard");
     const dashboard = await getDashboardData(organizationId);
@@ -323,6 +329,7 @@ describe("telemetry control-plane flow", () => {
         legal_hold_reason=NULL, legal_hold_set_at=NULL, telemetry_retention_days=30 WHERE organization_id=$1`, [organizationId]);
     }
     expect(await enforceRetentionPolicies(retentionNow)).toEqual({ organizations: 1, held: 0, purged: 2 });
+    expect(await verifyOrganization(organizationId, new Date(Date.now() + 60_000))).toMatchObject({ failures: 0 });
     const retainedEvidence = await getDashboardData(organizationId);
     expect(retainedEvidence?.retention).toMatchObject({ telemetryRetentionDays: 30, legalHold: false, tombstoneCount: 2 });
     expect(retainedEvidence?.models).toHaveLength(0);

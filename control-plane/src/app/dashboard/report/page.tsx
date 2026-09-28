@@ -188,6 +188,24 @@ export default async function ComplianceReportPage() {
               </dd>
             </dl>
           )}
+          <dl className="mt-5 border border-line p-4 text-xs">
+            <dt className="font-bold uppercase tracking-[0.12em] text-muted">Verifierad i efterhand</dt>
+            <dd className="mt-2">
+              {data.verification
+                ? `${timestamp.format(data.verification.lastRunAt)} · ${number.format(data.verification.eventsChecked)} event kontrollerade · ${number.format(data.verification.failures)} avvikelser${data.verification.complete ? "" : " · körningen hann inte slutföras"}`
+                : "Ingen efterhandsverifiering har körts ännu"}
+            </dd>
+            {data.verification && data.verification.legacyEvents > 0 && (
+              <dd className="mt-2 text-muted">
+                {number.format(data.verification.legacyEvents)} äldre event saknar sparad signerad payload och kontrolleras bara mot kedjan.
+              </dd>
+            )}
+            {data.verification?.failureSamples.map((sample, index) => (
+              <dd key={index} className="mt-2 break-all font-mono text-alert">
+                {sample.kind} · {sample.detail}{sample.sequence ? ` · sekvens ${sample.sequence}` : ""}
+              </dd>
+            ))}
+          </dl>
         </ReportSection>
 
         <ReportSection number="05" title="Retention och legal hold">

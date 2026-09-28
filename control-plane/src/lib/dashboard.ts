@@ -1,7 +1,10 @@
 import "server-only";
 
 import { and, asc, desc, eq, sql } from "drizzle-orm";
-import { aiSystems, organizations, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
+import {
+  aiSystems, organizations, telemetryEvents, telemetryMerkleCheckpoints, telemetryVerificationRuns,
+  type VerificationFailureSample,
+} from "@/db/schema";
 import { getDatabase } from "@/db/client";
 
 export type ChainStatus = "INTACT" | "ATTENTION_REQUIRED" | "NO_EVIDENCE";
@@ -39,6 +42,14 @@ export type DashboardData = {
     anchorStatus: "PENDING" | "ANCHORED";
     anchorId: string | null;
     anchoredAt: Date | null;
+  } | null;
+  verification: {
+    lastRunAt: Date;
+    complete: boolean;
+    eventsChecked: number;
+    legacyEvents: number;
+    failures: number;
+    failureSamples: VerificationFailureSample[];
   } | null;
   retention: {
     telemetryRetentionDays: number;
@@ -83,13 +94,21 @@ const policyViolationExpression = sql<boolean>`exists (
     and flag.key ~ '(_violation|_breach|_blocked|_failed)$'
 )`;
 
+const VERIFICATION_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+
 export function chainStatusFor(
   totalEvents: number,
   compromisedEvents: number,
   invalidSignatures: number,
+  verification: { completedAt: Date; complete: boolean; failures: number } | null,
+  now = new Date(),
 ): ChainStatus {
   if (totalEvents === 0) return "NO_EVIDENCE";
   if (compromisedEvents > 0 || invalidSignatures > 0) return "ATTENTION_REQUIRED";
+  // Stored evidence only counts as intact once it has been re-verified
+  // recently and in full (see lib/telemetry/verification.ts).
+  if (!verification || !verification.complete || verification.failures > 0
+    || now.getTime() - verification.completedAt.getTime() > VERIFICATION_MAX_AGE_MS) return "ATTENTION_REQUIRED";
   return "INTACT";
 }
 
@@ -102,7 +121,7 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
     .limit(1);
   if (!organization) return null;
 
-  const [models, [summary], [checkpoint], retentionResult] = await Promise.all([
+  const [models, [summary], [checkpoint], retentionResult, [verification]] = await Promise.all([
     database
       .select({
         applicationId: telemetryEvents.applicationId,
@@ -187,6 +206,16 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
       LEFT JOIN organization_retention_policies policy ON policy.organization_id = organization.id
       WHERE organization.id = ${organizationId}::uuid
     `),
+    database.select({
+      lastRunAt: telemetryVerificationRuns.completedAt,
+      complete: telemetryVerificationRuns.complete,
+      eventsChecked: telemetryVerificationRuns.eventsChecked,
+      legacyEvents: telemetryVerificationRuns.legacyEvents,
+      failures: telemetryVerificationRuns.failures,
+      failureSamples: telemetryVerificationRuns.failureSamples,
+    }).from(telemetryVerificationRuns)
+      .where(eq(telemetryVerificationRuns.organizationId, organizationId))
+      .orderBy(desc(telemetryVerificationRuns.completedAt), desc(telemetryVerificationRuns.id)).limit(1),
   ]);
 
   const normalizedSummary = summary ?? {
@@ -224,6 +253,7 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
     organization,
     models: inventory,
     checkpoint: checkpoint ?? null,
+    verification: verification ?? null,
     retention: retention?.telemetry_retention_days != null && retention.legal_hold != null ? {
       telemetryRetentionDays: retention.telemetry_retention_days,
       legalHold: retention.legal_hold,
@@ -237,6 +267,7 @@ export async function getDashboardData(organizationId: string): Promise<Dashboar
         normalizedSummary.totalEvents + (retention?.tombstone_count ?? 0),
         normalizedSummary.compromisedEvents,
         normalizedSummary.invalidSignatures,
+        verification ? { ...verification, completedAt: verification.lastRunAt } : null,
       ),
       unclassifiedSystems: inventory.filter((model) => !model.governance || model.governance.riskClass === "UNCLASSIFIED").length,
     },

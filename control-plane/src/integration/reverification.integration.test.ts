@@ -136,6 +136,8 @@ describe("re-verification of stored telemetry", () => {
     const stored = await client.query(`SELECT count(*)::integer AS count FROM telemetry_verification_runs WHERE organization_id = $1`,
       [chain.organizationId]);
     expect(stored.rows[0].count).toBe(1);
+    const { getDashboardData } = await import("@/lib/dashboard");
+    expect((await getDashboardData(chain.organizationId))?.summary.chainStatus).toBe("INTACT");
   });
 
   it("detects an edited compliance flag", async () => {
@@ -144,6 +146,8 @@ describe("re-verification of stored telemetry", () => {
       `UPDATE telemetry_events SET compliance_flags = '{"pii_detected":false,"pii_redacted":false}'::jsonb WHERE event_id = $1`,
       [chain.events[1].event_id]);
     expect(kinds(await verify(chain.organizationId))).toContain("PAYLOAD_MISMATCH");
+    const { getDashboardData } = await import("@/lib/dashboard");
+    expect((await getDashboardData(chain.organizationId))?.summary.chainStatus).toBe("ATTENTION_REQUIRED");
   });
 
   it("detects a payload edited consistently with its columns", async () => {
