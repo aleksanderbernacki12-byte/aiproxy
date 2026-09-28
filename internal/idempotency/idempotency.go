@@ -200,11 +200,15 @@ func (r *Registry) Store(client, key string, resp *Response) {
 	if !ok || e.response != nil {
 		return
 	}
+	// Room is made while e is still in flight, so it can never be picked
+	// as the oldest completed entry and evict itself (storedAt ties are
+	// common on coarse clocks).
+	size := int64(len(resp.Body))
+	keep := size <= r.MaxBytes && r.makeRoomLocked(0, size)
 	e.response = resp
 	e.storedAt = time.Now()
 	close(e.done)
-	size := int64(len(resp.Body))
-	if size > r.MaxBytes || !r.makeRoomLocked(0, size) {
+	if !keep {
 		// Too large to keep: requests already waiting still get this
 		// response (done is closed), but the record is dropped, so a
 		// later retry is processed fresh instead of holding the memory.

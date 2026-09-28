@@ -328,6 +328,25 @@ func TestRegistry_EntryCapEvictsOldestCompleted(t *testing.T) {
 	}
 }
 
+// TestRegistry_StoreNeverEvictsTheEntryBeingStored pins the ordering
+// that coarse clocks (Windows) produce by chance: when the entry being
+// stored is not newer than the others, making room must still evict an
+// older completed entry, never the new one itself.
+func TestRegistry_StoreNeverEvictsTheEntryBeingStored(t *testing.T) {
+	r := NewRegistry(time.Hour, time.Second)
+	r.MaxBytes = 10
+	storeFor(r, "a", "123456")
+	r.entries[recordKey{client: "client", key: "a"}].storedAt = time.Now().Add(time.Hour)
+	storeFor(r, "b", "123456")
+
+	if _, outcome := r.Claim(context.Background(), "client", "b", hashOf("b")); outcome != Replay {
+		t.Fatalf("b outcome = %v, want Replay: the entry being stored evicted itself", outcome)
+	}
+	if r.storedBytes != 6 {
+		t.Fatalf("storedBytes = %d, want 6", r.storedBytes)
+	}
+}
+
 func TestRegistry_AllInFlightAtCapacityReturnsFull(t *testing.T) {
 	r := NewRegistry(time.Hour, time.Second)
 	r.MaxEntries = 1
