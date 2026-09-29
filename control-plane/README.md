@@ -45,8 +45,11 @@ connects as the owner and creates the login role the application uses (see
 Compose runs migrations to completion before starting the non-root standalone
 Next.js container. A separate scheduler invokes telemetry processing every
 minute and Merkle checkpoints every five minutes. `/api/health/live` checks the
-process; `/api/health/ready` also requires PostgreSQL and migration
-`0019_per_database_app_role.sql`. It also validates every required secret,
+process; `/api/health/ready` also requires PostgreSQL, migration
+`0019_per_database_app_role.sql`, and a `DATABASE_URL` that logs in as the
+dedicated login role rather than the owner or a superuser (see
+[Tenant isolation](#tenant-isolation)); the log says so when it does not. It
+also validates every required secret,
 the report and anchor Ed25519 keys, the production anchor HTTPS URL, and the
 telemetry reorder window. Put a TLS-terminating reverse proxy in front of
 port 3000 in production and back up the PostgreSQL volume independently. Every
@@ -352,7 +355,10 @@ APP_DATABASE_PASSWORD='<random-hex>' npm run db:migrate
 Run the migration again with a new password to rotate it. The password is sent
 as a SCRAM-SHA-256 verifier, so it does not appear in PostgreSQL statement
 logs; providers that only accept plaintext passwords, such as Neon, get the
-plaintext instead and hash it themselves. A connection as the owner still works, but loses this protection.
+plaintext instead and hash it themselves. Readiness reports `NOT_READY` while the application logs in as the owner or a
+superuser, so a deployment cannot lose this protection unnoticed. A local
+`npm run dev` against the owner's URL still serves pages; only readiness
+refuses it.
 
 ## Ingestion
 

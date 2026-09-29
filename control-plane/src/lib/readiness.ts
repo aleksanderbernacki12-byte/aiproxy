@@ -52,9 +52,27 @@ export async function applicationRoleActive() {
   return result.rows[0]?.role_active === true;
 }
 
+// The database user itself must not bypass row-level security: logged in as
+// the owner or a superuser, a query that ever ran without the role switch
+// would see every tenant. Migrations create a login role for this.
+export async function dedicatedDatabaseLogin() {
+  const result = await withoutTenant((transaction) => transaction.execute<{ dedicated: boolean }>(sql`
+    SELECT NOT login.rolsuper AND NOT login.rolbypassrls AND NOT EXISTS (
+      SELECT 1 FROM pg_class WHERE relowner = login.oid AND relnamespace = 'public'::regnamespace
+    ) AS dedicated
+    FROM pg_roles login WHERE login.rolname = session_user
+  `));
+  return result.rows[0]?.dedicated === true;
+}
+
 export async function checkControlPlaneReadiness() {
   if (configurationFailures().length > 0) return false;
   if (!await applicationRoleActive()) return false;
+  if (!await dedicatedDatabaseLogin()) {
+    console.error("Control Plane is not ready: DATABASE_URL logs in as the database owner or a superuser. "
+      + "Run the migrations with APP_DATABASE_PASSWORD and connect as the <database>_login role they create.");
+    return false;
+  }
   const result = await withoutTenant((transaction) => transaction.execute<{ migration_ready: boolean }>(sql`
     SELECT EXISTS (
       SELECT 1 FROM control_plane_migrations WHERE filename = ${expectedMigration}
