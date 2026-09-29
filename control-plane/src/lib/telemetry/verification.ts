@@ -2,7 +2,7 @@ import "server-only";
 
 import canonicalize from "canonicalize";
 import { and, eq, sql } from "drizzle-orm";
-import { getCrossTenantDatabase } from "@/db/client";
+import { withCrossTenant } from "@/db/client";
 import {
   telemetryChainHeads,
   telemetryPublicKeys,
@@ -105,11 +105,11 @@ function payloadMismatch(row: StoredEvent, payload: TelemetryEvent) {
 }
 
 async function latestAnchoredCheckpoint(organizationId: string) {
-  const result = await getCrossTenantDatabase().execute<AnchoredCheckpoint>(sql`
+  const result = await withCrossTenant((transaction) => transaction.execute<AnchoredCheckpoint>(sql`
     SELECT id::text AS id, root_hash, chain_heads, anchor_receipt FROM telemetry_merkle_checkpoints
     WHERE organization_id = ${organizationId}::uuid AND anchor_status = 'ANCHORED'
     ORDER BY created_at DESC, id DESC LIMIT 1
-  `);
+  `));
   return result.rows[0] ?? null;
 }
 
@@ -132,14 +132,13 @@ async function verifyChain(
   deadline: Date,
   findings: Findings,
 ) {
-  const database = getCrossTenantDatabase();
   let expectedSequence = 1n;
   let priorHash = "";
   let last: ChainItem | null = null;
   const seenAnchored = new Set<string>();
   for (;;) {
     if (Date.now() > deadline.getTime()) return false;
-    const page = await database.execute<ChainItem>(sql`
+    const page = await withCrossTenant((transaction) => transaction.execute<ChainItem>(sql`
       SELECT chain_sequence::text AS chain_sequence, event_id::text AS event_id, event_hash, previous_event_hash, status FROM (
         SELECT chain_sequence, event_id, event_hash, previous_event_hash, status::text AS status
         FROM telemetry_events
@@ -152,7 +151,7 @@ async function verifyChain(
       WHERE chain_sequence >= ${expectedSequence.toString()}::bigint
       ORDER BY chain_sequence, event_id
       LIMIT ${PAGE_SIZE}
-    `);
+    `));
     for (const item of page.rows) {
       const sequence = BigInt(item.chain_sequence);
       if (sequence !== expectedSequence) {
@@ -183,9 +182,9 @@ async function verifyChain(
       findings.add("ANCHOR_MISMATCH", keyId, "an anchored chain head is no longer stored", sequence);
     }
   }
-  const [head] = await database.select().from(telemetryChainHeads).where(and(
+  const [head] = await withCrossTenant((transaction) => transaction.select().from(telemetryChainHeads).where(and(
     eq(telemetryChainHeads.organizationId, organizationId), eq(telemetryChainHeads.keyId, keyId),
-  )).limit(1);
+  )).limit(1));
   if (last && (!head || head.latestEventHash !== last.event_hash || head.sequence.toString() !== last.chain_sequence)) {
     findings.add("HEAD_MISMATCH", keyId, "the stored chain head does not match the last event in the chain", last.chain_sequence);
   }
@@ -193,23 +192,22 @@ async function verifyChain(
 }
 
 async function verifyPayloads(organizationId: string, keyId: string, deadline: Date, findings: Findings) {
-  const database = getCrossTenantDatabase();
-  const [registered] = await database.select({ publicKeyPem: telemetryPublicKeys.publicKeyPem }).from(telemetryPublicKeys)
-    .where(and(eq(telemetryPublicKeys.organizationId, organizationId), eq(telemetryPublicKeys.keyId, keyId))).limit(1);
+  const [registered] = await withCrossTenant((transaction) => transaction.select({ publicKeyPem: telemetryPublicKeys.publicKeyPem }).from(telemetryPublicKeys)
+    .where(and(eq(telemetryPublicKeys.organizationId, organizationId), eq(telemetryPublicKeys.keyId, keyId))).limit(1));
   let cursor = "0";
   let checked = 0;
   let legacy = 0;
   let keyMissingReported = false;
   for (;;) {
     if (Date.now() > deadline.getTime()) return { complete: false, checked, legacy };
-    const page = await database.execute<StoredEvent>(sql`
+    const page = await withCrossTenant((transaction) => transaction.execute<StoredEvent>(sql`
       SELECT id::text AS id, event_id::text AS event_id, event_timestamp, client_id_hash, application_id, routing,
         compliance_flags, metrics, hash_algorithm, request_response_hash, previous_event_hash, event_hash,
         signature_algorithm, key_id, signature, status::text AS status, signed_payload
       FROM telemetry_events
       WHERE organization_id = ${organizationId}::uuid AND key_id = ${keyId} AND id > ${cursor}::bigint
       ORDER BY id LIMIT ${PAGE_SIZE}
-    `);
+    `));
     for (const row of page.rows) {
       checked += 1;
       cursor = row.id;
@@ -256,11 +254,11 @@ export async function verifyOrganization(organizationId: string, deadline: Date)
 
   const checkpoint = await latestAnchoredCheckpoint(organizationId);
   if (checkpoint) verifyCheckpoint(organizationId, checkpoint, findings);
-  const keys = await getCrossTenantDatabase().execute<{ key_id: string }>(sql`
+  const keys = await withCrossTenant((transaction) => transaction.execute<{ key_id: string }>(sql`
     SELECT key_id FROM telemetry_events WHERE organization_id = ${organizationId}::uuid
     UNION SELECT key_id FROM telemetry_tombstones WHERE organization_id = ${organizationId}::uuid
     ORDER BY key_id
-  `);
+  `));
   for (const { key_id: keyId } of keys.rows) {
     const anchoredHeads = new Map(
       (checkpoint?.chain_heads ?? []).filter((head) => head.key_id === keyId).map((head) => [head.sequence, head.event_hash]),
@@ -282,7 +280,7 @@ export async function verifyOrganization(organizationId: string, deadline: Date)
     startedAt, completedAt: new Date(), complete, eventsChecked, legacyEvents,
     failures: findings.failures, failureSamples: findings.samples,
   };
-  await getCrossTenantDatabase().insert(telemetryVerificationRuns).values({ organizationId, ...run });
+  await withCrossTenant((transaction) => transaction.insert(telemetryVerificationRuns).values({ organizationId, ...run }));
   return run;
 }
 
@@ -291,7 +289,7 @@ export async function verifyOrganization(organizationId: string, deadline: Date)
 // the rest.
 export async function verifyStoredTelemetry(budgetMs = DEFAULT_BUDGET_MS) {
   const deadline = new Date(Date.now() + budgetMs);
-  const candidates = await getCrossTenantDatabase().execute<{ organization_id: string }>(sql`
+  const candidates = await withCrossTenant((transaction) => transaction.execute<{ organization_id: string }>(sql`
     SELECT organization.organization_id FROM (
       SELECT organization_id FROM telemetry_events UNION SELECT organization_id FROM telemetry_tombstones
     ) organization
@@ -300,7 +298,7 @@ export async function verifyStoredTelemetry(budgetMs = DEFAULT_BUDGET_MS) {
       WHERE run.organization_id = organization.organization_id
     ) latest ON true
     ORDER BY latest.last_run ASC NULLS FIRST, organization.organization_id
-  `);
+  `));
   const totals = { organizations: 0, eventsChecked: 0, failures: 0, incomplete: 0 };
   for (const { organization_id: organizationId } of candidates.rows) {
     if (Date.now() > deadline.getTime()) break;

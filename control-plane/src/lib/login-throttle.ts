@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHmac } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { withoutTenant } from "@/db/client";
 
 const WINDOW_MINUTES = 15;
 const MAX_FAILURES = 5;
@@ -32,10 +32,10 @@ export function hashLoginSource(request: Request, secret: string, hops = trusted
 }
 
 export async function getLoginThrottle(sourceHash: string, now = new Date()) {
-  const result = await getDatabase().execute<{ blocked_until: Date | null }>(sql`
+  const result = await withoutTenant((transaction) => transaction.execute<{ blocked_until: Date | null }>(sql`
     SELECT blocked_until FROM dashboard_login_attempts
     WHERE source_hash = ${sourceHash} AND blocked_until > ${now}
-  `);
+  `));
   const blockedUntil = result.rows[0]?.blocked_until ?? null;
   return {
     allowed: blockedUntil === null,
@@ -44,7 +44,7 @@ export async function getLoginThrottle(sourceHash: string, now = new Date()) {
 }
 
 export async function recordLoginFailure(sourceHash: string, now = new Date()) {
-  await getDatabase().execute(sql`
+  await withoutTenant((transaction) => transaction.execute(sql`
     WITH cleanup AS (
       DELETE FROM dashboard_login_attempts
       WHERE updated_at < ${now}::timestamptz - interval '24 hours'
@@ -63,9 +63,9 @@ export async function recordLoginFailure(sourceHash: string, now = new Date()) {
         WHEN dashboard_login_attempts.failures + 1 >= ${MAX_FAILURES} THEN ${now}::timestamptz + (${WINDOW_MINUTES}::integer * interval '1 minute')
         ELSE dashboard_login_attempts.blocked_until END,
       updated_at = ${now}
-  `);
+  `));
 }
 
 export async function clearLoginFailures(sourceHash: string) {
-  await getDatabase().execute(sql`DELETE FROM dashboard_login_attempts WHERE source_hash = ${sourceHash}`);
+  await withoutTenant((transaction) => transaction.execute(sql`DELETE FROM dashboard_login_attempts WHERE source_hash = ${sourceHash}`));
 }

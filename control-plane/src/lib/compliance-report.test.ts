@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { verifySealedReport, type SealedReport } from "./compliance-report";
 
 vi.mock("server-only", () => ({}));
-vi.mock("@/db/client", () => ({ getDatabase: vi.fn() }));
+vi.mock("@/db/client", () => ({ withOrganization: vi.fn() }));
 
 describe("sealed compliance reports", () => {
   it("verifies the payload hash, key fingerprint, and Ed25519 signature", () => {

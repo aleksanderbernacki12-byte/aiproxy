@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { getCrossTenantDatabase } from "@/db/client";
+import { withCrossTenant } from "@/db/client";
 import { securityAuditHeads } from "@/db/schema";
 
 const AUDIT_ANCHOR_DOMAIN = Buffer.from("aiproxy-security-audit-anchor-v1\0");
@@ -16,7 +16,7 @@ export function calculateSecurityAuditAnchorRoot(organizationId: string, sequenc
 }
 
 async function checkpointOrganization(organizationId: string) {
-  return getCrossTenantDatabase().transaction(async (transaction) => {
+  return withCrossTenant(async (transaction) => {
     await transaction.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"security-audit:" + organizationId}, 0))`);
     const verification = await transaction.execute<{ valid: boolean }>(sql`
       SELECT verify_security_audit_chain(${organizationId}::uuid) AS valid
@@ -39,7 +39,7 @@ async function checkpointOrganization(organizationId: string) {
 }
 
 export async function createSecurityAuditCheckpoints() {
-  const organizations = await getCrossTenantDatabase().select({ organizationId: securityAuditHeads.organizationId }).from(securityAuditHeads);
+  const organizations = await withCrossTenant((transaction) => transaction.select({ organizationId: securityAuditHeads.organizationId }).from(securityAuditHeads));
   let created = 0;
   let invalid = 0;
   for (const { organizationId } of organizations) {

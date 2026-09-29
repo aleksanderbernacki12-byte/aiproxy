@@ -2,7 +2,7 @@ import "server-only";
 
 import { createPrivateKey, createPublicKey } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { getDatabase } from "@/db/client";
+import { withoutTenant } from "@/db/client";
 
 export const expectedMigration = "0019_per_database_app_role.sql";
 
@@ -43,22 +43,22 @@ export function configurationFailures(environment: ReadinessEnvironment = proces
   return [...new Set(failures)];
 }
 
-// Row-level security only holds while the application runs as the
-// per-database role from migration 0019.
+// Row-level security only holds while queries run as the per-database role
+// from migration 0019; this checks that the database user may switch to it.
 export async function applicationRoleActive() {
-  const result = await getDatabase().execute<{ role_active: boolean }>(sql`
+  const result = await withoutTenant((transaction) => transaction.execute<{ role_active: boolean }>(sql`
     SELECT current_user = 'aiproxy_app_' || left(md5(current_database()), 12) AS role_active
-  `);
+  `));
   return result.rows[0]?.role_active === true;
 }
 
 export async function checkControlPlaneReadiness() {
   if (configurationFailures().length > 0) return false;
   if (!await applicationRoleActive()) return false;
-  const result = await getDatabase().execute<{ migration_ready: boolean }>(sql`
+  const result = await withoutTenant((transaction) => transaction.execute<{ migration_ready: boolean }>(sql`
     SELECT EXISTS (
       SELECT 1 FROM control_plane_migrations WHERE filename = ${expectedMigration}
     ) AS migration_ready
-  `);
+  `));
   return result.rows[0]?.migration_ready === true;
 }

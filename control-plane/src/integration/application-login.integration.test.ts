@@ -46,8 +46,8 @@ describe("application login role", () => {
   });
 
   afterAll(async () => {
-    const { getDatabase } = await import("@/db/client");
-    await getDatabase().$client.end();
+    const pool = (globalThis as typeof globalThis & { aiproxyPool?: { end(): Promise<void> } }).aiproxyPool;
+    await pool?.end();
     await owner.query(`DELETE FROM ai_systems WHERE organization_id = ANY($1::uuid[])`, [[organizationA, organizationB]]);
     await owner.query(`DELETE FROM organizations WHERE id = ANY($1::uuid[])`, [[organizationA, organizationB]]);
     await owner.query(`DROP ROLE IF EXISTS ${owner.escapeIdentifier(loginRole)}`);

@@ -4,7 +4,7 @@ import { createPublicKey, verify } from "node:crypto";
 import canonicalize from "canonicalize";
 import { asc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
-import { getCrossTenantDatabase } from "@/db/client";
+import { withCrossTenant } from "@/db/client";
 import { securityAuditCheckpoints, telemetryMerkleCheckpoints } from "@/db/schema";
 
 const MAX_BATCH = 5;
@@ -56,8 +56,7 @@ function anchorConfig() {
 export async function anchorPendingCheckpoints(fetcher: typeof fetch = fetch) {
   const config = anchorConfig();
   if (!config) return { configured: false, attempted: 0, anchored: 0, failed: 0 };
-  const database = getCrossTenantDatabase();
-  const [telemetry, audit] = await Promise.all([
+  const [telemetry, audit] = await withCrossTenant((database) => Promise.all([
     database.select({
       id: telemetryMerkleCheckpoints.id, rootHash: telemetryMerkleCheckpoints.rootHash,
       leafCount: telemetryMerkleCheckpoints.leafCount, createdAt: telemetryMerkleCheckpoints.createdAt,
@@ -71,7 +70,7 @@ export async function anchorPendingCheckpoints(fetcher: typeof fetch = fetch) {
     }).from(securityAuditCheckpoints).where(eq(securityAuditCheckpoints.anchorStatus, "PENDING"))
       .orderBy(asc(securityAuditCheckpoints.anchorAttempts), asc(securityAuditCheckpoints.createdAt), asc(securityAuditCheckpoints.id))
       .limit(MAX_BATCH),
-  ]);
+  ]));
   const checkpoints = [
     ...telemetry.map((checkpoint) => ({ ...checkpoint, kind: "telemetry" as const })),
     ...audit.map((checkpoint) => ({ ...checkpoint, leafCount: 1, kind: "security_audit" as const })),
@@ -83,7 +82,7 @@ export async function anchorPendingCheckpoints(fetcher: typeof fetch = fetch) {
   let failed = 0;
   for (const checkpoint of checkpoints) {
     const checkpointId = checkpoint.id.toString();
-    const outcome = await database.transaction(async (transaction) => {
+    const outcome = await withCrossTenant(async (transaction) => {
       const lock = checkpoint.kind === "telemetry"
         ? await transaction.execute<{ anchor_status: string }>(sql`
             SELECT anchor_status FROM telemetry_merkle_checkpoints WHERE id = ${checkpoint.id} FOR UPDATE

@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  getCrossTenantDatabase: vi.fn(),
+  withCrossTenant: vi.fn(),
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@/db/client", () => ({ getCrossTenantDatabase: mocks.getCrossTenantDatabase }));
+vi.mock("@/db/client", () => ({ withCrossTenant: mocks.withCrossTenant }));
 
 import { authenticateTenant, digestTenantKey, extractBearerToken } from "./tenant-auth";
 
@@ -39,7 +39,7 @@ describe("tenant authentication", () => {
     const innerJoin = vi.fn(() => ({ where }));
     const from = vi.fn(() => ({ innerJoin }));
     const select = vi.fn(() => ({ from }));
-    mocks.getCrossTenantDatabase.mockReturnValue({ select });
+    mocks.withCrossTenant.mockImplementation((work: (transaction: unknown) => unknown) => work({ select }));
     const request = new Request("https://control.example/api/telemetry/ingest", {
       headers: { authorization: `Bearer ${"customer-secret".padEnd(32, "x")}` },
     });
@@ -55,18 +55,18 @@ describe("tenant authentication", () => {
   });
 
   it("rejects a missing credential without querying Postgres", async () => {
-    mocks.getCrossTenantDatabase.mockClear();
+    mocks.withCrossTenant.mockClear();
     const request = new Request("https://control.example/api/telemetry/ingest");
     await expect(authenticateTenant(request)).resolves.toBeNull();
-    expect(mocks.getCrossTenantDatabase).not.toHaveBeenCalled();
+    expect(mocks.withCrossTenant).not.toHaveBeenCalled();
   });
 
   it("rejects undersized credentials without querying Postgres", async () => {
-    mocks.getCrossTenantDatabase.mockClear();
+    mocks.withCrossTenant.mockClear();
     const request = new Request("https://control.example/api/telemetry/ingest", {
       headers: { authorization: "Bearer short" },
     });
     await expect(authenticateTenant(request)).resolves.toBeNull();
-    expect(mocks.getCrossTenantDatabase).not.toHaveBeenCalled();
+    expect(mocks.withCrossTenant).not.toHaveBeenCalled();
   });
 });

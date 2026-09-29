@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
-import { getCrossTenantDatabase, withOrganization } from "@/db/client";
+import { withCrossTenant, withOrganization } from "@/db/client";
 import { dpoAccessKeys } from "@/db/schema";
 
 export type DPOIdentity = {
@@ -20,7 +20,7 @@ export function hashDPOAccessKey(key: string) {
 export async function authenticateDPOAccessKey(key: string, now = new Date()): Promise<DPOIdentity | null> {
   if (key.length < 32 || /\s/.test(key)) return null;
   // The organization is not known until the key is found.
-  const [identity] = await getCrossTenantDatabase()
+  const [identity] = await withCrossTenant((transaction) => transaction
     .select({
       credentialId: dpoAccessKeys.id, organizationId: dpoAccessKeys.organizationId, role: dpoAccessKeys.role,
       label: dpoAccessKeys.label, sessionVersion: dpoAccessKeys.sessionVersion,
@@ -31,7 +31,7 @@ export async function authenticateDPOAccessKey(key: string, now = new Date()): P
       isNull(dpoAccessKeys.revokedAt),
       or(isNull(dpoAccessKeys.expiresAt), gt(dpoAccessKeys.expiresAt, now)),
     ))
-    .limit(1);
+    .limit(1));
   return identity ?? null;
 }
 

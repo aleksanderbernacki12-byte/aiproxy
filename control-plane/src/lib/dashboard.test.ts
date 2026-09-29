@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
-vi.mock("@/db/client", () => ({ getDatabase: vi.fn() }));
+vi.mock("@/db/client", () => ({ withOrganization: vi.fn() }));
 
 import { chainStatusFor } from "./dashboard";
 
