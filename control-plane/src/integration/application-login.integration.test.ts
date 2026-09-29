@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { sql } from "drizzle-orm";
@@ -32,7 +32,15 @@ describe("application login role", () => {
   beforeAll(async () => {
     await owner.connect();
     const migrations = (await readdir(resolve("db/migrations"))).filter((name) => name.endsWith(".sql")).sort();
-    for (const migration of migrations) await owner.query(await readFile(resolve("db/migrations", migration), "utf8"));
+    // Recorded like scripts/migrate.mjs does, because readiness checks them.
+    await owner.query(`CREATE TABLE IF NOT EXISTS control_plane_migrations (
+      filename text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    for (const migration of migrations) {
+      await owner.query(await readFile(resolve("db/migrations", migration), "utf8"));
+      await owner.query(`INSERT INTO control_plane_migrations(filename) VALUES ($1) ON CONFLICT DO NOTHING`, [migration]);
+    }
     for (const organizationId of [organizationA, organizationB]) {
       await owner.query(`INSERT INTO organizations (id, name, tenant_key) VALUES ($1, $2, $3)`,
         [organizationId, "Login Organization", createHash("sha256").update(randomUUID()).digest("hex")]);
@@ -68,8 +76,15 @@ describe("application login role", () => {
   it("runs the application with tenant isolation", async () => {
     vi.stubEnv("DATABASE_URL", loginUrl(password));
     const { withOrganization } = await import("@/db/client");
-    const { applicationRoleActive } = await import("@/lib/readiness");
-    expect(await applicationRoleActive()).toBe(true);
+    vi.stubEnv("DASHBOARD_SESSION_SECRET", "s".repeat(32));
+    vi.stubEnv("CRON_SECRET", "c".repeat(32));
+    vi.stubEnv("MERKLE_ANCHOR_URL", "https://anchor.test/v1/checkpoints");
+    vi.stubEnv("MERKLE_ANCHOR_TOKEN", "a".repeat(32));
+    vi.stubEnv("MERKLE_ANCHOR_PUBLIC_KEY", generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }).toString());
+    vi.stubEnv("REPORT_SIGNING_PRIVATE_KEY", generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+    const { checkControlPlaneReadiness, dedicatedDatabaseLogin } = await import("@/lib/readiness");
+    expect(await dedicatedDatabaseLogin()).toBe(true);
+    expect(await checkControlPlaneReadiness()).toBe(true);
     const visible = await withOrganization(organizationA, (transaction) =>
       transaction.select({ organizationId: aiSystems.organizationId }).from(aiSystems)
         .where(sql`${aiSystems.applicationId} = 'login'`));

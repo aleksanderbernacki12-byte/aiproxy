@@ -207,8 +207,11 @@ describe("telemetry control-plane flow", () => {
     });
     expect(dashboard?.checkpoint?.rootHash).toMatch(/^[a-f0-9]{64}$/);
 
-    const { checkControlPlaneReadiness } = await import("@/lib/readiness");
-    expect(await checkControlPlaneReadiness()).toBe(true);
+    // This suite logs in as the owner, which readiness refuses; the login
+    // role's READY path is covered in application-login.integration.test.ts.
+    const { checkControlPlaneReadiness, dedicatedDatabaseLogin } = await import("@/lib/readiness");
+    expect(await dedicatedDatabaseLogin()).toBe(false);
+    expect(await checkControlPlaneReadiness()).toBe(false);
     const { clearLoginFailures, getLoginThrottle, recordLoginFailure } = await import("@/lib/login-throttle");
     const throttleNow = new Date("2026-09-15T12:00:00.000Z");
     expect((await getLoginThrottle(loginSourceHash, throttleNow)).allowed).toBe(true);
