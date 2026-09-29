@@ -129,6 +129,11 @@ jobs:
           git fetch --tags --force --depth=1 origin
           npm run test:upgrade
 
+      - name: Integration tests through pgbouncer in transaction mode
+        env:
+          TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: npm run test:pgbouncer
+
       # Build generates Next.js route types required by the standalone check.
       - name: Production build
         run: npm run build
