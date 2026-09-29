@@ -79,7 +79,7 @@ describe("application login role", () => {
   it("rotates the password on a second run", async () => {
     const rotated = randomUUID().replaceAll("-", "");
     expect(await ensureApplicationLogin(owner, rotated)).toBe(loginRole);
-    await expect(connectAsLogin(password)).rejects.toThrow(/password authentication failed/);
+    await expect(connectAsLogin(password)).rejects.toThrow(/password authentication failed|SASL authentication failed/);
     const client = await connectAsLogin(rotated);
     await client.end();
   });
