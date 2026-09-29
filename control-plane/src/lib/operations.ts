@@ -1,7 +1,7 @@
 import "server-only";
 
 import { sql } from "drizzle-orm";
-import { getCrossTenantDatabase } from "@/db/client";
+import { withCrossTenant } from "@/db/client";
 import { securityAuditCheckpoints, telemetryBuffer, telemetryEvents, telemetryMerkleCheckpoints } from "@/db/schema";
 
 export type ControlPlaneMetrics = {
@@ -16,8 +16,7 @@ export type ControlPlaneMetrics = {
 };
 
 export async function getControlPlaneMetrics(now = new Date()): Promise<ControlPlaneMetrics> {
-  const database = getCrossTenantDatabase();
-  const [[buffer], [events], [anchors], [auditAnchors], auditChains] = await Promise.all([
+  const [[buffer], [events], [anchors], [auditAnchors], auditChains] = await withCrossTenant((database) => Promise.all([
     database.select({
       pending: sql<number>`count(*)::integer`.mapWith(Number),
       oldest: sql<Date | null>`min(${telemetryBuffer.receivedAt})`,
@@ -39,7 +38,7 @@ export async function getControlPlaneMetrics(now = new Date()): Promise<ControlP
       SELECT count(*) filter (where not verify_security_audit_chain(organization_id))::integer AS broken
       FROM security_audit_heads
     `),
-  ]);
+  ]));
   const oldest = buffer?.oldest ? new Date(buffer.oldest) : null;
   const anchorDates = [anchors?.oldest, auditAnchors?.oldest].filter((value): value is Date => Boolean(value)).map((value) => new Date(value));
   const oldestAnchor = anchorDates.length > 0 ? new Date(Math.min(...anchorDates.map((value) => value.getTime()))) : null;

@@ -3,7 +3,7 @@ import "server-only";
 import { createHash } from "node:crypto";
 import { and, eq, gt, isNull, or } from "drizzle-orm";
 import { organizations, tenantAccessKeys } from "@/db/schema";
-import { getCrossTenantDatabase } from "@/db/client";
+import { withCrossTenant } from "@/db/client";
 
 export type AuthenticatedOrganization = {
   id: string;
@@ -28,7 +28,7 @@ export async function authenticateTenant(
     return null;
   }
   const digest = digestTenantKey(tenantKey);
-  const [organization] = await getCrossTenantDatabase()
+  const [organization] = await withCrossTenant((transaction) => transaction
     .select({ id: organizations.id, name: organizations.name })
     .from(tenantAccessKeys)
     .innerJoin(organizations, eq(organizations.id, tenantAccessKeys.organizationId))
@@ -37,6 +37,6 @@ export async function authenticateTenant(
       isNull(tenantAccessKeys.revokedAt),
       or(isNull(tenantAccessKeys.expiresAt), gt(tenantAccessKeys.expiresAt, new Date())),
     ))
-    .limit(1);
+    .limit(1));
   return organization ?? null;
 }

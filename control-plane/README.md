@@ -312,25 +312,27 @@ npm run reports:verify -- aiproxy-compliance-<report-id>.json report-public.pem
 Every table that holds tenant data (and `organizations` itself) has a
 PostgreSQL row-level security policy: a row is visible and writable only when
 its organization equals the transaction's `aiproxy.organization_id`, or when
-the connection is in explicit cross-tenant mode. The application pools switch
-every connection to a non-superuser role of this database,
+the transaction is in explicit cross-tenant mode. Every application query runs
+in a transaction (`withOrganization`, `withCrossTenant` or `withoutTenant`)
+that switches to a non-superuser role of this database,
 `aiproxy_app_<first 12 hex of md5(database name)>` (created by migration 0019;
 superusers bypass row-level security, and roles are cluster-wide, so each
-database gets its own), and request-driven code runs
-inside `withOrganization`, which also sets the role for its transaction so the
-policy holds behind a transaction-mode pooler such as pgbouncer. A query that
-forgets its organization filter therefore sees only its own tenant, and a
-query without a tenant context sees no tenant rows at all. Only tenant and DPO
-key lookups (before the organization is known) and the internal jobs use the
-cross-tenant pool. The policies are not forced, so the owner role that runs
+database gets its own), and sets the tenant context with transaction-local
+`set_config`. Nothing is kept on the connection, and both context values are
+set explicitly each time, so the policy also holds behind a transaction-mode
+pooler such as pgbouncer or Neon's pooled endpoint, where server connections
+and their session state pass between clients. A query that forgets its
+organization filter therefore sees only its own tenant, and a query without a
+tenant context sees no tenant rows at all. Only tenant and DPO key lookups
+(before the organization is known) and the internal jobs use
+`withCrossTenant`. The policies are not forced, so the owner role that runs
 migrations and the CLI scripts is unaffected. This guards against code
 mistakes, not against an attacker who can run arbitrary SQL.
 
 The user that runs migrations must be a superuser or hold `CREATEROLE` (the
 default owner on managed PostgreSQL such as Neon, Supabase and RDS), because
 migration 0019 creates and grants the role. Readiness reports `NOT_READY` when
-the application is not running as that role, since row-level security would
-then not apply.
+the application's database user cannot switch to that role.
 
 Run the application as the dedicated login role rather than the owner. When
 `APP_DATABASE_PASSWORD` (at least 32 printable ASCII characters; use hex so it

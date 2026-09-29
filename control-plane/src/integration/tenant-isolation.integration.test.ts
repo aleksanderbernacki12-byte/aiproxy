@@ -58,11 +58,12 @@ describe("tenant row-level security", () => {
   });
 
   it("shows and accepts nothing without a tenant context", async () => {
-    const { getDatabase } = await import("@/db/client");
-    const database = getDatabase();
-    const rows = await database.select().from(aiSystems).where(sql`${aiSystems.applicationId} = 'isolation'`);
+    const { withoutTenant } = await import("@/db/client");
+    const rows = await withoutTenant((transaction) =>
+      transaction.select().from(aiSystems).where(sql`${aiSystems.applicationId} = 'isolation'`));
     expect(rows).toHaveLength(0);
-    expect(await databaseError(database.insert(aiSystems).values({ ...aiSystem(organizationA), model: "no-context" })))
+    expect(await databaseError(withoutTenant((transaction) =>
+      transaction.insert(aiSystems).values({ ...aiSystem(organizationA), model: "no-context" }))))
       .toMatch(/row-level security/);
   });
 
@@ -80,20 +81,39 @@ describe("tenant row-level security", () => {
   });
 
   it("lets cross-tenant jobs see every organization", async () => {
-    const { getCrossTenantDatabase } = await import("@/db/client");
-    const rows = await getCrossTenantDatabase().select({ organizationId: aiSystems.organizationId }).from(aiSystems)
-      .where(sql`${aiSystems.applicationId} = 'isolation'`);
+    const { withCrossTenant } = await import("@/db/client");
+    const rows = await withCrossTenant((transaction) => transaction.select({ organizationId: aiSystems.organizationId })
+      .from(aiSystems).where(sql`${aiSystems.applicationId} = 'isolation'`));
     expect(rows.map((row) => row.organizationId).sort()).toEqual([organizationA, organizationB].sort());
   });
 
+  // A transaction-mode pooler (pgbouncer) hands the same server connection to
+  // the next client, including session state someone else left on it.
+  it("ignores tenant context left on the connection", async () => {
+    const { withCrossTenant, withOrganization, withoutTenant } = await import("@/db/client");
+    // Sequential use reuses one pooled connection; leave cross-tenant on for its session.
+    await withoutTenant((transaction) => transaction.execute(sql`SELECT set_config('aiproxy.cross_tenant', 'on', false),
+      set_config('aiproxy.organization_id', ${organizationB}, false)`));
+    try {
+      const unscoped = await withoutTenant((transaction) =>
+        transaction.select().from(aiSystems).where(sql`${aiSystems.applicationId} = 'isolation'`));
+      expect(unscoped).toHaveLength(0);
+      const scoped = await withOrganization(organizationA, (transaction) =>
+        transaction.select({ organizationId: aiSystems.organizationId }).from(aiSystems));
+      expect(scoped).toEqual([{ organizationId: organizationA }]);
+    } finally {
+      await withCrossTenant((transaction) => transaction.execute(sql`SELECT set_config('aiproxy.cross_tenant', 'off', false),
+        set_config('aiproxy.organization_id', '', false)`));
+    }
+  });
+
   it("runs application queries as the restricted role", async () => {
-    const { getDatabase } = await import("@/db/client");
-    const database = getDatabase();
-    const role = await database.execute<{ current_user: string }>(sql`SELECT current_user`);
+    const { withoutTenant } = await import("@/db/client");
+    const role = await withoutTenant((transaction) => transaction.execute<{ current_user: string }>(sql`SELECT current_user`));
     const expected = await client.query<{ role: string }>(`SELECT 'aiproxy_app_' || left(md5(current_database()), 12) AS role`);
     expect(role.rows[0].current_user).toBe(expected.rows[0].role);
     const { applicationRoleActive } = await import("@/lib/readiness");
     expect(await applicationRoleActive()).toBe(true);
-    expect(await databaseError(database.execute(sql`TRUNCATE ai_systems`))).toMatch(/permission denied/);
+    expect(await databaseError(withoutTenant((transaction) => transaction.execute(sql`TRUNCATE ai_systems`)))).toMatch(/permission denied/);
   });
 });
